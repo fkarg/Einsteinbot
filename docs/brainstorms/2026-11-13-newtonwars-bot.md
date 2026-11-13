@@ -155,3 +155,12 @@ User answer: pending.
 
 ## P1 accepted scope checkpoint
 Accepted, pending Q12 for the process/client ownership boundary. Stable work: module boundaries, TCP/protocol parser, typed semantic events, SQLite connection-scoped event store, name/config selection, core tests, README usage. Client fan-out and live multi-client behavior are held until Q12. No implementation edits have started.
+
+### P1 foundation implementation checkpoint (2026-11-13)
+- Implemented stable foundation only: `src/protocol.rs` typed server events and semantic client commands, incremental native-endian parser for message IDs 1–9, `src/event_store.rs` SQLite event capture with ordered typed JSON events, per-connection capture metadata and explicit end timestamp, and library exports in `src/lib.rs`. Added rusqlite bundled + serde dependencies and normalized Cargo package to `einsteinbot`.
+- Behavior contracts: parser accepts arbitrary read fragmentation and concatenated events; variable shot/planet counts are bounded (2,000 points / 64 planets); planet record size must be 32 bytes; unknown IDs and malformed framing return errors. Persisted data contains semantic event JSON only, capture-local sequence is authoritative, Unix-millisecond timestamps are contextual. `finish()` stores connection end time; an unfinalized capture remains NULL and can signal abrupt termination.
+- Core test coverage now includes fragmented fixed and variable frames, multiple events in a read, variable shot/planet decoding, text command encoding/validation, semantic event sequence round-trip, and separation/end-time across two captures in one DB.
+- Verification observed: `CARGO_HOME=/private/tmp/einsteinbot-cargo cargo test` passed (5 tests); `cargo fmt --check` passed; package-name warning removed.
+- General fresh-context same-model review found no blocking protocol/storage defects; its note that timestamps can collide within one millisecond is handled by sequence ordering. Test-quality review identified variable-length fragmentation and capture isolation as worthwhile coverage; both were added. Impact: added verification.
+- Files intentionally not yet implemented: `src/main.rs` remains Hello World; no TCP connection/prompt handling, CLI/name/config, logger wiring, bot actions, README operation instructions, or live telnet test yet.
+- P1 remains accepted but incomplete; single-vs-multiple client process/connection ownership is held at Q12. Stable code slice is ready to commit independently.
