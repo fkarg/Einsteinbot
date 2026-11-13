@@ -44,6 +44,10 @@ Set individual values with `EINSTEINBOT_HOST`, `EINSTEINBOT_PORT`, `EINSTEINBOT_
 
 The dummy chooses an integer velocity between 2 and `min(8, floor(energy))` and an integer angle from -180 through 180, at most one shot per energy response. Every outbound command, including connection setup and energy requests, passes through a client-side token bucket capped at 16 wire bytes per second with at most 512 bytes of burst. The upstream server starts each connection with a 512-byte allowance and replenishes one byte every three game-loop iterations. That is nominally 20 bytes per second at 60 loops per second; its actual limit changes with loop pace. NewtonWars exempts local connections from enforcement, but this client applies its stricter cap locally too.
 
+## Mapping library prototype
+
+The `map` module computes NewtonWars planet acceleration and its first and second spatial derivatives. The `simulation` module reproduces the source's 25-substep velocity-Verlet path and exposes position and reconstructed-acceleration residuals. `estimator::fit_fixed_count` fits planet centers and gravity weights from completed shot paths and returns local parameter covariance when the fit is full-rank. The caller must provide an initial candidate map; this first fitter keeps source count and radii fixed. It is a library prototype and is not yet wired to a capture-analysis CLI or bot policy.
+
 ## Local NewtonWars server
 
 The client does not start a server. From the NewtonWars checkout, the macOS source build is:

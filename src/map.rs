@@ -1,4 +1,5 @@
 use crate::protocol::Planet;
+use nalgebra::DMatrix;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Vec2 {
@@ -133,6 +134,55 @@ impl PlanetMap {
         }
         Ok(result)
     }
+
+    /// Jacobian of acceleration with respect to `[center_x, center_y, mass]` per planet.
+    pub fn acceleration_parameter_jacobian(
+        &self,
+        position: Vec2,
+    ) -> Result<DMatrix<f64>, SingularFieldError> {
+        let mut result = DMatrix::zeros(2, self.planets.len() * 3);
+        for (planet_index, planet) in self.planets.iter().enumerate() {
+            let dx = planet.x - position.x;
+            let dy = planet.y - position.y;
+            let distance_squared = dx * dx + dy * dy;
+            if distance_squared == 0.0 {
+                return Err(SingularFieldError { planet_index });
+            }
+            let inverse_r3 = 1.0 / (distance_squared * distance_squared.sqrt());
+            let inverse_r5 = inverse_r3 / distance_squared;
+            let column = planet_index * 3;
+            result[(0, column)] = planet.mass * (inverse_r3 - 3.0 * dx * dx * inverse_r5);
+            result[(1, column)] = -3.0 * planet.mass * dx * dy * inverse_r5;
+            result[(0, column + 1)] = -3.0 * planet.mass * dx * dy * inverse_r5;
+            result[(1, column + 1)] = planet.mass * (inverse_r3 - 3.0 * dy * dy * inverse_r5);
+            result[(0, column + 2)] = dx * inverse_r3;
+            result[(1, column + 2)] = dy * inverse_r3;
+        }
+        Ok(result)
+    }
+
+    /// Propagate covariance in `[center_x, center_y, mass]` map order into field covariance.
+    pub fn acceleration_covariance(
+        &self,
+        position: Vec2,
+        parameter_covariance: &DMatrix<f64>,
+    ) -> Result<Matrix2, String> {
+        let jacobian = self
+            .acceleration_parameter_jacobian(position)
+            .map_err(|error| error.to_string())?;
+        if parameter_covariance.nrows() != jacobian.ncols()
+            || parameter_covariance.ncols() != jacobian.ncols()
+        {
+            return Err("parameter covariance shape does not match planet map".to_owned());
+        }
+        let covariance = &jacobian * parameter_covariance * jacobian.transpose();
+        Ok(Matrix2 {
+            xx: covariance[(0, 0)],
+            xy: covariance[(0, 1)],
+            yx: covariance[(1, 0)],
+            yy: covariance[(1, 1)],
+        })
+    }
 }
 
 #[cfg(test)]
@@ -177,5 +227,48 @@ mod tests {
         assert!((numeric_second - hessian.values[0][0][0]).abs() < 1e-6);
         let numeric_mixed = (jac_plus.xy - jac_minus.xy) / (2.0 * h);
         assert!((numeric_mixed - hessian.values[0][0][1]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parameter_covariance_propagates_to_field_uncertainty() {
+        let map = PlanetMap {
+            planets: vec![planet(0.0, 0.0, 1.0, 8.0)],
+        };
+        let mut parameter_covariance = DMatrix::zeros(3, 3);
+        parameter_covariance[(2, 2)] = 4.0;
+
+        let covariance = map
+            .acceleration_covariance(Vec2::new(2.0, 0.0), &parameter_covariance)
+            .unwrap();
+
+        assert!((covariance.xx - 0.25).abs() < 1e-12);
+        assert!(covariance.xy.abs() < 1e-12);
+        assert!(covariance.yy.abs() < 1e-12);
+    }
+
+    #[test]
+    fn planet_parameter_jacobian_matches_finite_differences() {
+        let map = PlanetMap {
+            planets: vec![planet(0.0, 0.0, 1.0, 8.0)],
+        };
+        let position = Vec2::new(2.0, 3.0);
+        let jacobian = map.acceleration_parameter_jacobian(position).unwrap();
+        let h = 1e-5;
+
+        let mut moved_center = map.clone();
+        moved_center.planets[0].x += h;
+        let plus = moved_center.acceleration(position).unwrap();
+        moved_center.planets[0].x -= 2.0 * h;
+        let minus = moved_center.acceleration(position).unwrap();
+        assert!((((plus.x - minus.x) / (2.0 * h)) - jacobian[(0, 0)]).abs() < 1e-8);
+        assert!((((plus.y - minus.y) / (2.0 * h)) - jacobian[(1, 0)]).abs() < 1e-8);
+
+        let mut moved_mass = map.clone();
+        moved_mass.planets[0].mass += h;
+        let plus = moved_mass.acceleration(position).unwrap();
+        moved_mass.planets[0].mass -= 2.0 * h;
+        let minus = moved_mass.acceleration(position).unwrap();
+        assert!((((plus.x - minus.x) / (2.0 * h)) - jacobian[(0, 2)]).abs() < 1e-8);
+        assert!((((plus.y - minus.y) / (2.0 * h)) - jacobian[(1, 2)]).abs() < 1e-8);
     }
 }

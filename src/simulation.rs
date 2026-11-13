@@ -107,18 +107,13 @@ pub fn simulate_shot(
 
     while points.len() < max_samples {
         for _ in 0..world.substeps_per_tick {
-            let dt = 1.0 / world.substeps_per_tick as f64;
-            let new_position = Vec2::new(
-                position.x + velocity.x * dt + acceleration.x * 0.5 * dt * dt,
-                position.y + velocity.y * dt + acceleration.y * 0.5 * dt * dt,
-            );
-            let new_acceleration = map
-                .acceleration(new_position)
-                .map_err(|error| error.to_string())?;
-            velocity.x += (acceleration.x + new_acceleration.x) * 0.5 * dt;
-            velocity.y += (acceleration.y + new_acceleration.y) * 0.5 * dt;
-            position = new_position;
-            acceleration = new_acceleration;
+            integrate_substep(
+                map,
+                &mut position,
+                &mut velocity,
+                &mut acceleration,
+                world.substeps_per_tick,
+            )?;
 
             if let Some((planet_index, _)) = map.planets.iter().enumerate().find(|(_, planet)| {
                 let dx = planet.x - position.x;
@@ -152,6 +147,59 @@ pub fn simulate_shot(
         points,
         termination: Termination::SampleLimit,
     })
+}
+
+/// Simulate full-tick samples without collision stops, for a fixed-dimensional fit residual.
+///
+/// Planet endpoints have unknown substep time in protocol data, so the fitter compares only
+/// regular tick samples before the final observed point.
+pub fn simulate_sampled_path(
+    map: &PlanetMap,
+    shot: &ShotObservation,
+    world: WorldParameters,
+    sample_count: usize,
+) -> Result<Vec<Point>, String> {
+    Ok(simulate_sampled_positions(map, shot, world, sample_count)?
+        .into_iter()
+        .map(to_point)
+        .collect())
+}
+
+/// Simulate regular tick positions in f64 for parameter fitting.
+pub fn simulate_sampled_positions(
+    map: &PlanetMap,
+    shot: &ShotObservation,
+    world: WorldParameters,
+    sample_count: usize,
+) -> Result<Vec<Vec2>, String> {
+    if shot.points.is_empty() {
+        return Err("shot observation has no launch position".to_owned());
+    }
+    if world.substeps_per_tick == 0 {
+        return Err("substeps per tick must be nonzero".to_owned());
+    }
+
+    let start = &shot.points[0];
+    let mut position = Vec2::new(f64::from(start.x), f64::from(start.y));
+    let angle = shot.angle_degrees.to_radians();
+    let mut velocity = Vec2::new(shot.velocity * angle.cos(), -shot.velocity * angle.sin());
+    let mut acceleration = map
+        .acceleration(position)
+        .map_err(|error| error.to_string())?;
+    let mut points = vec![position];
+    while points.len() < sample_count {
+        for _ in 0..world.substeps_per_tick {
+            integrate_substep(
+                map,
+                &mut position,
+                &mut velocity,
+                &mut acceleration,
+                world.substeps_per_tick,
+            )?;
+        }
+        points.push(position);
+    }
+    Ok(points)
 }
 
 pub fn compare_trajectories(observed: &[Point], predicted: &[Point]) -> TrajectoryResiduals {
@@ -216,6 +264,28 @@ fn to_point(point: Vec2) -> Point {
         x: point.x as f32,
         y: point.y as f32,
     }
+}
+
+fn integrate_substep(
+    map: &PlanetMap,
+    position: &mut Vec2,
+    velocity: &mut Vec2,
+    acceleration: &mut Vec2,
+    substeps_per_tick: usize,
+) -> Result<(), String> {
+    let dt = 1.0 / substeps_per_tick as f64;
+    let next_position = Vec2::new(
+        position.x + velocity.x * dt + acceleration.x * 0.5 * dt * dt,
+        position.y + velocity.y * dt + acceleration.y * 0.5 * dt * dt,
+    );
+    let next_acceleration = map
+        .acceleration(next_position)
+        .map_err(|error| error.to_string())?;
+    velocity.x += (acceleration.x + next_acceleration.x) * 0.5 * dt;
+    velocity.y += (acceleration.y + next_acceleration.y) * 0.5 * dt;
+    *position = next_position;
+    *acceleration = next_acceleration;
+    Ok(())
 }
 
 #[cfg(test)]
