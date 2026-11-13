@@ -46,7 +46,13 @@ The dummy chooses an integer velocity between 2 and `min(8, floor(energy))` and 
 
 ## Mapping library prototype
 
-The `map` module computes NewtonWars planet acceleration and its first and second spatial derivatives. The `simulation` module reproduces the source's 25-substep velocity-Verlet path and exposes position and reconstructed-acceleration residuals. `estimator::fit_fixed_count` fits planet centers and gravity weights from completed shot paths and returns local parameter covariance when the fit is full-rank. The caller must provide an initial candidate map; this first fitter keeps source count and radii fixed. It is a library prototype and is not yet wired to a capture-analysis CLI or bot policy.
+The `map` module computes NewtonWars planet acceleration and its first and second spatial derivatives. The `simulation` module reproduces the source's 25-substep velocity-Verlet path and exposes position and reconstructed-acceleration residuals. `estimator::fit_greedy_source_counts` uses a deterministic grid search over acceleration residuals to seed planet candidates, then fits centers and gravity weights against shot paths. The separate `estimate` binary reads one recorded capture, extracts completed shot paths, and reports each candidate count's training and held-out position RMSE:
+
+```sh
+cargo run --bin estimate -- --capture-id 2
+```
+
+Use `--db-path PATH` for another SQLite file, `--max-sources N` to search further (the default is 4), `--validation-every 0` to disable the deterministic holdout, and `--radius-prior VALUE` / `--grid-spacing VALUE` to adjust seed assumptions. The default radius is fixed during fitting: smooth trajectories constrain centers and gravity weights, while radius needs collision evidence. Covariance is a local fit approximation and is reported only for full-rank fits. Candidate maps are proposals, not a claim that one count is correct. A local 61-shot capture favored two sources among the first four held-out scores; larger candidates had lower training error but much worse validation scores, demonstrating the risk of overfitting and local minima. The finite-difference fitter becomes expensive as source count grows, so raise the limit deliberately.
 
 ## Local NewtonWars server
 

@@ -1,5 +1,6 @@
+use crate::event_store::StoredEvent;
 use crate::map::PlanetMap;
-use crate::protocol::Planet;
+use crate::protocol::{Planet, RecordedEvent, ServerEvent};
 use crate::simulation::{
     ShotObservation, WorldParameters, reconstruct_acceleration, simulate_sampled_positions,
 };
@@ -33,6 +34,28 @@ pub struct AccelerationResidual {
     pub predicted: crate::map::Vec2,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct SourceCountCandidate {
+    pub result: FitResult,
+    /// `None` means no holdout observations were supplied.
+    pub validation_rmse: Option<f64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SourceCountStopReason {
+    ReachedMaximum,
+    NoPositiveResidual,
+    InsufficientResiduals { required: usize, available: usize },
+    CandidateFitFailed(String),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SourceCountSearch {
+    /// Candidate maps are proposals, not proof that each source exists.
+    pub candidates: Vec<SourceCountCandidate>,
+    pub stop_reason: SourceCountStopReason,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FitError(String);
 
@@ -43,6 +66,19 @@ impl fmt::Display for FitError {
 }
 
 impl Error for FitError {}
+
+/// Extract completed protocol-version-8 trajectories from one ordered event capture.
+pub fn shot_observations(events: &[StoredEvent]) -> Vec<ShotObservation> {
+    events
+        .iter()
+        .filter_map(|stored| match &stored.event {
+            RecordedEvent::Inbound(event @ ServerEvent::ShotFin { .. }) => {
+                ShotObservation::try_from(event).ok()
+            }
+            _ => None,
+        })
+        .collect()
+}
 
 /// Compare acceleration reconstructed from a shot's regular samples with the planet field.
 pub fn acceleration_residuals(
@@ -62,6 +98,213 @@ pub fn acceleration_residuals(
             })
         })
         .collect()
+}
+
+/// Find one deterministic point-source seed that best explains the current acceleration residual.
+///
+/// This coarse-grid initializer avoids sampling random planet layouts. Its output is a starting
+/// candidate only; the full trajectory fit should refine the source and assess whether it helps.
+pub fn seed_planet_from_residuals(
+    current_map: &PlanetMap,
+    observations: &[ShotObservation],
+    world: WorldParameters,
+    radius_prior: f64,
+    grid_spacing: f64,
+) -> Result<Planet, FitError> {
+    try_seed_planet_from_residuals(current_map, observations, world, radius_prior, grid_spacing)?
+        .ok_or_else(|| FitError("no positive point-source residual fit found".to_owned()))
+}
+
+fn try_seed_planet_from_residuals(
+    current_map: &PlanetMap,
+    observations: &[ShotObservation],
+    world: WorldParameters,
+    radius_prior: f64,
+    grid_spacing: f64,
+) -> Result<Option<Planet>, FitError> {
+    if observations.is_empty() {
+        return Err(FitError(
+            "at least one shot observation is required".to_owned(),
+        ));
+    }
+    if !radius_prior.is_finite()
+        || radius_prior <= 0.0
+        || grid_spacing <= 0.0
+        || !grid_spacing.is_finite()
+        || !world.battlefield_width.is_finite()
+        || !world.battlefield_height.is_finite()
+        || world.battlefield_width <= 2.0 * radius_prior
+        || world.battlefield_height <= 2.0 * radius_prior
+    {
+        return Err(FitError(
+            "seed radius, grid spacing, or world dimensions are invalid".to_owned(),
+        ));
+    }
+
+    let samples = observations
+        .iter()
+        .flat_map(|observation| reconstruct_acceleration(&observation.points))
+        .map(|(position, observed)| {
+            let predicted = current_map
+                .acceleration(position)
+                .map_err(|error| FitError(error.to_string()))?;
+            Ok((
+                position,
+                crate::map::Vec2::new(observed.x - predicted.x, observed.y - predicted.y),
+            ))
+        })
+        .collect::<Result<Vec<_>, FitError>>()?;
+    if samples.is_empty() {
+        return Err(FitError(
+            "shot observations contain no regular acceleration samples".to_owned(),
+        ));
+    }
+
+    let mut best: Option<(f64, Planet)> = None;
+    let mut center_x = radius_prior;
+    while center_x <= world.battlefield_width - radius_prior {
+        let mut center_y = radius_prior;
+        while center_y <= world.battlefield_height - radius_prior {
+            let mut numerator = 0.0;
+            let mut denominator = 0.0;
+            for (position, residual) in &samples {
+                let dx = center_x - position.x;
+                let dy = center_y - position.y;
+                let distance_squared = dx * dx + dy * dy;
+                if distance_squared == 0.0 {
+                    continue;
+                }
+                let scale = 1.0 / (distance_squared * distance_squared.sqrt());
+                let gx = dx * scale;
+                let gy = dy * scale;
+                numerator += residual.x * gx + residual.y * gy;
+                denominator += gx * gx + gy * gy;
+            }
+            if denominator > 0.0 && numerator > 0.0 {
+                let mass = numerator / denominator;
+                let score = numerator * numerator / denominator;
+                if mass.is_finite()
+                    && score.is_finite()
+                    && best
+                        .as_ref()
+                        .is_none_or(|(best_score, _)| score > *best_score)
+                {
+                    best = Some((
+                        score,
+                        Planet {
+                            x: center_x,
+                            y: center_y,
+                            radius: radius_prior,
+                            mass,
+                        },
+                    ));
+                }
+            }
+            center_y += grid_spacing;
+        }
+        center_x += grid_spacing;
+    }
+
+    Ok(best.map(|(_, planet)| planet))
+}
+
+/// Greedily propose and fit increasing fixed source counts from acceleration residuals.
+///
+/// Returns candidate maps up to the stopping point, preserving alternatives for later comparison.
+/// Any positive projected residual can produce a proposal; held-out scores should be used to
+/// compare them. If validation observations are provided, each fit is scored on those shots.
+pub fn fit_greedy_source_counts(
+    training: &[ShotObservation],
+    validation: &[ShotObservation],
+    world: WorldParameters,
+    max_sources: usize,
+    radius_prior: f64,
+    grid_spacing: f64,
+) -> Result<SourceCountSearch, FitError> {
+    if training.is_empty() {
+        return Err(FitError(
+            "at least one training shot is required".to_owned(),
+        ));
+    }
+    if max_sources == 0 || max_sources > 64 {
+        return Err(FitError("max_sources must be between 1 and 64".to_owned()));
+    }
+
+    let mut fitted_map = PlanetMap { planets: vec![] };
+    let mut candidates = Vec::with_capacity(max_sources);
+    let mut stop_reason = SourceCountStopReason::ReachedMaximum;
+    for source_count in 1..=max_sources {
+        let required = source_count * PARAMETERS_PER_PLANET;
+        let available = usable_residual_count(training);
+        if available < required {
+            stop_reason = SourceCountStopReason::InsufficientResiduals {
+                required,
+                available,
+            };
+            break;
+        }
+        let Some(seed) = try_seed_planet_from_residuals(
+            &fitted_map,
+            training,
+            world,
+            radius_prior,
+            grid_spacing,
+        )?
+        else {
+            stop_reason = SourceCountStopReason::NoPositiveResidual;
+            break;
+        };
+        fitted_map.planets.push(seed);
+        let result = match fit_fixed_count(&fitted_map, training, world) {
+            Ok(result) => result,
+            Err(error) => {
+                stop_reason = SourceCountStopReason::CandidateFitFailed(error.to_string());
+                break;
+            }
+        };
+        let validation_rmse = if validation.is_empty() {
+            None
+        } else {
+            Some(position_rmse(&result.map, validation, world)?)
+        };
+        fitted_map = result.map.clone();
+        candidates.push(SourceCountCandidate {
+            result,
+            validation_rmse,
+        });
+    }
+    Ok(SourceCountSearch {
+        candidates,
+        stop_reason,
+    })
+}
+
+fn position_rmse(
+    map: &PlanetMap,
+    observations: &[ShotObservation],
+    world: WorldParameters,
+) -> Result<f64, FitError> {
+    let mut squared_error = 0.0;
+    let mut coordinate_count = 0;
+    for shot in observations {
+        let usable_samples = shot.points.len().saturating_sub(1);
+        if usable_samples < 2 {
+            continue;
+        }
+        let predicted =
+            simulate_sampled_positions(map, shot, world, usable_samples).map_err(FitError)?;
+        for (observed, predicted) in shot.points[1..usable_samples].iter().zip(&predicted[1..]) {
+            squared_error += (f64::from(observed.x) - predicted.x).powi(2);
+            squared_error += (f64::from(observed.y) - predicted.y).powi(2);
+            coordinate_count += 2;
+        }
+    }
+    if coordinate_count == 0 {
+        return Err(FitError(
+            "validation shots contain no regular positions".to_owned(),
+        ));
+    }
+    Ok((squared_error / coordinate_count as f64).sqrt())
 }
 
 /// Batch-fit centers and gravity weights for a fixed candidate source count.
@@ -435,6 +678,202 @@ mod tests {
         };
 
         assert!(fit_fixed_count(&initial, &[observation], WorldParameters::default()).is_err());
+    }
+
+    #[test]
+    fn extracts_only_completed_shots_with_launch_parameters_from_capture() {
+        let events = vec![
+            StoredEvent {
+                sequence: 0,
+                timestamp_unix_ms: 10,
+                event: RecordedEvent::Inbound(ServerEvent::ShotBegin {
+                    player_id: 2,
+                    angle: 30.0,
+                    velocity: 8.0,
+                }),
+            },
+            StoredEvent {
+                sequence: 1,
+                timestamp_unix_ms: 11,
+                event: RecordedEvent::Inbound(ServerEvent::ShotFin {
+                    player_id: 2,
+                    angle: 30.0,
+                    velocity: 8.0,
+                    points: vec![
+                        crate::protocol::Point { x: 1.0, y: 2.0 },
+                        crate::protocol::Point { x: 3.0, y: 4.0 },
+                    ],
+                }),
+            },
+        ];
+
+        let shots = shot_observations(&events);
+
+        assert_eq!(shots.len(), 1);
+        assert_eq!(shots[0].player_id, 2);
+        assert_eq!(shots[0].angle_degrees, 30.0);
+        assert_eq!(shots[0].velocity, 8.0);
+        assert_eq!(shots[0].points[0].x, 1.0);
+    }
+
+    #[test]
+    fn deterministic_residual_seed_provides_a_starting_planet_for_batch_fit() {
+        let world = WorldParameters::default();
+        let truth = PlanetMap {
+            planets: vec![Planet {
+                x: 500.0,
+                y: 450.0,
+                radius: 30.0,
+                mass: 40_000.0,
+            }],
+        };
+        let observations = vec![
+            observation(&truth, (200.0, 200.0), 25.0, 8.0),
+            observation(&truth, (800.0, 250.0), 150.0, 8.0),
+            observation(&truth, (300.0, 850.0), -40.0, 9.0),
+        ];
+
+        let seed = seed_planet_from_residuals(
+            &PlanetMap { planets: vec![] },
+            &observations,
+            world,
+            30.0,
+            80.0,
+        )
+        .unwrap();
+        let seeded_map = PlanetMap {
+            planets: vec![seed],
+        };
+        let fit = fit_fixed_count(&seeded_map, &observations, world).unwrap();
+
+        assert!(
+            fit.residual_rmse < 0.1,
+            "fit rmse was {}",
+            fit.residual_rmse
+        );
+        assert!((fit.map.planets[0].x - truth.planets[0].x).abs() < 1.0);
+        assert!((fit.map.planets[0].y - truth.planets[0].y).abs() < 1.0);
+        assert!((fit.map.planets[0].mass - truth.planets[0].mass).abs() < 100.0);
+    }
+
+    #[test]
+    fn acceleration_residual_seed_can_propose_a_second_source() {
+        let world = WorldParameters::default();
+        let truth = PlanetMap {
+            planets: vec![
+                Planet {
+                    x: 500.0,
+                    y: 450.0,
+                    radius: 30.0,
+                    mass: 40_000.0,
+                },
+                Planet {
+                    x: 1_300.0,
+                    y: 600.0,
+                    radius: 30.0,
+                    mass: 55_000.0,
+                },
+            ],
+        };
+        let observations = vec![
+            observation(&truth, (100.0, 300.0), 0.0, 15.0),
+            observation(&truth, (100.0, 800.0), -5.0, 15.0),
+            observation(&truth, (1_800.0, 300.0), 180.0, 15.0),
+            observation(&truth, (1_800.0, 900.0), 175.0, 15.0),
+            observation(&truth, (800.0, 100.0), 80.0, 15.0),
+            observation(&truth, (800.0, 1_000.0), -80.0, 15.0),
+        ];
+        let known_first = PlanetMap {
+            planets: vec![truth.planets[0].clone()],
+        };
+
+        let second =
+            seed_planet_from_residuals(&known_first, &observations, world, 30.0, 80.0).unwrap();
+        let fit = fit_fixed_count(
+            &PlanetMap {
+                planets: vec![truth.planets[0].clone(), second],
+            },
+            &observations,
+            world,
+        )
+        .unwrap();
+
+        assert!((fit.map.planets[1].x - truth.planets[1].x).abs() < 5.0);
+        assert!((fit.map.planets[1].y - truth.planets[1].y).abs() < 5.0);
+        assert!((fit.map.planets[1].mass - truth.planets[1].mass).abs() < 1_000.0);
+    }
+
+    #[test]
+    fn greedy_source_count_search_returns_validation_scores_for_each_map() {
+        let world = WorldParameters::default();
+        let truth = PlanetMap {
+            planets: vec![
+                Planet {
+                    x: 500.0,
+                    y: 450.0,
+                    radius: 30.0,
+                    mass: 40_000.0,
+                },
+                Planet {
+                    x: 1_300.0,
+                    y: 600.0,
+                    radius: 30.0,
+                    mass: 55_000.0,
+                },
+            ],
+        };
+        let observations = vec![
+            observation(&truth, (100.0, 300.0), 0.0, 15.0),
+            observation(&truth, (100.0, 800.0), -5.0, 15.0),
+            observation(&truth, (1_800.0, 300.0), 180.0, 15.0),
+            observation(&truth, (1_800.0, 900.0), 175.0, 15.0),
+            observation(&truth, (800.0, 100.0), 80.0, 15.0),
+            observation(&truth, (800.0, 1_000.0), -80.0, 15.0),
+        ];
+
+        let candidates =
+            fit_greedy_source_counts(&observations[..4], &observations[4..], world, 2, 30.0, 80.0)
+                .unwrap();
+
+        assert_eq!(candidates.candidates.len(), 2);
+        assert_eq!(candidates.candidates[0].result.map.planets.len(), 1);
+        assert_eq!(candidates.candidates[1].result.map.planets.len(), 2);
+        assert!(candidates.candidates[0].validation_rmse.is_some());
+        assert!(
+            candidates.candidates[1].validation_rmse.unwrap()
+                < candidates.candidates[0].validation_rmse.unwrap()
+        );
+        assert_eq!(
+            candidates.stop_reason,
+            SourceCountStopReason::ReachedMaximum
+        );
+    }
+
+    #[test]
+    fn greedy_source_count_search_keeps_lower_counts_when_later_count_lacks_data() {
+        let world = WorldParameters::default();
+        let truth = PlanetMap {
+            planets: vec![Planet {
+                x: 500.0,
+                y: 450.0,
+                radius: 30.0,
+                mass: 40_000.0,
+            }],
+        };
+        let mut short_shot = observation(&truth, (200.0, 200.0), 25.0, 8.0);
+        short_shot.points.truncate(4);
+
+        let search = fit_greedy_source_counts(&[short_shot], &[], world, 2, 30.0, 80.0).unwrap();
+
+        assert_eq!(search.candidates.len(), 1);
+        assert_eq!(search.candidates[0].result.map.planets.len(), 1);
+        assert_eq!(
+            search.stop_reason,
+            SourceCountStopReason::InsufficientResiduals {
+                required: 6,
+                available: 4,
+            }
+        );
     }
 
     #[test]

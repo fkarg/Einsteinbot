@@ -99,26 +99,13 @@ impl EventLog {
     }
 
     pub fn read_events(&self) -> StoreResult<Vec<StoredEvent>> {
-        let mut statement = self.connection.prepare(
-            "SELECT sequence, timestamp_unix_ms, event_json
-             FROM events WHERE capture_id = ?1 ORDER BY sequence ASC",
-        )?;
-        let rows = statement.query_map([self.capture_id], |row| {
-            let sequence: i64 = row.get(0)?;
-            let timestamp_unix_ms = row.get(1)?;
-            let event_json: String = row.get(2)?;
-            Ok((sequence, timestamp_unix_ms, event_json))
-        })?;
+        read_capture_events(&self.connection, self.capture_id)
+    }
 
-        rows.map(|row| {
-            let (sequence, timestamp_unix_ms, event_json) = row?;
-            Ok(StoredEvent {
-                sequence,
-                timestamp_unix_ms,
-                event: serde_json::from_str(&event_json)?,
-            })
-        })
-        .collect()
+    /// Read the ordered events from an existing capture without opening a client session.
+    pub fn read_capture(path: impl AsRef<Path>, capture_id: i64) -> StoreResult<Vec<StoredEvent>> {
+        let connection = Connection::open(path)?;
+        read_capture_events(&connection, capture_id)
     }
 
     pub fn append_server_event(
@@ -128,6 +115,29 @@ impl EventLog {
     ) -> StoreResult<i64> {
         self.append(timestamp_unix_ms, &RecordedEvent::Inbound(event.clone()))
     }
+}
+
+fn read_capture_events(connection: &Connection, capture_id: i64) -> StoreResult<Vec<StoredEvent>> {
+    let mut statement = connection.prepare(
+        "SELECT sequence, timestamp_unix_ms, event_json
+         FROM events WHERE capture_id = ?1 ORDER BY sequence ASC",
+    )?;
+    let rows = statement.query_map([capture_id], |row| {
+        let sequence: i64 = row.get(0)?;
+        let timestamp_unix_ms = row.get(1)?;
+        let event_json: String = row.get(2)?;
+        Ok((sequence, timestamp_unix_ms, event_json))
+    })?;
+
+    rows.map(|row| {
+        let (sequence, timestamp_unix_ms, event_json) = row?;
+        Ok(StoredEvent {
+            sequence,
+            timestamp_unix_ms,
+            event: serde_json::from_str(&event_json)?,
+        })
+    })
+    .collect()
 }
 
 #[cfg(test)]
@@ -235,6 +245,10 @@ mod tests {
         assert_eq!(
             second.read_events().unwrap()[0].event,
             RecordedEvent::Inbound(ServerEvent::OwnId { player_id: 2 })
+        );
+        assert_eq!(
+            EventLog::read_capture(&path, first.capture_id()).unwrap()[0].event,
+            RecordedEvent::Inbound(ServerEvent::OwnId { player_id: 1 })
         );
 
         let connection = Connection::open(&path).unwrap();
