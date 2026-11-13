@@ -67,6 +67,173 @@ impl fmt::Display for FitError {
 
 impl Error for FitError {}
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LiveEstimatorSettings {
+    pub max_sources: usize,
+    pub radius_prior: f64,
+    pub grid_spacing: f64,
+    /// Hold out every Nth unique trajectory once enough data are available; zero disables it.
+    pub validation_every: usize,
+    /// Refit only after this many new unique trajectories since the last fit; one means refit
+    /// after every trajectory. Batching bounds refit cost as accumulated observations grow.
+    pub refit_batch: usize,
+}
+
+impl Default for LiveEstimatorSettings {
+    fn default() -> Self {
+        Self {
+            max_sources: 4,
+            radius_prior: 30.0,
+            grid_spacing: 80.0,
+            validation_every: 5,
+            refit_batch: 4,
+        }
+    }
+}
+
+/// What `LiveEstimator::observe` did with one completed-shot event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObservationOutcome {
+    /// An identical trajectory was already accumulated.
+    Duplicate,
+    /// Accumulated without reaching the next refit batch.
+    Accumulated,
+    /// Accumulated and the candidate search was refit.
+    Refitted,
+}
+
+/// Rebuild candidate planet maps from the unique completed paths observed in this map epoch.
+#[derive(Clone, Debug)]
+pub struct LiveEstimator {
+    world: WorldParameters,
+    settings: LiveEstimatorSettings,
+    observations: Vec<ShotObservation>,
+    pending_since_last_fit: usize,
+    search: Option<SourceCountSearch>,
+    last_fit_error: Option<String>,
+}
+
+impl Default for LiveEstimator {
+    fn default() -> Self {
+        Self::new(WorldParameters::default(), LiveEstimatorSettings::default())
+    }
+}
+
+impl LiveEstimator {
+    pub fn new(world: WorldParameters, settings: LiveEstimatorSettings) -> Self {
+        Self {
+            world,
+            settings,
+            observations: Vec::new(),
+            pending_since_last_fit: 0,
+            search: None,
+            last_fit_error: None,
+        }
+    }
+
+    /// Add one completed shot and refit the accumulated distinct paths once enough new
+    /// trajectories have arrived. Exact replays are ignored so repeated identical shots do not
+    /// falsely shrink covariance as if they were independent evidence.
+    pub fn observe(&mut self, event: &ServerEvent) -> ObservationOutcome {
+        let Ok(observation) = ShotObservation::try_from(event) else {
+            return ObservationOutcome::Duplicate;
+        };
+        if self.observations.contains(&observation) {
+            return ObservationOutcome::Duplicate;
+        }
+        self.observations.push(observation);
+        self.pending_since_last_fit += 1;
+        let should_refit = self.search.is_none()
+            || self.pending_since_last_fit >= self.settings.refit_batch.max(1);
+        if !should_refit {
+            return ObservationOutcome::Accumulated;
+        }
+        self.pending_since_last_fit = 0;
+        let (training, validation) =
+            split_live_observations(&self.observations, self.settings.validation_every);
+        match fit_greedy_source_counts(
+            &training,
+            &validation,
+            self.world,
+            self.settings.max_sources,
+            self.settings.radius_prior,
+            self.settings.grid_spacing,
+        ) {
+            Ok(search) => {
+                self.search = Some(search);
+                self.last_fit_error = None;
+            }
+            Err(error) => self.last_fit_error = Some(error.to_string()),
+        }
+        ObservationOutcome::Refitted
+    }
+
+    /// Select the candidate map to publish as the current belief: lowest held-out score first;
+    /// without holdout shots, the highest fitted source count (training error is monotone in
+    /// sources and cannot select).
+    pub fn best_map(&self) -> Option<(PlanetMap, Option<DMatrix<f64>>)> {
+        let search = self.search.as_ref()?;
+        search
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.validation_rmse.is_some())
+            .min_by(|left, right| {
+                left.validation_rmse
+                    .unwrap_or(f64::INFINITY)
+                    .total_cmp(&right.validation_rmse.unwrap_or(f64::INFINITY))
+            })
+            .or_else(|| search.candidates.last())
+            .map(|candidate| {
+                (
+                    candidate.result.map.clone(),
+                    candidate.result.covariance.clone(),
+                )
+            })
+    }
+
+    pub fn observations(&self) -> &[ShotObservation] {
+        &self.observations
+    }
+
+    pub fn search(&self) -> Option<&SourceCountSearch> {
+        self.search.as_ref()
+    }
+
+    pub fn last_fit_error(&self) -> Option<&str> {
+        self.last_fit_error.as_deref()
+    }
+
+    pub fn reset(&mut self) {
+        self.observations.clear();
+        self.pending_since_last_fit = 0;
+        self.search = None;
+        self.last_fit_error = None;
+    }
+}
+
+fn split_live_observations(
+    observations: &[ShotObservation],
+    validation_every: usize,
+) -> (Vec<ShotObservation>, Vec<ShotObservation>) {
+    if validation_every < 2 || observations.len() < validation_every {
+        return (observations.to_vec(), Vec::new());
+    }
+    let mut training = Vec::new();
+    let mut validation = Vec::new();
+    for (index, observation) in observations.iter().enumerate() {
+        if (index + 1) % validation_every == 0 {
+            validation.push(observation.clone());
+        } else {
+            training.push(observation.clone());
+        }
+    }
+    if training.is_empty() || validation.is_empty() {
+        (observations.to_vec(), Vec::new())
+    } else {
+        (training, validation)
+    }
+}
+
 /// Extract completed protocol-version-8 trajectories from one ordered event capture.
 pub fn shot_observations(events: &[StoredEvent]) -> Vec<ShotObservation> {
     events
@@ -644,6 +811,137 @@ mod tests {
         };
         shot.points = simulate_sampled_path(map, &shot, WorldParameters::default(), 40).unwrap();
         shot
+    }
+
+    #[test]
+    fn live_estimator_refits_on_first_observation_and_in_batches() {
+        let world = WorldParameters::default();
+        let truth = PlanetMap {
+            planets: vec![Planet {
+                x: 500.0,
+                y: 450.0,
+                radius: 30.0,
+                mass: 40_000.0,
+            }],
+        };
+        let shots = [
+            observation(&truth, (200.0, 200.0), 25.0, 8.0),
+            observation(&truth, (800.0, 250.0), 150.0, 8.0),
+            observation(&truth, (300.0, 850.0), -40.0, 9.0),
+            observation(&truth, (900.0, 700.0), 80.0, 7.0),
+            observation(&truth, (150.0, 600.0), -110.0, 8.0),
+        ];
+        let mut live = LiveEstimator::new(
+            world,
+            LiveEstimatorSettings {
+                max_sources: 1,
+                radius_prior: 30.0,
+                grid_spacing: 80.0,
+                validation_every: 0,
+                refit_batch: 2,
+            },
+        );
+
+        let event = |shot: &ShotObservation| ServerEvent::ShotFin {
+            player_id: shot.player_id,
+            angle: shot.angle_degrees,
+            velocity: shot.velocity,
+            points: shot.points.clone(),
+        };
+
+        assert_eq!(
+            live.observe(&event(&shots[0])),
+            ObservationOutcome::Refitted
+        );
+        assert!(live.best_map().is_some());
+        assert_eq!(
+            live.observe(&event(&shots[1])),
+            ObservationOutcome::Accumulated
+        );
+        assert_eq!(
+            live.observe(&event(&shots[2])),
+            ObservationOutcome::Refitted
+        );
+        assert_eq!(
+            live.observe(&event(&shots[3])),
+            ObservationOutcome::Accumulated
+        );
+        assert_eq!(
+            live.observe(&event(&shots[4])),
+            ObservationOutcome::Refitted
+        );
+        let duplicate = ServerEvent::ShotFin {
+            player_id: shots[4].player_id,
+            angle: shots[4].angle_degrees,
+            velocity: shots[4].velocity,
+            points: shots[4].points.clone(),
+        };
+        assert_eq!(live.observe(&duplicate), ObservationOutcome::Duplicate);
+        assert_eq!(live.observations().len(), 5);
+        assert_eq!(live.search().unwrap().candidates.len(), 1);
+    }
+
+    #[test]
+    fn live_estimator_publishes_lowest_validation_rmse_then_highest_source_count() {
+        let fit = |planets: usize, residual_rmse: f64| FitResult {
+            map: PlanetMap {
+                planets: vec![
+                    Planet {
+                        x: 0.0,
+                        y: 0.0,
+                        radius: 30.0,
+                        mass: 1_000.0,
+                    };
+                    planets
+                ],
+            },
+            covariance: None,
+            rank: 3 * planets,
+            singular_values: vec![],
+            residual_rmse,
+            converged: true,
+        };
+        let search = SourceCountSearch {
+            candidates: vec![
+                SourceCountCandidate {
+                    result: fit(1, 10.0),
+                    validation_rmse: Some(9.0),
+                },
+                SourceCountCandidate {
+                    result: fit(2, 5.0),
+                    validation_rmse: Some(4.0),
+                },
+                SourceCountCandidate {
+                    result: fit(3, 1.0),
+                    validation_rmse: None,
+                },
+            ],
+            stop_reason: SourceCountStopReason::ReachedMaximum,
+        };
+        let mut live =
+            LiveEstimator::new(WorldParameters::default(), LiveEstimatorSettings::default());
+        live.search = Some(search);
+
+        let (selected_planets, covariance) = live.best_map().unwrap();
+        assert_eq!(selected_planets.planets.len(), 2);
+        assert!(covariance.is_none());
+
+        let no_holdout = SourceCountSearch {
+            candidates: vec![
+                SourceCountCandidate {
+                    result: fit(1, 8.0),
+                    validation_rmse: None,
+                },
+                SourceCountCandidate {
+                    result: fit(2, 2.0),
+                    validation_rmse: None,
+                },
+            ],
+            stop_reason: SourceCountStopReason::ReachedMaximum,
+        };
+        live.search = Some(no_holdout);
+        let selected = live.best_map().unwrap();
+        assert_eq!(selected.0.planets.len(), 2);
     }
 
     #[test]
