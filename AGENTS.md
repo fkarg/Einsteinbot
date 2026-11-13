@@ -12,6 +12,9 @@ The project target is to infer planet locations and gravity effects efficiently,
 - Build a basic Rust telnet/TCP client and map the communication protocol before concentrating on bot strategy.
 - Keep transport, protocol parsing, game state/map estimation, simulation, targeting, and bot policy modular, with clear interfaces.
 - Keep early automated coverage small and focused on core behavior.
+- Bias toward action: build a small end-to-end slice before spending time refining the design.
+- Test uncertain details cheaply with local source inspection, synthetic examples, stored captures, or the local oracle when available; ask only when a real architectural tradeoff cannot be resolved by a reversible experiment.
+- Prefer implementing a reasonable baseline and learning from its behavior over extended speculative design. Keep unresolved ideas explicit, but do not let them block independent implementation work.
 
 ## Settled runtime contracts
 
