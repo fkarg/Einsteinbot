@@ -279,7 +279,7 @@ pub fn fit_greedy_source_counts(
     })
 }
 
-fn position_rmse(
+pub fn position_rmse(
     map: &PlanetMap,
     observations: &[ShotObservation],
     world: WorldParameters,
@@ -287,17 +287,13 @@ fn position_rmse(
     let mut squared_error = 0.0;
     let mut coordinate_count = 0;
     for shot in observations {
-        let usable_samples = shot.points.len().saturating_sub(1);
-        if usable_samples < 2 {
+        let Some((shot_squared_error, shot_coordinate_count)) =
+            shot_position_squared_error(map, shot, world)?
+        else {
             continue;
-        }
-        let predicted =
-            simulate_sampled_positions(map, shot, world, usable_samples).map_err(FitError)?;
-        for (observed, predicted) in shot.points[1..usable_samples].iter().zip(&predicted[1..]) {
-            squared_error += (f64::from(observed.x) - predicted.x).powi(2);
-            squared_error += (f64::from(observed.y) - predicted.y).powi(2);
-            coordinate_count += 2;
-        }
+        };
+        squared_error += shot_squared_error;
+        coordinate_count += shot_coordinate_count;
     }
     if coordinate_count == 0 {
         return Err(FitError(
@@ -305,6 +301,40 @@ fn position_rmse(
         ));
     }
     Ok((squared_error / coordinate_count as f64).sqrt())
+}
+
+/// Position RMSE for one completed trajectory, excluding its untimed terminal sample.
+pub fn shot_position_rmse(
+    map: &PlanetMap,
+    observation: &ShotObservation,
+    world: WorldParameters,
+) -> Result<Option<f64>, FitError> {
+    shot_position_squared_error(map, observation, world).map(|result| {
+        result.map(|(squared_error, coordinate_count)| {
+            (squared_error / coordinate_count as f64).sqrt()
+        })
+    })
+}
+
+fn shot_position_squared_error(
+    map: &PlanetMap,
+    shot: &ShotObservation,
+    world: WorldParameters,
+) -> Result<Option<(f64, usize)>, FitError> {
+    let usable_samples = shot.points.len().saturating_sub(1);
+    if usable_samples < 2 {
+        return Ok(None);
+    }
+    let predicted =
+        simulate_sampled_positions(map, shot, world, usable_samples).map_err(FitError)?;
+    let mut squared_error = 0.0;
+    let mut coordinate_count = 0;
+    for (observed, predicted) in shot.points[1..usable_samples].iter().zip(&predicted[1..]) {
+        squared_error += (f64::from(observed.x) - predicted.x).powi(2);
+        squared_error += (f64::from(observed.y) - predicted.y).powi(2);
+        coordinate_count += 2;
+    }
+    Ok(Some((squared_error, coordinate_count)))
 }
 
 /// Batch-fit centers and gravity weights for a fixed candidate source count.

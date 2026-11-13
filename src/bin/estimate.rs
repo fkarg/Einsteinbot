@@ -1,6 +1,12 @@
-use einsteinbot::estimator::{fit_greedy_source_counts, shot_observations};
+use einsteinbot::estimator::{
+    fit_greedy_source_counts, position_rmse, shot_observations, shot_position_rmse,
+};
 use einsteinbot::event_store::EventLog;
+use einsteinbot::map::PlanetMap;
+use einsteinbot::protocol::{RecordedEvent, ServerEvent};
 use einsteinbot::simulation::WorldParameters;
+use indicatif::ProgressBar;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[derive(Debug)]
@@ -11,6 +17,7 @@ struct Options {
     radius_prior: f64,
     grid_spacing: f64,
     validation_every: usize,
+    use_oracle: bool,
 }
 
 fn main() {
@@ -29,6 +36,16 @@ fn run() -> Result<(), String> {
     };
     let events = EventLog::read_capture(&options.db_path, options.capture_id)
         .map_err(|error| format!("cannot read capture {}: {error}", options.capture_id))?;
+    if options.use_oracle
+        && events.iter().any(|event| {
+            matches!(
+                &event.event,
+                RecordedEvent::Inbound(ServerEvent::Planets { .. })
+            )
+        })
+    {
+        return run_oracle_diagnostic(&events, &options);
+    }
     let shots = shot_observations(&events);
     if shots.is_empty() {
         return Err(format!(
@@ -38,6 +55,13 @@ fn run() -> Result<(), String> {
     }
 
     let (training, validation) = split_shots(&shots, options.validation_every);
+    let progress = ProgressBar::new_spinner();
+    progress.enable_steady_tick(std::time::Duration::from_millis(100));
+    progress.set_message(format!(
+        "fitting up to {} source counts from {} training shots (finite-difference optimizer)",
+        options.max_sources,
+        training.len()
+    ));
     let candidates = fit_greedy_source_counts(
         &training,
         &validation,
@@ -47,6 +71,7 @@ fn run() -> Result<(), String> {
         options.grid_spacing,
     )
     .map_err(|error| error.to_string())?;
+    progress.finish_and_clear();
 
     println!(
         "capture={} events={} training_shots={} validation_shots={}",
@@ -84,7 +109,170 @@ fn run() -> Result<(), String> {
     }
     println!("search_stopped={:?}", candidates.stop_reason);
     println!("World settings use NewtonWars source defaults; no oracle map is used for fitting.");
+    println!(
+        "RMSE is per-coordinate position error in world units; compare held-out scores first."
+    );
+    println!(
+        "converged means the numerical optimizer stopped successfully, not that the map is correct."
+    );
     Ok(())
+}
+
+fn run_oracle_diagnostic(
+    events: &[einsteinbot::event_store::StoredEvent],
+    options: &Options,
+) -> Result<(), String> {
+    let mut groups: Vec<(
+        Vec<einsteinbot::protocol::Planet>,
+        Vec<einsteinbot::event_store::StoredEvent>,
+    )> = Vec::new();
+    let mut current_planets: Option<Vec<einsteinbot::protocol::Planet>> = None;
+    let mut current_events = Vec::new();
+    for event in events {
+        match &event.event {
+            RecordedEvent::Inbound(ServerEvent::Planets { planets }) => {
+                if let Some(current) = current_planets.replace(planets.clone()) {
+                    groups.push((current, std::mem::take(&mut current_events)));
+                }
+            }
+            _ if current_planets.is_some() => current_events.push(event.clone()),
+            _ => {}
+        }
+    }
+    if let Some(planets) = current_planets {
+        groups.push((planets, current_events));
+    }
+    if groups.is_empty() {
+        return Err(
+            "capture has no recorded Planets event; --oracle needs a sendplanets 1 capture"
+                .to_owned(),
+        );
+    }
+
+    let world = WorldParameters::default();
+    println!(
+        "capture={} oracle_segments={}",
+        options.capture_id,
+        groups.len()
+    );
+    for (index, (planets, segment_events)) in groups.iter().enumerate() {
+        let shots = shot_observations(segment_events);
+        let map = PlanetMap {
+            planets: planets.clone(),
+        };
+        if shots.is_empty() {
+            println!(
+                "segment={} planets={} shots=0 oracle_train_rmse=unavailable oracle_validation_rmse=unavailable",
+                index + 1,
+                planets.len()
+            );
+            continue;
+        }
+        let split = split_shots(&shots, options.validation_every);
+        let training_rmse = position_rmse(&map, &split.0, world)
+            .map(|value| format!("{value:.6}"))
+            .unwrap_or_else(|_| "unavailable".to_owned());
+        let validation_rmse = position_rmse(&map, &split.1, world)
+            .map(|value| format!("{value:.6}"))
+            .unwrap_or_else(|_| "unavailable".to_owned());
+        println!(
+            "segment={} planets={} shots={} oracle_train_rmse={} oracle_validation_rmse={}",
+            index + 1,
+            planets.len(),
+            shots.len(),
+            training_rmse,
+            validation_rmse
+        );
+        for ((start_x, start_y), position_shots) in group_shots_by_launch_point(segment_events) {
+            let launch_rmse = position_rmse(&map, &position_shots, world)
+                .map(|value| format!("{value:.6}"))
+                .unwrap_or_else(|_| "unavailable".to_owned());
+            println!(
+                "  launch_point=({:.1},{:.1}) shots={} oracle_rmse={}",
+                start_x as f64 / 10.0,
+                start_y as f64 / 10.0,
+                position_shots.len(),
+                launch_rmse
+            );
+            let mut per_shot = position_shots
+                .into_iter()
+                .filter_map(|shot| {
+                    let rmse = shot_position_rmse(&map, &shot, world).ok()??;
+                    Some((shot, rmse))
+                })
+                .collect::<Vec<_>>();
+            per_shot.sort_by(|left, right| right.1.total_cmp(&left.1));
+            for (shot, rmse) in per_shot.into_iter().take(3) {
+                let start = &shot.points[0];
+                println!(
+                    "    worst_shot start=({:.1},{:.1}) points={} rmse={:.3}",
+                    start.x,
+                    start.y,
+                    shot.points.len(),
+                    rmse
+                );
+            }
+        }
+        let progress = ProgressBar::new_spinner();
+        progress.enable_steady_tick(std::time::Duration::from_millis(100));
+        progress.set_message(format!(
+            "fitting candidates for oracle segment {}/{}",
+            index + 1,
+            groups.len()
+        ));
+        let (training, validation) = split;
+        let candidates = fit_greedy_source_counts(
+            &training,
+            &validation,
+            world,
+            options.max_sources,
+            options.radius_prior,
+            options.grid_spacing,
+        )
+        .map_err(|error| error.to_string())?;
+        progress.finish_and_clear();
+        for candidate in candidates.candidates {
+            println!(
+                "  candidate_sources={} train_rmse={:.3} validation_rmse={}",
+                candidate.result.map.planets.len(),
+                candidate.result.residual_rmse,
+                candidate
+                    .validation_rmse
+                    .map(|value| format!("{value:.3}"))
+                    .unwrap_or_else(|| "unavailable".to_owned())
+            );
+        }
+        println!("  search_stopped={:?}", candidates.stop_reason);
+    }
+    println!("Oracle values score maps and identify map epochs; fits use only shot paths.");
+    println!(
+        "RMSE is per-coordinate position error in world units; compare held-out scores first."
+    );
+    Ok(())
+}
+
+fn group_shots_by_launch_point(
+    events: &[einsteinbot::event_store::StoredEvent],
+) -> BTreeMap<(i64, i64), Vec<einsteinbot::simulation::ShotObservation>> {
+    let mut groups = BTreeMap::new();
+    for stored in events {
+        let RecordedEvent::Inbound(event @ ServerEvent::ShotFin { .. }) = &stored.event else {
+            continue;
+        };
+        let Ok(shot) = einsteinbot::simulation::ShotObservation::try_from(event) else {
+            continue;
+        };
+        let Some(start) = shot.points.first() else {
+            continue;
+        };
+        // Bucket f32 protocol coordinates to 0.1 world units to absorb wire rounding.
+        let key = (
+            (f64::from(start.x) * 10.0).round() as i64,
+            (f64::from(start.y) * 10.0).round() as i64,
+        );
+        groups.entry(key).or_insert_with(Vec::new).push(shot);
+    }
+    groups
 }
 
 fn parse_args<I>(args: I) -> Result<Option<Options>, String>
@@ -100,6 +288,7 @@ where
     let mut radius_prior = 30.0_f64;
     let mut grid_spacing = 80.0_f64;
     let mut validation_every = 5;
+    let mut use_oracle = true;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => {
@@ -124,6 +313,7 @@ where
             "--validation-every" => {
                 validation_every = parse_value(&value(&mut args, &arg)?, &arg)?;
             }
+            "--no-oracle" => use_oracle = false,
             _ => return Err(format!("unknown option {arg}\n\n{}", help_text())),
         }
     }
@@ -147,6 +337,7 @@ where
         radius_prior,
         grid_spacing,
         validation_every,
+        use_oracle,
     }))
 }
 
@@ -208,5 +399,52 @@ fn help_text() -> &'static str {
        --radius-prior VALUE    Radius used for seeding (default: 30)\n\
        --grid-spacing VALUE    Deterministic seed-grid spacing (default: 80)\n\
        --validation-every N    Hold out every Nth shot; 0 disables (default: 5)\n\
+       --no-oracle             Ignore captured Planets maps\n\
        -h, --help              Show this help\n"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use einsteinbot::protocol::{Point, ServerEvent};
+
+    fn shot(sequence: i64, start_x: f32, start_y: f32) -> einsteinbot::event_store::StoredEvent {
+        einsteinbot::event_store::StoredEvent {
+            sequence,
+            timestamp_unix_ms: sequence,
+            event: RecordedEvent::Inbound(ServerEvent::ShotFin {
+                player_id: 0,
+                angle: 0.0,
+                velocity: 2.0,
+                points: vec![
+                    Point {
+                        x: start_x,
+                        y: start_y,
+                    },
+                    Point {
+                        x: start_x + 1.0,
+                        y: start_y,
+                    },
+                    Point {
+                        x: start_x + 2.0,
+                        y: start_y,
+                    },
+                ],
+            }),
+        }
+    }
+
+    #[test]
+    fn oracle_scores_group_shots_by_launch_point_not_finish_order() {
+        let events = vec![
+            shot(1, 10.0, 20.0),
+            shot(2, 100.0, 200.0),
+            // This old trajectory finished after the shot from the new position.
+            shot(3, 10.0, 20.0),
+        ];
+        let groups = group_shots_by_launch_point(&events);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[&(100, 200)].len(), 2);
+        assert_eq!(groups[&(1000, 2000)].len(), 1);
+    }
 }

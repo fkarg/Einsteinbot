@@ -54,6 +54,14 @@ cargo run --bin estimate -- --capture-id 2
 
 Use `--db-path PATH` for another SQLite file, `--max-sources N` to search further (the default is 4), `--validation-every 0` to disable the deterministic holdout, and `--radius-prior VALUE` / `--grid-spacing VALUE` to adjust seed assumptions. The default radius is fixed during fitting: smooth trajectories constrain centers and gravity weights, while radius needs collision evidence. Covariance is a local fit approximation and is reported only for full-rank fits. Candidate maps are proposals, not a claim that one count is correct. A local 61-shot capture favored two sources among the first four held-out scores; larger candidates had lower training error but much worse validation scores, demonstrating the risk of overfitting and local minima. The finite-difference fitter becomes expensive as source count grows, so raise the limit deliberately.
 
+While fitting, the command shows a spinner because the nonlinear optimizer does not expose meaningful iteration progress. `train_position_rmse` is the root mean square error for each recorded x/y coordinate, in world units. Lower is better, especially on held-out shots. `converged=true` only means the optimizer met its stopping condition; a full-rank Jacobian only means its local parameters were numerically distinguishable at that candidate. Neither proves the planet count or map is correct. For traces recorded with `sendplanets 1`, the command automatically reports fit quality by each captured map epoch and compares candidate fits with the true map as a local diagnostic:
+
+```sh
+cargo run --bin estimate -- --capture-id 7
+```
+
+When oracle data are present, they define map epochs and provide a true-map score; the candidate fit still uses only shot paths. Each shot includes its launch point, so shots from before and after a hit can contribute to the same map fit. The diagnostic groups oracle scores by each shot's starting coordinate rather than event order, since a shot's completion can arrive after a later player-position update. Use `--no-oracle` to ignore available planet messages.
+
 ## Local NewtonWars server
 
 The client does not start a server. From the NewtonWars checkout, the macOS source build is:
