@@ -34,15 +34,21 @@ name = "Einstein"
 record = true
 db_path = "einsteinbot.sqlite3"
 dummy = false
+targeting = false
+oracle_map_for_policy = false
 ```
 
 ```sh
 cargo run -- --config einsteinbot.toml
 ```
 
-Set individual values with `EINSTEINBOT_HOST`, `EINSTEINBOT_PORT`, `EINSTEINBOT_NAME`, `EINSTEINBOT_RECORD`, `EINSTEINBOT_DUMMY`, and `EINSTEINBOT_DB_PATH`. Set `EINSTEINBOT_CONFIG` to choose a config file through the environment. Recording defaults to on; set `record = false` or `EINSTEINBOT_RECORD=false`, or pass `--no-record` to disable it. Dummy actions default to off; set `dummy = true`, `EINSTEINBOT_DUMMY=true`, or pass `--dummy` to enable them.
+Set individual values with `EINSTEINBOT_HOST`, `EINSTEINBOT_PORT`, `EINSTEINBOT_NAME`, `EINSTEINBOT_RECORD`, `EINSTEINBOT_DUMMY`, `EINSTEINBOT_TARGETING`, `EINSTEINBOT_ORACLE_MAP`, and `EINSTEINBOT_DB_PATH`. Set `EINSTEINBOT_CONFIG` to choose a config file through the environment. Recording defaults to on; set `record = false` or `EINSTEINBOT_RECORD=false`, or pass `--no-record` to disable it. Dummy actions default to off; set `dummy = true`, `EINSTEINBOT_DUMMY=true`, or pass `--dummy` to enable them.
 
 The dummy chooses an integer velocity between 2 and `min(8, floor(energy))` and an integer angle from -180 through 180, at most one shot per energy response. Every outbound command, including connection setup and energy requests, passes through a client-side token bucket capped at 16 wire bytes per second with at most 512 bytes of burst. The upstream server starts each connection with a 512-byte allowance and replenishes one byte every three game-loop iterations. That is nominally 20 bytes per second at 60 loops per second; its actual limit changes with loop pace. NewtonWars exempts local connections from enforcement, but this client applies its stricter cap locally too.
+
+Targeting is opt-in with `--target` or `targeting = true`. It searches legal integer velocities and 10-degree angles through the NewtonWars simulator, then picks a predicted hit against the latest known player positions. If it sees no opponent or finds no usable action, it falls back to the random dummy. An information bonus is considered only when no predicted hit is available and the average field uncertainty along the path clears a threshold. This first bonus uses marginal parameter variances as an uncertainty-exposure proxy, not a full posterior information-gain calculation.
+
+The client does not yet have an online map-estimate producer. Without the explicit local-test option `--oracle-map`, the target policy currently simulates a flat field (no planets) and prints that limitation when it starts. `--oracle-map` allows a received `Planets` message to drive local target simulation; do not use it as a production assumption. The policy API accepts a map and parameter covariance, so a later online estimator can supply both. `--dummy` takes precedence if combined with `--target`.
 
 ## Mapping library prototype
 

@@ -14,6 +14,8 @@ pub struct AppConfig {
     pub name: String,
     pub record: bool,
     pub dummy: bool,
+    pub targeting: bool,
+    pub oracle_map_for_policy: bool,
     pub db_path: PathBuf,
 }
 
@@ -25,6 +27,8 @@ struct CliOptions {
     name: Option<String>,
     record: Option<bool>,
     dummy: Option<bool>,
+    targeting: Option<bool>,
+    oracle_map_for_policy: Option<bool>,
     db_path: Option<PathBuf>,
 }
 
@@ -36,6 +40,8 @@ struct FileOptions {
     name: Option<String>,
     record: Option<bool>,
     dummy: Option<bool>,
+    targeting: Option<bool>,
+    oracle_map_for_policy: Option<bool>,
     db_path: Option<PathBuf>,
 }
 
@@ -46,6 +52,8 @@ struct EnvOptions {
     name: Option<String>,
     record: Option<String>,
     dummy: Option<String>,
+    targeting: Option<String>,
+    oracle_map_for_policy: Option<String>,
     db_path: Option<PathBuf>,
 }
 
@@ -89,6 +97,8 @@ impl EnvOptions {
             name: get("EINSTEINBOT_NAME"),
             record: get("EINSTEINBOT_RECORD"),
             dummy: get("EINSTEINBOT_DUMMY"),
+            targeting: get("EINSTEINBOT_TARGETING"),
+            oracle_map_for_policy: get("EINSTEINBOT_ORACLE_MAP"),
             db_path: get("EINSTEINBOT_DB_PATH").map(PathBuf::from),
         })
     }
@@ -148,6 +158,20 @@ fn resolve(cli: CliOptions, env: EnvOptions, file: FileOptions) -> Result<AppCon
         } else {
             file.dummy.unwrap_or(false)
         },
+        targeting: if let Some(targeting) = cli.targeting {
+            targeting
+        } else if let Some(value) = env.targeting {
+            parse_bool(&value, "EINSTEINBOT_TARGETING")?
+        } else {
+            file.targeting.unwrap_or(false)
+        },
+        oracle_map_for_policy: if let Some(oracle_map) = cli.oracle_map_for_policy {
+            oracle_map
+        } else if let Some(value) = env.oracle_map_for_policy {
+            parse_bool(&value, "EINSTEINBOT_ORACLE_MAP")?
+        } else {
+            file.oracle_map_for_policy.unwrap_or(false)
+        },
         db_path: cli
             .db_path
             .or(env.db_path)
@@ -180,6 +204,10 @@ where
             "--no-record" => options.record = Some(false),
             "--dummy" => options.dummy = Some(true),
             "--no-dummy" => options.dummy = Some(false),
+            "--target" => options.targeting = Some(true),
+            "--no-target" => options.targeting = Some(false),
+            "--oracle-map" => options.oracle_map_for_policy = Some(true),
+            "--no-oracle-map" => options.oracle_map_for_policy = Some(false),
             _ => return Err(format!("unknown argument: {arg}\n\n{}", help_text())),
         }
     }
@@ -225,11 +253,15 @@ fn help_text() -> &'static str {
        --no-record         Disable SQLite recording\n\
        --dummy             Fire low-energy random shots\n\
        --no-dummy          Disable dummy actions\n\
+       --target            Target known players using trajectory search\n\
+       --no-target         Disable targeting\n\
+       --oracle-map        Allow local Planets events to drive targeting\n\
+       --no-oracle-map     Ignore Planets events for targeting (default)\n\
        --db-path PATH      SQLite file (default: einsteinbot.sqlite3)\n\
        -h, --help          Show this help\n\
      \n\
      Precedence: command line, environment, TOML config, defaults.\n\
-     Environment: EINSTEINBOT_CONFIG, _HOST, _PORT, _NAME, _RECORD, _DUMMY, _DB_PATH.\n"
+     Environment: EINSTEINBOT_CONFIG, _HOST, _PORT, _NAME, _RECORD, _DUMMY, _TARGETING, _ORACLE_MAP, _DB_PATH.\n"
 }
 
 #[cfg(test)]
@@ -343,6 +375,27 @@ mod tests {
         };
         let dummy = resolve(cli, EnvOptions::default(), FileOptions::default()).unwrap();
         assert!(dummy.dummy);
+    }
+
+    #[test]
+    fn targeting_is_opt_in_and_oracle_map_requires_an_explicit_flag() {
+        let passive = resolve(
+            CliOptions::default(),
+            EnvOptions::default(),
+            FileOptions::default(),
+        )
+        .unwrap();
+        assert!(!passive.targeting);
+        assert!(!passive.oracle_map_for_policy);
+
+        let ParsedCli::Options(cli) =
+            parse_args(["--target", "--oracle-map"].map(str::to_owned)).unwrap()
+        else {
+            panic!("expected parsed options");
+        };
+        let config = resolve(cli, EnvOptions::default(), FileOptions::default()).unwrap();
+        assert!(config.targeting);
+        assert!(config.oracle_map_for_policy);
     }
 
     #[test]

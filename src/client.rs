@@ -1,8 +1,10 @@
 use crate::config::AppConfig;
 use crate::dummy::commands_for_energy;
 use crate::event_store::{CaptureMetadata, EventLog};
+use crate::map::PlanetMap;
 use crate::protocol::{ClientCommand, EventParser, RecordedEvent, ServerEvent};
 use crate::rate_limit::ByteRateLimiter;
+use crate::strategy::{BotState, MapBelief, TargetingPolicy};
 use std::error::Error;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
@@ -25,6 +27,11 @@ pub fn run(config: &AppConfig) -> ClientResult<()> {
         "Connecting to {}:{} as {}",
         config.host, config.port, config.name
     );
+    if config.targeting && !config.oracle_map_for_policy {
+        eprintln!(
+            "Targeting has no live estimated-map feed yet; using a flat-field simulator until a map belief is supplied."
+        );
+    }
     let mut stream = TcpStream::connect((config.host.as_str(), config.port))?;
     let mut event_log = if config.record {
         Some(EventLog::create(
@@ -46,6 +53,8 @@ pub fn run(config: &AppConfig) -> ClientResult<()> {
         &mut stream,
         &config.name,
         config.dummy,
+        config.targeting,
+        config.oracle_map_for_policy,
         &running,
         &mut event_log,
     );
@@ -63,6 +72,8 @@ fn run_session(
     stream: &mut TcpStream,
     name: &str,
     dummy: bool,
+    targeting: bool,
+    oracle_map_for_policy: bool,
     running: &AtomicBool,
     event_log: &mut Option<EventLog>,
 ) -> ClientResult<()> {
@@ -94,6 +105,8 @@ fn run_session(
 
     stream.set_read_timeout(Some(SOCKET_POLL_INTERVAL))?;
     let mut parser = EventParser::new();
+    let mut bot_state = BotState::default();
+    let target_policy = TargetingPolicy::default();
     send_command(
         stream,
         event_log,
@@ -117,16 +130,52 @@ fn run_session(
             Ok(length) => {
                 for event in parser.feed(&buffer[..length])? {
                     println!("{}", event_summary(&event));
+                    bot_state.observe(&event);
+                    if oracle_map_for_policy {
+                        if let ServerEvent::Planets { planets } = &event {
+                            bot_state.set_map_belief(Some(MapBelief::new(
+                                PlanetMap {
+                                    planets: planets.clone(),
+                                },
+                                None,
+                            )));
+                        }
+                    }
                     if let Some(log) = event_log.as_mut() {
                         log.append(now_unix_ms()?, &RecordedEvent::Inbound(event.clone()))?;
                     }
-                    if dummy {
-                        if let ServerEvent::OwnEnergy { energy, .. } = event {
-                            let mut rng = rand::rng();
-                            if let Some(commands) = commands_for_energy(energy, &mut rng) {
-                                for command in commands {
-                                    send_command(stream, event_log, &mut rate_limiter, command)?;
-                                }
+                    if let ServerEvent::OwnEnergy { energy, .. } = event {
+                        let mut rng = rand::rng();
+                        let commands = if dummy {
+                            commands_for_energy(energy, &mut rng)
+                        } else if targeting {
+                            target_policy
+                                .choose(&bot_state, energy)
+                                .map(|choice| {
+                                    println!(
+                                        "TargetChoice reason={:?} velocity={} angle={} miss={:.2} information={:.3}",
+                                        choice.reason,
+                                        choice.velocity,
+                                        choice.angle_degrees,
+                                        choice.miss_distance,
+                                        choice.information_score
+                                    );
+                                    [
+                                        ClientCommand::SetVelocity {
+                                            velocity: f64::from(choice.velocity),
+                                        },
+                                        ClientCommand::SetAngle {
+                                            angle: f64::from(choice.angle_degrees),
+                                        },
+                                    ]
+                                })
+                                .or_else(|| commands_for_energy(energy, &mut rng))
+                        } else {
+                            None
+                        };
+                        if let Some(commands) = commands {
+                            for command in commands {
+                                send_command(stream, event_log, &mut rate_limiter, command)?;
                             }
                         }
                     }

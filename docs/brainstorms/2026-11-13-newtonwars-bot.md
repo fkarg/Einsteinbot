@@ -362,3 +362,10 @@ User answer: pending.
 - Q21: retain dummy as an option/fallback; otherwise bias toward simulated hit chances. Information gain may affect the choice only above an uncertainty threshold and when no good hit is available.
 - P1 and P2 accepted. User reports session usage at 17% and asks to make progress in small steps with periodic commits.
 - Implementation order is policy seam + targeting first, then multi-bot manager; this sequencing incorporates the same-model design challenge's finding that a supervisor is most useful after a strategy exists.
+
+#### Implementation checkpoint — P1 targeting baseline
+- Accepted P1 is implemented in `strategy.rs` and wired into the client behind `--target` / `targeting = true`; `--dummy` takes precedence, and target mode falls back to the dummy when there is no target or no legal action.
+- The policy sweeps integer velocities and 10-degree angle increments through the existing simulator, chooses a predicted hit before considering uncertainty, and only evaluates uncertainty when no hit exists. Its information score is mean path exposure to diagonal-only propagated parameter variance; it is a cheap ranking proxy, not posterior information gain.
+- The online estimator is not connected to the live client yet. Without explicit `--oracle-map`, targeting uses an empty planet map and warns at startup. Oracle map support is explicitly local-only. This baseline therefore validates policy/simulator wiring, not production target accuracy.
+- `cargo fmt` and `cargo test` pass (38 tests). Commit is pending at the time this note was written.
+- P2 remains accepted: local manager with shared world events, bot-tagged own-energy/input and outbound commands, and controlled parameter variants of the same policy. Do not create a separate full world-event copy per bot.
