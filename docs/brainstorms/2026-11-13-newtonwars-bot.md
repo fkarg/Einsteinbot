@@ -209,3 +209,23 @@ Accepted, pending Q12 for the process/client ownership boundary. Stable work: mo
 - Main session: map/estimation design remains open. Determine how to use optional direct planet messages locally while supporting inference from trajectories when absent; map physical observables and inverse problem before implementation.
 - User: remote competitor environment remains a later target after local diagnostic and bot behavior are understood.
 - Future: improve dummy policy and then design incremental map/uncertainty state; RL stays deferred.
+
+## Next design round preparation — map representation (2026-11-13)
+
+### Relevant local facts
+- Observed in `../NewtonWars/simulation.c`: default game has 24 planets; each radius is sampled uniformly from 20–40 and mass is `radius^3 / 10`; positions are non-overlapping with radius-sized battlefield margins. Generation retries until a potential-grid condition succeeds.
+- Observed: acceleration is a sum of source contributions `unit(planet_position - point) * mass / distance^2`; no extra gravitational constant. The simulation uses velocity-Verlet with 25 substeps per game-loop step. It logs each loop's shot position as f32; a completed `SHOTFIN` sends the full trajectory, so observations arrive at shot completion rather than continuously.
+- Observed: `sendplanets 1` sends count, f64 position, radius and mass at bot handshake and after reinitialize; default is off. The live capture had no Planets event. Player start positions are selected using map potential, not uniform across the battlefield.
+- Inference: `mass = radius^3/10` is a useful source-specific prior, but shouldn't be assumed for a different server build without checking direct events or residuals. Planet count/model ambiguity means a single fitted map may not be unique.
+
+### External estimation research
+- JPL and DESCANSO describe orbit/trajectory reconstruction using iterative weighted least squares around a nonlinear propagated model, repeatedly relinearized. This is a useful baseline for comparing a candidate map against full observed paths: https://cneos.jpl.nasa.gov/sentry/intro.html and https://descanso.jpl.nasa.gov/monograph/series1/Descanso1_all.pdf.
+- Particle filters can retain nonlinear/multimodal uncertainty but require a candidate population and more computation: Gordon et al. (1993), https://ahstat.github.io/images/2014-7-11-Introduction-particle-filters/gordon1993_particle_filters.pdf.
+- Identifiability work notes that distinct source configurations may produce the same observations; no optimizer can resolve them without informative trajectories or priors: https://pmc.ncbi.nlm.nih.gov/articles/PMC6685009/ and https://arxiv.org/abs/1004.4939.
+- Design tension: batch fitting is an established baseline, while user Notes.md requests state updates whose cost does not grow with old trajectory count. Record this as a policy: keep online updates bounded with respect to the number of historical shots, likely via fixed-size sufficient state per candidate model; whether occasional offline refinement is allowed remains open.
+
+### Q13 — representation for the first gravity/map estimate
+Context: NewtonWars' source represents a finite set of planets with position, radius and mass, and shots reveal full trajectories only when finished. The target environment may not send direct planets; local runs can expose them with `sendplanets 1`. The Notes ask for planet count/location/size uncertainty and gravity effects, while also asking for updates that do not revisit all prior trajectories.
+Options: (A) explicit planet hypotheses with uncertain count/position/radius/mass — matches source and goal and remains compact, but is nonlinear and can have multiple plausible layouts; (B) grid of gravity values with uncertainty — flexible and naturally map-shaped, but does not directly recover count/radius/mass and carries many cells; (C) hybrid planet hypotheses plus residual gravity grid — can explain mismatches but brings more state and complexity.
+Session recommendation: A for the first model because the server physics is exactly a sum of planet contributions and Notes explicitly prioritize planet properties. Keep fixed-size online summaries per hypothesis; revisit grid residuals only if observed trajectories show the source model is inadequate. No peer call by explicit user instruction.
+User answer: pending.
