@@ -716,6 +716,7 @@ mod tests {
             StoredEvent {
                 sequence: 0,
                 timestamp_unix_ms: 10,
+                bot_name: None,
                 event: RecordedEvent::Inbound(ServerEvent::ShotBegin {
                     player_id: 2,
                     angle: 30.0,
@@ -725,6 +726,7 @@ mod tests {
             StoredEvent {
                 sequence: 1,
                 timestamp_unix_ms: 11,
+                bot_name: None,
                 event: RecordedEvent::Inbound(ServerEvent::ShotFin {
                     player_id: 2,
                     angle: 30.0,

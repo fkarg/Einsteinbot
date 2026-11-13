@@ -20,6 +20,7 @@ pub struct CaptureMetadata {
 pub struct StoredEvent {
     pub sequence: i64,
     pub timestamp_unix_ms: i64,
+    pub bot_name: Option<String>,
     pub event: RecordedEvent,
 }
 
@@ -45,12 +46,24 @@ impl EventLog {
                  capture_id INTEGER NOT NULL REFERENCES captures(id),
                  sequence INTEGER NOT NULL,
                  timestamp_unix_ms INTEGER NOT NULL,
+                 bot_name TEXT,
                  direction TEXT NOT NULL CHECK(direction IN ('inbound', 'outbound')),
                  event_type TEXT NOT NULL,
                  event_json TEXT NOT NULL,
                  PRIMARY KEY(capture_id, sequence)
              );",
         )?;
+        let has_bot_name = {
+            let mut statement = connection.prepare("PRAGMA table_info(events)")?;
+            let names = statement.query_map([], |row| row.get::<_, String>(1))?;
+            names
+                .collect::<Result<Vec<_>, _>>()?
+                .iter()
+                .any(|name| name == "bot_name")
+        };
+        if !has_bot_name {
+            connection.execute("ALTER TABLE events ADD COLUMN bot_name TEXT", [])?;
+        }
 
         let metadata_json = serde_json::to_string(metadata)?;
         connection.execute(
@@ -79,16 +92,26 @@ impl EventLog {
     }
 
     pub fn append(&mut self, timestamp_unix_ms: i64, event: &RecordedEvent) -> StoreResult<i64> {
+        self.append_for_bot(timestamp_unix_ms, None, event)
+    }
+
+    pub fn append_for_bot(
+        &mut self,
+        timestamp_unix_ms: i64,
+        bot_name: Option<&str>,
+        event: &RecordedEvent,
+    ) -> StoreResult<i64> {
         let sequence = self.next_sequence;
         let event_json = serde_json::to_string(event)?;
         self.connection.execute(
             "INSERT INTO events
-                (capture_id, sequence, timestamp_unix_ms, direction, event_type, event_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                (capture_id, sequence, timestamp_unix_ms, bot_name, direction, event_type, event_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 self.capture_id,
                 sequence,
                 timestamp_unix_ms,
+                bot_name,
                 event.direction(),
                 event.kind(),
                 event_json,
@@ -119,21 +142,23 @@ impl EventLog {
 
 fn read_capture_events(connection: &Connection, capture_id: i64) -> StoreResult<Vec<StoredEvent>> {
     let mut statement = connection.prepare(
-        "SELECT sequence, timestamp_unix_ms, event_json
+        "SELECT sequence, timestamp_unix_ms, bot_name, event_json
          FROM events WHERE capture_id = ?1 ORDER BY sequence ASC",
     )?;
     let rows = statement.query_map([capture_id], |row| {
         let sequence: i64 = row.get(0)?;
         let timestamp_unix_ms = row.get(1)?;
-        let event_json: String = row.get(2)?;
-        Ok((sequence, timestamp_unix_ms, event_json))
+        let bot_name = row.get(2)?;
+        let event_json: String = row.get(3)?;
+        Ok((sequence, timestamp_unix_ms, bot_name, event_json))
     })?;
 
     rows.map(|row| {
-        let (sequence, timestamp_unix_ms, event_json) = row?;
+        let (sequence, timestamp_unix_ms, bot_name, event_json) = row?;
         Ok(StoredEvent {
             sequence,
             timestamp_unix_ms,
+            bot_name,
             event: serde_json::from_str(&event_json)?,
         })
     })
@@ -188,16 +213,19 @@ mod tests {
                 StoredEvent {
                     sequence: 0,
                     timestamp_unix_ms: 1_001,
+                    bot_name: None,
                     event: RecordedEvent::Inbound(ServerEvent::OwnId { player_id: 3 }),
                 },
                 StoredEvent {
                     sequence: 1,
                     timestamp_unix_ms: 1_002,
+                    bot_name: None,
                     event: RecordedEvent::Outbound(ClientCommand::SetAngle { angle: 45.0 }),
                 },
                 StoredEvent {
                     sequence: 2,
                     timestamp_unix_ms: 1_003,
+                    bot_name: None,
                     event: RecordedEvent::Inbound(ServerEvent::ShotFinished {
                         player_id: 3,
                         points: vec![Point { x: 1.0, y: 2.0 }],
@@ -264,6 +292,92 @@ mod tests {
         drop(connection);
         drop(first);
         drop(second);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn tagged_events_keep_bot_identity_in_shared_capture() {
+        let metadata = CaptureMetadata {
+            started_at_unix_ms: 1_000,
+            process_id: 42,
+            host: "127.0.0.1".to_owned(),
+            port: 3490,
+            client_name: "local-manager".to_owned(),
+            protocol_version: 8,
+        };
+        let mut log = EventLog::create(":memory:", &metadata).unwrap();
+        log.append_for_bot(
+            1_001,
+            Some("Curie"),
+            &RecordedEvent::Inbound(ServerEvent::OwnEnergy {
+                player_id: 4,
+                energy: 6.0,
+            }),
+        )
+        .unwrap();
+        log.append_for_bot(
+            1_002,
+            None,
+            &RecordedEvent::Inbound(ServerEvent::PlayerLeave { player_id: 5 }),
+        )
+        .unwrap();
+        let events = log.read_events().unwrap();
+        assert_eq!(events[0].bot_name.as_deref(), Some("Curie"));
+        assert_eq!(events[1].bot_name, None);
+    }
+
+    #[test]
+    fn adds_bot_tag_column_to_an_existing_database() {
+        let path = std::env::temp_dir().join(format!(
+            "einsteinbot-legacy-events-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let legacy = Connection::open(&path).unwrap();
+        legacy
+            .execute_batch(
+                "CREATE TABLE captures (
+                    id INTEGER PRIMARY KEY,
+                    started_at_unix_ms INTEGER NOT NULL,
+                    ended_at_unix_ms INTEGER,
+                    metadata_json TEXT NOT NULL
+                );
+                CREATE TABLE events (
+                    capture_id INTEGER NOT NULL REFERENCES captures(id),
+                    sequence INTEGER NOT NULL,
+                    timestamp_unix_ms INTEGER NOT NULL,
+                    direction TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    event_json TEXT NOT NULL,
+                    PRIMARY KEY(capture_id, sequence)
+                );",
+            )
+            .unwrap();
+        drop(legacy);
+
+        let metadata = CaptureMetadata {
+            started_at_unix_ms: 1_000,
+            process_id: 42,
+            host: "127.0.0.1".to_owned(),
+            port: 3490,
+            client_name: "Curie".to_owned(),
+            protocol_version: 8,
+        };
+        let mut log = EventLog::create(&path, &metadata).unwrap();
+        log.append_for_bot(
+            1_001,
+            Some("Curie"),
+            &RecordedEvent::Inbound(ServerEvent::OwnId { player_id: 4 }),
+        )
+        .unwrap();
+        assert_eq!(
+            log.read_events().unwrap()[0].bot_name.as_deref(),
+            Some("Curie")
+        );
+        drop(log);
         std::fs::remove_file(path).unwrap();
     }
 }

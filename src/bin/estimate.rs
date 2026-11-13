@@ -412,6 +412,7 @@ mod tests {
         einsteinbot::event_store::StoredEvent {
             sequence,
             timestamp_unix_ms: sequence,
+            bot_name: None,
             event: RecordedEvent::Inbound(ServerEvent::ShotFin {
                 player_id: 0,
                 angle: 0.0,

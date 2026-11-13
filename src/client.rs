@@ -4,11 +4,12 @@ use crate::event_store::{CaptureMetadata, EventLog};
 use crate::map::PlanetMap;
 use crate::protocol::{ClientCommand, EventParser, RecordedEvent, ServerEvent};
 use crate::rate_limit::ByteRateLimiter;
-use crate::strategy::{BotState, MapBelief, TargetingPolicy};
+use crate::strategy::{BotState, MapBelief, TargetingPolicy, TargetingSettings};
 use std::error::Error;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -23,59 +24,122 @@ pub fn run(config: &AppConfig) -> ClientResult<()> {
     let signal_running = Arc::clone(&running);
     ctrlc::set_handler(move || signal_running.store(false, Ordering::SeqCst))?;
 
-    eprintln!(
-        "Connecting to {}:{} as {}",
-        config.host, config.port, config.name
-    );
     if config.targeting && !config.oracle_map_for_policy {
         eprintln!(
             "Targeting has no live estimated-map feed yet; using a flat-field simulator until a map belief is supplied."
         );
     }
-    let mut stream = TcpStream::connect((config.host.as_str(), config.port))?;
-    let mut event_log = if config.record {
-        Some(EventLog::create(
+    let names = (0..config.clients)
+        .map(|index| client_name(config, index))
+        .collect::<Vec<_>>();
+    eprintln!(
+        "Connecting {} client(s) to {}:{} as {}",
+        config.clients,
+        config.host,
+        config.port,
+        names.join(", ")
+    );
+    let event_log = if config.record {
+        Some(Arc::new(Mutex::new(EventLog::create(
             &config.db_path,
             &CaptureMetadata {
                 started_at_unix_ms: now_unix_ms()?,
                 process_id: std::process::id(),
                 host: config.host.clone(),
                 port: config.port,
-                client_name: config.name.clone(),
+                client_name: names.join(","),
                 protocol_version: PROTOCOL_VERSION,
             },
-        )?)
+        )?)))
     } else {
         None
     };
+    let mut workers = Vec::new();
+    for (index, name) in names.into_iter().enumerate() {
+        let config = config.clone();
+        let running = Arc::clone(&running);
+        let event_log = event_log.clone();
+        workers.push(std::thread::spawn(move || {
+            let result = run_worker(&config, index, &name, &running, event_log);
+            if result.is_err() {
+                running.store(false, Ordering::SeqCst);
+            }
+            result
+        }));
+    }
+    let mut worker_error = None;
+    for worker in workers {
+        match worker.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) if worker_error.is_none() => worker_error = Some(error),
+            Err(_) if worker_error.is_none() => {
+                worker_error = Some("client worker panicked".into())
+            }
+            _ => {}
+        }
+    }
+    let finish_result = if let Some(log) = &event_log {
+        log.lock()
+            .map_err(|_| "event log mutex poisoned")?
+            .finish(now_unix_ms()?)
+    } else {
+        Ok(())
+    };
+    if let Some(error) = worker_error {
+        return Err(error);
+    }
+    finish_result?;
+    Ok(())
+}
 
-    let result = run_session(
+fn client_name(config: &AppConfig, index: usize) -> String {
+    if index == 0 {
+        return config.name.clone();
+    }
+    let mut names = vec![config.name.clone()];
+    for name in [
+        "Einstein", "Curie", "Galilei", "Feynman", "Noether", "Faraday", "Maxwell", "Hawking",
+        "Turing", "Herschel", "Hubble",
+    ] {
+        if !names.iter().any(|existing| existing == name) {
+            names.push(name.to_owned());
+        }
+    }
+    names
+        .get(index)
+        .cloned()
+        .unwrap_or_else(|| format!("Scientist{index}"))
+}
+
+fn run_worker(
+    config: &AppConfig,
+    index: usize,
+    name: &str,
+    running: &AtomicBool,
+    event_log: Option<Arc<Mutex<EventLog>>>,
+) -> ClientResult<()> {
+    let mut stream = TcpStream::connect((config.host.as_str(), config.port))?;
+    run_session(
         &mut stream,
-        &config.name,
+        name,
+        index,
         config.dummy,
         config.targeting,
         config.oracle_map_for_policy,
-        &running,
-        &mut event_log,
-    );
-    let finish_result = event_log
-        .as_mut()
-        .map(|log| log.finish(now_unix_ms()?))
-        .transpose();
-
-    result?;
-    finish_result?;
-    Ok(())
+        running,
+        event_log,
+    )
 }
 
 fn run_session(
     stream: &mut TcpStream,
     name: &str,
+    bot_index: usize,
     dummy: bool,
     targeting: bool,
     oracle_map_for_policy: bool,
     running: &AtomicBool,
-    event_log: &mut Option<EventLog>,
+    event_log: Option<Arc<Mutex<EventLog>>>,
 ) -> ClientResult<()> {
     let mut rate_limiter = ByteRateLimiter::new();
     stream.set_read_timeout(Some(Duration::from_secs(3)))?;
@@ -85,7 +149,8 @@ fn run_session(
 
     send_command(
         stream,
-        event_log,
+        &event_log,
+        name,
         &mut rate_limiter,
         ClientCommand::SetName {
             name: name.to_owned(),
@@ -96,7 +161,8 @@ fn run_session(
     let _ = read_prompt(stream)?;
     send_command(
         stream,
-        event_log,
+        &event_log,
+        name,
         &mut rate_limiter,
         ClientCommand::NegotiateProtocol {
             version: PROTOCOL_VERSION,
@@ -106,10 +172,13 @@ fn run_session(
     stream.set_read_timeout(Some(SOCKET_POLL_INTERVAL))?;
     let mut parser = EventParser::new();
     let mut bot_state = BotState::default();
-    let target_policy = TargetingPolicy::default();
+    let mut targeting_settings = TargetingSettings::default();
+    targeting_settings.angle_step_degrees = [8, 10, 12][bot_index % 3];
+    let target_policy = TargetingPolicy::new(targeting_settings);
     send_command(
         stream,
-        event_log,
+        &event_log,
+        name,
         &mut rate_limiter,
         ClientCommand::RequestEnergy,
     )?;
@@ -141,8 +210,14 @@ fn run_session(
                             )));
                         }
                     }
-                    if let Some(log) = event_log.as_mut() {
-                        log.append(now_unix_ms()?, &RecordedEvent::Inbound(event.clone()))?;
+                    if should_record_event(bot_index, &event) {
+                        let bot_specific = is_bot_specific(&event);
+                        append_event(
+                            &event_log,
+                            if bot_specific { Some(name) } else { None },
+                            now_unix_ms()?,
+                            &RecordedEvent::Inbound(event.clone()),
+                        )?;
                     }
                     if let ServerEvent::OwnEnergy { energy, .. } = event {
                         let mut rng = rand::rng();
@@ -175,7 +250,7 @@ fn run_session(
                         };
                         if let Some(commands) = commands {
                             for command in commands {
-                                send_command(stream, event_log, &mut rate_limiter, command)?;
+                                send_command(stream, &event_log, name, &mut rate_limiter, command)?;
                             }
                         }
                     }
@@ -191,7 +266,8 @@ fn run_session(
         if last_energy_request.elapsed() >= ENERGY_POLL_INTERVAL {
             send_command(
                 stream,
-                event_log,
+                &event_log,
+                name,
                 &mut rate_limiter,
                 ClientCommand::RequestEnergy,
             )?;
@@ -202,13 +278,25 @@ fn run_session(
     if shutdown_requested {
         send_command(
             stream,
-            event_log,
+            &event_log,
+            name,
             &mut rate_limiter,
             ClientCommand::Disconnect,
         )?;
     }
 
     Ok(())
+}
+
+fn is_bot_specific(event: &ServerEvent) -> bool {
+    matches!(
+        event,
+        ServerEvent::OwnId { .. } | ServerEvent::OwnEnergy { .. }
+    )
+}
+
+fn should_record_event(bot_index: usize, event: &ServerEvent) -> bool {
+    bot_index == 0 || is_bot_specific(event)
 }
 
 fn event_summary(event: &ServerEvent) -> String {
@@ -232,16 +320,34 @@ fn event_summary(event: &ServerEvent) -> String {
 
 fn send_command(
     stream: &mut TcpStream,
-    event_log: &mut Option<EventLog>,
+    event_log: &Option<Arc<Mutex<EventLog>>>,
+    bot_name: &str,
     rate_limiter: &mut ByteRateLimiter,
     command: ClientCommand,
 ) -> ClientResult<()> {
     let line = command.wire_line()?;
-    if let Some(log) = event_log.as_mut() {
-        log.append(now_unix_ms()?, &RecordedEvent::Outbound(command))?;
-    }
+    append_event(
+        event_log,
+        bot_name.into(),
+        now_unix_ms()?,
+        &RecordedEvent::Outbound(command),
+    )?;
     rate_limiter.wait_for(line.len())?;
     stream.write_all(line.as_bytes())?;
+    Ok(())
+}
+
+fn append_event(
+    event_log: &Option<Arc<Mutex<EventLog>>>,
+    bot_name: Option<&str>,
+    timestamp_unix_ms: i64,
+    event: &RecordedEvent,
+) -> ClientResult<()> {
+    if let Some(log) = event_log {
+        log.lock()
+            .map_err(|_| "event log mutex poisoned")?
+            .append_for_bot(timestamp_unix_ms, bot_name, event)?;
+    }
     Ok(())
 }
 
@@ -287,6 +393,44 @@ mod tests {
 
         assert_eq!(read_prompt(&mut stream).unwrap(), b"welcome> ");
         assert_eq!(read_prompt(&mut stream).unwrap(), b"> ");
+    }
+
+    #[test]
+    fn only_canonical_bot_records_shared_world_events() {
+        let world_event = ServerEvent::PlayerPosition {
+            player_id: 9,
+            x: 10.0,
+            y: 20.0,
+        };
+        let own_event = ServerEvent::OwnEnergy {
+            player_id: 3,
+            energy: 4.0,
+        };
+        assert!(should_record_event(0, &world_event));
+        assert!(!should_record_event(1, &world_event));
+        assert!(should_record_event(1, &own_event));
+    }
+
+    #[test]
+    fn local_client_names_are_unique_for_parameter_variants() {
+        let config = AppConfig {
+            host: "127.0.0.1".to_owned(),
+            port: 3490,
+            name: "Einstein".to_owned(),
+            record: false,
+            dummy: false,
+            targeting: true,
+            oracle_map_for_policy: false,
+            clients: 3,
+            db_path: "unused.sqlite".into(),
+        };
+        let names = (0..config.clients)
+            .map(|index| client_name(&config, index))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(names.len(), 3);
+        assert!(names.contains("Einstein"));
+        assert!(names.contains("Curie"));
+        assert!(names.contains("Galilei"));
     }
 }
 

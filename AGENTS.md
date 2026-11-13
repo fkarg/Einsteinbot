@@ -18,13 +18,14 @@ The project target is to infer planet locations and gravity effects efficiently,
 
 ## Settled runtime contracts
 
-- A single-client invocation owns one TCP connection. The local manager may start several such clients against localhost; upstream rejects concurrent same-IP remote clients, so remote fan-out is not assumed.
+- One bot session owns one TCP connection. `--clients N` starts several concurrent sessions only against loopback hosts; same-IP remote fan-out is rejected by NewtonWars. A manager run has one SQLite capture: the first session records shared world events once, and each session tags its own identity/energy events and outbound commands with its bot name.
 - The client uses the NewtonWars protocol version 8. Keep transport, typed protocol events, and bot policy in separate modules.
-- SQLite recording defaults on and stores parsed semantic inbound events and outbound commands, ordered per connection. It does not store raw TCP bytes. `--no-record` disables it; `--dummy` opts into the simple energy-gated firing policy.
+- SQLite recording defaults on and stores parsed semantic inbound events and outbound commands in global sequence order per invocation. A multi-client manager records shared world events once and tags bot-specific events and commands; it does not store raw TCP bytes. `--no-record` disables it; `--dummy` opts into the simple energy-gated firing policy.
 - A SQLite capture remains one connection's complete replay log. The estimator treats each observed `Planets` update as a separate map-fit episode; oracle maps are used automatically when present for boundaries and scoring, never as fit input. A shot's first recorded point is its launch position, so fit paths across player position changes together when the map is unchanged.
 - The client rate limiter is per TCP connection: 16 outbound wire bytes per second with a 512-byte burst. Upstream refills one byte every three loop steps and exempts localhost, so its actual wall-clock rate depends on loop pace. Keep the client cap unless upstream source or limits change.
 - NewtonWars only sends planet positions when launched with `sendplanets 1`.
 - Targeting is opt-in and separate from transport. It prioritizes simulated hits; uncertainty probing is considered only without a predicted hit and above a threshold. Until an online map estimator supplies beliefs, target mode uses an empty map unless local oracle-map use is explicitly enabled. The uncertainty score is a cheap marginal-variance exposure proxy, not posterior information gain.
+- Local manager variants use the same targeting policy with controlled angle-step values of 8, 10, and 12 degrees; keep policy differences explicit and small until capture comparisons justify distinct roles.
 - `Notes.md` is user-owned; do not edit it. Durable project operation belongs in README.md and lasting development conventions belong here.
 
 ## Verification

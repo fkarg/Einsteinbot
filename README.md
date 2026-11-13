@@ -4,7 +4,7 @@ Rust client and eventual information-gathering bot for [NewtonWars](https://gith
 
 ## Diagnostic client
 
-One invocation opens one TCP connection. It reads the server's text welcome prompt, enters bot protocol 8, prints parsed game events, and requests energy once per second. By default it is passive; `--dummy` enables small randomized shots when reported energy is at least 2.
+Each bot session opens one TCP connection. By default, one invocation starts one session; `--clients N` starts a local manager with N sessions. It reads the server's text welcome prompt, enters bot protocol 8, prints parsed game events, and requests energy once per second. By default it is passive; `--dummy` enables small randomized shots when reported energy is at least 2.
 
 ```sh
 cargo run -- --name Einstein
@@ -20,11 +20,11 @@ By default the client connects to `127.0.0.1:3490`, chooses a random name from a
 cargo run -- --no-record
 ```
 
-The database stores one capture per connection. Each parsed server event and semantic client command gets a sequence number and timestamp. Raw TCP bytes are not stored. For a different database file, use `--db-path PATH`.
+The database stores one capture per invocation. Each parsed shared world event is recorded once, and each bot's own events and semantic commands are tagged by bot name. Events get a global sequence number and timestamp. Raw TCP bytes are not stored. For a different database file, use `--db-path PATH`.
 
 Custom names must be printable ASCII and at most 15 bytes, matching the NewtonWars server limit.
 
-Options can come from a TOML file, environment variables, and command-line arguments. Later sources override earlier ones in this order: config file, environment, command line. For example:
+Options can come from a TOML file, environment variables, and command-line arguments. Later sources override earlier ones in this order: config file, environment, command line. `--clients N` starts a local manager with N concurrent loopback connections (maximum 16); multiple clients are rejected for non-loopback hosts because NewtonWars blocks same-IP remote duplicates. The clients use the same targeting policy with 8°, 10°, and 12° angle-step variants. For example:
 
 ```toml
 # einsteinbot.toml
@@ -36,13 +36,14 @@ db_path = "einsteinbot.sqlite3"
 dummy = false
 targeting = false
 oracle_map_for_policy = false
+clients = 1
 ```
 
 ```sh
 cargo run -- --config einsteinbot.toml
 ```
 
-Set individual values with `EINSTEINBOT_HOST`, `EINSTEINBOT_PORT`, `EINSTEINBOT_NAME`, `EINSTEINBOT_RECORD`, `EINSTEINBOT_DUMMY`, `EINSTEINBOT_TARGETING`, `EINSTEINBOT_ORACLE_MAP`, and `EINSTEINBOT_DB_PATH`. Set `EINSTEINBOT_CONFIG` to choose a config file through the environment. Recording defaults to on; set `record = false` or `EINSTEINBOT_RECORD=false`, or pass `--no-record` to disable it. Dummy actions default to off; set `dummy = true`, `EINSTEINBOT_DUMMY=true`, or pass `--dummy` to enable them.
+Set individual values with `EINSTEINBOT_HOST`, `EINSTEINBOT_PORT`, `EINSTEINBOT_NAME`, `EINSTEINBOT_RECORD`, `EINSTEINBOT_DUMMY`, `EINSTEINBOT_TARGETING`, `EINSTEINBOT_ORACLE_MAP`, `EINSTEINBOT_CLIENTS`, and `EINSTEINBOT_DB_PATH`. Set `EINSTEINBOT_CONFIG` to choose a config file through the environment. Recording defaults to on; set `record = false` or `EINSTEINBOT_RECORD=false`, or pass `--no-record` to disable it. Dummy actions default to off; set `dummy = true`, `EINSTEINBOT_DUMMY=true`, or pass `--dummy` to enable them.
 
 The dummy chooses an integer velocity between 2 and `min(8, floor(energy))` and an integer angle from -180 through 180, at most one shot per energy response. Every outbound command, including connection setup and energy requests, passes through a client-side token bucket capped at 16 wire bytes per second with at most 512 bytes of burst. The upstream server starts each connection with a 512-byte allowance and replenishes one byte every three game-loop iterations. That is nominally 20 bytes per second at 60 loops per second; its actual limit changes with loop pace. NewtonWars exempts local connections from enforcement, but this client applies its stricter cap locally too.
 
@@ -78,4 +79,6 @@ cd ../NewtonWars
 ./nw fullscreen 0 sendplanets 1 throttle 16
 ```
 
-The `sendplanets 1` option is required if the server should disclose planet positions. If a local server is already running, connect to it without starting another copy. Local NewtonWars connections may be run side by side; use separate Einsteinbot invocations for now.
+The `sendplanets 1` option is required if the server should disclose planet positions. If a local server is already running, connect to it without starting another copy. Local NewtonWars connections may be run side by side; use `cargo run -- --clients 3 --target` to launch three parameter variants under one manager.
+
+With recording enabled, the manager writes one capture for the whole run. The first connection writes shared world events once; every connection writes its own identity/energy events and outbound commands tagged by bot name. Older databases are upgraded by adding a nullable `bot_name` column; single-client events remain untagged as before.

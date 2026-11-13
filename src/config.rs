@@ -16,6 +16,7 @@ pub struct AppConfig {
     pub dummy: bool,
     pub targeting: bool,
     pub oracle_map_for_policy: bool,
+    pub clients: usize,
     pub db_path: PathBuf,
 }
 
@@ -29,6 +30,7 @@ struct CliOptions {
     dummy: Option<bool>,
     targeting: Option<bool>,
     oracle_map_for_policy: Option<bool>,
+    clients: Option<String>,
     db_path: Option<PathBuf>,
 }
 
@@ -42,6 +44,7 @@ struct FileOptions {
     dummy: Option<bool>,
     targeting: Option<bool>,
     oracle_map_for_policy: Option<bool>,
+    clients: Option<usize>,
     db_path: Option<PathBuf>,
 }
 
@@ -54,6 +57,7 @@ struct EnvOptions {
     dummy: Option<String>,
     targeting: Option<String>,
     oracle_map_for_policy: Option<String>,
+    clients: Option<String>,
     db_path: Option<PathBuf>,
 }
 
@@ -99,6 +103,7 @@ impl EnvOptions {
             dummy: get("EINSTEINBOT_DUMMY"),
             targeting: get("EINSTEINBOT_TARGETING"),
             oracle_map_for_policy: get("EINSTEINBOT_ORACLE_MAP"),
+            clients: get("EINSTEINBOT_CLIENTS"),
             db_path: get("EINSTEINBOT_DB_PATH").map(PathBuf::from),
         })
     }
@@ -139,6 +144,19 @@ fn resolve(cli: CliOptions, env: EnvOptions, file: FileOptions) -> Result<AppCon
     if !name.bytes().all(|byte| (b' '..=b'~').contains(&byte)) {
         return Err("name must contain printable ASCII only".to_owned());
     }
+    let clients = if let Some(value) = cli.clients {
+        parse_clients(&value, "--clients")?
+    } else if let Some(value) = env.clients {
+        parse_clients(&value, "EINSTEINBOT_CLIENTS")?
+    } else {
+        file.clients.unwrap_or(1)
+    };
+    if clients == 0 || clients > 16 {
+        return Err("clients must be between 1 and 16".to_owned());
+    }
+    if clients > 1 && !is_loopback_host(&host) {
+        return Err("multiple clients are supported only for a loopback host".to_owned());
+    }
 
     Ok(AppConfig {
         host,
@@ -172,6 +190,7 @@ fn resolve(cli: CliOptions, env: EnvOptions, file: FileOptions) -> Result<AppCon
         } else {
             file.oracle_map_for_policy.unwrap_or(false)
         },
+        clients,
         db_path: cli
             .db_path
             .or(env.db_path)
@@ -208,10 +227,24 @@ where
             "--no-target" => options.targeting = Some(false),
             "--oracle-map" => options.oracle_map_for_policy = Some(true),
             "--no-oracle-map" => options.oracle_map_for_policy = Some(false),
+            "--clients" => options.clients = Some(value(&mut args, &arg)?),
             _ => return Err(format!("unknown argument: {arg}\n\n{}", help_text())),
         }
     }
     Ok(ParsedCli::Options(options))
+}
+
+fn parse_clients(value: &str, source: &str) -> Result<usize, String> {
+    value
+        .parse::<usize>()
+        .map_err(|error| format!("invalid {source} value {value:?}: {error}"))
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 fn value<I>(args: &mut I, option: &str) -> Result<String, String>
@@ -257,11 +290,12 @@ fn help_text() -> &'static str {
        --no-target         Disable targeting\n\
        --oracle-map        Allow local Planets events to drive targeting\n\
        --no-oracle-map     Ignore Planets events for targeting (default)\n\
+       --clients N         Run N local bot connections (default: 1, max: 16)\n\
        --db-path PATH      SQLite file (default: einsteinbot.sqlite3)\n\
        -h, --help          Show this help\n\
      \n\
      Precedence: command line, environment, TOML config, defaults.\n\
-     Environment: EINSTEINBOT_CONFIG, _HOST, _PORT, _NAME, _RECORD, _DUMMY, _TARGETING, _ORACLE_MAP, _DB_PATH.\n"
+     Environment: EINSTEINBOT_CONFIG, _HOST, _PORT, _NAME, _RECORD, _DUMMY, _TARGETING, _ORACLE_MAP, _CLIENTS, _DB_PATH.\n"
 }
 
 #[cfg(test)]
@@ -396,6 +430,29 @@ mod tests {
         let config = resolve(cli, EnvOptions::default(), FileOptions::default()).unwrap();
         assert!(config.targeting);
         assert!(config.oracle_map_for_policy);
+    }
+
+    #[test]
+    fn multiple_clients_require_loopback_and_have_a_small_cap() {
+        let ParsedCli::Options(cli) = parse_args(["--clients", "2"].map(str::to_owned)).unwrap()
+        else {
+            panic!("expected parsed options");
+        };
+        let config = resolve(cli, EnvOptions::default(), FileOptions::default()).unwrap();
+        assert_eq!(config.clients, 2);
+
+        let ParsedCli::Options(cli) =
+            parse_args(["--host", "example.com", "--clients", "2"].map(str::to_owned)).unwrap()
+        else {
+            panic!("expected parsed options");
+        };
+        assert!(resolve(cli, EnvOptions::default(), FileOptions::default()).is_err());
+
+        let ParsedCli::Options(cli) = parse_args(["--clients", "17"].map(str::to_owned)).unwrap()
+        else {
+            panic!("expected parsed options");
+        };
+        assert!(resolve(cli, EnvOptions::default(), FileOptions::default()).is_err());
     }
 
     #[test]
