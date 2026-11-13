@@ -104,8 +104,14 @@ impl ClientCommand {
     pub fn wire_line(&self) -> Result<String, CommandError> {
         match self {
             Self::SetName { name } => {
-                if name.contains(['\r', '\n']) {
-                    return Err(CommandError("name cannot contain a line break"));
+                if name.is_empty() {
+                    return Err(CommandError("name cannot be empty"));
+                }
+                if name.len() > 15 {
+                    return Err(CommandError("name cannot exceed 15 bytes"));
+                }
+                if !name.bytes().all(|byte| (b' '..=b'~').contains(&byte)) {
+                    return Err(CommandError("name must contain printable ASCII only"));
                 }
                 Ok(format!("n {name}\n"))
             }
@@ -460,6 +466,13 @@ mod tests {
         assert!(
             ClientCommand::SetName {
                 name: "bad\nq".to_owned()
+            }
+            .wire_line()
+            .is_err()
+        );
+        assert!(
+            ClientCommand::SetName {
+                name: "a scientist name too long".to_owned()
             }
             .wire_line()
             .is_err()
