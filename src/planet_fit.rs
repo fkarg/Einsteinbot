@@ -117,6 +117,7 @@ pub fn fit_planet_map(
         contacts: contacts.to_vec(),
         world,
         cancelled,
+        workers: std::thread::available_parallelism().map_or(1, usize::from),
     };
     let initial_residual = problem
         .residual_vector(&problem.parameters)
@@ -256,6 +257,7 @@ fn contact_seeded_map(
             contacts: contacts.to_vec(),
             world,
             cancelled,
+            workers: 1,
         };
         problem
             .residual_vector(&problem.parameters)
@@ -364,6 +366,7 @@ struct Problem<'a> {
     contacts: Vec<ContactConstraint>,
     world: WorldParameters,
     cancelled: &'a AtomicBool,
+    workers: usize,
 }
 impl Problem<'_> {
     fn decode(&self, parameters: &DVector<f64>) -> Option<PlanetMap> {
@@ -461,22 +464,59 @@ impl Problem<'_> {
     }
     fn jacobian_at(&self, parameters: &DVector<f64>) -> Option<DMatrix<f64>> {
         let baseline = self.residual_vector(parameters)?;
-        let mut jacobian = DMatrix::zeros(baseline.len(), parameters.len());
-        for column in 0..parameters.len() {
-            let step = 1e-5 * (1.0 + parameters[column].abs());
-            let mut plus = parameters.clone();
-            let mut minus = parameters.clone();
-            plus[column] += step;
-            minus[column] -= step;
-            let plus = self.residual_vector(&plus);
-            let minus = self.residual_vector(&minus);
-            for row in 0..baseline.len() {
-                jacobian[(row, column)] = match (&plus, &minus) {
-                    (Some(plus), Some(minus)) => (plus[row] - minus[row]) / (2.0 * step),
-                    (Some(plus), None) => (plus[row] - baseline[row]) / step,
-                    (None, Some(minus)) => (baseline[row] - minus[row]) / step,
-                    (None, None) => return None,
-                };
+        let columns = parameters.len();
+        let workers = self.workers.max(1).min(columns.max(1));
+        let chunk = columns.div_ceil(workers);
+        let calculate = |start: usize, end: usize| -> Option<Vec<(usize, Vec<f64>)>> {
+            let mut result = Vec::new();
+            for column in start..end {
+                let step = 1e-5 * (1.0 + parameters[column].abs());
+                let mut plus = parameters.clone();
+                let mut minus = parameters.clone();
+                plus[column] += step;
+                minus[column] -= step;
+                let plus = self.residual_vector(&plus);
+                let minus = self.residual_vector(&minus);
+                if self.cancelled.load(Ordering::Relaxed) {
+                    return None;
+                }
+                let mut values = Vec::with_capacity(baseline.len());
+                for row in 0..baseline.len() {
+                    values.push(match (&plus, &minus) {
+                        (Some(plus), Some(minus)) => (plus[row] - minus[row]) / (2.0 * step),
+                        (Some(plus), None) => (plus[row] - baseline[row]) / step,
+                        (None, Some(minus)) => (baseline[row] - minus[row]) / step,
+                        (None, None) => return None,
+                    });
+                }
+                result.push((column, values));
+            }
+            Some(result)
+        };
+        let results = if workers == 1 {
+            calculate(0, columns)?
+        } else {
+            std::thread::scope(|scope| {
+                let mut handles = Vec::new();
+                for start in (0..columns).step_by(chunk) {
+                    let calculate = &calculate;
+                    handles
+                        .push(scope.spawn(move || calculate(start, (start + chunk).min(columns))));
+                }
+                let mut results = Vec::new();
+                for handle in handles {
+                    results.extend(handle.join().expect("Jacobian worker panicked")?);
+                }
+                Some(results)
+            })?
+        };
+        if self.cancelled.load(Ordering::Relaxed) {
+            return None;
+        }
+        let mut jacobian = DMatrix::zeros(baseline.len(), columns);
+        for (column, values) in results {
+            for (row, value) in values.into_iter().enumerate() {
+                jacobian[(row, column)] = value;
             }
         }
         Some(jacobian)
@@ -505,6 +545,45 @@ mod tests {
     use super::*;
     use crate::protocol::Planet;
     use crate::simulation::simulate_sampled_path;
+
+    #[test]
+    fn parallel_jacobian_matches_serial_and_respects_cancellation() {
+        let world = WorldParameters::default();
+        let planet = Planet {
+            x: 500.0,
+            y: 500.0,
+            radius: 30.0,
+            mass: 2700.0,
+        };
+        let map = PlanetMap {
+            planets: vec![planet],
+        };
+        let mut shot = ShotObservation {
+            player_id: 1,
+            angle_degrees: 0.0,
+            velocity: 4.0,
+            points: vec![Point { x: 300.0, y: 450.0 }],
+        };
+        shot.points = simulate_sampled_path(&map, &shot, world, 12).unwrap();
+        let cancelled = AtomicBool::new(false);
+        let mut problem = Problem {
+            parameters: encode_planets(&map, world),
+            observations: vec![shot],
+            contacts: vec![ContactConstraint {
+                planet_index: 0,
+                point: Point { x: 470.0, y: 500.0 },
+            }],
+            world,
+            cancelled: &cancelled,
+            workers: 1,
+        };
+        let serial = problem.jacobian_at(&problem.parameters).unwrap();
+        problem.workers = 3;
+        let parallel = problem.jacobian_at(&problem.parameters).unwrap();
+        assert_eq!(serial, parallel);
+        cancelled.store(true, Ordering::Relaxed);
+        assert!(problem.jacobian_at(&problem.parameters).is_none());
+    }
 
     #[test]
     fn jointly_refines_two_planets_and_ties_mass_to_radius() {
@@ -648,6 +727,7 @@ mod tests {
             contacts: vec![],
             world: WorldParameters::default(),
             cancelled: &cancelled,
+            workers: 1,
         };
         let map = problem
             .decode(&problem.parameters)

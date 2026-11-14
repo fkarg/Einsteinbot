@@ -29,6 +29,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut capture = None;
     let mut compare = false;
     let mut fit_planets = false;
+    let mut batch_shots = 1_usize;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--capture-id" => {
@@ -36,10 +37,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--compare-policy" => compare = true,
             "--fit-planets" => fit_planets = true,
+            "--batch-shots" => {
+                batch_shots = args.next().ok_or("missing batch size")?.parse()?;
+                if batch_shots == 0 {
+                    return Err("--batch-shots must be positive".into());
+                }
+            }
             "--db-path" => path = args.next().ok_or("missing database path")?,
             "--help" | "-h" => {
                 println!(
-                    "Usage: targeting_report --capture-id ID [--db-path PATH] [--compare-policy] [--fit-planets]"
+                    "Usage: targeting_report --capture-id ID [--db-path PATH] [--compare-policy] [--fit-planets] [--batch-shots N]"
                 );
                 return Ok(());
             }
@@ -68,7 +75,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         compare_policy(&events);
     }
     if fit_planets {
-        let mut replay = PlanetReplay::default();
+        let mut replay = PlanetReplay {
+            batch_shots,
+            ..PlanetReplay::default()
+        };
         for (_, event) in &events {
             if let RecordedEvent::Inbound(event) = event {
                 if let Some(belief) = replay.observe(event) {
@@ -76,9 +86,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        if let Some(belief) = replay.flush() {
+            replay.print_fit(&belief);
+        }
         replay.print_summary();
         println!(
-            "Planet replay performs sequential prefix-only fits from positions and completed trajectories. Disclosed Planets only reset epochs and score outputs, never enter the estimator. Matched planets use one-to-one greedy center distance <=50; unmatched inferred planets count as unresolved/false hypotheses, unmatched truth as undiscovered. Reported fit RMSE is training error. Future RMSE scores each newly completed trajectory against the map published before learning that trajectory; early empty maps and invalid comparisons are unscored. Flat-field RMSE uses exactly the same scored trajectories. Epoch resets clear all prediction and fit metrics; contact refinement that changes the fitted map clears its covariance/convergence/model-error metadata rather than attaching old-fit metrics to new geometry."
+            "Planet replay performs prefix-only fits from positions and completed trajectories, flushing every configured number of distinct paths and at epoch/end boundaries. All paths within a pending batch use the preceding published map for prediction scoring. Disclosed Planets only reset epochs and score outputs, never enter the estimator. Matched planets use deterministic maximum-cardinality one-to-one center matching within 50 units (neighbors ordered by distance, not minimum-total-distance matching); unmatched inferred planets count as unresolved/false hypotheses, unmatched truth as undiscovered. Reported fit RMSE is training error. Future RMSE scores each newly completed trajectory against the map published before learning that trajectory; early empty maps and invalid comparisons are unscored. Flat-field RMSE uses exactly the same scored trajectories. Epoch resets clear all prediction and fit metrics; contact refinement that changes the fitted map clears its covariance/convergence/model-error metadata rather than attaching old-fit metrics to new geometry."
         );
     }
     let mut epoch = 0;
@@ -222,16 +235,38 @@ struct PlanetReplay {
     epoch: usize,
     oracle: Option<einsteinbot::map::PlanetMap>,
     fits: usize,
+    total_fits: usize,
     shots: usize,
     errors: Vec<f64>,
     last_map: Option<einsteinbot::map::PlanetMap>,
     future_errors: Vec<f64>,
     future_flat_errors: Vec<f64>,
     future_unscored: usize,
+    batch_shots: usize,
+    pending: Vec<ServerEvent>,
+    pending_distinct: usize,
+    seen: Vec<einsteinbot::simulation::ShotObservation>,
 }
 impl PlanetReplay {
+    fn flush(&mut self) -> Option<einsteinbot::strategy::MapBelief> {
+        let events = std::mem::take(&mut self.pending);
+        self.pending_distinct = 0;
+        let belief = self
+            .estimator
+            .observe_batch(&events, &std::sync::atomic::AtomicBool::new(false))?;
+        self.fits += 1;
+        self.total_fits += 1;
+        if let Some(error) = belief.model_position_rmse {
+            self.errors.push(error);
+        }
+        self.last_map = Some(belief.map.clone());
+        Some(belief)
+    }
     fn observe(&mut self, event: &ServerEvent) -> Option<einsteinbot::strategy::MapBelief> {
         if let ServerEvent::Planets { planets } = event {
+            if let Some(belief) = self.flush() {
+                self.print_fit(&belief);
+            }
             if self.epoch > 0 || self.fits > 0 {
                 self.print_summary();
             }
@@ -247,6 +282,7 @@ impl PlanetReplay {
             self.future_errors.clear();
             self.future_flat_errors.clear();
             self.future_unscored = 0;
+            self.seen.clear();
             return None;
         }
         if matches!(event, ServerEvent::ShotFin { .. }) {
@@ -283,28 +319,40 @@ impl PlanetReplay {
                 self.future_unscored += 1;
             }
         }
-        let belief = self
-            .estimator
-            .observe(event, &std::sync::atomic::AtomicBool::new(false))?;
-        self.fits += 1;
-        if let Some(error) = belief.model_position_rmse {
-            self.errors.push(error);
+        if matches!(
+            event,
+            ServerEvent::PlayerPosition { .. }
+                | ServerEvent::PlayerLeave { .. }
+                | ServerEvent::ShotFin { .. }
+        ) {
+            self.pending.push(event.clone());
+            if let Ok(shot) = einsteinbot::simulation::ShotObservation::try_from(event) {
+                if !self.seen.contains(&shot) {
+                    self.seen.push(shot);
+                    self.pending_distinct += 1;
+                }
+            }
         }
-        self.last_map = Some(belief.map.clone());
-        Some(belief)
+        if self.pending_distinct >= self.batch_shots.max(1) {
+            self.flush()
+        } else {
+            None
+        }
     }
     fn print_fit(&self, belief: &einsteinbot::strategy::MapBelief) {
         println!(
-            "planet_fit epoch={} fit={} prefix_shots={} inferred={} position_rmse={} covariance={}",
+            "planet_fit epoch={} fit={} prefix_shots={} inferred={} ambiguous={} position_rmse={} covariance={} batch_shots={}",
             self.epoch,
             self.fits,
             self.shots,
             belief.map.planets.len(),
+            belief.uncertain_associations,
             belief
                 .model_position_rmse
                 .map(|x| format!("{x:.6}"))
                 .unwrap_or_else(|| "unavailable".to_owned()),
-            belief.parameter_covariance.is_some()
+            belief.parameter_covariance.is_some(),
+            self.batch_shots.max(1)
         );
         self.print_matching(&belief.map);
     }
@@ -326,9 +374,10 @@ impl PlanetReplay {
     }
     fn print_summary(&self) {
         println!(
-            "planet_epoch epoch={} fits={} shots={} median_fit_position_rmse={} future_scored={} future_unscored={} median_future_position_rmse={} median_future_flat_rmse={}",
+            "planet_epoch epoch={} fits={} total_fits={} shots={} median_fit_position_rmse={} future_scored={} future_unscored={} median_future_position_rmse={} median_future_flat_rmse={}",
             self.epoch,
             self.fits,
+            self.total_fits,
             self.shots,
             median(&self.errors),
             self.future_errors.len(),
@@ -345,29 +394,64 @@ fn match_planets(
     inferred: &einsteinbot::map::PlanetMap,
     truth: &einsteinbot::map::PlanetMap,
 ) -> (Vec<f64>, Vec<f64>, usize) {
-    let mut pairs = Vec::new();
-    for (i, predicted) in inferred.planets.iter().enumerate() {
-        for (j, actual) in truth.planets.iter().enumerate() {
-            let distance =
-                ((predicted.x - actual.x).powi(2) + (predicted.y - actual.y).powi(2)).sqrt();
-            if distance <= 50.0 {
-                pairs.push((distance, i, j));
+    let neighbors = inferred
+        .planets
+        .iter()
+        .map(|predicted| {
+            let mut candidates = truth
+                .planets
+                .iter()
+                .enumerate()
+                .filter_map(|(j, actual)| {
+                    let distance = ((predicted.x - actual.x).powi(2)
+                        + (predicted.y - actual.y).powi(2))
+                    .sqrt();
+                    (distance <= 50.0).then_some((distance, j))
+                })
+                .collect::<Vec<_>>();
+            candidates.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            candidates
+        })
+        .collect::<Vec<_>>();
+    // Augmenting paths maximize match count. Distance only orders neighbors;
+    // this deliberately does not minimize total assignment distance.
+    fn augment(
+        i: usize,
+        neighbors: &[Vec<(f64, usize)>],
+        seen: &mut [bool],
+        assigned: &mut [Option<usize>],
+    ) -> bool {
+        for &(_, j) in &neighbors[i] {
+            if seen[j] {
+                continue;
+            }
+            seen[j] = true;
+            if assigned[j].is_none() || augment(assigned[j].unwrap(), neighbors, seen, assigned) {
+                assigned[j] = Some(i);
+                return true;
             }
         }
+        false
     }
-    pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let mut predicted_used = BTreeSet::new();
-    let mut truth_used = BTreeSet::new();
+    let mut assigned = vec![None; truth.planets.len()];
+    for i in 0..inferred.planets.len() {
+        augment(
+            i,
+            &neighbors,
+            &mut vec![false; truth.planets.len()],
+            &mut assigned,
+        );
+    }
     let mut centers = Vec::new();
     let mut radii = Vec::new();
-    for (distance, i, j) in pairs {
-        if predicted_used.contains(&i) || truth_used.contains(&j) {
-            continue;
+    for (j, i) in assigned.into_iter().enumerate() {
+        if let Some(i) = i {
+            let predicted = &inferred.planets[i];
+            let actual = &truth.planets[j];
+            centers
+                .push(((predicted.x - actual.x).powi(2) + (predicted.y - actual.y).powi(2)).sqrt());
+            radii.push((predicted.radius - actual.radius).abs());
         }
-        predicted_used.insert(i);
-        truth_used.insert(j);
-        centers.push(distance);
-        radii.push((inferred.planets[i].radius - truth.planets[j].radius).abs());
     }
     let unmatched = inferred.planets.len() - centers.len();
     (centers, radii, unmatched)
@@ -496,6 +580,30 @@ mod tests {
     }
 
     #[test]
+    fn oracle_matching_reassigns_nearest_pair_to_preserve_two_valid_matches() {
+        // Nearest-first consumes truth x=0 for x=24 and strands x=-26;
+        // the valid assignment is -26→0 and 24→50, both within the 50-unit cutoff.
+        use einsteinbot::map::PlanetMap;
+        use einsteinbot::protocol::Planet;
+        let planet = |x| Planet {
+            x,
+            y: 0.,
+            radius: 20.,
+            mass: 800.,
+        };
+        let truth = PlanetMap {
+            planets: vec![planet(0.), planet(50.)],
+        };
+        let inferred = PlanetMap {
+            planets: vec![planet(24.), planet(-26.)],
+        };
+        let (center, radius, unmatched) = match_planets(&inferred, &truth);
+        assert_eq!(center, vec![26., 26.]);
+        assert_eq!(radius, vec![0., 0.]);
+        assert_eq!(unmatched, 0);
+    }
+
+    #[test]
     fn oracle_matching_counts_duplicate_and_distant_hypotheses_as_unmatched() {
         use einsteinbot::map::PlanetMap;
         use einsteinbot::protocol::Planet;
@@ -608,6 +716,45 @@ mod tests {
         assert!(replay.estimator.belief().is_none());
         assert!(replay.future_errors.is_empty());
         assert!(replay.future_flat_errors.is_empty());
+    }
+
+    #[test]
+    fn batch_replay_waits_for_distinct_paths_and_flushes_a_partial_epoch() {
+        let shot = |velocity| ServerEvent::ShotFin {
+            player_id: 1,
+            angle: 0.,
+            velocity,
+            points: vec![
+                Point { x: 10., y: 20. },
+                Point { x: 12., y: 20. },
+                Point { x: 14., y: 20. },
+            ],
+        };
+        let mut replay = PlanetReplay {
+            batch_shots: 2,
+            ..PlanetReplay::default()
+        };
+        assert!(replay.observe(&shot(2.)).is_none());
+        assert!(
+            replay.observe(&shot(2.)).is_none(),
+            "duplicates cannot fill a batch"
+        );
+        assert!(
+            replay.estimator.belief().is_none(),
+            "no early or future fit"
+        );
+        assert!(replay.observe(&shot(3.)).is_some());
+        assert_eq!(replay.fits, 1);
+        assert!(replay.pending.is_empty());
+        assert!(replay.observe(&shot(4.)).is_none());
+        replay.observe(&ServerEvent::Planets { planets: vec![] });
+        assert_eq!(
+            replay.total_fits, 2,
+            "epoch boundary must publish the partial batch before resetting"
+        );
+        assert!(replay.pending.is_empty());
+        assert!(replay.seen.is_empty());
+        assert!(replay.estimator.belief().is_none());
     }
 
     #[test]

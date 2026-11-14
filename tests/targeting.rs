@@ -258,6 +258,19 @@ fn planet_beyond_target_does_not_disqualify_a_hit() {
     learn_contact(&mut state);
     let choice = TargetingPolicy::default().choose(&state, 8.0).unwrap();
     assert_eq!(choice.reason, ShotReason::Hit);
-    assert!(!choice.blocked_by_contact);
+    assert!(!choice.contact_before_target);
     assert!(choice.miss_distance <= 4.0);
+}
+
+#[test]
+fn observed_contact_does_not_veto_a_shot_aimed_at_an_opponent() {
+    use einsteinbot::protocol::Point;
+    let mut state = state_with_enemy(100.0, 0.0);
+    let mut belief = MapBelief::new(PlanetMap { planets: vec![] }, None);
+    belief.contact_points.push(Point { x: 50.0, y: 0.0 });
+    state.set_map_belief(Some(belief));
+    let choice = TargetingPolicy::default().choose(&state, 2.0).unwrap();
+    assert!(choice.contact_before_target);
+    assert_eq!(choice.reason, ShotReason::Hit);
+    assert_eq!(choice.angle_degrees, 0);
 }

@@ -17,30 +17,44 @@ pub struct OnlineEstimator {
 }
 
 impl OnlineEstimator {
-    pub fn observe(&mut self, event: &ServerEvent, cancelled: &AtomicBool) -> Option<MapBelief> {
-        if cancelled.load(Ordering::SeqCst) {
-            return None;
-        }
-        match event {
-            ServerEvent::PlayerPosition { player_id, x, y } => {
-                self.players.insert(*player_id, Point { x: *x, y: *y });
+    /// Ingest an ordered group of events, then fit once if it contains new trajectories.
+    pub fn observe_batch(
+        &mut self,
+        events: &[ServerEvent],
+        cancelled: &AtomicBool,
+    ) -> Option<MapBelief> {
+        let mut changed = false;
+        for event in events {
+            if cancelled.load(Ordering::SeqCst) {
                 return None;
             }
-            ServerEvent::PlayerLeave { player_id } => {
-                self.players.remove(player_id);
-                return None;
+            match event {
+                ServerEvent::PlayerPosition { player_id, x, y } => {
+                    self.players.insert(*player_id, Point { x: *x, y: *y });
+                    continue;
+                }
+                ServerEvent::PlayerLeave { player_id } => {
+                    self.players.remove(player_id);
+                    continue;
+                }
+                ServerEvent::ShotFin { .. } => {}
+                _ => continue,
             }
-            ServerEvent::ShotFin { .. } => {}
-            _ => return None,
+            let Ok(shot) = ShotObservation::try_from(event) else {
+                continue;
+            };
+            if self.observations.contains(&shot) {
+                continue;
+            }
+            let players = self.players.values().cloned().collect::<Vec<_>>();
+            self.contacts
+                .observe(&shot.points, &players, WorldParameters::default());
+            self.observations.push(shot);
+            changed = true;
         }
-        let shot = ShotObservation::try_from(event).ok()?;
-        if self.observations.contains(&shot) {
+        if !changed {
             return None;
         }
-        let players = self.players.values().cloned().collect::<Vec<_>>();
-        self.contacts
-            .observe(&shot.points, &players, WorldParameters::default());
-        self.observations.push(shot);
         let active = self
             .contacts
             .hypotheses()
@@ -124,6 +138,10 @@ impl OnlineEstimator {
         belief.contact_points = self.contacts.contact_points().to_vec();
         self.belief = Some(belief.clone());
         Some(belief)
+    }
+    /// Sequential replay fits after each event, preserving the historical decision boundary.
+    pub fn observe(&mut self, event: &ServerEvent, cancelled: &AtomicBool) -> Option<MapBelief> {
+        self.observe_batch(std::slice::from_ref(event), cancelled)
     }
     pub fn belief(&self) -> Option<&MapBelief> {
         self.belief.as_ref()
@@ -240,6 +258,55 @@ mod tests {
             "known player termination must not seed a planet after reset"
         );
         assert!(belief.contact_points.is_empty());
+    }
+
+    #[test]
+    fn batched_contacts_use_player_positions_at_each_shot() {
+        let mut estimator = OnlineEstimator::default();
+        let cancelled = AtomicBool::new(false);
+        let first = contact(500.0);
+        let second = contact(800.0);
+        let ServerEvent::ShotFin {
+            points: first_points,
+            ..
+        } = &first
+        else {
+            unreachable!()
+        };
+        let ServerEvent::ShotFin {
+            points: second_points,
+            ..
+        } = &second
+        else {
+            unreachable!()
+        };
+        let target = first_points.last().unwrap();
+        let events = vec![
+            ServerEvent::PlayerPosition {
+                player_id: 1,
+                x: 100.0,
+                y: 100.0,
+            },
+            ServerEvent::PlayerPosition {
+                player_id: 2,
+                x: target.x,
+                y: target.y,
+            },
+            first.clone(),
+            ServerEvent::PlayerPosition {
+                player_id: 2,
+                x: 1500.0,
+                y: 1000.0,
+            },
+            second.clone(),
+        ];
+        let belief = estimator.observe_batch(&events, &cancelled).unwrap();
+        assert_eq!(estimator.observations.len(), 2);
+        assert_eq!(
+            belief.contact_points,
+            vec![second_points.last().unwrap().clone()]
+        );
+        assert_eq!(belief.map.planets.len(), 1);
     }
 
     #[test]

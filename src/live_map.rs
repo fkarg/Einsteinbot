@@ -37,7 +37,7 @@ impl LiveMap {
         (feed, Some(worker))
     }
 
-    fn spawn_with(
+    pub(crate) fn spawn_with(
         mut fit: impl FnMut(&mut OnlineEstimator, &ServerEvent, &AtomicBool) -> Option<MapBelief>
         + Send
         + 'static,
@@ -108,6 +108,39 @@ mod tests {
     use super::*;
     use crate::map::PlanetMap;
     use std::time::Duration;
+
+    #[test]
+    fn latest_belief_remains_available_while_next_fit_runs_and_reset_clears_it() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut fits = 0;
+        let (feed, worker) = LiveMap::spawn_with(move |_, _, _| {
+            fits += 1;
+            if fits == 2 {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            }
+            Some(MapBelief::new(PlanetMap { planets: vec![] }, None))
+        });
+        feed.observe(&ServerEvent::PlayerLeave { player_id: 1 })
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while feed.snapshot().1.is_none() {
+            assert!(std::time::Instant::now() < deadline);
+            thread::yield_now();
+        }
+        feed.observe(&ServerEvent::PlayerLeave { player_id: 2 })
+            .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (updating, belief) = feed.snapshot();
+        assert!(updating);
+        assert!(belief.is_some());
+        feed.reset();
+        assert!(feed.snapshot().1.is_none());
+        release_tx.send(()).unwrap();
+        drop(feed);
+        worker.join().unwrap();
+    }
 
     #[test]
     fn reset_cancels_active_fit_and_does_not_leave_pending_evidence() {

@@ -212,7 +212,7 @@ pub struct ShotChoice {
     pub uncertainty_available: bool,
     pub covered_fraction: f64,
     /// A provisional contact disk intersects this path before its closest target passage.
-    pub blocked_by_contact: bool,
+    pub contact_before_target: bool,
     pub reason: ShotReason,
 }
 
@@ -286,7 +286,7 @@ impl TargetingPolicy {
                 ) else {
                     continue;
                 };
-                let (miss_distance, blocked_by_contact) = targets
+                let (miss_distance, contact_before_target) = targets
                     .iter()
                     .map(|target| {
                         let (miss, passage) = closest_path_passage(
@@ -308,10 +308,7 @@ impl TargetingPolicy {
                         });
                         (miss, blocked)
                     })
-                    .min_by(|left, right| {
-                        (left.0 + if left.1 { 80.0 } else { 0.0 })
-                            .total_cmp(&(right.0 + if right.1 { 80.0 } else { 0.0 }))
-                    })
+                    .min_by(|left, right| left.0.total_cmp(&right.0))
                     .unwrap();
                 let cells = path_cells(&trajectory.points);
                 let covered_fraction = if cells.is_empty() {
@@ -326,7 +323,7 @@ impl TargetingPolicy {
                     information_score: 0.0,
                     uncertainty_available: covariance_available,
                     covered_fraction,
-                    blocked_by_contact,
+                    contact_before_target,
                     reason: ShotReason::Approach,
                 });
             }
@@ -352,10 +349,7 @@ impl TargetingPolicy {
 
         if let Some(best_hit) = pool
             .iter()
-            .filter(|candidate| {
-                !candidate.blocked_by_contact
-                    && candidate.miss_distance <= self.settings.target_radius
-            })
+            .filter(|candidate| candidate.miss_distance <= self.settings.target_radius)
             .min_by(|left, right| {
                 left.miss_distance
                     .total_cmp(&right.miss_distance)
@@ -412,8 +406,7 @@ impl TargetingPolicy {
         if let Some(best_information) = pool
             .iter()
             .filter(|candidate| {
-                !candidate.blocked_by_contact
-                    && candidate.uncertainty_available
+                candidate.uncertainty_available
                     && candidate.information_score >= self.settings.information_threshold
             })
             .max_by(|left, right| {
@@ -432,15 +425,12 @@ impl TargetingPolicy {
         }
 
         pool.into_iter().min_by(|left, right| {
-            (left.miss_distance
-                + self.settings.coverage_penalty * left.covered_fraction
-                + if left.blocked_by_contact { 80.0 } else { 0.0 })
-            .total_cmp(
-                &(right.miss_distance
-                    + self.settings.coverage_penalty * right.covered_fraction
-                    + if right.blocked_by_contact { 80.0 } else { 0.0 }),
-            )
-            .then_with(|| left.velocity.cmp(&right.velocity))
+            (left.miss_distance + self.settings.coverage_penalty * left.covered_fraction)
+                .total_cmp(
+                    &(right.miss_distance
+                        + self.settings.coverage_penalty * right.covered_fraction),
+                )
+                .then_with(|| left.velocity.cmp(&right.velocity))
         })
     }
 }

@@ -269,9 +269,6 @@ fn run_session(
                             };
                         let commands = if dummy {
                             commands_for_energy(energy, &mut rng)
-                        } else if targeting && map_updating {
-                            // Keep reading and polling energy while the shared estimator learns.
-                            None
                         } else if targeting {
                             if !oracle_map_for_policy {
                                 bot_state.set_map_belief(map_belief);
@@ -280,7 +277,7 @@ fn run_session(
                                 .choose(&bot_state, energy)
                                 .map(|choice| {
                                     println!(
-                                        "TargetChoice reason={:?} velocity={} angle={} miss={:.2} information={:.3} covariance={} covered={:.3} contact_blocked={}",
+                                        "TargetChoice reason={:?} velocity={} angle={} miss={:.2} information={:.3} covariance={} covered={:.3} contact_before_target={} map_updating={}",
                                         choice.reason,
                                         choice.velocity,
                                         choice.angle_degrees,
@@ -288,7 +285,8 @@ fn run_session(
                                         choice.information_score,
                                     choice.uncertainty_available,
                                     choice.covered_fraction,
-                                    choice.blocked_by_contact
+                                    choice.contact_before_target,
+                                    map_updating
                                     );
                                     [
                                         ClientCommand::SetVelocity {
@@ -450,6 +448,103 @@ fn read_prompt(reader: &mut impl Read) -> ClientResult<Vec<u8>> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn targeting_keeps_firing_while_the_map_worker_is_busy() {
+        use std::io::{BufRead, BufReader};
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (feed, fitter) = LiveMap::spawn_with(move |_, _, _| {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            None
+        });
+        feed.observe(&ServerEvent::PlayerLeave { player_id: 99 })
+            .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shots_tx, shots_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            socket.write_all(b"welcome> ").unwrap();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            socket.write_all(b"> ").unwrap();
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            let mut frames = Vec::new();
+            frames.extend(1u32.to_ne_bytes());
+            frames.extend(1u32.to_ne_bytes());
+            for (id, x, y) in [(1u32, 100.0f32, 100.0f32), (2, 200.0, 100.0)] {
+                frames.extend(3u32.to_ne_bytes());
+                frames.extend(id.to_ne_bytes());
+                frames.extend(x.to_ne_bytes());
+                frames.extend(y.to_ne_bytes());
+            }
+            for _ in 0..2 {
+                frames.extend(8u32.to_ne_bytes());
+                frames.extend(1u32.to_ne_bytes());
+                frames.extend(8f64.to_ne_bytes());
+            }
+            socket.write_all(&frames).unwrap();
+            let mut shots = 0;
+            let mut polls = 0;
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) if line.trim().parse::<f64>().is_ok() => {
+                        shots += 1;
+                        if shots == 2 {
+                            break;
+                        }
+                    }
+                    Ok(_) if line.trim() == "u" => {
+                        polls += 1;
+                        if polls == 3 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            shots_tx.send(shots).unwrap();
+        });
+        let running = Arc::new(AtomicBool::new(true));
+        let worker_running = Arc::clone(&running);
+        let worker_feed = feed.clone();
+        let client = std::thread::spawn(move || {
+            let mut socket = TcpStream::connect(address).unwrap();
+            run_session(
+                &mut socket,
+                "Einstein",
+                1,
+                false,
+                true,
+                false,
+                &worker_running,
+                None,
+                &worker_feed,
+            )
+        });
+        let shots = shots_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        running.store(false, Ordering::SeqCst);
+        release_tx.send(()).unwrap();
+        server.join().unwrap();
+        let _ = client.join().unwrap();
+        drop(feed);
+        fitter.join().unwrap();
+        assert_eq!(shots, 2, "fit work must not suppress energy-driven shots");
+    }
 
     #[test]
     fn shutdown_interrupts_a_buffered_energy_command_backlog() {
