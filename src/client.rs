@@ -8,7 +8,7 @@ use crate::rate_limit::ByteRateLimiter;
 use crate::strategy::{BotState, MapBelief, TargetingPolicy, TargetingSettings};
 use std::error::Error;
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -157,6 +157,7 @@ fn run_session(
     map_feed: &LiveMap,
 ) -> ClientResult<()> {
     let mut rate_limiter = ByteRateLimiter::new();
+    stream.set_write_timeout(Some(SOCKET_POLL_INTERVAL))?;
     stream.set_read_timeout(Some(Duration::from_secs(3)))?;
     let welcome = read_prompt(stream)?;
     print!("{}", String::from_utf8_lossy(&welcome));
@@ -167,6 +168,7 @@ fn run_session(
         &event_log,
         name,
         &mut rate_limiter,
+        running,
         ClientCommand::SetName {
             name: name.to_owned(),
         },
@@ -179,6 +181,7 @@ fn run_session(
         &event_log,
         name,
         &mut rate_limiter,
+        running,
         ClientCommand::NegotiateProtocol {
             version: PROTOCOL_VERSION,
         },
@@ -195,15 +198,13 @@ fn run_session(
         &event_log,
         name,
         &mut rate_limiter,
+        running,
         ClientCommand::RequestEnergy,
     )?;
     let mut last_energy_request = Instant::now();
     let mut buffer = [0u8; 4096];
-    let mut shutdown_requested = false;
-
-    loop {
+    'session: loop {
         if !running.load(Ordering::SeqCst) {
-            shutdown_requested = true;
             break;
         }
         match stream.read(&mut buffer) {
@@ -213,6 +214,9 @@ fn run_session(
             }
             Ok(length) => {
                 for event in parser.feed(&buffer[..length])? {
+                    if !running.load(Ordering::SeqCst) {
+                        break 'session;
+                    }
                     println!("{}", event_summary(&event));
                     bot_state.observe(&event);
                     if oracle_map_for_policy {
@@ -229,9 +233,20 @@ fn run_session(
                         match &event {
                             ServerEvent::Planets { .. } => {
                                 map_feed.reset();
+                                // Upstream can send our new position before Planets. Carry
+                                // the tracked snapshot across the epoch's queue invalidation.
+                                for (player_id, position) in bot_state.player_positions() {
+                                    map_feed.observe(&ServerEvent::PlayerPosition {
+                                        player_id: *player_id,
+                                        x: position.x,
+                                        y: position.y,
+                                    })?;
+                                }
                                 eprintln!("LiveMap reset: new map epoch");
                             }
-                            ServerEvent::ShotFin { .. } => map_feed.observe(&event)?,
+                            ServerEvent::ShotFin { .. }
+                            | ServerEvent::PlayerPosition { .. }
+                            | ServerEvent::PlayerLeave { .. } => map_feed.observe(&event)?,
                             _ => {}
                         }
                     }
@@ -246,25 +261,34 @@ fn run_session(
                     }
                     if let ServerEvent::OwnEnergy { energy, .. } = event {
                         let mut rng = rand::rng();
+                        let (map_updating, map_belief) =
+                            if targeting && !dummy && !oracle_map_for_policy {
+                                map_feed.snapshot()
+                            } else {
+                                (false, None)
+                            };
                         let commands = if dummy {
                             commands_for_energy(energy, &mut rng)
+                        } else if targeting && map_updating {
+                            // Keep reading and polling energy while the shared estimator learns.
+                            None
                         } else if targeting {
                             if !oracle_map_for_policy {
-                                let belief = map_feed.belief();
-                                bot_state.set_map_belief(belief);
+                                bot_state.set_map_belief(map_belief);
                             }
                             target_policy
                                 .choose(&bot_state, energy)
                                 .map(|choice| {
                                     println!(
-                                        "TargetChoice reason={:?} velocity={} angle={} miss={:.2} information={:.3} covariance={} covered={:.3}",
+                                        "TargetChoice reason={:?} velocity={} angle={} miss={:.2} information={:.3} covariance={} covered={:.3} contact_blocked={}",
                                         choice.reason,
                                         choice.velocity,
                                         choice.angle_degrees,
                                         choice.miss_distance,
                                         choice.information_score,
                                     choice.uncertainty_available,
-                                    choice.covered_fraction
+                                    choice.covered_fraction,
+                                    choice.blocked_by_contact
                                     );
                                     [
                                         ClientCommand::SetVelocity {
@@ -281,7 +305,17 @@ fn run_session(
                         };
                         if let Some(commands) = commands {
                             for command in commands {
-                                send_command(stream, &event_log, name, &mut rate_limiter, command)?;
+                                if !running.load(Ordering::SeqCst) {
+                                    break 'session;
+                                }
+                                send_command(
+                                    stream,
+                                    &event_log,
+                                    name,
+                                    &mut rate_limiter,
+                                    running,
+                                    command,
+                                )?;
                             }
                         }
                     }
@@ -300,20 +334,16 @@ fn run_session(
                 &event_log,
                 name,
                 &mut rate_limiter,
+                running,
                 ClientCommand::RequestEnergy,
             )?;
             last_energy_request = Instant::now();
         }
     }
 
-    if shutdown_requested {
-        send_command(
-            stream,
-            &event_log,
-            name,
-            &mut rate_limiter,
-            ClientCommand::Disconnect,
-        )?;
+    // Closing TCP is sufficient to leave the game, and never waits for rate-limit credit.
+    if !running.load(Ordering::SeqCst) {
+        stream.shutdown(Shutdown::Both)?;
     }
 
     Ok(())
@@ -354,16 +384,19 @@ fn send_command(
     event_log: &Option<Arc<Mutex<EventLog>>>,
     bot_name: &str,
     rate_limiter: &mut ByteRateLimiter,
+    running: &AtomicBool,
     command: ClientCommand,
 ) -> ClientResult<()> {
     let line = command.wire_line()?;
+    if !rate_limiter.wait_for(line.len(), running)? {
+        return Ok(());
+    }
     append_event(
         event_log,
         bot_name.into(),
         now_unix_ms()?,
         &RecordedEvent::Outbound(command),
     )?;
-    rate_limiter.wait_for(line.len())?;
     stream.write_all(line.as_bytes())?;
     Ok(())
 }
@@ -417,6 +450,87 @@ fn read_prompt(reader: &mut impl Read) -> ClientResult<Vec<u8>> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn shutdown_interrupts_a_buffered_energy_command_backlog() {
+        // Cancellation used to be checked only before socket reads: a buffered energy burst
+        // kept firing and waiting for rate credit. Exhaust credit before cancelling to pin it.
+        use std::io::{BufRead, BufReader};
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let running = Arc::new(AtomicBool::new(true));
+        let worker_running = Arc::clone(&running);
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            socket.write_all(b"welcome> ").unwrap();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            socket.write_all(b"> ").unwrap();
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            let mut frames = Vec::new();
+            for _ in 0..256 {
+                frames.extend(8u32.to_ne_bytes());
+                frames.extend(1u32.to_ne_bytes());
+                frames.extend(8f64.to_ne_bytes());
+            }
+            socket.write_all(&frames).unwrap();
+            let mut bytes = 0;
+            while bytes < 512 {
+                line.clear();
+                let count = reader.read_line(&mut line).unwrap();
+                assert!(count > 0);
+                bytes += count;
+            }
+            ready_tx.send(()).unwrap();
+            // Keep draining until cancellation closes the socket; do not force the client out.
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+            }
+        });
+        let (done_tx, done_rx) = mpsc::channel();
+        let client = std::thread::spawn(move || {
+            let (feed, fitter) = LiveMap::spawn(false);
+            let mut socket = TcpStream::connect(address).unwrap();
+            let result = run_session(
+                &mut socket,
+                "Einstein",
+                0,
+                true,
+                false,
+                false,
+                &worker_running,
+                None,
+                &feed,
+            );
+            drop(fitter);
+            done_tx
+                .send(result.map_err(|error| error.to_string()))
+                .unwrap();
+        });
+        ready_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        running.store(false, Ordering::SeqCst);
+        assert!(
+            done_rx
+                .recv_timeout(Duration::from_millis(500))
+                .unwrap()
+                .is_ok()
+        );
+        client.join().unwrap();
+        server.join().unwrap();
+    }
 
     #[test]
     fn reads_text_prompts_separately_before_binary_mode() {

@@ -28,16 +28,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut path = "einsteinbot.sqlite3".to_owned();
     let mut capture = None;
     let mut compare = false;
+    let mut fit_planets = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--capture-id" => {
                 capture = Some(args.next().ok_or("missing capture id")?.parse::<i64>()?)
             }
             "--compare-policy" => compare = true,
+            "--fit-planets" => fit_planets = true,
             "--db-path" => path = args.next().ok_or("missing database path")?,
             "--help" | "-h" => {
                 println!(
-                    "Usage: targeting_report --capture-id ID [--db-path PATH] [--compare-policy]"
+                    "Usage: targeting_report --capture-id ID [--db-path PATH] [--compare-policy] [--fit-planets]"
                 );
                 return Ok(());
             }
@@ -64,6 +66,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     if compare {
         compare_policy(&events);
+    }
+    if fit_planets {
+        let mut replay = PlanetReplay::default();
+        for (_, event) in &events {
+            if let RecordedEvent::Inbound(event) = event {
+                if let Some(belief) = replay.observe(event) {
+                    replay.print_fit(&belief);
+                }
+            }
+        }
+        replay.print_summary();
+        println!(
+            "Planet replay performs sequential prefix-only fits from positions and completed trajectories. Disclosed Planets only reset epochs and score outputs, never enter the estimator. Matched planets use one-to-one greedy center distance <=50; unmatched inferred planets count as unresolved/false hypotheses, unmatched truth as undiscovered. Reported fit RMSE is training error. Future RMSE scores each newly completed trajectory against the map published before learning that trajectory; early empty maps and invalid comparisons are unscored. Flat-field RMSE uses exactly the same scored trajectories. Epoch resets clear all prediction and fit metrics; contact refinement that changes the fitted map clears its covariance/convergence/model-error metadata rather than attaching old-fit metrics to new geometry."
+        );
     }
     let mut epoch = 0;
     let mut report = Report::default();
@@ -195,9 +211,166 @@ fn compare_policy(events: &[(Option<String>, RecordedEvent)]) -> Comparison {
         result.miss / n
     );
     println!(
-        "Counterfactual choices use recorded histories and oracle maps, with 8/10/12 degree profiles assigned in first-identity order. They do not generate new observations, model live estimator errors, or establish win rates."
+        "Counterfactual choices use recorded histories and oracle maps, with 8/10/12 degree profiles assigned in first-identity order. Both policies retain the same contact handling; only coverage scoring differs. They do not generate new observations, model live estimator errors, or establish win rates."
     );
     result
+}
+
+#[derive(Default)]
+struct PlanetReplay {
+    estimator: einsteinbot::online_map::OnlineEstimator,
+    epoch: usize,
+    oracle: Option<einsteinbot::map::PlanetMap>,
+    fits: usize,
+    shots: usize,
+    errors: Vec<f64>,
+    last_map: Option<einsteinbot::map::PlanetMap>,
+    future_errors: Vec<f64>,
+    future_flat_errors: Vec<f64>,
+    future_unscored: usize,
+}
+impl PlanetReplay {
+    fn observe(&mut self, event: &ServerEvent) -> Option<einsteinbot::strategy::MapBelief> {
+        if let ServerEvent::Planets { planets } = event {
+            if self.epoch > 0 || self.fits > 0 {
+                self.print_summary();
+            }
+            self.estimator.reset();
+            self.epoch += 1;
+            self.oracle = Some(einsteinbot::map::PlanetMap {
+                planets: planets.clone(),
+            });
+            self.fits = 0;
+            self.shots = 0;
+            self.errors.clear();
+            self.last_map = None;
+            self.future_errors.clear();
+            self.future_flat_errors.clear();
+            self.future_unscored = 0;
+            return None;
+        }
+        if matches!(event, ServerEvent::ShotFin { .. }) {
+            self.shots += 1;
+            // Evaluate this newly completed path before supplying it to the estimator.
+            // Empty/no map is not counted as a learned prediction.
+            let prediction = self
+                .estimator
+                .belief()
+                .filter(|belief| !belief.map.planets.is_empty())
+                .and_then(|belief| {
+                    let shot = einsteinbot::simulation::ShotObservation::try_from(event).ok()?;
+                    let world = einsteinbot::simulation::WorldParameters::default();
+                    let error =
+                        einsteinbot::estimator::shot_position_rmse(&belief.map, &shot, world)
+                            .ok()??;
+                    let flat = einsteinbot::estimator::shot_position_rmse(
+                        &einsteinbot::map::PlanetMap { planets: vec![] },
+                        &shot,
+                        world,
+                    )
+                    .ok()??;
+                    Some((error, flat))
+                })
+                .filter(|(error, flat)| error.is_finite() && flat.is_finite());
+            if let Some((error, flat)) = prediction {
+                self.future_flat_errors.push(flat);
+                self.future_errors.push(error);
+                println!(
+                    "planet_prediction epoch={} next_shot={} preupdate_rmse={error:.6} flat_rmse={flat:.6}",
+                    self.epoch, self.shots
+                );
+            } else {
+                self.future_unscored += 1;
+            }
+        }
+        let belief = self
+            .estimator
+            .observe(event, &std::sync::atomic::AtomicBool::new(false))?;
+        self.fits += 1;
+        if let Some(error) = belief.model_position_rmse {
+            self.errors.push(error);
+        }
+        self.last_map = Some(belief.map.clone());
+        Some(belief)
+    }
+    fn print_fit(&self, belief: &einsteinbot::strategy::MapBelief) {
+        println!(
+            "planet_fit epoch={} fit={} prefix_shots={} inferred={} position_rmse={} covariance={}",
+            self.epoch,
+            self.fits,
+            self.shots,
+            belief.map.planets.len(),
+            belief
+                .model_position_rmse
+                .map(|x| format!("{x:.6}"))
+                .unwrap_or_else(|| "unavailable".to_owned()),
+            belief.parameter_covariance.is_some()
+        );
+        self.print_matching(&belief.map);
+    }
+    fn print_matching(&self, map: &einsteinbot::map::PlanetMap) {
+        if let Some(oracle) = &self.oracle {
+            let (center, radius, unmatched) = match_planets(map, oracle);
+            println!(
+                "planet_score epoch={} inferred={} truth={} matched={} unmatched_inferred={} undiscovered_truth={} median_center_error={} median_radius_error={}",
+                self.epoch,
+                map.planets.len(),
+                oracle.planets.len(),
+                center.len(),
+                unmatched,
+                oracle.planets.len() - center.len(),
+                median(&center),
+                median(&radius)
+            );
+        }
+    }
+    fn print_summary(&self) {
+        println!(
+            "planet_epoch epoch={} fits={} shots={} median_fit_position_rmse={} future_scored={} future_unscored={} median_future_position_rmse={} median_future_flat_rmse={}",
+            self.epoch,
+            self.fits,
+            self.shots,
+            median(&self.errors),
+            self.future_errors.len(),
+            self.future_unscored,
+            median(&self.future_errors),
+            median(&self.future_flat_errors)
+        );
+        if let Some(map) = &self.last_map {
+            self.print_matching(map);
+        }
+    }
+}
+fn match_planets(
+    inferred: &einsteinbot::map::PlanetMap,
+    truth: &einsteinbot::map::PlanetMap,
+) -> (Vec<f64>, Vec<f64>, usize) {
+    let mut pairs = Vec::new();
+    for (i, predicted) in inferred.planets.iter().enumerate() {
+        for (j, actual) in truth.planets.iter().enumerate() {
+            let distance =
+                ((predicted.x - actual.x).powi(2) + (predicted.y - actual.y).powi(2)).sqrt();
+            if distance <= 50.0 {
+                pairs.push((distance, i, j));
+            }
+        }
+    }
+    pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut predicted_used = BTreeSet::new();
+    let mut truth_used = BTreeSet::new();
+    let mut centers = Vec::new();
+    let mut radii = Vec::new();
+    for (distance, i, j) in pairs {
+        if predicted_used.contains(&i) || truth_used.contains(&j) {
+            continue;
+        }
+        predicted_used.insert(i);
+        truth_used.insert(j);
+        centers.push(distance);
+        radii.push((inferred.planets[i].radius - truth.planets[j].radius).abs());
+    }
+    let unmatched = inferred.planets.len() - centers.len();
+    (centers, radii, unmatched)
 }
 
 #[derive(Default)]
@@ -320,6 +493,121 @@ mod tests {
         assert_eq!(result.changed, 1);
         assert_eq!(result.hits, 0);
         assert!(result.coverage < result.baseline_coverage);
+    }
+
+    #[test]
+    fn oracle_matching_counts_duplicate_and_distant_hypotheses_as_unmatched() {
+        use einsteinbot::map::PlanetMap;
+        use einsteinbot::protocol::Planet;
+        let planet = |x| Planet {
+            x,
+            y: 0.,
+            radius: 20.,
+            mass: 800.,
+        };
+        let truth = PlanetMap {
+            planets: vec![planet(100.)],
+        };
+        let inferred = PlanetMap {
+            planets: vec![planet(101.), planet(102.), planet(300.)],
+        };
+        let (center, radius, unmatched) = match_planets(&inferred, &truth);
+        assert_eq!(center, vec![1.]);
+        assert_eq!(radius, vec![0.]);
+        assert_eq!(unmatched, 2);
+    }
+
+    #[test]
+    fn planet_replay_uses_paths_not_oracle_and_resets_physical_map() {
+        use einsteinbot::map::{PlanetMap, Vec2};
+        use einsteinbot::protocol::Planet;
+        use einsteinbot::simulation::{ShotObservation, WorldParameters, simulate_shot};
+        let truth = PlanetMap {
+            planets: vec![Planet {
+                x: 500.,
+                y: 500.,
+                radius: 30.,
+                mass: 2700.,
+            }],
+        };
+        let mut replay = PlanetReplay::default();
+        replay.observe(&ServerEvent::Planets {
+            planets: vec![Planet {
+                x: 1500.,
+                y: 100.,
+                radius: 20.,
+                mass: 800.,
+            }],
+        });
+        assert!(
+            replay.estimator.belief().is_none(),
+            "oracle must never seed fit"
+        );
+        let shot = ShotObservation {
+            player_id: 1,
+            angle_degrees: 0.,
+            velocity: 3.,
+            points: vec![Point { x: 410., y: 500. }],
+        };
+        let path = simulate_shot(&truth, &shot, WorldParameters::default(), 180).unwrap();
+        replay.observe(&ServerEvent::PlayerPosition {
+            player_id: 1,
+            x: 410.,
+            y: 500.,
+        });
+        let belief = replay
+            .observe(&ServerEvent::ShotFin {
+                player_id: 1,
+                angle: 0.,
+                velocity: 3.,
+                points: path.points.clone(),
+            })
+            .expect("trajectory seeds physical map");
+        assert_eq!(belief.map.planets.len(), 1);
+        assert!(
+            replay.future_errors.is_empty(),
+            "first trajectory cannot score against its own fitted map"
+        );
+        let event = ServerEvent::ShotFin {
+            player_id: 1,
+            angle: 0.,
+            velocity: 3.,
+            points: path.points,
+        };
+        let expected = einsteinbot::estimator::shot_position_rmse(
+            &belief.map,
+            &ShotObservation::try_from(&event).unwrap(),
+            WorldParameters::default(),
+        )
+        .unwrap()
+        .unwrap();
+        replay.observe(&event);
+        assert_eq!(
+            replay.future_errors,
+            vec![expected],
+            "evaluate only the pre-update map"
+        );
+        let expected_flat = einsteinbot::estimator::shot_position_rmse(
+            &PlanetMap { planets: vec![] },
+            &ShotObservation::try_from(&event).unwrap(),
+            WorldParameters::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(replay.future_flat_errors, vec![expected_flat]);
+        assert!(replay.future_errors[0] < replay.future_flat_errors[0]);
+        let point = Vec2::new(410., 500.);
+        let actual = truth.acceleration(point).unwrap();
+        let inferred = belief.map.acceleration(point).unwrap();
+        let error = (actual.x - inferred.x).powi(2) + (actual.y - inferred.y).powi(2);
+        assert!(
+            error < actual.norm_squared() / 10.,
+            "inferred field improves on flat baseline"
+        );
+        replay.observe(&ServerEvent::Planets { planets: vec![] });
+        assert!(replay.estimator.belief().is_none());
+        assert!(replay.future_errors.is_empty());
+        assert!(replay.future_flat_errors.is_empty());
     }
 
     #[test]

@@ -10,6 +10,13 @@ pub struct MapBelief {
     pub map: PlanetMap,
     /// Covariance ordered by `[center_x, center_y, mass]` for each planet.
     pub parameter_covariance: Option<DMatrix<f64>>,
+    /// Observed contact points, retained even before radius is identifiable.
+    pub contact_points: Vec<Point>,
+    /// Raw trajectory error exposes model mismatch beyond local covariance.
+    pub model_position_rmse: Option<f64>,
+    pub fit_converged: Option<bool>,
+    pub planet_contact_counts: Vec<usize>,
+    pub uncertain_associations: usize,
 }
 
 impl MapBelief {
@@ -17,6 +24,11 @@ impl MapBelief {
         Self {
             map,
             parameter_covariance,
+            contact_points: Vec::new(),
+            model_position_rmse: None,
+            fit_converged: None,
+            planet_contact_counts: Vec::new(),
+            uncertain_associations: 0,
         }
     }
 
@@ -76,6 +88,7 @@ impl BotState {
             ServerEvent::Planets { .. } => {
                 self.known_shots.clear();
                 self.covered_cells.clear();
+                self.map_belief = None;
                 self.in_flight.clear();
             }
             ServerEvent::OwnId { player_id } => self.own_id = Some(*player_id),
@@ -198,6 +211,8 @@ pub struct ShotChoice {
     pub information_score: f64,
     pub uncertainty_available: bool,
     pub covered_fraction: f64,
+    /// A provisional contact disk intersects this path before its closest target passage.
+    pub blocked_by_contact: bool,
     pub reason: ShotReason,
 }
 
@@ -271,10 +286,33 @@ impl TargetingPolicy {
                 ) else {
                     continue;
                 };
-                let miss_distance = targets
+                let (miss_distance, blocked_by_contact) = targets
                     .iter()
-                    .map(|target| closest_path_distance(target, &trajectory.points))
-                    .fold(f64::INFINITY, f64::min);
+                    .map(|target| {
+                        let (miss, passage) = closest_path_passage(
+                            target,
+                            &trajectory.points,
+                            self.settings.target_radius,
+                        );
+                        let blocked = map.planets.iter().any(|planet| {
+                            contact_before_target(planet, &trajectory.points, passage)
+                        }) || state.map_belief.as_ref().is_some_and(|belief| {
+                            belief.contact_points.iter().any(|contact| {
+                                first_circle_entry(
+                                    &Vec2::new(f64::from(contact.x), f64::from(contact.y)),
+                                    5.0,
+                                    &trajectory.points,
+                                )
+                                .is_some_and(|entry| entry < passage)
+                            })
+                        });
+                        (miss, blocked)
+                    })
+                    .min_by(|left, right| {
+                        (left.0 + if left.1 { 80.0 } else { 0.0 })
+                            .total_cmp(&(right.0 + if right.1 { 80.0 } else { 0.0 }))
+                    })
+                    .unwrap();
                 let cells = path_cells(&trajectory.points);
                 let covered_fraction = if cells.is_empty() {
                     1.0
@@ -288,6 +326,7 @@ impl TargetingPolicy {
                     information_score: 0.0,
                     uncertainty_available: covariance_available,
                     covered_fraction,
+                    blocked_by_contact,
                     reason: ShotReason::Approach,
                 });
             }
@@ -313,7 +352,10 @@ impl TargetingPolicy {
 
         if let Some(best_hit) = pool
             .iter()
-            .filter(|candidate| candidate.miss_distance <= self.settings.target_radius)
+            .filter(|candidate| {
+                !candidate.blocked_by_contact
+                    && candidate.miss_distance <= self.settings.target_radius
+            })
             .min_by(|left, right| {
                 left.miss_distance
                     .total_cmp(&right.miss_distance)
@@ -370,7 +412,8 @@ impl TargetingPolicy {
         if let Some(best_information) = pool
             .iter()
             .filter(|candidate| {
-                candidate.uncertainty_available
+                !candidate.blocked_by_contact
+                    && candidate.uncertainty_available
                     && candidate.information_score >= self.settings.information_threshold
             })
             .max_by(|left, right| {
@@ -389,36 +432,76 @@ impl TargetingPolicy {
         }
 
         pool.into_iter().min_by(|left, right| {
-            (left.miss_distance + self.settings.coverage_penalty * left.covered_fraction)
-                .total_cmp(
-                    &(right.miss_distance
-                        + self.settings.coverage_penalty * right.covered_fraction),
-                )
-                .then_with(|| left.velocity.cmp(&right.velocity))
+            (left.miss_distance
+                + self.settings.coverage_penalty * left.covered_fraction
+                + if left.blocked_by_contact { 80.0 } else { 0.0 })
+            .total_cmp(
+                &(right.miss_distance
+                    + self.settings.coverage_penalty * right.covered_fraction
+                    + if right.blocked_by_contact { 80.0 } else { 0.0 }),
+            )
+            .then_with(|| left.velocity.cmp(&right.velocity))
         })
     }
 }
 
-fn closest_path_distance(target: &Vec2, points: &[Point]) -> f64 {
-    points
+/// Distance and fractional segment index at the closest target passage.
+fn closest_path_passage(target: &Vec2, points: &[Point], target_radius: f64) -> (f64, f64) {
+    let (distance, closest) = points
         .windows(2)
-        .map(|segment| {
+        .enumerate()
+        .map(|(index, segment)| {
             let start = Vec2::new(f64::from(segment[0].x), f64::from(segment[0].y));
-            let end = Vec2::new(f64::from(segment[1].x), f64::from(segment[1].y));
-            let delta = Vec2::new(end.x - start.x, end.y - start.y);
-            let offset = Vec2::new(target.x - start.x, target.y - start.y);
-            let length_squared = delta.norm_squared();
-            let fraction = if length_squared == 0.0 {
+            let delta = Vec2::new(
+                f64::from(segment[1].x) - start.x,
+                f64::from(segment[1].y) - start.y,
+            );
+            let fraction = if delta.norm_squared() == 0.0 {
                 0.0
             } else {
-                ((offset.x * delta.x + offset.y * delta.y) / length_squared).clamp(0.0, 1.0)
+                (((target.x - start.x) * delta.x + (target.y - start.y) * delta.y)
+                    / delta.norm_squared())
+                .clamp(0.0, 1.0)
             };
-            let closest = Vec2::new(start.x + fraction * delta.x, start.y + fraction * delta.y);
-            Vec2::new(target.x - closest.x, target.y - closest.y)
-                .norm_squared()
-                .sqrt()
+            let distance = ((target.x - start.x - fraction * delta.x).powi(2)
+                + (target.y - start.y - fraction * delta.y).powi(2))
+            .sqrt();
+            (distance, index as f64 + fraction)
         })
-        .fold(f64::INFINITY, f64::min)
+        .min_by(|left, right| left.0.total_cmp(&right.0))
+        .unwrap_or((f64::INFINITY, 0.0));
+    (
+        distance,
+        first_circle_entry(target, target_radius, points).unwrap_or(closest),
+    )
+}
+
+fn first_circle_entry(center: &Vec2, radius: f64, points: &[Point]) -> Option<f64> {
+    points.windows(2).enumerate().find_map(|(index, segment)| {
+        let x = f64::from(segment[0].x) - center.x;
+        let y = f64::from(segment[0].y) - center.y;
+        let dx = f64::from(segment[1].x) - f64::from(segment[0].x);
+        let dy = f64::from(segment[1].y) - f64::from(segment[0].y);
+        let c = x * x + y * y - radius * radius;
+        if c <= 0.0 {
+            return Some(index as f64);
+        }
+        let a = dx * dx + dy * dy;
+        let b = x * dx + y * dy;
+        let discriminant = b * b - a * c;
+        if a == 0.0 || discriminant < 0.0 {
+            return None;
+        }
+        let fraction = (-b - discriminant.sqrt()) / a;
+        (0.0..=1.0)
+            .contains(&fraction)
+            .then_some(index as f64 + fraction)
+    })
+}
+
+fn contact_before_target(planet: &crate::protocol::Planet, points: &[Point], passage: f64) -> bool {
+    first_circle_entry(&Vec2::new(planet.x, planet.y), planet.radius, points)
+        .is_some_and(|entry| entry < passage)
 }
 
 #[cfg(test)]
@@ -451,6 +534,28 @@ mod tests {
                 y: launch.1,
             }],
         }
+    }
+
+    #[test]
+    fn an_early_target_entry_precedes_a_later_obstacle_and_closer_passage() {
+        let points = vec![
+            Point { x: 0.0, y: 3.0 },
+            Point { x: 20.0, y: 3.0 },
+            Point { x: 30.0, y: 3.0 },
+            Point { x: 10.0, y: 0.0 },
+        ];
+        let target = Vec2::new(10.0, 0.0);
+        let planet = crate::protocol::Planet {
+            x: 25.0,
+            y: 3.0,
+            radius: 2.0,
+            mass: 1.0,
+        };
+        let (_, passage) = closest_path_passage(&target, &points, 4.0);
+        assert!(
+            !contact_before_target(&planet, &points, passage),
+            "a later planet cannot undo an earlier hit"
+        );
     }
 
     #[test]

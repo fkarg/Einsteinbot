@@ -181,3 +181,83 @@ fn invalid_covariance_is_reported_as_unavailable_even_for_hits() {
     assert_eq!(choice.reason, ShotReason::Hit);
     assert!(!choice.uncertainty_available);
 }
+
+fn planet_contact() -> ServerEvent {
+    use einsteinbot::protocol::Point;
+    use einsteinbot::simulation::{ShotObservation, WorldParameters, simulate_shot};
+    let shot = ShotObservation {
+        player_id: 0,
+        angle_degrees: 0.0,
+        velocity: 2.0,
+        points: vec![Point { x: 100.0, y: 100.0 }],
+    };
+    let map = PlanetMap {
+        planets: vec![Planet {
+            x: 300.0,
+            y: 100.0,
+            radius: 30.0,
+            mass: 2700.0,
+        }],
+    };
+    let path = simulate_shot(&map, &shot, WorldParameters::default(), 180).unwrap();
+    ServerEvent::ShotFin {
+        player_id: 0,
+        angle: 0.0,
+        velocity: 2.0,
+        points: path.points,
+    }
+}
+
+fn learn_contact(state: &mut BotState) {
+    use einsteinbot::online_map::OnlineEstimator;
+    use std::sync::atomic::AtomicBool;
+    let mut estimator = OnlineEstimator::default();
+    let cancelled = AtomicBool::new(false);
+    for (player_id, point) in state.player_positions() {
+        estimator.observe(
+            &ServerEvent::PlayerPosition {
+                player_id: *player_id,
+                x: point.x,
+                y: point.y,
+            },
+            &cancelled,
+        );
+    }
+    let event = planet_contact();
+    state.observe(&event);
+    state.set_map_belief(estimator.observe(&event, &cancelled));
+}
+
+#[test]
+fn observed_planet_contact_discourages_a_false_nominal_hit_and_resets() {
+    let mut state = state_with_enemy(500.0, 100.0);
+    state.observe(&ServerEvent::PlayerPosition {
+        player_id: 0,
+        x: 100.0,
+        y: 100.0,
+    });
+    learn_contact(&mut state);
+    let policy = TargetingPolicy::default();
+    let choice = policy.choose(&state, 8.0).unwrap();
+    assert_ne!(
+        choice.angle_degrees, 0,
+        "do not keep shooting through the observed planet"
+    );
+    state.observe(&ServerEvent::Planets { planets: vec![] });
+    assert_eq!(policy.choose(&state, 8.0).unwrap().reason, ShotReason::Hit);
+}
+
+#[test]
+fn planet_beyond_target_does_not_disqualify_a_hit() {
+    let mut state = state_with_enemy(200.0, 100.0);
+    state.observe(&ServerEvent::PlayerPosition {
+        player_id: 0,
+        x: 100.0,
+        y: 100.0,
+    });
+    learn_contact(&mut state);
+    let choice = TargetingPolicy::default().choose(&state, 8.0).unwrap();
+    assert_eq!(choice.reason, ShotReason::Hit);
+    assert!(!choice.blocked_by_contact);
+    assert!(choice.miss_distance <= 4.0);
+}

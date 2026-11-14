@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -21,13 +22,16 @@ impl ByteRateLimiter {
         }
     }
 
-    pub fn wait_for(&mut self, bytes: usize) -> Result<(), RateLimitError> {
+    pub fn wait_for(&mut self, bytes: usize, running: &AtomicBool) -> Result<bool, RateLimitError> {
         loop {
+            if !running.load(Ordering::SeqCst) {
+                return Ok(false);
+            }
             let wait = self.reserve_at(bytes, Instant::now())?;
             if wait.is_zero() {
-                return Ok(());
+                return Ok(true);
             }
-            thread::sleep(wait);
+            thread::sleep(wait.min(Duration::from_millis(20)));
         }
     }
 

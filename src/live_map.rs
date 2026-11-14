@@ -1,7 +1,8 @@
 //! Background map fitting; socket workers only enqueue observations and read beliefs.
-use crate::estimator::{LiveEstimator, ObservationOutcome};
+use crate::online_map::OnlineEstimator;
 use crate::protocol::ServerEvent;
 use crate::strategy::MapBelief;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
@@ -9,6 +10,8 @@ use std::thread::{self, JoinHandle};
 struct Published {
     epoch: u64,
     belief: Option<MapBelief>,
+    pending: usize,
+    fit_cancel: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -29,46 +32,41 @@ impl LiveMap {
                 None,
             );
         }
-        let (feed, worker) = Self::spawn_with(|estimator, event| {
-            if estimator.observe(event) != ObservationOutcome::Refitted {
-                return None;
-            }
-            if let Some(error) = estimator.last_fit_error() {
-                eprintln!("LiveMapFitError {error}");
-                return None;
-            }
-            estimator.best_map().map(|(map, covariance)| {
-                eprintln!(
-                    "LiveMapFit sources={} observations={}",
-                    map.planets.len(),
-                    estimator.observations().len()
-                );
-                MapBelief::new(map, covariance)
-            })
-        });
+        let (feed, worker) =
+            Self::spawn_with(|estimator, event, cancelled| estimator.observe(event, cancelled));
         (feed, Some(worker))
     }
 
     fn spawn_with(
-        mut fit: impl FnMut(&mut LiveEstimator, &ServerEvent) -> Option<MapBelief> + Send + 'static,
+        mut fit: impl FnMut(&mut OnlineEstimator, &ServerEvent, &AtomicBool) -> Option<MapBelief>
+        + Send
+        + 'static,
     ) -> (Self, JoinHandle<()>) {
         let published = Arc::new(Mutex::new(Published::default()));
         let (sender, receiver) = mpsc::channel::<(u64, ServerEvent)>();
         let worker_state = Arc::clone(&published);
         let worker = thread::spawn(move || {
-            let mut estimator = LiveEstimator::default();
+            let mut estimator = OnlineEstimator::default();
             let mut estimator_epoch = 0;
             while let Ok((epoch, event)) = receiver.recv() {
-                if worker_state.lock().unwrap().epoch != epoch {
-                    continue;
-                }
+                let cancelled = {
+                    let state = worker_state.lock().unwrap();
+                    if state.epoch != epoch {
+                        continue;
+                    }
+                    Arc::clone(&state.fit_cancel)
+                };
                 if estimator_epoch != epoch {
-                    estimator.reset();
+                    // The canonical connection sends a complete player snapshot
+                    // after reset; old queued leave events may have been discarded.
+                    estimator = OnlineEstimator::default();
                     estimator_epoch = epoch;
                 }
-                if let Some(belief) = fit(&mut estimator, &event) {
-                    let mut state = worker_state.lock().unwrap();
-                    if state.epoch == epoch {
+                let belief = fit(&mut estimator, &event, &cancelled);
+                let mut state = worker_state.lock().unwrap();
+                if state.epoch == epoch {
+                    state.pending -= 1;
+                    if let Some(belief) = belief {
                         state.belief = Some(belief);
                     }
                 }
@@ -79,20 +77,29 @@ impl LiveMap {
 
     pub(crate) fn reset(&self) {
         let mut state = self.published.lock().unwrap();
+        state.fit_cancel.store(true, Ordering::SeqCst);
+        state.fit_cancel = Arc::new(AtomicBool::new(false));
         state.epoch += 1;
         state.belief = None;
+        state.pending = 0;
     }
 
     pub(crate) fn observe(
         &self,
         event: &ServerEvent,
     ) -> Result<(), mpsc::SendError<(u64, ServerEvent)>> {
-        let epoch = self.published.lock().unwrap().epoch;
+        let epoch = {
+            let mut state = self.published.lock().unwrap();
+            state.pending += 1;
+            state.epoch
+        };
         self.sender.send((epoch, event.clone()))
     }
 
-    pub(crate) fn belief(&self) -> Option<MapBelief> {
-        self.published.lock().unwrap().belief.clone()
+    /// Read readiness and its corresponding belief under one lock.
+    pub(crate) fn snapshot(&self) -> (bool, Option<MapBelief>) {
+        let state = self.published.lock().unwrap();
+        (state.pending > 0, state.belief.clone())
     }
 }
 
@@ -103,13 +110,108 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn reset_cancels_active_fit_and_does_not_leave_pending_evidence() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (cancelled_tx, cancelled_rx) = mpsc::channel();
+        let (feed, worker) = LiveMap::spawn_with(move |_, _, cancelled| {
+            started_tx.send(()).unwrap();
+            while !cancelled.load(Ordering::SeqCst) {
+                thread::yield_now();
+            }
+            cancelled_tx.send(()).unwrap();
+            None
+        });
+        feed.observe(&ServerEvent::PlayerLeave { player_id: 1 })
+            .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(feed.snapshot().0);
+        feed.reset();
+        cancelled_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(!feed.snapshot().0);
+        assert!(feed.snapshot().1.is_none());
+        drop(feed);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn reset_snapshot_drops_a_departed_player_even_when_leave_was_queued() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let (feed, worker) = LiveMap::spawn_with(move |estimator, event, cancelled| {
+            if matches!(event, ServerEvent::PlayerLeave { player_id: 99 }) {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                return None;
+            }
+            let result = estimator.observe(event, cancelled);
+            if matches!(event, ServerEvent::ShotFin { .. }) {
+                done_tx.send(()).unwrap();
+            }
+            result
+        });
+        feed.observe(&ServerEvent::PlayerPosition {
+            player_id: 1,
+            x: 10.0,
+            y: 10.0,
+        })
+        .unwrap();
+        feed.observe(&ServerEvent::PlayerPosition {
+            player_id: 2,
+            x: 100.0,
+            y: 100.0,
+        })
+        .unwrap();
+        feed.observe(&ServerEvent::PlayerLeave { player_id: 99 })
+            .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        feed.observe(&ServerEvent::PlayerLeave { player_id: 2 })
+            .unwrap();
+        feed.reset();
+        feed.observe(&ServerEvent::PlayerPosition {
+            player_id: 1,
+            x: 10.0,
+            y: 10.0,
+        })
+        .unwrap();
+        feed.observe(&ServerEvent::ShotFin {
+            player_id: 1,
+            angle: 0.0,
+            velocity: 2.0,
+            points: (95..=100)
+                .map(|x| crate::protocol::Point {
+                    x: x as f32,
+                    y: 100.0,
+                })
+                .collect(),
+        })
+        .unwrap();
+        release_tx.send(()).unwrap();
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let published = Arc::clone(&feed.published);
+        drop(feed);
+        worker.join().unwrap();
+        assert_eq!(
+            published
+                .lock()
+                .unwrap()
+                .belief
+                .as_ref()
+                .unwrap()
+                .contact_points
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn shutdown_discards_queued_fits_and_joins_active_fit() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let calls = Arc::new(AtomicUsize::new(0));
         let worker_calls = Arc::clone(&calls);
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        let (feed, worker) = LiveMap::spawn_with(move |_, _| {
+        let (feed, worker) = LiveMap::spawn_with(move |_, _, _| {
             worker_calls.fetch_add(1, Ordering::SeqCst);
             started_tx.send(()).unwrap();
             release_rx.recv().unwrap();
@@ -140,7 +242,7 @@ mod tests {
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let (processed_tx, processed_rx) = mpsc::channel();
-        let (feed, worker) = LiveMap::spawn_with(move |_, _| {
+        let (feed, worker) = LiveMap::spawn_with(move |_, _, _| {
             started_tx.send(()).unwrap();
             release_rx.recv().unwrap();
             Some(MapBelief::new(PlanetMap { planets: vec![] }, None))
@@ -165,7 +267,7 @@ mod tests {
         resetter.join().unwrap();
         release_tx.send(()).unwrap();
         started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(feed.belief().is_none());
+        assert!(feed.snapshot().1.is_none());
         release_tx.send(()).unwrap();
         let published = Arc::clone(&feed.published);
         drop(feed);
