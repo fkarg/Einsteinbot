@@ -1,11 +1,10 @@
 use crate::config::AppConfig;
 use crate::dummy::commands_for_energy;
-use crate::estimator::{LiveEstimator, LiveEstimatorSettings, ObservationOutcome};
 use crate::event_store::{CaptureMetadata, EventLog};
+use crate::live_map::LiveMap;
 use crate::map::PlanetMap;
 use crate::protocol::{ClientCommand, EventParser, RecordedEvent, ServerEvent};
 use crate::rate_limit::ByteRateLimiter;
-use crate::simulation::WorldParameters;
 use crate::strategy::{BotState, MapBelief, TargetingPolicy, TargetingSettings};
 use std::error::Error;
 use std::io::{self, Read, Write};
@@ -20,15 +19,13 @@ const ENERGY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 type ClientResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
-/// Map belief fitted once by the canonical worker and read by every targeting session.
-type SharedMapBelief = Arc<Mutex<Option<MapBelief>>>;
 
 pub fn run(config: &AppConfig) -> ClientResult<()> {
     let running = Arc::new(AtomicBool::new(true));
     let signal_running = Arc::clone(&running);
     ctrlc::set_handler(move || signal_running.store(false, Ordering::SeqCst))?;
 
-    if config.targeting && !config.oracle_map_for_policy {
+    if config.targeting && !config.dummy && !config.oracle_map_for_policy {
         eprintln!(
             "Targeting fits a live map from completed trajectories; early shots use a flat field until the first fit lands."
         );
@@ -58,13 +55,14 @@ pub fn run(config: &AppConfig) -> ClientResult<()> {
     } else {
         None
     };
-    let map_feed: SharedMapBelief = Arc::new(Mutex::new(None));
+    let (map_feed, map_worker) =
+        LiveMap::spawn(config.targeting && !config.dummy && !config.oracle_map_for_policy);
     let mut workers = Vec::new();
     for (index, name) in names.into_iter().enumerate() {
         let config = config.clone();
         let running = Arc::clone(&running);
         let event_log = event_log.clone();
-        let map_feed = Arc::clone(&map_feed);
+        let map_feed = map_feed.clone();
         workers.push(std::thread::spawn(move || {
             let result = run_worker(&config, index, &name, &running, event_log, &map_feed);
             if result.is_err() {
@@ -82,6 +80,14 @@ pub fn run(config: &AppConfig) -> ClientResult<()> {
                 worker_error = Some("client worker panicked".into())
             }
             _ => {}
+        }
+    }
+    // Discard queued work and join the currently running fit before leaving the manager.
+    map_feed.reset();
+    drop(map_feed);
+    if let Some(map_worker) = map_worker {
+        if map_worker.join().is_err() && worker_error.is_none() {
+            worker_error = Some("map fitter worker panicked".into());
         }
     }
     let finish_result = if let Some(log) = &event_log {
@@ -123,7 +129,7 @@ fn run_worker(
     name: &str,
     running: &AtomicBool,
     event_log: Option<Arc<Mutex<EventLog>>>,
-    map_feed: &SharedMapBelief,
+    map_feed: &LiveMap,
 ) -> ClientResult<()> {
     let mut stream = TcpStream::connect((config.host.as_str(), config.port))?;
     run_session(
@@ -148,7 +154,7 @@ fn run_session(
     oracle_map_for_policy: bool,
     running: &AtomicBool,
     event_log: Option<Arc<Mutex<EventLog>>>,
-    map_feed: &SharedMapBelief,
+    map_feed: &LiveMap,
 ) -> ClientResult<()> {
     let mut rate_limiter = ByteRateLimiter::new();
     stream.set_read_timeout(Some(Duration::from_secs(3)))?;
@@ -184,16 +190,6 @@ fn run_session(
     let mut targeting_settings = TargetingSettings::default();
     targeting_settings.angle_step_degrees = [8, 10, 12][bot_index % 3];
     let target_policy = TargetingPolicy::new(targeting_settings);
-    // The canonical connection owns the shared live estimator: it sees every world broadcast,
-    // fits candidate maps from completed trajectories, and publishes beliefs for all sessions.
-    let mut live_estimator = if targeting && !oracle_map_for_policy && bot_index == 0 {
-        Some(LiveEstimator::new(
-            WorldParameters::default(),
-            LiveEstimatorSettings::default(),
-        ))
-    } else {
-        None
-    };
     send_command(
         stream,
         &event_log,
@@ -229,38 +225,13 @@ fn run_session(
                             )));
                         }
                     }
-                    if let Some(estimator) = &mut live_estimator {
+                    if targeting && !dummy && !oracle_map_for_policy && bot_index == 0 {
                         match &event {
                             ServerEvent::Planets { .. } => {
-                                // Planet data identify a map epoch boundary, including the
-                                // handshake event when the server runs with sendplanets 1.
-                                estimator.reset();
-                                *map_feed.lock().map_err(|_| "map belief mutex poisoned")? = None;
+                                map_feed.reset();
                                 eprintln!("LiveMap reset: new map epoch");
                             }
-                            ServerEvent::ShotFin { .. } => {
-                                if estimator.observe(&event) == ObservationOutcome::Refitted {
-                                    match estimator.best_map() {
-                                        Some((map, covariance)) => {
-                                            eprintln!(
-                                                "LiveMapFit sources={} observations={}",
-                                                map.planets.len(),
-                                                estimator.observations().len()
-                                            );
-                                            *map_feed
-                                                .lock()
-                                                .map_err(|_| "map belief mutex poisoned")? =
-                                                Some(MapBelief::new(map, covariance));
-                                        }
-                                        None => {
-                                            eprintln!("LiveMapFit produced no candidate map");
-                                            if let Some(error) = estimator.last_fit_error() {
-                                                eprintln!("LiveMapFitError {error}");
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                            ServerEvent::ShotFin { .. } => map_feed.observe(&event)?,
                             _ => {}
                         }
                     }
@@ -279,10 +250,7 @@ fn run_session(
                             commands_for_energy(energy, &mut rng)
                         } else if targeting {
                             if !oracle_map_for_policy {
-                                let belief = map_feed
-                                    .lock()
-                                    .map_err(|_| "map belief mutex poisoned")?
-                                    .clone();
+                                let belief = map_feed.belief();
                                 bot_state.set_map_belief(belief);
                             }
                             target_policy

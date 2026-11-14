@@ -402,8 +402,25 @@ User answer: pending.
 - Server housekeeping: the `nw` process (PID 86403) exited with SIGPIPE when its background shell's output pipe closed; port 3490 free. Relaunching with the documented `./nw fullscreen 0 sendplanets 1 throttle 16` and running a 2-client targeting session to probe the canonical-starvation pattern.
 
 #### Checkpoint 2026-11-13 ~18:00 UTC — wiring committed; status answer delivered
-- Round 19 wiring committed as `f05794b` after live verification (48 tests green locally at commit time, `cargo fmt --check` clean). Not merged/PR'd — local main only.
+- Round 19 wiring committed as `9d05367` after live verification (48 tests green locally at commit time, `cargo fmt --check` clean). Not merged/PR'd — local main only.
 - User's question "are bots firing hot & targeting properly, updating on new information?" answered: firing hot yes (capture 15 zero repeats), targeting works when opponents known (`reason=Hit` at miss 0.16–3.57, capture 17), silently random-dummy with no opponents (capture 13), estimator updates live (resets per Planets, observations 69→105 in capture 17).
 - Contamination note recorded: my aborted 2-client run briefly joined the user's live 4-bot session (players 4–5); captures 16 (user's run) and 17 (mine) are the same server session from different connections. Avoid joining user sessions again.
 - Per-connection starvation anomaly revised: it is per-connection, not bot-0-specific — capture 14 starved Curie (13 vs 48 energy events), capture 15 starved Einstein (9 vs 37), capture 17 starved Hubble (6 vs 212). Any multi-client connection can be starved; single-session runs unaffected. Mechanism unresolved; next step is a clean 2-client run on an idle server.
 - Open items surfaced: learning depth per epoch with `throttle 16` (~30 s rounds), fitter's ≤4-source cap vs 24 real planets (miss distances oscillate as Approach re-aims), and the mixed-capture caveat for 16/17.
+
+
+### Round 20 — isolate live fitting and repair epoch state (2026-11-14)
+- User accepted the review recommendations and authorized implementation and subagent assistance.
+- Design: one background estimator worker consumes canonical completed trajectories. The canonical socket loop synchronously advances the shared epoch and clears its belief on `Planets`; publication checks the epoch under the same lock, preventing late fits from restoring an old map. No fitting occurs while holding the belief lock. Shutdown discards queued observations and waits only for an active fit.
+- `BotState` clears completed and in-flight shot exclusions on `Planets`, allowing new-map shots from reused launch coordinates.
+- Independent same-model design check (runtime did not expose model identity) added shutdown-backlog and worker-failure checks. Its attempted falsifications covered stale publication after reset, multiple queued resets, shutdown backlog, failure after successful fit, and worker death. Decision impact: added verification and shutdown requirements; no change to the thread approach. Cross-model peer remains skipped per the existing session instruction.
+- README now describes the online estimator and uses release-mode run examples. Corrected the previous checkpoint's commit reference against local Git history.
+
+- Verification observed: `cargo fmt --check`, all 51 tests, and `git diff --check` pass. New channel-controlled tests hold a fit open across reset/publication and shutdown to exercise the race windows. No live server session was joined, avoiding interference with user games. Remaining limitation: active optimization cannot be cancelled, and same-epoch queued trajectories can accumulate.
+
+
+### Targeting diagnosis requested during Round 20
+- Observed by read-only source review: only exact shot inputs are excluded; nearby trajectories have no coverage penalty. Nominal hits bypass uncertainty scoring. Missing/rank-deficient covariance yields zero uncertainty. The policy averages diagonal-only acceleration uncertainty along a nominal path; it does not propagate position uncertainty or estimate conditional information gain.
+- The fitter already extracts local acceleration constraints from trajectories, but targeting retains no local coverage model. The ≤4-source fit and fixed radii cannot represent all missing-planet/model uncertainty.
+- Recommendation pending further work: replay a stored map epoch to measure spatial path overlap, covariance availability and prediction error, comparing oracle simulation diagnostically. Then test a small coverage/novelty penalty; keep full trajectory covariance propagation as a separate design choice.
+- External primary-source research supports sensitivity-based path covariance and conditional information gain, with cautions about rank deficiency, correlated trajectory samples and model mismatch: NASA https://ntrs.nasa.gov/api/citations/20150011109/downloads/20150011109.pdf ; Krause et al. https://www.jmlr.org/papers/v9/krause08a.html ; Ceres https://ceres-solver.readthedocs.io/latest/nnls_covariance.html . No targeting-quality change implemented in this checkpoint.

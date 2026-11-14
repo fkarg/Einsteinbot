@@ -71,6 +71,10 @@ pub struct BotState {
 impl BotState {
     pub fn observe(&mut self, event: &ServerEvent) {
         match event {
+            ServerEvent::Planets { .. } => {
+                self.known_shots.clear();
+                self.in_flight.clear();
+            }
             ServerEvent::OwnId { player_id } => self.own_id = Some(*player_id),
             ServerEvent::PlayerPosition { player_id, x, y } => {
                 self.player_positions
@@ -487,6 +491,26 @@ mod tests {
             (after.velocity, after.angle_degrees),
             (baseline.velocity, baseline.angle_degrees)
         );
+    }
+
+    #[test]
+    fn map_change_forgets_completed_and_in_flight_shots() {
+        // Old-map paths must not exclude shots when a new map reuses a launch position.
+        let mut state = flat_field_state();
+        let launch = Point { x: 100.0, y: 100.0 };
+        state.observe(&observed_shot((100.0, 100.0), 3.0, 0));
+        state.observe(&ServerEvent::ShotBegin {
+            player_id: 1,
+            angle: 10.0,
+            velocity: 4.0,
+        });
+        assert!(state.is_known_shot(&launch, 3, 0));
+        assert!(state.is_known_shot(&launch, 4, 10));
+
+        state.observe(&ServerEvent::Planets { planets: vec![] });
+
+        assert!(!state.is_known_shot(&launch, 3, 0));
+        assert!(!state.is_known_shot(&launch, 4, 10));
     }
 
     #[test]
