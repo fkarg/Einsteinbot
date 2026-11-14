@@ -47,7 +47,7 @@ Set individual values with `EINSTEINBOT_HOST`, `EINSTEINBOT_PORT`, `EINSTEINBOT_
 
 The dummy chooses an integer velocity between 2 and `min(8, floor(energy))` and an integer angle from -180 through 180, at most one shot per energy response. Every outbound command, including connection setup and energy requests, passes through a client-side token bucket capped at 16 wire bytes per second with at most 512 bytes of burst. The upstream server starts each connection with a 512-byte allowance and replenishes one byte every three game-loop iterations. That is nominally 20 bytes per second at 60 loops per second; its actual limit changes with loop pace. NewtonWars exempts local connections from enforcement, but this client applies its stricter cap locally too.
 
-Targeting is opt-in with `--target` or `targeting = true`. It searches legal integer velocities and 10-degree angles through the NewtonWars simulator, then picks a predicted hit against the latest known player positions. If it sees no opponent or finds no usable action, it falls back to the random dummy. An information bonus is considered only when no predicted hit is available and the average field uncertainty along the path clears a threshold. This first bonus uses marginal parameter variances as an uncertainty-exposure proxy, not a full posterior information-gain calculation.
+Targeting is opt-in with `--target` or `targeting = true`. It searches legal integer velocities and 10-degree angles through the NewtonWars simulator, then picks a predicted hit against the latest known player positions. If it sees no opponent or finds no usable action, it falls back to the random dummy. An information bonus is considered only when no predicted hit is available and the average field uncertainty along the path clears a threshold. This bonus uses marginal parameter variances as an uncertainty-exposure proxy, not a full posterior information-gain calculation. Completed trajectories from all players populate a 20-unit spatial coverage grid, reset on each `Planets` update. The policy discounts probes by their fraction of new cells and adds up to 40 world units of miss-distance penalty to covered non-hit approaches. Predicted hits still take priority. This is a diversity heuristic, not evidence of higher hit probability. `TargetChoice` logs include covariance availability and covered fraction; missing covariance is reported as unavailable and cannot trigger the uncertainty branch.
 
 The canonical connection feeds completed trajectories to a background map estimator. It fits on the first usable trajectory and then in batches of four new distinct trajectories, sharing the resulting map and parameter covariance with every targeting bot. Early shots use a flat field until a fit is available. `Planets` messages reset the estimator and shot history; fits from an earlier map epoch cannot replace the current belief. Fitting does not block socket reads, though shutdown waits for an active fit to finish. `--oracle-map` explicitly uses disclosed planets for local target simulation instead of fitting. `--dummy` takes precedence if combined with `--target`.
 
@@ -82,3 +82,15 @@ cd ../NewtonWars
 The `sendplanets 1` option is required if the server should disclose planet positions. If a local server is already running, connect to it without starting another copy. Local NewtonWars connections may be run side by side; use `cargo run --release -- --clients 3 --target` to launch three parameter variants under one manager.
 
 With recording enabled, the manager writes one capture for the whole run. The first connection writes shared world events once; every connection writes its own identity/energy events and outbound commands tagged by bot name. Older databases are upgraded by adding a nullable `bot_name` column; single-client events remain untagged as before.
+
+
+## Targeting capture diagnostics
+
+Analyze recorded paths without changing the database or running the expensive fitter:
+
+```sh
+cargo run --release --bin targeting_report -- --capture-id 21
+cargo run --release --bin targeting_report -- --capture-id 21 --compare-policy
+```
+
+The report separates map epochs and prints exact repeats, spatial overlap, short paths, and oracle trajectory RMSE when disclosed planets exist. Coverage measures distinct cells crossed by segments, excluding the launch cell and untimed final observation. All completed paths include debris. `--compare-policy` compares the coverage penalty against zero on the same recorded histories using oracle maps strictly for diagnostics. It reports overlap and nominal miss distance; it does not simulate new observations, reproduce live fitting, or establish hit rates. Bot angle profiles are assigned in first-identity order, which may differ from actual connection order.

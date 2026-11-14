@@ -1,8 +1,9 @@
+use crate::coverage::path_cells;
 use crate::map::{PlanetMap, Vec2};
 use crate::protocol::{Point, ServerEvent};
 use crate::simulation::{ShotObservation, WorldParameters, simulate_shot};
 use nalgebra::DMatrix;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug)]
 pub struct MapBelief {
@@ -19,15 +20,15 @@ impl MapBelief {
         }
     }
 
-    fn field_uncertainty(&self, position: Vec2) -> f64 {
+    fn field_uncertainty(&self, position: Vec2) -> Option<f64> {
         let Some(covariance) = &self.parameter_covariance else {
-            return 0.0;
+            return None;
         };
         let Ok(jacobian) = self.map.acceleration_parameter_jacobian(position) else {
-            return 0.0;
+            return None;
         };
         if covariance.nrows() != jacobian.ncols() || covariance.ncols() != jacobian.ncols() {
-            return 0.0;
+            return None;
         }
         // Use only marginal parameter variances for this ranking proxy. Full
         // covariance propagation is quadratic in planet count and this path
@@ -38,7 +39,7 @@ impl MapBelief {
                     * covariance[(parameter, parameter)].max(0.0)
             })
             .sum::<f64>();
-        variance.max(0.0).sqrt()
+        Some(variance.max(0.0).sqrt())
     }
 }
 
@@ -65,6 +66,7 @@ pub struct BotState {
     player_positions: BTreeMap<u32, Point>,
     map_belief: Option<MapBelief>,
     known_shots: Vec<KnownShot>,
+    covered_cells: BTreeSet<(i32, i32)>,
     in_flight: Vec<InFlightShot>,
 }
 
@@ -73,6 +75,7 @@ impl BotState {
         match event {
             ServerEvent::Planets { .. } => {
                 self.known_shots.clear();
+                self.covered_cells.clear();
                 self.in_flight.clear();
             }
             ServerEvent::OwnId { player_id } => self.own_id = Some(*player_id),
@@ -113,6 +116,8 @@ impl BotState {
                 }
                 // Every connection receives every ShotFin broadcast, so each bot sees all
                 // completed trajectories and remembers their exact inputs and launch point.
+                self.covered_cells
+                    .extend(path_cells(&points[..points.len().saturating_sub(1)]));
                 if let Some(launch) = points.first() {
                     self.known_shots.push(KnownShot {
                         launch: launch.clone(),
@@ -161,6 +166,8 @@ pub struct TargetingSettings {
     /// Average acceleration standard deviation required before probing is considered.
     pub information_threshold: f64,
     pub information_weight: f64,
+    /// Maximum approach-distance penalty for retracing observed space (world units).
+    pub coverage_penalty: f64,
 }
 
 impl Default for TargetingSettings {
@@ -171,6 +178,7 @@ impl Default for TargetingSettings {
             target_radius: 4.0,
             information_threshold: 0.05,
             information_weight: 1.0,
+            coverage_penalty: 40.0,
         }
     }
 }
@@ -188,6 +196,8 @@ pub struct ShotChoice {
     pub angle_degrees: i32,
     pub miss_distance: f64,
     pub information_score: f64,
+    pub uncertainty_available: bool,
+    pub covered_fraction: f64,
     pub reason: ShotReason,
 }
 
@@ -230,6 +240,15 @@ impl TargetingPolicy {
             .as_ref()
             .map(|belief| &belief.map)
             .unwrap_or(&empty_map);
+        let covariance_available = state.map_belief.as_ref().is_some_and(|belief| {
+            belief
+                .parameter_covariance
+                .as_ref()
+                .is_some_and(|covariance| {
+                    covariance.nrows() == belief.map.planets.len() * 3
+                        && covariance.ncols() == belief.map.planets.len() * 3
+                })
+        });
         let angle_step = usize::from(self.settings.angle_step_degrees.max(1));
         let mut candidates = Vec::new();
         for velocity in 2..=max_velocity {
@@ -256,11 +275,19 @@ impl TargetingPolicy {
                     .iter()
                     .map(|target| closest_path_distance(target, &trajectory.points))
                     .fold(f64::INFINITY, f64::min);
+                let cells = path_cells(&trajectory.points);
+                let covered_fraction = if cells.is_empty() {
+                    1.0
+                } else {
+                    cells.intersection(&state.covered_cells).count() as f64 / cells.len() as f64
+                };
                 candidates.push(ShotChoice {
                     velocity,
                     angle_degrees: angle,
                     miss_distance,
                     information_score: 0.0,
+                    uncertainty_available: covariance_available,
+                    covered_fraction,
                     reason: ShotReason::Approach,
                 });
             }
@@ -300,6 +327,10 @@ impl TargetingPolicy {
         }
 
         for candidate in pool.iter_mut() {
+            if !candidate.uncertainty_available {
+                continue;
+            }
+            candidate.uncertainty_available = false;
             candidate.information_score = state
                 .map_belief
                 .as_ref()
@@ -317,18 +348,31 @@ impl TargetingPolicy {
                     ) else {
                         return 0.0;
                     };
-                    let uncertainty_sum = trajectory.points.iter().fold(0.0, |sum, point| {
-                        sum + belief
+                    let uncertainty_sum = trajectory.points.iter().try_fold(0.0, |sum, point| {
+                        belief
                             .field_uncertainty(Vec2::new(f64::from(point.x), f64::from(point.y)))
+                            .map(|uncertainty| sum + uncertainty)
                     });
+                    let Some(uncertainty_sum) = uncertainty_sum else {
+                        return 0.0;
+                    };
+                    candidate.uncertainty_available = true;
                     uncertainty_sum / trajectory.points.len().max(1) as f64
+                        * if self.settings.coverage_penalty > 0.0 {
+                            1.0 - candidate.covered_fraction
+                        } else {
+                            1.0
+                        }
                 })
                 .unwrap_or(0.0);
         }
 
         if let Some(best_information) = pool
             .iter()
-            .filter(|candidate| candidate.information_score >= self.settings.information_threshold)
+            .filter(|candidate| {
+                candidate.uncertainty_available
+                    && candidate.information_score >= self.settings.information_threshold
+            })
             .max_by(|left, right| {
                 (left.information_score * self.settings.information_weight
                     / f64::from(left.velocity))
@@ -345,8 +389,11 @@ impl TargetingPolicy {
         }
 
         pool.into_iter().min_by(|left, right| {
-            left.miss_distance
-                .total_cmp(&right.miss_distance)
+            (left.miss_distance + self.settings.coverage_penalty * left.covered_fraction)
+                .total_cmp(
+                    &(right.miss_distance
+                        + self.settings.coverage_penalty * right.covered_fraction),
+                )
                 .then_with(|| left.velocity.cmp(&right.velocity))
         })
     }

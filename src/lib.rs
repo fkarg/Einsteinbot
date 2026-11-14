@@ -1,5 +1,6 @@
 pub mod client;
 pub mod config;
+pub mod coverage;
 pub mod dummy;
 pub mod estimator;
 pub mod event_store;

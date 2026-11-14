@@ -118,3 +118,66 @@ fn falls_back_when_energy_cannot_pay_for_a_shot() {
     let state = state_with_enemy(20.0, 0.0);
     assert!(TargetingPolicy::default().choose(&state, 1.99).is_none());
 }
+
+#[test]
+fn covered_non_hit_corridor_is_penalized_and_reset_restores_it() {
+    use einsteinbot::protocol::Point;
+    // A very distant target cannot be hit in 30 ticks. The old policy retraces
+    // its straight best approach even after observing that entire corridor.
+    let mut state = state_with_enemy(1700.0, 0.0);
+    let policy = TargetingPolicy::new(TargetingSettings {
+        max_simulation_ticks: 30,
+        ..TargetingSettings::default()
+    });
+    let first = policy.choose(&state, 2.0).unwrap();
+    assert_eq!(first.angle_degrees, 0);
+    state.observe(&ServerEvent::ShotFin {
+        player_id: 9,
+        angle: 1.0,
+        velocity: 2.0,
+        points: (0..=60)
+            .map(|x| Point {
+                x: x as f32,
+                y: 0.0,
+            })
+            .collect(),
+    });
+    let next = policy.choose(&state, 2.0).unwrap();
+    assert_ne!(next.angle_degrees, 0);
+    assert_eq!(next.reason, ShotReason::Approach);
+    state.observe(&ServerEvent::Planets { planets: vec![] });
+    assert_eq!(policy.choose(&state, 2.0).unwrap().angle_degrees, 0);
+}
+
+#[test]
+fn coverage_never_overrides_a_predicted_hit_and_unknown_covariance_is_reported() {
+    use einsteinbot::protocol::Point;
+    let mut state = state_with_enemy(20.0, 0.0);
+    state.observe(&ServerEvent::ShotFin {
+        player_id: 9,
+        angle: 1.0,
+        velocity: 2.0,
+        points: (0..=30)
+            .map(|x| Point {
+                x: x as f32,
+                y: 0.0,
+            })
+            .collect(),
+    });
+    let choice = TargetingPolicy::default().choose(&state, 2.0).unwrap();
+    assert_eq!(choice.reason, ShotReason::Hit);
+    assert_eq!(choice.angle_degrees, 0);
+    assert!(!choice.uncertainty_available);
+}
+
+#[test]
+fn invalid_covariance_is_reported_as_unavailable_even_for_hits() {
+    let mut state = state_with_enemy(20.0, 0.0);
+    state.set_map_belief(Some(MapBelief::new(
+        PlanetMap { planets: vec![] },
+        Some(DMatrix::identity(3, 3)),
+    )));
+    let choice = TargetingPolicy::default().choose(&state, 2.0).unwrap();
+    assert_eq!(choice.reason, ShotReason::Hit);
+    assert!(!choice.uncertainty_available);
+}

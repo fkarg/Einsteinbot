@@ -257,12 +257,14 @@ fn run_session(
                                 .choose(&bot_state, energy)
                                 .map(|choice| {
                                     println!(
-                                        "TargetChoice reason={:?} velocity={} angle={} miss={:.2} information={:.3}",
+                                        "TargetChoice reason={:?} velocity={} angle={} miss={:.2} information={:.3} covariance={} covered={:.3}",
                                         choice.reason,
                                         choice.velocity,
                                         choice.angle_degrees,
                                         choice.miss_distance,
-                                        choice.information_score
+                                        choice.information_score,
+                                    choice.uncertainty_available,
+                                    choice.covered_fraction
                                     );
                                     [
                                         ClientCommand::SetVelocity {
