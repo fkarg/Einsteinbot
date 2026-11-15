@@ -91,6 +91,12 @@ The `sendplanets 1` option is required if the server should disclose planet posi
 With recording enabled, the manager writes one capture for the whole run. The first connection writes shared world events once; every connection writes its own identity/energy events and outbound commands tagged by bot name. Older databases are upgraded by adding a nullable `bot_name` column; single-client events remain untagged as before.
 
 
+## Offline learning scenarios
+
+Run `cargo run --release --bin learning_scenarios` to compare flat, learned, and oracle-map targeting on deterministic synthetic worlds. The ladder covers a gravity-free observation, a single-planet flyby and contact, repeated contacts, a partly learned two-planet field, and an established two-planet curved shot. Each training path is checked for its intended termination; each target has a collision-checked witness. Reports include actual shot outcome, the same held-out path error across maps, inferred planet errors, and fit/search time. A failed scenario is printed as a result, not hidden by a passing test.
+
+The oracle generates and scores synthetic paths; it is never passed to the online estimator. These cases share the bot's physics simulator, so they diagnose learning and targeting separately but cannot independently validate the simulator against the server. A single successful impact fixture does not imply every first shot identifies a planet.
+
 ## Targeting capture diagnostics
 
 Analyze recorded paths without changing the database or running the expensive fitter:
