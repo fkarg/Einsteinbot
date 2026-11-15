@@ -53,6 +53,7 @@ impl TryFrom<&ServerEvent> for ShotObservation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Termination {
     PlanetCollision(usize),
+    PlayerCollision(u32),
     BattlefieldMargin,
     SampleLimit,
 }
@@ -85,6 +86,30 @@ pub fn simulate_shot(
     world: WorldParameters,
     max_samples: usize,
 ) -> Result<PredictedTrajectory, String> {
+    simulate_shot_with_players(map, shot, world, max_samples, &[], 0.0)
+}
+
+/// Simulate collisions against the latest known player positions, in server slot order.
+/// Positions are snapshots: the server may move players while the shot is in flight.
+pub fn simulate_targeting_shot(
+    map: &PlanetMap,
+    shot: &ShotObservation,
+    world: WorldParameters,
+    max_samples: usize,
+    players: &[(u32, Vec2)],
+    player_radius: f64,
+) -> Result<PredictedTrajectory, String> {
+    simulate_shot_with_players(map, shot, world, max_samples, players, player_radius)
+}
+
+fn simulate_shot_with_players(
+    map: &PlanetMap,
+    shot: &ShotObservation,
+    world: WorldParameters,
+    max_samples: usize,
+    players: &[(u32, Vec2)],
+    player_radius: f64,
+) -> Result<PredictedTrajectory, String> {
     if shot.points.is_empty() {
         return Err("shot observation has no launch position".to_owned());
     }
@@ -104,6 +129,7 @@ pub fn simulate_shot(
         y: position.y as f32,
     }];
     let max_samples = max_samples.max(1);
+    let mut left_source = false;
 
     while points.len() < max_samples {
         for _ in 0..world.substeps_per_tick {
@@ -125,6 +151,22 @@ pub fn simulate_shot(
                     points,
                     termination: Termination::PlanetCollision(planet_index),
                 });
+            }
+
+            for (player_id, player_position) in players {
+                let distance_squared = (position.x - player_position.x).powi(2)
+                    + (position.y - player_position.y).powi(2);
+                if left_source && distance_squared <= player_radius * player_radius {
+                    points.push(to_point(position));
+                    return Ok(PredictedTrajectory {
+                        points,
+                        termination: Termination::PlayerCollision(*player_id),
+                    });
+                }
+                if *player_id == shot.player_id && distance_squared > (player_radius + 1.0).powi(2)
+                {
+                    left_source = true;
+                }
             }
 
             if position.x < -world.margin
@@ -291,6 +333,80 @@ fn integrate_substep(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn targeting_stops_at_first_player_after_leaving_source() {
+        let shot = ShotObservation {
+            player_id: 1,
+            angle_degrees: 0.0,
+            velocity: 10.0,
+            points: vec![Point { x: 0.0, y: 0.0 }],
+        };
+        let players = [
+            (1, Vec2::new(0.0, 0.0)),
+            (2, Vec2::new(20.0, 0.0)),
+            (3, Vec2::new(40.0, 0.0)),
+        ];
+        let path = simulate_targeting_shot(
+            &PlanetMap { planets: vec![] },
+            &shot,
+            WorldParameters::default(),
+            10,
+            &players,
+            4.0,
+        )
+        .unwrap();
+        assert_eq!(path.termination, Termination::PlayerCollision(2));
+        assert_eq!(path.points.last().unwrap().x, 16.0);
+    }
+
+    #[test]
+    fn targeting_checks_discrete_substeps_not_swept_segments() {
+        let shot = ShotObservation {
+            player_id: 1,
+            angle_degrees: 0.0,
+            velocity: 20.0,
+            points: vec![Point { x: 0.0, y: 0.0 }],
+        };
+        let players = [(1, Vec2::new(0.0, 0.0)), (2, Vec2::new(10.0, 0.0))];
+        let world = WorldParameters {
+            substeps_per_tick: 1,
+            ..WorldParameters::default()
+        };
+        let path = simulate_targeting_shot(
+            &PlanetMap { planets: vec![] },
+            &shot,
+            world,
+            2,
+            &players,
+            4.0,
+        )
+        .unwrap();
+        assert_eq!(path.termination, Termination::SampleLimit);
+    }
+
+    #[test]
+    fn targeting_stops_at_planet_before_reaching_player() {
+        let shot = ShotObservation {
+            player_id: 1,
+            angle_degrees: 0.0,
+            velocity: 10.0,
+            points: vec![Point { x: 0.0, y: 0.0 }],
+        };
+        let map = PlanetMap {
+            planets: vec![crate::protocol::Planet {
+                x: 10.0,
+                y: 0.0,
+                radius: 1.0,
+                mass: 0.0,
+            }],
+        };
+        let players = [(1, Vec2::new(0.0, 0.0)), (2, Vec2::new(20.0, 0.0))];
+        let path =
+            simulate_targeting_shot(&map, &shot, WorldParameters::default(), 10, &players, 4.0)
+                .unwrap();
+        assert_eq!(path.termination, Termination::PlanetCollision(0));
+    }
 
     #[test]
     fn empty_map_preserves_constant_velocity_and_exact_position_residuals() {

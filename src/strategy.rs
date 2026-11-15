@@ -1,7 +1,7 @@
 use crate::coverage::path_cells;
 use crate::map::{PlanetMap, Vec2};
 use crate::protocol::{Point, ServerEvent};
-use crate::simulation::{ShotObservation, WorldParameters, simulate_shot};
+use crate::simulation::{ShotObservation, Termination, WorldParameters, simulate_targeting_shot};
 use nalgebra::DMatrix;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -55,7 +55,7 @@ impl MapBelief {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 struct KnownShot {
     launch: Point,
     velocity: f64,
@@ -64,7 +64,7 @@ struct KnownShot {
 
 /// A shot that began but has not finished yet. `launch` is the player's tracked position when
 /// the begin event arrived (`None` when unknown); it never constrains candidates from elsewhere.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 struct InFlightShot {
     player_id: u32,
     launch: Option<Point>,
@@ -162,6 +162,16 @@ impl BotState {
         })
     }
 
+    pub fn diagnostic_snapshot(&self) -> serde_json::Value {
+        serde_json::json!({
+            "own_id": self.own_id,
+            "player_positions": self.player_positions,
+            "known_shots": self.known_shots,
+            "in_flight": self.in_flight,
+            "covered_cells": self.covered_cells,
+        })
+    }
+
     pub fn player_positions(&self) -> &BTreeMap<u32, Point> {
         &self.player_positions
     }
@@ -214,6 +224,7 @@ pub struct ShotChoice {
     /// A provisional contact disk intersects this path before its closest target passage.
     pub contact_before_target: bool,
     pub reason: ShotReason,
+    pub predicted_hit: bool,
 }
 
 pub struct TargetingPolicy {
@@ -248,7 +259,7 @@ impl TargetingPolicy {
             return None;
         }
 
-        let max_velocity = energy.floor().min(8.0) as i32;
+        let max_velocity = energy.floor().min(50.0) as i32;
         let empty_map = PlanetMap { planets: vec![] };
         let map = state
             .map_belief
@@ -265,36 +276,38 @@ impl TargetingPolicy {
                 })
         });
         let angle_step = usize::from(self.settings.angle_step_degrees.max(1));
-        let mut candidates = Vec::new();
-        for velocity in 2..=max_velocity {
-            let mut angles = (-180..=180).step_by(angle_step).collect::<Vec<_>>();
-            if angles.last() != Some(&180) {
-                angles.push(180);
-            }
-            for angle in angles {
-                let shot = ShotObservation {
-                    player_id: own_id,
-                    angle_degrees: f64::from(angle),
-                    velocity: f64::from(velocity),
-                    points: vec![start.clone()],
-                };
-                let Ok(trajectory) = simulate_shot(
-                    map,
-                    &shot,
-                    self.world,
-                    self.settings.max_simulation_ticks.max(2),
-                ) else {
-                    continue;
-                };
-                let (miss_distance, contact_before_target) = targets
-                    .iter()
-                    .map(|target| {
-                        let (miss, passage) = closest_path_passage(
-                            target,
-                            &trajectory.points,
-                            self.settings.target_radius,
-                        );
-                        let blocked = map.planets.iter().any(|planet| {
+        let players = state
+            .player_positions
+            .iter()
+            .map(|(&id, position)| (id, Vec2::new(f64::from(position.x), f64::from(position.y))))
+            .collect::<Vec<_>>();
+        let evaluate = |velocity: i32, angle: i32| -> Option<ShotChoice> {
+            let shot = ShotObservation {
+                player_id: own_id,
+                angle_degrees: f64::from(angle),
+                velocity: f64::from(velocity),
+                points: vec![start.clone()],
+            };
+            let Ok(trajectory) = simulate_targeting_shot(
+                map,
+                &shot,
+                self.world,
+                self.settings.max_simulation_ticks.max(2),
+                &players,
+                self.settings.target_radius,
+            ) else {
+                return None;
+            };
+            let (miss_distance, contact_before_target) = targets
+                .iter()
+                .map(|target| {
+                    let (miss, passage) = closest_path_passage(
+                        target,
+                        &trajectory.points,
+                        self.settings.target_radius,
+                    );
+                    let blocked =
+                        map.planets.iter().any(|planet| {
                             contact_before_target(planet, &trajectory.points, passage)
                         }) || state.map_belief.as_ref().is_some_and(|belief| {
                             belief.contact_points.iter().any(|contact| {
@@ -306,26 +319,99 @@ impl TargetingPolicy {
                                 .is_some_and(|entry| entry < passage)
                             })
                         });
-                        (miss, blocked)
-                    })
-                    .min_by(|left, right| left.0.total_cmp(&right.0))
-                    .unwrap();
-                let cells = path_cells(&trajectory.points);
-                let covered_fraction = if cells.is_empty() {
-                    1.0
-                } else {
-                    cells.intersection(&state.covered_cells).count() as f64 / cells.len() as f64
-                };
-                candidates.push(ShotChoice {
-                    velocity,
-                    angle_degrees: angle,
-                    miss_distance,
-                    information_score: 0.0,
-                    uncertainty_available: covariance_available,
-                    covered_fraction,
-                    contact_before_target,
-                    reason: ShotReason::Approach,
-                });
+                    (miss, blocked)
+                })
+                .min_by(|left, right| left.0.total_cmp(&right.0))
+                .unwrap();
+            let cells = path_cells(&trajectory.points);
+            let covered_fraction = if cells.is_empty() {
+                1.0
+            } else {
+                cells.intersection(&state.covered_cells).count() as f64 / cells.len() as f64
+            };
+            let predicted_hit =
+                matches!(trajectory.termination, Termination::PlayerCollision(id) if id != own_id);
+            let miss_distance = match trajectory.termination {
+                Termination::PlayerCollision(id) if id == own_id => 1.0e9,
+                Termination::PlayerCollision(id) => {
+                    // Estimate the impact margin from the incoming direction, rather than
+                    // treating every first entry into the player radius as equally central.
+                    let target = &state.player_positions[&id];
+                    let points = &trajectory.points;
+                    let end = &points[points.len() - 1];
+                    let previous = &points[points.len() - 2];
+                    let dx = f64::from(end.x - previous.x);
+                    let dy = f64::from(end.y - previous.y);
+                    let length = dx.hypot(dy);
+                    if length == 0.0 {
+                        miss_distance
+                    } else {
+                        let tx = f64::from(target.x - end.x);
+                        let ty = f64::from(target.y - end.y);
+                        (tx * dy - ty * dx).abs() / length
+                    }
+                }
+                _ => miss_distance,
+            };
+            Some(ShotChoice {
+                velocity,
+                angle_degrees: angle,
+                miss_distance,
+                information_score: 0.0,
+                uncertainty_available: covariance_available,
+                covered_fraction,
+                contact_before_target,
+                reason: ShotReason::Approach,
+                predicted_hit,
+            })
+        };
+        let mut candidates = Vec::new();
+        for velocity in 2..=max_velocity {
+            let mut angles = (-180..=180).step_by(angle_step).collect::<Vec<_>>();
+            if angles.last() != Some(&180) {
+                angles.push(180);
+            }
+            for angle in angles {
+                if let Some(candidate) = evaluate(velocity, angle) {
+                    candidates.push(candidate);
+                }
+            }
+        }
+        // Refine several promising basins; the coarse scan still covers the full energy range.
+        let mut seeds = candidates
+            .iter()
+            .filter(|candidate| {
+                !state.is_known_shot(start, candidate.velocity, candidate.angle_degrees)
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        if seeds.is_empty() {
+            seeds = candidates.clone();
+        }
+        seeds.sort_by(|a, b| a.miss_distance.total_cmp(&b.miss_distance));
+        let mut sampled = candidates
+            .iter()
+            .map(|c| (c.velocity, c.angle_degrees))
+            .collect::<BTreeSet<_>>();
+        let mut seed_counts = BTreeMap::new();
+        for seed in seeds
+            .into_iter()
+            .filter(|seed| {
+                let count = seed_counts.entry(seed.angle_degrees).or_insert(0);
+                *count += 1;
+                *count <= 2
+            })
+            .take(12)
+        {
+            for angle in (seed.angle_degrees - angle_step as i32 + 1)
+                ..(seed.angle_degrees + angle_step as i32)
+            {
+                let angle = (angle + 180).rem_euclid(360) - 180;
+                if sampled.insert((seed.velocity, angle)) {
+                    if let Some(candidate) = evaluate(seed.velocity, angle) {
+                        candidates.push(candidate);
+                    }
+                }
             }
         }
         if candidates.is_empty() {
@@ -349,11 +435,11 @@ impl TargetingPolicy {
 
         if let Some(best_hit) = pool
             .iter()
-            .filter(|candidate| candidate.miss_distance <= self.settings.target_radius)
+            .filter(|candidate| candidate.predicted_hit)
             .min_by(|left, right| {
-                left.miss_distance
-                    .total_cmp(&right.miss_distance)
-                    .then_with(|| left.velocity.cmp(&right.velocity))
+                left.velocity
+                    .cmp(&right.velocity)
+                    .then_with(|| left.miss_distance.total_cmp(&right.miss_distance))
             })
         {
             return Some(ShotChoice {
@@ -363,7 +449,7 @@ impl TargetingPolicy {
         }
 
         for candidate in pool.iter_mut() {
-            if !candidate.uncertainty_available {
+            if !candidate.uncertainty_available || candidate.miss_distance >= 1.0e9 {
                 continue;
             }
             candidate.uncertainty_available = false;
@@ -371,7 +457,7 @@ impl TargetingPolicy {
                 .map_belief
                 .as_ref()
                 .map(|belief| {
-                    let Ok(trajectory) = simulate_shot(
+                    let Ok(trajectory) = simulate_targeting_shot(
                         &belief.map,
                         &ShotObservation {
                             player_id: own_id,
@@ -381,6 +467,8 @@ impl TargetingPolicy {
                         },
                         self.world,
                         self.settings.max_simulation_ticks.max(2),
+                        &players,
+                        self.settings.target_radius,
                     ) else {
                         return 0.0;
                     };
@@ -549,6 +637,32 @@ mod tests {
     }
 
     #[test]
+    fn policy_refines_angles_between_coarse_samples() {
+        let mut state = flat_field_state();
+        state.observe(&ServerEvent::PlayerPosition {
+            player_id: 2,
+            x: 300.0,
+            y: 89.5,
+        });
+        let choice = TargetingPolicy::default().choose(&state, 2.0).unwrap();
+        assert_eq!(choice.reason, ShotReason::Hit);
+        assert!((2..=4).contains(&choice.angle_degrees));
+    }
+
+    #[test]
+    fn policy_uses_available_energy_to_reach_a_distant_player() {
+        let mut state = flat_field_state();
+        state.observe(&ServerEvent::PlayerPosition {
+            player_id: 2,
+            x: 1700.0,
+            y: 100.0,
+        });
+        let choice = TargetingPolicy::default().choose(&state, 9.0).unwrap();
+        assert_eq!(choice.reason, ShotReason::Hit);
+        assert_eq!(choice.velocity, 9);
+    }
+
+    #[test]
     fn policy_avoids_repeating_a_known_shot_from_the_same_launch_point() {
         let mut state = flat_field_state();
         let policy = TargetingPolicy::default();
@@ -658,7 +772,7 @@ mod tests {
     #[test]
     fn policy_falls_back_to_known_shots_when_every_candidate_is_known() {
         let mut state = flat_field_state();
-        for angle in (-180..=180).step_by(10) {
+        for angle in -180..=180 {
             state.observe(&observed_shot((100.0, 100.0), 2.0, angle));
         }
         let policy = TargetingPolicy::default();

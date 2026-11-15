@@ -190,6 +190,7 @@ fn run_session(
     stream.set_read_timeout(Some(SOCKET_POLL_INTERVAL))?;
     let mut parser = EventParser::new();
     let mut bot_state = BotState::default();
+    let mut oracle_belief = None;
     let mut targeting_settings = TargetingSettings::default();
     targeting_settings.angle_step_degrees = [8, 10, 12][bot_index % 3];
     let target_policy = TargetingPolicy::new(targeting_settings);
@@ -221,12 +222,13 @@ fn run_session(
                     bot_state.observe(&event);
                     if oracle_map_for_policy {
                         if let ServerEvent::Planets { planets } = &event {
-                            bot_state.set_map_belief(Some(MapBelief::new(
+                            oracle_belief = Some(MapBelief::new(
                                 PlanetMap {
                                     planets: planets.clone(),
                                 },
                                 None,
-                            )));
+                            ));
+                            bot_state.set_map_belief(oracle_belief.clone());
                         }
                     }
                     if targeting && !dummy && !oracle_map_for_policy && bot_index == 0 {
@@ -265,16 +267,56 @@ fn run_session(
                             if targeting && !dummy && !oracle_map_for_policy {
                                 map_feed.snapshot()
                             } else {
-                                (false, None)
+                                (false, oracle_belief.clone())
                             };
                         let commands = if dummy {
                             commands_for_energy(energy, &mut rng)
                         } else if targeting {
                             if !oracle_map_for_policy {
-                                bot_state.set_map_belief(map_belief);
+                                bot_state.set_map_belief(map_belief.clone());
                             }
-                            target_policy
-                                .choose(&bot_state, energy)
+                            let started = Instant::now();
+                            let choice = target_policy.choose(&bot_state, energy);
+                            let search_duration_ms = started.elapsed().as_millis();
+                            if let Some(log) = &event_log {
+                                let belief = map_belief.as_ref().map(|belief| serde_json::json!({
+                                    "planets": belief.map.planets,
+                                    "contact_points": belief.contact_points,
+                                    "covariance": belief.parameter_covariance.as_ref().map(|matrix| {
+                                        (0..matrix.nrows()).map(|row| (0..matrix.ncols()).map(|col| matrix[(row, col)]).collect::<Vec<_>>()).collect::<Vec<_>>()
+                                    }),
+                                    "model_position_rmse": belief.model_position_rmse,
+                                    "fit_converged": belief.fit_converged,
+                                    "planet_contact_counts": belief.planet_contact_counts,
+                                    "uncertain_associations": belief.uncertain_associations,
+                                }));
+                                let decision = choice.map(|choice| {
+                                    serde_json::json!({
+                                        "reason": format!("{:?}", choice.reason),
+                                        "velocity": choice.velocity,
+                                        "angle_degrees": choice.angle_degrees,
+                                        "miss_distance": choice.miss_distance,
+                                    "predicted_hit": choice.predicted_hit,
+                                        "information_score": choice.information_score,
+                                        "uncertainty_available": choice.uncertainty_available,
+                                        "covered_fraction": choice.covered_fraction,
+                                        "contact_before_target": choice.contact_before_target,
+                                    })
+                                });
+                                log.lock().map_err(|_| "event log mutex poisoned")?.append_diagnostic(
+                                    now_unix_ms()?, name, "target_decision", &serde_json::json!({
+                                        "energy": energy,
+                                        "map_updating": map_updating,
+                                        "map_source": if oracle_map_for_policy { "oracle" } else { "online" },
+                                        "map_belief": belief,
+                                        "bot_state": bot_state.diagnostic_snapshot(),
+                                        "angle_step_degrees": targeting_settings.angle_step_degrees,
+                                        "search_duration_ms": search_duration_ms,
+                                        "choice": decision,
+                                    }),
+                                )?;
+                            }
+                            choice
                                 .map(|choice| {
                                     println!(
                                         "TargetChoice reason={:?} velocity={} angle={} miss={:.2} information={:.3} covariance={} covered={:.3} contact_before_target={} map_updating={}",
@@ -522,6 +564,26 @@ mod tests {
         let running = Arc::new(AtomicBool::new(true));
         let worker_running = Arc::clone(&running);
         let worker_feed = feed.clone();
+        let path = std::env::temp_dir().join(format!(
+            "einsteinbot-diagnostic-{}-{}.sqlite",
+            std::process::id(),
+            now_unix_ms().unwrap()
+        ));
+        let log = Arc::new(Mutex::new(
+            EventLog::create(
+                &path,
+                &CaptureMetadata {
+                    started_at_unix_ms: 1,
+                    process_id: 42,
+                    host: "localhost".into(),
+                    port: 3490,
+                    client_name: "Einstein".into(),
+                    protocol_version: 8,
+                },
+            )
+            .unwrap(),
+        ));
+        let worker_log = Arc::clone(&log);
         let client = std::thread::spawn(move || {
             let mut socket = TcpStream::connect(address).unwrap();
             run_session(
@@ -532,7 +594,7 @@ mod tests {
                 true,
                 false,
                 &worker_running,
-                None,
+                Some(worker_log),
                 &worker_feed,
             )
         });
@@ -544,6 +606,17 @@ mod tests {
         drop(feed);
         fitter.join().unwrap();
         assert_eq!(shots, 2, "fit work must not suppress energy-driven shots");
+        let db = rusqlite::Connection::open(&path).unwrap();
+        let data: String = db.query_row("SELECT data_json FROM diagnostics WHERE kind = 'target_decision' ORDER BY sequence LIMIT 1", [], |row| row.get(0)).unwrap();
+        let decision: serde_json::Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(decision["energy"], 8.0);
+        assert_eq!(decision["map_updating"], true);
+        assert_eq!(decision["map_belief"], serde_json::Value::Null);
+        assert_eq!(decision["bot_state"]["player_positions"]["2"]["x"], 200.0);
+        assert!(decision["choice"]["velocity"].is_number());
+        drop(db);
+        drop(log);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

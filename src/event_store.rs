@@ -51,6 +51,15 @@ impl EventLog {
                  event_type TEXT NOT NULL,
                  event_json TEXT NOT NULL,
                  PRIMARY KEY(capture_id, sequence)
+             );
+             CREATE TABLE IF NOT EXISTS diagnostics (
+                 capture_id INTEGER NOT NULL REFERENCES captures(id),
+                 sequence INTEGER NOT NULL,
+                 timestamp_unix_ms INTEGER NOT NULL,
+                 bot_name TEXT NOT NULL,
+                 kind TEXT NOT NULL,
+                 data_json TEXT NOT NULL,
+                 PRIMARY KEY(capture_id, sequence)
              );",
         )?;
         let has_bot_name = {
@@ -65,7 +74,12 @@ impl EventLog {
             connection.execute("ALTER TABLE events ADD COLUMN bot_name TEXT", [])?;
         }
 
-        let metadata_json = serde_json::to_string(metadata)?;
+        let mut metadata_json = serde_json::to_value(metadata)?;
+        metadata_json["build"] = serde_json::json!({
+            "git_revision": option_env!("EINSTEINBOT_GIT_REVISION"),
+            "source_changes": option_env!("EINSTEINBOT_GIT_DIRTY").and_then(|value| value.parse::<bool>().ok()),
+        });
+        let metadata_json = serde_json::to_string(&metadata_json)?;
         connection.execute(
             "INSERT INTO captures (started_at_unix_ms, metadata_json) VALUES (?1, ?2)",
             params![metadata.started_at_unix_ms, metadata_json],
@@ -125,6 +139,23 @@ impl EventLog {
         read_capture_events(&self.connection, self.capture_id)
     }
 
+    /// Append an internal observation in the same sequence as protocol events.
+    pub fn append_diagnostic(
+        &mut self,
+        timestamp_unix_ms: i64,
+        bot_name: &str,
+        kind: &str,
+        data: &serde_json::Value,
+    ) -> StoreResult<i64> {
+        let sequence = self.next_sequence;
+        self.connection.execute(
+            "INSERT INTO diagnostics (capture_id, sequence, timestamp_unix_ms, bot_name, kind, data_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![self.capture_id, sequence, timestamp_unix_ms, bot_name, kind, serde_json::to_string(data)?],
+        )?;
+        self.next_sequence += 1;
+        Ok(sequence)
+    }
+
     /// Read the ordered events from an existing capture without opening a client session.
     pub fn read_capture(path: impl AsRef<Path>, capture_id: i64) -> StoreResult<Vec<StoredEvent>> {
         let connection = Connection::open(path)?;
@@ -169,6 +200,63 @@ fn read_capture_events(connection: &Connection, capture_id: i64) -> StoreResult<
 mod tests {
     use super::*;
     use crate::protocol::{ClientCommand, Point};
+
+    #[test]
+    fn diagnostics_share_event_sequence_and_capture_build_metadata() {
+        let metadata = CaptureMetadata {
+            started_at_unix_ms: 1,
+            process_id: 42,
+            host: "localhost".into(),
+            port: 3490,
+            client_name: "Curie".into(),
+            protocol_version: 8,
+        };
+        let mut log = EventLog::create(":memory:", &metadata).unwrap();
+        log.append_server_event(2, &ServerEvent::OwnId { player_id: 4 })
+            .unwrap();
+        assert_eq!(
+            log.append_diagnostic(
+                3,
+                "Curie",
+                "target_decision",
+                &serde_json::json!({"energy": 9})
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            log.append_server_event(4, &ServerEvent::PlayerLeave { player_id: 5 })
+                .unwrap(),
+            2
+        );
+        let (seq, name, payload): (i64, String, String) = log
+            .connection
+            .query_row(
+                "SELECT sequence, bot_name, data_json FROM diagnostics WHERE capture_id = ?1",
+                [log.capture_id()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((seq, name), (1, "Curie".into()));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&payload).unwrap(),
+            serde_json::json!({"energy": 9})
+        );
+        let metadata_json: String = log
+            .connection
+            .query_row(
+                "SELECT metadata_json FROM captures WHERE id = ?1",
+                [log.capture_id()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let metadata: serde_json::Value = serde_json::from_str(&metadata_json).unwrap();
+        assert!(
+            metadata["build"]["git_revision"].is_string()
+                || metadata["build"]["git_revision"].is_null()
+        );
+        assert!(metadata["build"].get("source_changes").is_some());
+    }
 
     #[test]
     fn stores_semantic_events_in_sequence_order() {
