@@ -58,7 +58,7 @@ impl MapBelief {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 struct KnownShot {
     launch: Point,
     velocity: f64,
@@ -67,7 +67,7 @@ struct KnownShot {
 
 /// A shot that began but has not finished yet. `launch` is the player's tracked position when
 /// the begin event arrived (`None` when unknown); it never constrains candidates from elsewhere.
-#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 struct InFlightShot {
     player_id: u32,
     launch: Option<Point>,
@@ -75,10 +75,11 @@ struct InFlightShot {
     angle_degrees: f64,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Deserialize)]
 pub struct BotState {
     own_id: Option<u32>,
     player_positions: BTreeMap<u32, Point>,
+    #[serde(skip)]
     map_belief: Option<MapBelief>,
     known_shots: Vec<KnownShot>,
     covered_cells: BTreeSet<(i32, i32)>,
@@ -86,6 +87,13 @@ pub struct BotState {
 }
 
 impl BotState {
+    /// Restore the bot's captured targeting state for offline inspection and replay.
+    pub fn from_diagnostic_snapshot(
+        snapshot: &serde_json::Value,
+    ) -> Result<Self, serde_json::Error> {
+        serde_json::from_value(snapshot.clone())
+    }
+
     pub fn observe(&mut self, event: &ServerEvent) {
         match event {
             ServerEvent::Planets { .. } => {
@@ -177,6 +185,10 @@ impl BotState {
 
     pub fn player_positions(&self) -> &BTreeMap<u32, Point> {
         &self.player_positions
+    }
+
+    pub fn own_id(&self) -> Option<u32> {
+        self.own_id
     }
 
     pub fn set_map_belief(&mut self, map_belief: Option<MapBelief>) {
@@ -871,6 +883,25 @@ mod tests {
             .field_uncertainty(Vec2::new(2.0, 0.0))
             .expect("matching covariance");
         assert!((uncertainty - 4.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn diagnostic_snapshot_restores_targeting_history() {
+        let mut state = flat_field_state();
+        state.observe(&observed_shot((100.0, 100.0), 3.0, 15));
+        state.observe(&ServerEvent::ShotBegin {
+            player_id: 2,
+            angle: -30.0,
+            velocity: 4.0,
+        });
+        let snapshot = state.diagnostic_snapshot();
+        let restored = BotState::from_diagnostic_snapshot(&snapshot).unwrap();
+
+        assert_eq!(restored.own_id, state.own_id);
+        assert_eq!(restored.player_positions, state.player_positions);
+        assert_eq!(restored.known_shots, state.known_shots);
+        assert_eq!(restored.covered_cells, state.covered_cells);
+        assert_eq!(restored.in_flight, state.in_flight);
     }
 
     #[test]

@@ -4,13 +4,13 @@ use crate::map::{PlanetMap, Vec2};
 use crate::planet_fit::fit_planet_map;
 use crate::protocol::{Planet, Point};
 use crate::simulation::{ShotObservation, WorldParameters, simulate_sampled_positions};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// An explanatory gravity source only: it does not describe a planet or a collision surface.
 /// The support path and continuation errors permit measuring evidence proximity, not a
 /// calibrated uncertainty or posterior probability. Re-assess against independent paths.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct FieldHypothesis {
     pub x: f64,
     pub y: f64,

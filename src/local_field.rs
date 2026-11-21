@@ -5,13 +5,13 @@
 //! The physical field is subtracted at construction; rebuild whenever that map changes.
 use crate::map::{PlanetMap, Vec2};
 use crate::simulation::{ShotObservation, reconstruct_acceleration};
-use serde::Serialize;
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 
 const SUPPORT: f64 = 40.0;
 const AGGREGATE_CELL: f64 = 8.0;
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct Sample {
     x: f64,
     y: f64,
@@ -26,6 +26,32 @@ pub struct LocalField {
     samples: Vec<Sample>,
     #[serde(skip)]
     grid: BTreeMap<(i32, i32), Vec<usize>>,
+}
+
+impl<'de> Deserialize<'de> for LocalField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct SerializedField {
+            samples: Vec<Sample>,
+        }
+
+        let SerializedField { samples } = SerializedField::deserialize(deserializer)?;
+        let mut field = Self {
+            samples,
+            grid: BTreeMap::new(),
+        };
+        for (index, sample) in field.samples.iter().enumerate() {
+            field
+                .grid
+                .entry(cell(Vec2::new(sample.x, sample.y), SUPPORT))
+                .or_default()
+                .push(index);
+        }
+        Ok(field)
+    }
 }
 
 fn cell(position: Vec2, width: f64) -> (i32, i32) {
@@ -202,5 +228,18 @@ mod tests {
             residual.norm_squared().sqrt() < 0.001,
             "residual={residual:?}"
         );
+    }
+
+    #[test]
+    fn serialized_local_field_rebuilds_its_spatial_index() {
+        let flat = PlanetMap { planets: vec![] };
+        let field = LocalField::from_observations(&flat, &[trajectory(&flat, 400.0)]);
+        let point = Vec2::new(400.0, 400.0);
+        let expected = field.residual(point).unwrap();
+        let restored: LocalField =
+            serde_json::from_value(serde_json::to_value(&field).expect("serialize field"))
+                .expect("deserialize field");
+
+        assert_eq!(restored.residual(point), Some(expected));
     }
 }
