@@ -6,6 +6,7 @@ use crate::simulation::{ShotObservation, WorldParameters, simulate_sampled_posit
 use levenberg_marquardt::{LeastSquaresProblem, LevenbergMarquardt};
 use nalgebra::{DMatrix, DVector, Dyn, U1, VecStorage, linalg::SVD};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
 pub struct ContactConstraint {
@@ -32,6 +33,22 @@ pub struct PlanetFit {
     pub converged: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PlanetFitProfile {
+    pub planets: usize,
+    pub observations: usize,
+    pub trajectory_points: usize,
+    pub contact_constraints: usize,
+    pub parameters: usize,
+    pub optimizer_evaluations: usize,
+    pub optimizer_converged: Option<bool>,
+    pub contact_seeding: Duration,
+    pub optimizer: Duration,
+    pub final_residual: Duration,
+    pub final_jacobian_and_covariance: Duration,
+    pub path_validation: Duration,
+}
+
 /// Refine physical planets jointly. Each trajectory contributes its mean robust
 /// coordinate loss (pseudo-Huber scale 5 world units), so long paths and missing
 /// distant sources cannot dominate merely by supplying many correlated samples.
@@ -45,6 +62,46 @@ pub fn fit_planet_map(
     contacts: &[ContactConstraint],
     world: WorldParameters,
     cancelled: &AtomicBool,
+) -> Result<PlanetFit, String> {
+    fit_planet_map_inner(
+        initial,
+        observations,
+        contacts,
+        world,
+        cancelled,
+        None,
+        None,
+    )
+}
+
+pub(crate) fn fit_planet_map_profiled(
+    initial: &PlanetMap,
+    observations: &[ShotObservation],
+    contacts: &[ContactConstraint],
+    world: WorldParameters,
+    cancelled: &AtomicBool,
+    profile: &mut PlanetFitProfile,
+    patience: usize,
+) -> Result<PlanetFit, String> {
+    fit_planet_map_inner(
+        initial,
+        observations,
+        contacts,
+        world,
+        cancelled,
+        Some(profile),
+        Some(patience),
+    )
+}
+
+fn fit_planet_map_inner(
+    initial: &PlanetMap,
+    observations: &[ShotObservation],
+    contacts: &[ContactConstraint],
+    world: WorldParameters,
+    cancelled: &AtomicBool,
+    mut profile: Option<&mut PlanetFitProfile>,
+    patience: Option<usize>,
 ) -> Result<PlanetFit, String> {
     if cancelled.load(Ordering::Relaxed) {
         return Err("planet fit cancelled".into());
@@ -111,10 +168,24 @@ pub fn fit_planet_map(
         .iter()
         .filter(|shot| shot.points.len() >= 3)
         .count();
+    if let Some(profile) = profile.as_deref_mut() {
+        profile.planets = initial.planets.len();
+        profile.observations = unique_observations.len();
+        profile.trajectory_points = unique_observations
+            .iter()
+            .map(|shot| shot.points.len())
+            .sum();
+        profile.contact_constraints = contacts.len();
+        profile.parameters = initial.planets.len() * 3;
+    }
     if independent_paths == 0 && contacts.is_empty() {
         return Err("fit requires trajectory samples or associated contacts".into());
     }
+    let seed_started = profile.as_ref().map(|_| Instant::now());
     let seeded = contact_seeded_map(initial, &unique_observations, contacts, world, cancelled);
+    if let (Some(profile), Some(started)) = (profile.as_deref_mut(), seed_started) {
+        profile.contact_seeding += started.elapsed();
+    }
     let parameters = encode_planets(&seeded, world);
     let problem = Problem {
         parameters,
@@ -132,12 +203,24 @@ pub fn fit_planet_map(
     }
     let initial_contact_violation =
         contact_violation(initial, contacts).min(contact_violation(&seeded, contacts));
+    let optimizer_started = profile.as_ref().map(|_| Instant::now());
     let (problem, converged) = if initial_residual.len() >= problem.parameters.len() {
-        let (problem, report) = LevenbergMarquardt::new().minimize(problem);
+        let optimizer = match patience {
+            Some(patience) => LevenbergMarquardt::new().with_patience(patience),
+            None => LevenbergMarquardt::new(),
+        };
+        let (problem, report) = optimizer.minimize(problem);
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.optimizer_evaluations = report.number_of_evaluations;
+            profile.optimizer_converged = Some(report.termination.was_successful());
+        }
         (problem, report.termination.was_successful())
     } else {
         (problem, false)
     };
+    if let (Some(profile), Some(started)) = (profile.as_deref_mut(), optimizer_started) {
+        profile.optimizer += started.elapsed();
+    }
     if cancelled.load(Ordering::Relaxed) {
         return Err("planet fit cancelled".into());
     }
@@ -152,9 +235,14 @@ pub fn fit_planet_map(
             "joint fit worsened observed contact geometry; retain the provisional map".into(),
         );
     }
+    let residual_started = profile.as_ref().map(|_| Instant::now());
     let residuals = problem
         .residual_vector(&problem.parameters)
         .ok_or("cannot evaluate fitted map")?;
+    if let (Some(profile), Some(started)) = (profile.as_deref_mut(), residual_started) {
+        profile.final_residual += started.elapsed();
+    }
+    let linear_algebra_started = profile.as_ref().map(|_| Instant::now());
     let jacobian = problem
         .jacobian_at(&problem.parameters)
         .ok_or("cannot evaluate fitted Jacobian")?;
@@ -190,6 +278,10 @@ pub fn fit_planet_map(
     } else {
         None
     };
+    if let (Some(profile), Some(started)) = (profile.as_deref_mut(), linear_algebra_started) {
+        profile.final_jacobian_and_covariance += started.elapsed();
+    }
+    let validation_started = profile.as_ref().map(|_| Instant::now());
     let mut squared_position = 0.0;
     let mut coordinates = 0;
     for shot in &problem.observations {
@@ -206,6 +298,9 @@ pub fn fit_planet_map(
                 + (f64::from(observed.y) - predicted.y).powi(2);
             coordinates += 2;
         }
+    }
+    if let (Some(profile), Some(started)) = (profile.as_deref_mut(), validation_started) {
+        profile.path_validation += started.elapsed();
     }
     let contact_rmse = if contacts.is_empty() {
         0.0

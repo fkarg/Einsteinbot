@@ -24,6 +24,7 @@ struct Options {
     online: bool,
     profile_events: bool,
     replay_speed: f64,
+    fit_patience: usize,
 }
 
 fn main() {
@@ -132,7 +133,7 @@ fn run_online_profile(
     options: &Options,
 ) -> Result<(), String> {
     let started = Instant::now();
-    let samples = replay_capture(events, options.replay_speed)?;
+    let samples = replay_capture(events, options.replay_speed, options.fit_patience)?;
     let elapsed_ms = started.elapsed().as_millis();
     let active_count = samples.iter().filter(|sample| !sample.stale).count();
     let shot_fin_count = samples
@@ -171,9 +172,24 @@ fn run_online_profile(
             + stages.local_residual
             + stages.field_hypothesis
             + stages.hypothesis_residual;
+        let fit_substage_sum = stages.fit_contact_seeding
+            + stages.fit_optimizer
+            + stages.fit_final_residual
+            + stages.fit_final_jacobian_and_covariance
+            + stages.fit_path_validation;
+        let fit_other = stages.planet_fit.saturating_sub(fit_substage_sum);
+        let fit_optimizer_converged = stages
+            .fit_optimizer_converged
+            .map_or_else(|| "n/a".to_owned(), |value| value.to_string());
+        let fit_candidate_accepted = stages
+            .fit_candidate_accepted
+            .map_or_else(|| "n/a".to_owned(), |value| value.to_string());
+        let fit_patience = stages
+            .fit_patience
+            .map_or_else(|| "n/a".to_owned(), |value| value.to_string());
         let other = sample.service_time.saturating_sub(stage_sum);
         println!(
-            "  event seq={} recorded_unix_ms={} epoch={} watermark={} kind={} queue_ms={:.3} service_ms={:.3} prepare_ms={:.3} planet_fit_ms={:.3} local_residual_ms={:.3} field_hypothesis_ms={:.3} hypothesis_residual_ms={:.3} other_ms={:.3} backlog={} stale={}",
+            "  event seq={} recorded_unix_ms={} epoch={} watermark={} kind={} queue_ms={:.3} service_ms={:.3} prepare_ms={:.3} planet_fit_ms={:.3} fit_planets={} fit_paths={} fit_points={} fit_contacts={} fit_parameters={} fit_patience={} fit_lm_evaluations={} fit_converged={} fit_candidate_accepted={} fit_seed_ms={:.3} fit_optimizer_ms={:.3} fit_final_residual_ms={:.3} fit_final_jacobian_covariance_ms={:.3} fit_path_validation_ms={:.3} fit_other_ms={:.3} local_residual_ms={:.3} field_hypothesis_ms={:.3} hypothesis_residual_ms={:.3} other_ms={:.3} backlog={} stale={}",
             sample.sequence,
             sample.recorded_at_unix_ms,
             sample.epoch,
@@ -183,6 +199,21 @@ fn run_online_profile(
             sample.service_time.as_secs_f64() * 1000.0,
             stages.prepare.as_secs_f64() * 1000.0,
             stages.planet_fit.as_secs_f64() * 1000.0,
+            stages.fit_planets,
+            stages.fit_observations,
+            stages.fit_trajectory_points,
+            stages.fit_contact_constraints,
+            stages.fit_parameters,
+            fit_patience,
+            stages.fit_optimizer_evaluations,
+            fit_optimizer_converged,
+            fit_candidate_accepted,
+            stages.fit_contact_seeding.as_secs_f64() * 1000.0,
+            stages.fit_optimizer.as_secs_f64() * 1000.0,
+            stages.fit_final_residual.as_secs_f64() * 1000.0,
+            stages.fit_final_jacobian_and_covariance.as_secs_f64() * 1000.0,
+            stages.fit_path_validation.as_secs_f64() * 1000.0,
+            fit_other.as_secs_f64() * 1000.0,
             stages.local_residual.as_secs_f64() * 1000.0,
             stages.field_hypothesis.as_secs_f64() * 1000.0,
             stages.hypothesis_residual.as_secs_f64() * 1000.0,
@@ -229,6 +260,11 @@ fn print_profile_summary(samples: &[ProfileSample]) {
                 total.local_residual += stage.local_residual;
                 total.field_hypothesis += stage.field_hypothesis;
                 total.hypothesis_residual += stage.hypothesis_residual;
+                total.fit_contact_seeding += stage.fit_contact_seeding;
+                total.fit_optimizer += stage.fit_optimizer;
+                total.fit_final_residual += stage.fit_final_residual;
+                total.fit_final_jacobian_and_covariance += stage.fit_final_jacobian_and_covariance;
+                total.fit_path_validation += stage.fit_path_validation;
                 total
             },
         );
@@ -237,6 +273,11 @@ fn print_profile_summary(samples: &[ProfileSample]) {
             + stages.local_residual
             + stages.field_hypothesis
             + stages.hypothesis_residual;
+        let fit_substage_sum = stages.fit_contact_seeding
+            + stages.fit_optimizer
+            + stages.fit_final_residual
+            + stages.fit_final_jacobian_and_covariance
+            + stages.fit_path_validation;
         let service_total = active
             .iter()
             .map(|sample| sample.service_time)
@@ -252,7 +293,7 @@ fn print_profile_summary(samples: &[ProfileSample]) {
             .map(|sample| sample.queue_wait)
             .sum::<std::time::Duration>();
         println!(
-            "  summary kind={event} active={} stale_rows={} stale_service_ms={:.3} stale_queue_ms={:.3} service_ms[p50/p95/max]={}/{}/{} queue_ms[p50/p95/max]={}/{}/{} stage_total_ms[prepare/planet_fit/local_residual/field_hypothesis/hypothesis_residual/other]={:.3}/{:.3}/{:.3}/{:.3}/{:.3}/{:.3} max_backlog={}",
+            "  summary kind={event} active={} stale_rows={} stale_service_ms={:.3} stale_queue_ms={:.3} service_ms[p50/p95/max]={}/{}/{} queue_ms[p50/p95/max]={}/{}/{} stage_total_ms[prepare/planet_fit/local_residual/field_hypothesis/hypothesis_residual/other]={:.3}/{:.3}/{:.3}/{:.3}/{:.3}/{:.3} fit_breakdown_ms[contact_seeding/optimizer/final_residual/final_jacobian_covariance/path_validation/other]={:.3}/{:.3}/{:.3}/{:.3}/{:.3}/{:.3} max_backlog={}",
             active.len(),
             stale_rows,
             stale_service.as_secs_f64() * 1000.0,
@@ -273,6 +314,16 @@ fn print_profile_summary(samples: &[ProfileSample]) {
             stages.field_hypothesis.as_secs_f64() * 1000.0,
             stages.hypothesis_residual.as_secs_f64() * 1000.0,
             service_total.saturating_sub(stage_sum).as_secs_f64() * 1000.0,
+            stages.fit_contact_seeding.as_secs_f64() * 1000.0,
+            stages.fit_optimizer.as_secs_f64() * 1000.0,
+            stages.fit_final_residual.as_secs_f64() * 1000.0,
+            stages.fit_final_jacobian_and_covariance.as_secs_f64() * 1000.0,
+            stages.fit_path_validation.as_secs_f64() * 1000.0,
+            stages
+                .planet_fit
+                .saturating_sub(fit_substage_sum)
+                .as_secs_f64()
+                * 1000.0,
             max_backlog,
         );
     }
@@ -468,6 +519,8 @@ where
     let mut profile_events = false;
     let mut replay_speed = 1.0_f64;
     let mut replay_speed_explicit = false;
+    let mut fit_patience = 100_usize;
+    let mut fit_patience_explicit = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => {
@@ -499,6 +552,10 @@ where
                 replay_speed = parse_value(&value(&mut args, &arg)?, &arg)?;
                 replay_speed_explicit = true;
             }
+            "--fit-patience" => {
+                fit_patience = parse_value(&value(&mut args, &arg)?, &arg)?;
+                fit_patience_explicit = true;
+            }
             _ => return Err(format!("unknown option {arg}\n\n{}", help_text())),
         }
     }
@@ -515,8 +572,11 @@ where
     if validation_every == 1 {
         return Err("--validation-every must be 0 or at least 2".to_owned());
     }
-    if !online && (profile_events || replay_speed_explicit) {
-        return Err("--speed and --profile-events require --online".to_owned());
+    if !online && (profile_events || replay_speed_explicit || fit_patience_explicit) {
+        return Err("--speed, --fit-patience and --profile-events require --online".to_owned());
+    }
+    if fit_patience == 0 {
+        return Err("--fit-patience must be positive".to_owned());
     }
     if !replay_speed.is_finite() || replay_speed < 0.0 {
         return Err("--speed must be finite and nonnegative".to_owned());
@@ -532,6 +592,7 @@ where
         online,
         profile_events,
         replay_speed,
+        fit_patience,
     }))
 }
 
@@ -596,6 +657,7 @@ fn help_text() -> &'static str {
        --no-oracle             Ignore captured Planets maps\n\
        --online                Replay through the live map worker and report timing\n\
        --speed FACTOR          Timing factor: 1 uses recorded intervals, 0 is unpaced\n\
+       --fit-patience N        LM evaluation limit factor (default: 100)\n\
        --profile-events        Print timing for every map event (default: ShotFin only)\n\
        -h, --help              Show this help\n"
 }
@@ -675,7 +737,7 @@ mod tests {
             event(3, 1002, ServerEvent::Planets { planets: vec![] }),
         ];
 
-        let samples = replay_capture(&events, 0.0).unwrap();
+        let samples = replay_capture(&events, 0.0, 100).unwrap();
         assert_eq!(samples.len(), 2);
         assert_eq!(samples[0].event, "player_position");
         assert_eq!(samples[1].event, "reset_seed_player_position");
@@ -691,6 +753,20 @@ mod tests {
 
     #[test]
     fn online_profile_rejects_invalid_speed_before_starting_a_worker() {
-        assert!(replay_capture(&[], -1.0).is_err());
+        assert!(replay_capture(&[], -1.0, 100).is_err());
+        assert!(replay_capture(&[], 0.0, 0).is_err());
+    }
+
+    #[test]
+    fn fit_patience_is_positive_and_online_profile_only() {
+        let parse = |arguments: &[&str]| {
+            parse_args(arguments.iter().map(|argument| (*argument).to_owned()))
+        };
+        assert!(parse(&["--capture-id", "1", "--fit-patience", "0"]).is_err());
+        assert!(parse(&["--capture-id", "1", "--fit-patience", "2"]).is_err());
+        let options = parse(&["--capture-id", "1", "--online", "--fit-patience", "2"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(options.fit_patience, 2);
     }
 }

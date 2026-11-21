@@ -31,9 +31,16 @@ struct ReplayContext {
 
 /// Replay only events submitted to the live map worker, preserving capture arrival timing.
 /// A speed of zero disables pacing; otherwise 1.0 replays at recorded time intervals.
-pub fn replay_capture(events: &[StoredEvent], speed: f64) -> Result<Vec<ProfileSample>, String> {
+pub fn replay_capture(
+    events: &[StoredEvent],
+    speed: f64,
+    fit_patience: usize,
+) -> Result<Vec<ProfileSample>, String> {
     if !speed.is_finite() || speed < 0.0 {
         return Err("replay speed must be finite and nonnegative".to_owned());
+    }
+    if fit_patience == 0 {
+        return Err("fit patience must be positive".to_owned());
     }
 
     let replay_started = std::time::Instant::now();
@@ -61,7 +68,7 @@ pub fn replay_capture(events: &[StoredEvent], speed: f64) -> Result<Vec<ProfileS
             .ok_or_else(|| "replay deadline is out of range".to_owned())?;
     }
 
-    let (feed, worker, profiles) = LiveMap::spawn_profiled();
+    let (feed, worker, profiles) = LiveMap::spawn_profiled(fit_patience);
     let mut state = BotState::default();
     let mut contexts = VecDeque::new();
 

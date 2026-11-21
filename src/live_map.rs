@@ -86,11 +86,13 @@ impl LiveMap {
         )
     }
 
-    pub(crate) fn spawn_profiled() -> (Self, JoinHandle<()>, mpsc::Receiver<WorkProfile>) {
+    pub(crate) fn spawn_profiled(
+        fit_patience: usize,
+    ) -> (Self, JoinHandle<()>, mpsc::Receiver<WorkProfile>) {
         let (profile_tx, profile_rx) = mpsc::channel();
         let (feed, worker) = Self::spawn_inner(
-            |estimator, event, cancelled| {
-                let (belief, stages) = estimator.observe_profiled(event, cancelled);
+            move |estimator, event, cancelled| {
+                let (belief, stages) = estimator.observe_profiled(event, cancelled, fit_patience);
                 FitOutcome { belief, stages }
             },
             Some(profile_tx),

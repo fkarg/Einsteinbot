@@ -1,7 +1,9 @@
 //! Authoritative live physical planet map, seeded by contacts and refined by trajectories.
 use crate::contacts::ContactMap;
 use crate::map::PlanetMap;
-use crate::planet_fit::{ContactConstraint, fit_planet_map};
+use crate::planet_fit::{
+    ContactConstraint, PlanetFitProfile, fit_planet_map, fit_planet_map_profiled,
+};
 use crate::protocol::{Point, ServerEvent};
 use crate::simulation::{ShotObservation, WorldParameters};
 use crate::strategy::MapBelief;
@@ -16,6 +18,20 @@ pub struct OnlineStageProfile {
     pub local_residual: Duration,
     pub field_hypothesis: Duration,
     pub hypothesis_residual: Duration,
+    pub fit_contact_seeding: Duration,
+    pub fit_optimizer: Duration,
+    pub fit_final_residual: Duration,
+    pub fit_final_jacobian_and_covariance: Duration,
+    pub fit_path_validation: Duration,
+    pub fit_planets: usize,
+    pub fit_observations: usize,
+    pub fit_trajectory_points: usize,
+    pub fit_contact_constraints: usize,
+    pub fit_parameters: usize,
+    pub fit_optimizer_evaluations: usize,
+    pub fit_patience: Option<usize>,
+    pub fit_optimizer_converged: Option<bool>,
+    pub fit_candidate_accepted: Option<bool>,
 }
 
 #[derive(Default)]
@@ -34,17 +50,22 @@ impl OnlineEstimator {
         events: &[ServerEvent],
         cancelled: &AtomicBool,
     ) -> Option<MapBelief> {
-        self.observe_batch_inner(events, cancelled, None)
+        self.observe_batch_inner(events, cancelled, None, None)
     }
 
     pub(crate) fn observe_profiled(
         &mut self,
         event: &ServerEvent,
         cancelled: &AtomicBool,
+        fit_patience: usize,
     ) -> (Option<MapBelief>, OnlineStageProfile) {
         let mut stages = OnlineStageProfile::default();
-        let belief =
-            self.observe_batch_inner(std::slice::from_ref(event), cancelled, Some(&mut stages));
+        let belief = self.observe_batch_inner(
+            std::slice::from_ref(event),
+            cancelled,
+            Some(&mut stages),
+            Some(fit_patience),
+        );
         (belief, stages)
     }
 
@@ -53,6 +74,7 @@ impl OnlineEstimator {
         events: &[ServerEvent],
         cancelled: &AtomicBool,
         mut stages: Option<&mut OnlineStageProfile>,
+        fit_patience: Option<usize>,
     ) -> Option<MapBelief> {
         let prepare_started = stages.as_ref().map(|_| Instant::now());
         let mut prior_observations = self.observations.clone();
@@ -130,13 +152,42 @@ impl OnlineEstimator {
             belief.covariance_unavailable_reason =
                 Some(crate::estimator::CovarianceUnavailableReason::FitFailed);
             let fit_started = stages.as_ref().map(|_| Instant::now());
-            let fit_result = fit_planet_map(
-                &belief.map,
-                &self.observations,
-                &contact_constraints,
-                WorldParameters::default(),
-                cancelled,
-            );
+            let fit_result = if let Some(profile) = stages.as_deref_mut() {
+                let mut fit_profile = PlanetFitProfile::default();
+                let result = fit_planet_map_profiled(
+                    &belief.map,
+                    &self.observations,
+                    &contact_constraints,
+                    WorldParameters::default(),
+                    cancelled,
+                    &mut fit_profile,
+                    fit_patience.unwrap_or(100),
+                );
+                profile.fit_planets = fit_profile.planets;
+                profile.fit_observations = fit_profile.observations;
+                profile.fit_trajectory_points = fit_profile.trajectory_points;
+                profile.fit_contact_constraints = fit_profile.contact_constraints;
+                profile.fit_parameters = fit_profile.parameters;
+                profile.fit_optimizer_evaluations = fit_profile.optimizer_evaluations;
+                profile.fit_patience = fit_patience;
+                profile.fit_optimizer_converged = fit_profile.optimizer_converged;
+                profile.fit_candidate_accepted = Some(result.is_ok());
+                profile.fit_contact_seeding += fit_profile.contact_seeding;
+                profile.fit_optimizer += fit_profile.optimizer;
+                profile.fit_final_residual += fit_profile.final_residual;
+                profile.fit_final_jacobian_and_covariance +=
+                    fit_profile.final_jacobian_and_covariance;
+                profile.fit_path_validation += fit_profile.path_validation;
+                result
+            } else {
+                fit_planet_map(
+                    &belief.map,
+                    &self.observations,
+                    &contact_constraints,
+                    WorldParameters::default(),
+                    cancelled,
+                )
+            };
             if let (Some(profile), Some(started)) = (stages.as_deref_mut(), fit_started) {
                 profile.planet_fit += started.elapsed();
             }
