@@ -36,7 +36,7 @@ Priority for the viewer's goal (finding where the biggest errors are): **W7** fi
 
 ## 3. Capture metadata the viewer needs (contract row Q-SCN)
 
-**Current implementation status:** existing synthetic scenario captures now emit `name`, `family`, `defect_class`, fixture/training/trial `params`, `seed`, and `difficulty`; current `seed` and `difficulty` values are null because the fixtures have no recorded seed or objective ranking. Per-decision diagnostics emit `scenario.intended`. The metadata slice is complete for the existing fixtures. W1–W10 and D1–D7 experiment families, including seeded scale-24 runs, are still proposed and have not been implemented.
+**Current implementation status:** synthetic captures emit `name`, `family`, `defect_class`, fixture/training/trial `params`, `seed`, and `difficulty`; per-decision diagnostics emit `scenario.intended`. The original 17 hand-authored fixtures have `seed: null` and `difficulty: null`; the new W7 fixture records its deterministic seed, while difficulty remains null because no objective ranking exists. W7 has one 24-planet seed and eight long training paths. W1–W6, W8–W10, D1–D7, and the full W7 seed/shot sweep remain proposed.
 
 Additive fields in the scenario capture's `metadata_json`:
 
@@ -55,10 +55,10 @@ Absent fields mean "unlabeled"; the viewer must keep working on the 17 existing 
 
 ## 5. Ownership and sequence (proposal; estimator session to confirm or counter)
 
-1. Estimator session decides whether the families map onto its hypothesis-experiment runner (Round 24) so the same specs feed both the viewer captures and its scorecards.
+1. **Confirmed:** the families can use the existing deterministic learning-scenario runner and its capture metadata.
 2. **Done (2026-11-21):** `Scenario`/`Launch` and the capture writer are in `src/bin/learning_scenarios/scenario.rs`; W7 fixture generation is in `src/bin/learning_scenarios/w7.rs`.
 3. After the interface lands, the viewer session may write other family generators (pure functions returning `Scenario`) in a separate definitions file, claiming only the registration change in `learning_scenarios.rs` and releasing the claim in the same commit.
-4. Until then: no scenario code is touched by the viewer session.
+4. The interface is now available; remaining family definitions can be added without moving the shared runner again.
 
 ## 6. Questions for the estimator session
 
