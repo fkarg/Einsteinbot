@@ -6,6 +6,7 @@ use crate::simulation::{
     simulate_targeting_shot_with_hypothesis, simulate_targeting_shot_with_local_field,
 };
 use nalgebra::DMatrix;
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug)]
@@ -596,11 +597,7 @@ impl TargetingPolicy {
             .filter(|candidate| candidate.predicted_hit)
             .copied()
             .collect::<Vec<_>>();
-        hits.sort_by(|left, right| {
-            left.velocity
-                .cmp(&right.velocity)
-                .then_with(|| left.miss_distance.total_cmp(&right.miss_distance))
-        });
+        hits.sort_by(compare_hit_quality);
         if let Some(mut best_hit) = hits.first().copied() {
             if let Some(belief) = state
                 .map_belief
@@ -824,6 +821,14 @@ fn contact_before_target(planet: &crate::protocol::Planet, points: &[Point], pas
         .is_some_and(|entry| entry < passage)
 }
 
+fn compare_hit_quality(left: &ShotChoice, right: &ShotChoice) -> Ordering {
+    // Until the model predicts hits reliably, prefer the most central impact. Save
+    // energy only when predicted aim quality is equal.
+    left.miss_distance
+        .total_cmp(&right.miss_distance)
+        .then_with(|| left.velocity.cmp(&right.velocity))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -866,6 +871,56 @@ mod tests {
             .field_uncertainty(Vec2::new(2.0, 0.0))
             .expect("matching covariance");
         assert!((uncertainty - 4.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn hit_quality_precedes_energy_conservation() {
+        let grazing_low_energy = ShotChoice {
+            velocity: 2,
+            miss_distance: 3.5,
+            ..test_choice()
+        };
+        let central_high_energy = ShotChoice {
+            velocity: 8,
+            miss_distance: 0.5,
+            ..test_choice()
+        };
+
+        assert_eq!(
+            compare_hit_quality(&central_high_energy, &grazing_low_energy),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_hit_quality(
+                &grazing_low_energy,
+                &ShotChoice {
+                    miss_distance: 3.5,
+                    velocity: 4,
+                    ..test_choice()
+                }
+            ),
+            Ordering::Less,
+            "energy remains the tie-breaker when hit quality is equal"
+        );
+    }
+
+    fn test_choice() -> ShotChoice {
+        ShotChoice {
+            velocity: 1,
+            angle_degrees: 0,
+            miss_distance: 0.0,
+            information_score: 0.0,
+            uncertainty_available: false,
+            covered_fraction: 0.0,
+            contact_before_target: false,
+            reason: ShotReason::Hit,
+            predicted_hit: true,
+            used_field_hypothesis: false,
+            predicted_victim: Some(2),
+            alternative_agrees: None,
+            hypothesis_uncertainty_proxy: None,
+            local_support_fraction: None,
+        }
     }
 
     fn observed_shot(launch: (f32, f32), velocity: f64, angle_degrees: i32) -> ServerEvent {
