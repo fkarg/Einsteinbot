@@ -21,8 +21,8 @@ use std::path::PathBuf;
 const PAGE: &str = include_str!("../../web/map_viewer.html");
 const DEFAULT_PORT: u16 = 8765;
 const PLAYER_RADIUS: f64 = 4.0;
-const FIELD_GRID_STEP: usize = 5;
-const MAX_FIELD_SAMPLES: usize = 200_000;
+const FIELD_GRID_STEP: usize = 3;
+const MAX_FIELD_SAMPLES: usize = 300_000;
 
 fn main() {
     if let Err(error) = run() {
@@ -329,12 +329,16 @@ fn selected_snapshot(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Resul
     };
     let events = read_events_before(&connection, capture_id, sequence.saturating_add(1))?;
     let actual_planets = latest_actual_planets(&events);
+    let display_field = parameters.get("field").copied().unwrap_or("delta");
+    if !["delta", "total", "physical", "residual", "oracle"].contains(&display_field) {
+        return Err("field must be delta, total, physical, residual, or oracle".to_owned());
+    }
     let grid_step = parameters.get("step").map_or(Ok(FIELD_GRID_STEP), |step| {
         step.parse::<usize>()
             .map_err(|_| "invalid grid step".to_owned())
     })?;
-    if ![1, 2, 5, 10, 25].contains(&grid_step) {
-        return Err("grid step must be 1, 2, 5, 10, or 25 world units".to_owned());
+    if ![1, 2, 3, 5, 10, 25].contains(&grid_step) {
+        return Err("grid step must be 1, 2, 3, 5, 10, or 25 world units".to_owned());
     }
     let world = WorldParameters::default();
     let view = Viewport {
@@ -364,7 +368,13 @@ fn selected_snapshot(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Resul
             "viewport at {grid_step}-unit spacing requests {sample_count} samples; zoom in or choose a coarser grid"
         ));
     }
-    let field_grid = make_field_grid(&data, actual_planets.as_deref(), grid_step, view)?;
+    let field_grid = make_field_grid(
+        &data,
+        actual_planets.as_deref(),
+        grid_step,
+        view,
+        display_field,
+    )?;
     let selected_shot = selection.strip_prefix("event:").and_then(|_| {
         events
                 .iter()
@@ -375,6 +385,15 @@ fn selected_snapshot(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Resul
                     json!({"sequence":event_sequence,"event":record["event"]})
                 })
     });
+    let trace_map = decode_belief(&data["map_belief"])
+        .ok()
+        .flatten()
+        .map(|belief| belief.map);
+    let map_epoch_start = events
+        .iter()
+        .rev()
+        .find(|(_, record)| record["event"]["type"] == "planets")
+        .map_or(0, |(sequence, _)| *sequence);
     let trajectories = events
         .iter()
         .filter(|(_, record)| record["event"]["type"] == "shot_fin")
@@ -383,7 +402,17 @@ fn selected_snapshot(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Resul
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
-        .map(|(sequence, record)| json!({"sequence": sequence, "record": record}))
+        .map(|(sequence, record)| {
+            let points = serde_json::from_value::<Vec<Point>>(record["event"]["points"].clone())
+                .unwrap_or_default();
+            let residual_samples = trace_map
+                .as_ref()
+                .map(|map| {
+                    trajectory_residual_samples_in_epoch(*sequence, map_epoch_start, &points, map)
+                })
+                .unwrap_or_default();
+            json!({"sequence": sequence, "record": record, "residual_samples": residual_samples})
+        })
         .collect::<Vec<_>>();
     Ok(json!({
         "capture_id": capture_id,
@@ -498,6 +527,7 @@ fn make_field_grid(
     actual: Option<&[Planet]>,
     grid_step: usize,
     view: Viewport,
+    display_field: &str,
 ) -> Result<Value, String> {
     let belief = decode_belief(&data["map_belief"])?;
     let covariance = belief
@@ -519,75 +549,64 @@ fn make_field_grid(
                 let oracle = actual_map
                     .as_ref()
                     .and_then(|map| map.acceleration(position).ok());
-                samples.push(json!({"x":x,"y":y,"gravity":null,"total":null,"oracle":oracle.map(|v|json!({"x":v.x,"y":v.y})),"sigma":null,"supported":false,"hypothesis_proxy":null,"actual_gravity":oracle.map(|v| v.x.hypot(v.y))}));
+                let selected = (display_field == "oracle").then_some(oracle).flatten();
+                samples.push(json!([
+                    x,
+                    y,
+                    selected.map(|v| v.x),
+                    selected.map(|v| v.y),
+                    Option::<f64>::None,
+                    Option::<f64>::None,
+                    Option::<f64>::None,
+                    Option::<f64>::None,
+                    Option::<f64>::None,
+                    Option::<f64>::None,
+                    oracle.map(|v| v.x),
+                    oracle.map(|v| v.y),
+                    Option::<f64>::None,
+                    false
+                ]));
                 continue;
             };
             let physical = belief.map.acceleration(position).ok();
             let residual_observed = belief.local_field.residual(position);
-            let hypothesis = belief.field_hypothesis.as_ref().and_then(|hypothesis| {
-                hypothesis.acceleration(position).map(|gravity| {
-                    let local = belief
-                        .hypothesis_local_field
-                        .as_ref()
-                        .and_then(|field| field.residual(position))
-                        .unwrap_or_default();
-                    (gravity.x + local.x, gravity.y + local.y)
-                })
-            });
             let has_residual = residual_observed.is_some();
             let residual = residual_observed.unwrap_or_default();
             let gravity =
                 physical.map(|physical| (physical.x + residual.x, physical.y + residual.y));
-            let hypothesis_local = belief
-                .hypothesis_local_field
-                .as_ref()
-                .and_then(|field| field.residual(position))
-                .unwrap_or_default();
-            let hypothesis_source = belief
-                .field_hypothesis
-                .as_ref()
-                .and_then(|hypothesis| hypothesis.acceleration(position));
-            let hypothesis_extra = hypothesis_source.map(|source| {
-                Vec2::new(source.x + hypothesis_local.x, source.y + hypothesis_local.y)
-            });
-            let hypothesis_gravity = physical
-                .zip(hypothesis)
-                .map(|(physical, extra)| (physical.x + extra.0, physical.y + extra.1));
             let actual_vector = actual_map
                 .as_ref()
                 .and_then(|map| map.acceleration(position).ok());
             let delta = gravity
                 .zip(actual_vector)
-                .map(|(estimate, oracle)| Vec2::new(estimate.0 - oracle.x, estimate.1 - oracle.y));
-            let hypothesis_delta = hypothesis_gravity
-                .zip(actual_vector)
-                .map(|(estimate, oracle)| Vec2::new(estimate.0 - oracle.x, estimate.1 - oracle.y));
+                .map(|(estimate, oracle)| (estimate.0 - oracle.x, estimate.1 - oracle.y));
             let sigma = covariance
                 .and_then(|matrix| belief.map.acceleration_covariance(position, matrix).ok())
                 .map(|covariance| (covariance.xx + covariance.yy).max(0.0).sqrt());
-            let hypothesis_proxy = belief
-                .field_hypothesis
-                .as_ref()
-                .map(|hypothesis| hypothesis.relative_uncertainty_proxy(position));
-            samples.push(json!({
-                "x":x,"y":y,
-                "physical":physical.map(|v|json!({"x":v.x,"y":v.y})),
-                "residual":json!({"x":residual.x,"y":residual.y}),
-                "total":gravity.map(|(x,y)|json!({"x":x,"y":y})),
-                "hypothesis_source":hypothesis_source.map(|v|json!({"x":v.x,"y":v.y})),
-                "hypothesis_residual":json!({"x":hypothesis_local.x,"y":hypothesis_local.y}),
-                "hypothesis_extra":hypothesis_extra.map(|v|json!({"x":v.x,"y":v.y})),
-                "hypothesis_total":hypothesis_gravity.map(|(x,y)|json!({"x":x,"y":y})),
-                "oracle":actual_vector.map(|v|json!({"x":v.x,"y":v.y})),
-                "delta":delta.map(|v|json!({"x":v.x,"y":v.y})),
-                "hypothesis_delta":hypothesis_delta.map(|v|json!({"x":v.x,"y":v.y})),
-                "gravity":gravity.map(|(ax,ay)| ax.hypot(ay)),
-                "hypothesis_gravity":hypothesis_gravity.map(|(ax,ay)| ax.hypot(ay)),
-                "sigma":sigma,
-                "supported":has_residual,
-                "hypothesis_proxy":hypothesis_proxy,
-                "actual_gravity":actual_map.as_ref().and_then(|map| map.acceleration(position).ok()).map(|v| v.x.hypot(v.y)),
-            }));
+            let selected = match display_field {
+                "delta" => delta,
+                "total" => gravity,
+                "physical" => physical.map(|v| (v.x, v.y)),
+                "residual" => residual_observed.map(|v| (v.x, v.y)),
+                "oracle" => actual_vector.map(|v| (v.x, v.y)),
+                _ => unreachable!("display field is validated by selected_snapshot"),
+            };
+            samples.push(json!([
+                x,
+                y,
+                selected.map(|v| v.0),
+                selected.map(|v| v.1),
+                gravity.map(|v| v.0),
+                gravity.map(|v| v.1),
+                physical.map(|v| v.x),
+                physical.map(|v| v.y),
+                residual.x,
+                residual.y,
+                actual_vector.map(|v| v.x),
+                actual_vector.map(|v| v.y),
+                sigma,
+                has_residual
+            ]));
         }
     }
     Ok(json!({
@@ -602,6 +621,34 @@ fn make_field_grid(
         "has_covariance": covariance.is_some(),
         "has_belief": belief.is_some(),
     }))
+}
+
+fn trajectory_residual_samples(points: &[Point], map: &PlanetMap) -> Vec<[f64; 4]> {
+    einsteinbot::simulation::reconstruct_acceleration(points)
+        .into_iter()
+        .filter_map(|(position, observed)| {
+            let predicted = map.acceleration(position).ok()?;
+            Some([
+                position.x,
+                position.y,
+                observed.x - predicted.x,
+                observed.y - predicted.y,
+            ])
+        })
+        .collect()
+}
+
+fn trajectory_residual_samples_in_epoch(
+    sequence: i64,
+    map_epoch_start: i64,
+    points: &[Point],
+    map: &PlanetMap,
+) -> Vec<[f64; 4]> {
+    if sequence > map_epoch_start {
+        trajectory_residual_samples(points, map)
+    } else {
+        Vec::new()
+    }
 }
 
 fn simulate_request(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Result<Value, String> {
@@ -993,5 +1040,65 @@ mod tests {
         assert_eq!(snapshot["selected_shot"]["event"]["points"][0]["x"], 10.0);
         drop(log);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn trajectory_residual_samples_follow_recorded_paths_at_sample_resolution() {
+        let map = PlanetMap { planets: vec![] };
+        let points = vec![
+            Point { x: 1.0, y: 2.0 },
+            Point { x: 2.0, y: 4.0 },
+            Point { x: 3.0, y: 6.0 },
+            Point { x: 4.0, y: 8.0 },
+            Point { x: 5.0, y: 10.0 },
+        ];
+        let samples = trajectory_residual_samples(&points, &map);
+        assert_eq!(samples.len(), 2);
+        assert!(
+            samples
+                .iter()
+                .all(|sample| sample[2].hypot(sample[3]) == 0.0)
+        );
+    }
+
+    #[test]
+    fn trajectory_residual_samples_do_not_cross_planet_map_epochs() {
+        let map = PlanetMap { planets: vec![] };
+        let points = vec![
+            Point { x: 1.0, y: 2.0 },
+            Point { x: 2.0, y: 4.0 },
+            Point { x: 3.0, y: 6.0 },
+            Point { x: 4.0, y: 8.0 },
+            Point { x: 5.0, y: 10.0 },
+        ];
+        assert!(trajectory_residual_samples_in_epoch(9, 10, &points, &map).is_empty());
+        assert_eq!(
+            trajectory_residual_samples_in_epoch(11, 10, &points, &map).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn field_grid_returns_compact_rows_for_the_selected_layer() {
+        let data = json!({"map_belief":{"planets":[],"local_field":{"samples":[]}}});
+        let actual = [];
+        let grid = make_field_grid(
+            &data,
+            Some(&actual),
+            1,
+            Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+            "delta",
+        )
+        .unwrap();
+        let sample = &grid["samples"][0];
+        assert_eq!(sample.as_array().unwrap().len(), 14);
+        assert_eq!(sample[2], 0.0);
+        assert_eq!(sample[3], 0.0);
+        assert_eq!(sample[13], false);
     }
 }
