@@ -81,7 +81,6 @@
     const sigmas=g.samples?.map(p=>p.sigma).filter(Number.isFinite)||[];const sorted=[...sigmas].sort((a,b)=>a-b);const median=sorted.length?sorted[Math.floor(sorted.length/2)]:null;
     const local=b.local_field?.samples?.length||0;
     const delta=snapshot.field_grid?.samples?.map(p=>{const base=corrections?p.total:p.physical;return base&&p.oracle?{x:base.x-p.oracle.x,y:base.y-p.oracle.y}:null;}).filter(v=>v&&Number.isFinite(v.x)&&Number.isFinite(v.y))||[],errors=delta.map(v=>Math.hypot(v.x,v.y)).sort((a,b)=>a-b),fieldRmse=delta.length?Math.sqrt(delta.reduce((sum,v)=>sum+v.x*v.x+v.y*v.y,0)/delta.length):null;
-    const middle=a=>{if(!a.length)return null;const m=a.length>>1;return a.length%2?a[m]:(a[m-1]+a[m])/2;};
     const matches=planetMatches();const centerErrors=matches.map(m=>m.distance).sort((a,b)=>a-b),radiusErrors=matches.map(m=>Math.abs(m.radiusError)).sort((a,b)=>a-b);
     const stale=d.map_updating===true;
     const oracle=Boolean(snapshot.actual_planets);
@@ -118,6 +117,47 @@
   canvas.addEventListener('dblclick',resetView);
   canvas.addEventListener('pointerdown',e=>{panned=false;if(!e.shiftKey&&e.button!==1)return;const rect=canvas.getBoundingClientRect();viewDrag={clientX:e.clientX,clientY:e.clientY,rect,view:{...view}};canvas.setPointerCapture(e.pointerId);});
   canvas.addEventListener('pointermove',e=>{if(!viewDrag)return;const dx=(e.clientX-viewDrag.clientX)/viewDrag.rect.width*viewDrag.view.width,dy=(e.clientY-viewDrag.clientY)/viewDrag.rect.height*viewDrag.view.height;view={...viewDrag.view,x:Math.max(0,Math.min(W-viewDrag.view.width,viewDrag.view.x-dx)),y:Math.max(0,Math.min(H-viewDrag.view.height,viewDrag.view.y-dy))};render();});canvas.addEventListener('pointerup',()=>{if(viewDrag){viewDrag=null;panned=true;refreshViewport();}});
+  // ---- Captures overview: the landing table, one row per capture, sortable, with global metrics ----
+  let overviewRows=[],overviewSort={key:'id',dir:-1};
+  const overviewValue={
+    id:r=>r.id,kind:r=>r.kind,name:r=>r.name,decisions:r=>r.decisions,shots:r=>r.shots,
+    estimated:r=>r.last?.planets,disclosed:r=>r.last?.accuracy?.actual_planets,missing:r=>r.last?.accuracy?.missing_planets,
+    missingShare:r=>r.last?.accuracy?r.last.accuracy.missing_planets/Math.max(1,r.last.accuracy.actual_planets):null,
+    centerError:r=>r.last?.accuracy?.median_center_error,rmse:r=>r.last?.fit_rmse,converged:r=>r.last?.fit_converged==null?null:r.last.fit_converged?1:0,
+  };
+  const overviewColumns=[['id','#'],['kind','kind'],['name','name'],['decisions','decisions'],['shots','shots'],['estimated','est. planets'],['disclosed','disclosed'],['missing','missing'],['missingShare','missing %'],['centerError','median center err'],['rmse','fit RMSE'],['converged','converged']];
+  function middle(values){const a=values.filter(Number.isFinite).sort((x,y)=>x-y);if(!a.length)return null;const m=a.length>>1;return a.length%2?a[m]:(a[m-1]+a[m])/2;}
+  async function loadOverview(){try{overviewRows=(await api('/api/overview')).captures;renderOverview();}catch(e){setStatus(e.message);}}
+  function renderOverview(){
+    const kind=$('overviewKind').value,rows=overviewRows.filter(r=>kind==='all'||r.kind===kind);
+    const sortValue=overviewValue[overviewSort.key];
+    rows.sort((a,b)=>{const x=sortValue(a),y=sortValue(b);if(x==null&&y==null)return 0;if(x==null)return 1;if(y==null)return -1;return (x<y?-1:x>y?1:0)*overviewSort.dir;});
+    const withTruth=rows.filter(r=>r.last?.accuracy);
+    const pct=v=>Number.isFinite(v)?`${fmt(v*100,0)}%`:'—';
+    kv($('globalMetrics'),[
+      ['Captures shown',`${rows.length} · ${rows.filter(r=>r.kind==='live').length} live, ${rows.filter(r=>r.kind==='scenario').length} scenario`],
+      ['Shots · decisions',`${rows.reduce((s,r)=>s+r.shots,0)} · ${rows.reduce((s,r)=>s+r.decisions,0)}`],
+      ['With a disclosed map and a decision',String(withTruth.length)],
+      ['Median final missing share',pct(middle(withTruth.map(overviewValue.missingShare)))],
+      ['Median final center error',Number.isFinite(middle(withTruth.map(overviewValue.centerError)))?`${fmt(middle(withTruth.map(overviewValue.centerError)))} units`:'—'],
+      ['Median final fit RMSE',Number.isFinite(middle(rows.map(overviewValue.rmse)))?`${fmt(middle(rows.map(overviewValue.rmse)))} units`:'—'],
+    ]);
+    const table=$('overviewTable');table.replaceChildren();
+    const head=document.createElement('tr');
+    for(const [key,label] of overviewColumns){const th=document.createElement('th');th.textContent=label+(overviewSort.key===key?(overviewSort.dir>0?' ▲':' ▼'):'');th.addEventListener('click',()=>{overviewSort={key,dir:overviewSort.key===key?-overviewSort.dir:-1};renderOverview();});head.append(th);}
+    table.append(head);
+    for(const r of rows){
+      const a=r.last?.accuracy,tr=document.createElement('tr');tr.className='row';
+      tr.title=`${new Date(r.started_at_unix_ms).toLocaleString()}${r.revision?` · ${r.revision.slice(0,8)}`:''}${r.last?.stage?` · ${r.last.stage}`:''}`;
+      const cells=[r.id,r.kind,r.name,r.decisions,r.shots,r.last?.planets??'—',a?.actual_planets??'—',a?.missing_planets??'—',a?pct(a.missing_planets/Math.max(1,a.actual_planets)):'—',a&&a.median_center_error!=null?fmt(a.median_center_error,1):'—',Number.isFinite(r.last?.fit_rmse)?fmt(r.last.fit_rmse,1):'—',r.last?.fit_converged==null?'—':r.last.fit_converged?'yes':'no'];
+      for(const c of cells){const td=document.createElement('td');td.textContent=String(c);tr.append(td);}
+      tr.addEventListener('click',()=>openCapture(r.id));table.append(tr);
+    }
+  }
+  function openCapture(id){$('capture').value=String(id);$('overview').hidden=true;document.querySelector('main').hidden=false;resetView();loadDecisions();}
+  $('overviewBtn').addEventListener('click',()=>{const showing=!$('overview').hidden;$('overview').hidden=showing;document.querySelector('main').hidden=!showing;if(!showing)loadOverview();else{render();drawScrub();}});
+  $('overviewKind').addEventListener('change',renderOverview);
+
   // ---- Layers: Gravity, Uncertainty, Evidence and Error are self-contained modes; the client derives every vector from the per-sample fields ----
   function syncLayerButtons(){
     const hasOracle=Boolean(snapshot?.actual_planets),shown=shownLayer();
@@ -342,5 +382,6 @@
   });
   canvas.addEventListener('mouseleave',()=>{tip.style.display='none';});
   canvas.addEventListener('click',e=>{if(panned){panned=false;return;}if(!snapshot||viewDrag)return;const m=mapPoint(e);sel=hitTest(m.x,m.y,m.tol)||{kind:'point',x:m.x,y:m.y};render();});
+  loadOverview();
   loadCaptures().catch(e=>setStatus(e.message));
 })();

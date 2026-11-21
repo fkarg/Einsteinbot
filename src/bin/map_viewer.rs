@@ -91,6 +91,7 @@ fn handle(mut stream: TcpStream, db_path: &PathBuf) -> Result<(), Box<dyn Error>
     let parameters = parse_query(query);
     let result = match path {
         "/api/captures" => list_captures(db_path),
+        "/api/overview" => capture_overview(db_path),
         "/api/decisions" => {
             required_id(&parameters, "id").and_then(|id| list_decisions(db_path, id))
         }
@@ -192,6 +193,89 @@ fn list_captures(path: &PathBuf) -> Result<Value, String> {
     Ok(json!({"captures": captures}))
 }
 
+/// One summary row per capture for the landing table. Only each capture's last decision is parsed.
+fn capture_overview(path: &PathBuf) -> Result<Value, String> {
+    let connection = open_database(path)?;
+    let mut counts: BTreeMap<(i64, String), i64> = BTreeMap::new();
+    let mut statement = connection
+        .prepare(
+            "SELECT capture_id, event_type, COUNT(*) FROM events GROUP BY capture_id, event_type",
+        )
+        .map_err(|error| error.to_string())?;
+    for row in statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+    {
+        let (id, kind, count) = row.map_err(|error| error.to_string())?;
+        counts.insert((id, kind), count);
+    }
+    let mut captures = Vec::new();
+    let mut statement = connection
+        .prepare("SELECT id, started_at_unix_ms, ended_at_unix_ms, metadata_json FROM captures ORDER BY id DESC")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?;
+    for row in rows {
+        let (id, started, ended, metadata) = row.map_err(|error| error.to_string())?;
+        let metadata: Value = serde_json::from_str(&metadata).unwrap_or(Value::Null);
+        let count = |kind: &str| counts.get(&(id, kind.to_owned())).copied().unwrap_or(0);
+        let decisions: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM diagnostics WHERE capture_id=?1 AND kind='target_decision'",
+                [id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let last = connection
+            .query_row(
+                "SELECT sequence, data_json FROM diagnostics WHERE capture_id=?1 AND kind='target_decision' ORDER BY sequence DESC LIMIT 1",
+                [id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .ok()
+            .and_then(|(sequence, text)| {
+                let data: Value = serde_json::from_str(&text).ok()?;
+                let belief = &data["map_belief"];
+                let disclosed = disclosed_maps(&connection, id).ok()?;
+                Some(json!({
+                    "sequence": sequence,
+                    "stage": data["scenario"]["stage"],
+                    "planets": belief["planets"].as_array().map(Vec::len),
+                    "fit_rmse": belief["model_position_rmse"],
+                    "fit_converged": belief["fit_converged"],
+                    "accuracy": decision_accuracy(&disclosed, sequence, belief),
+                }))
+            });
+        captures.push(json!({
+            "id": id,
+            "started_at_unix_ms": started,
+            "ended_at_unix_ms": ended,
+            "kind": if metadata["host"] == "synthetic-scenario" { "scenario" } else { "live" },
+            "name": metadata["client_name"],
+            "revision": metadata["build"]["git_revision"],
+            "shots": count("shot_fin"),
+            "events": counts.range((id, String::new())..).take_while(|((capture, _), _)| *capture == id).map(|(_, n)| n).sum::<i64>(),
+            "decisions": decisions,
+            "last": last,
+        }));
+    }
+    Ok(json!({"captures": captures}))
+}
+
 fn list_decisions(path: &PathBuf, capture_id: i64) -> Result<Value, String> {
     let connection = open_database(path)?;
     let mut statement = connection
@@ -204,23 +288,7 @@ fn list_decisions(path: &PathBuf, capture_id: i64) -> Result<Value, String> {
             let data: Value = serde_json::from_str(&data).unwrap_or(Value::Null);
             let belief = &data["map_belief"];
             let sequence: i64 = row.get(0)?;
-            let accuracy = disclosed
-                .iter()
-                .rev()
-                .find(|(planets_sequence, _)| *planets_sequence < sequence)
-                .and_then(|(_, actual)| {
-                    let estimated: Vec<Planet> =
-                        serde_json::from_value(belief["planets"].clone()).ok()?;
-                    let pairs = match_planets(&estimated, actual);
-                    let mut errors: Vec<f64> = pairs.iter().map(|pair| pair.2).collect();
-                    errors.sort_by(f64::total_cmp);
-                    Some(json!({
-                        "actual_planets": actual.len(),
-                        "matched_planets": pairs.len(),
-                        "missing_planets": actual.len() - pairs.len(),
-                        "median_center_error": median(&errors),
-                    }))
-                });
+            let accuracy = decision_accuracy(&disclosed, sequence, belief);
             Ok(json!({
                 "sequence": sequence,
                 "timestamp_unix_ms": row.get::<_, i64>(1)?,
@@ -374,6 +442,28 @@ fn match_planets(estimated: &[Planet], actual: &[Planet]) -> Vec<(usize, usize, 
     }
     pairs.sort_by_key(|pair| pair.1);
     pairs
+}
+
+/// How well a decision's belief matches the latest disclosed map before it, if there is both.
+fn decision_accuracy(
+    disclosed: &[(i64, Vec<Planet>)],
+    sequence: i64,
+    belief: &Value,
+) -> Option<Value> {
+    let (_, actual) = disclosed
+        .iter()
+        .rev()
+        .find(|(planets_sequence, _)| *planets_sequence < sequence)?;
+    let estimated: Vec<Planet> = serde_json::from_value(belief["planets"].clone()).ok()?;
+    let pairs = match_planets(&estimated, actual);
+    let mut errors: Vec<f64> = pairs.iter().map(|pair| pair.2).collect();
+    errors.sort_by(f64::total_cmp);
+    Some(json!({
+        "actual_planets": actual.len(),
+        "matched_planets": pairs.len(),
+        "missing_planets": actual.len() - pairs.len(),
+        "median_center_error": median(&errors),
+    }))
 }
 
 /// Median of an ascending slice; `None` when empty.
@@ -1220,6 +1310,24 @@ mod tests {
         let pairs = match_planets(&[planet(0.0), planet(79.0)], &[planet(1.0), planet(-79.0)]);
         assert_eq!(pairs.len(), 1);
         assert_eq!((pairs[0].0, pairs[0].1), (0, 0));
+    }
+
+    #[test]
+    fn decision_accuracy_needs_a_belief_and_an_earlier_disclosed_map() {
+        let planet = |x: f64| Planet {
+            x,
+            y: 0.0,
+            radius: 20.0,
+            mass: 1000.0,
+        };
+        let disclosed = vec![(10, vec![planet(0.0), planet(500.0)])];
+        let belief = json!({"planets": [planet(3.0)]});
+        assert_eq!(decision_accuracy(&disclosed, 9, &belief), None);
+        assert_eq!(decision_accuracy(&disclosed, 11, &Value::Null), None);
+        let accuracy = decision_accuracy(&disclosed, 11, &belief).unwrap();
+        assert_eq!(accuracy["missing_planets"], 1);
+        assert_eq!(accuracy["matched_planets"], 1);
+        assert_eq!(accuracy["median_center_error"], 3.0);
     }
 
     #[test]

@@ -6,7 +6,7 @@
   <title>Einsteinbot map inspector</title>
   <style>
     :root { color-scheme: dark; font: 14px/1.45 system-ui, sans-serif; background:#0b1018; color:#e7edf6; }
-    * { box-sizing:border-box; }
+    * { box-sizing:border-box; } [hidden] { display:none !important; }
     body { margin:0; min-width:320px; }
     header { display:flex; align-items:center; gap:12px; flex-wrap:wrap; padding:12px 16px; border-bottom:1px solid #263244; background:#111a27; }
     h1 { font-size:17px; margin:0 12px 0 0; letter-spacing:.02em; }
@@ -45,6 +45,7 @@
     details.explain p { margin:7px 0; }
     .layers { display:flex; } .layer { background:#172334; border-color:#34445a; border-radius:0; } .layer:first-child { border-radius:5px 0 0 5px; } .layer:last-child { border-radius:0 5px 5px 0; } .layer.active { background:#21476a; border-color:#ffe27a; color:#ffe27a; } .layer:disabled { opacity:.45; cursor:not-allowed; }
     details.explain ul { margin:6px 0; padding-left:18px; }
+    .overview { padding:12px 16px; display:flex; flex-direction:column; gap:10px; max-width:1500px; } .overview .table th { cursor:pointer; user-select:none; } .overview .table th:nth-child(-n+3), .overview .table td:nth-child(-n+3) { text-align:left; }
     .scrubbar { display:flex; gap:6px; align-items:center; flex-wrap:wrap; } .scrubbar button { padding:3px 9px; }
     #scrub { width:100%; height:104px; background:#080d13; border:1px solid #263244; border-radius:5px; cursor:ew-resize; touch-action:none; }
     .table { width:100%; border-collapse:collapse; font:11px/1.4 ui-monospace,monospace; color:#b6c5d8; }
@@ -59,10 +60,19 @@
     <h1>Einsteinbot map inspector</h1>
     <label>Capture <select id="capture"></select></label>
     <label>Bot <select id="bot"><option value="all">All bots</option></select></label>
+    <button id="overviewBtn" title="All captures with error metrics">Captures</button>
     <button id="refresh">Refresh capture</button>
     <span id="status"></span>
   </header>
-  <main>
+  <section id="overview" class="overview">
+    <div class="toolbar">
+      <label>Show <select id="overviewKind"><option value="all">all captures</option><option value="live">live runs</option><option value="scenario">synthetic scenarios</option></select></label>
+      <span class="note">Click a column to sort, a row to open that capture at its latest state. Error columns need a disclosed map (<code>sendplanets 1</code> live, always present in scenarios).</span>
+    </div>
+    <div id="globalMetrics" class="metrics"></div>
+    <table id="overviewTable" class="table"></table>
+  </section>
+  <main hidden>
     <section class="map-area">
       <div class="scrubbar">
         <button id="prevDecision" title="Previous decision (Shift+←)">⏮</button><button id="prevEvent" title="Previous event (←)">◀</button><button id="nextEvent" title="Next event (→)">▶</button><button id="nextDecision" title="Next decision (Shift+→)">⏭</button><button id="latest" title="Latest state (End)">Latest</button>
