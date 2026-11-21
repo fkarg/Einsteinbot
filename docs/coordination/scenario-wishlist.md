@@ -64,3 +64,25 @@ Absent fields mean "unlabeled"; the viewer must keep working on the 17 existing 
 - Which of the pass criteria conflict with the metrics your runner reports?
 - Is the generator's radius range (20–40) and the 24-planet count the right scale for W7, and which seeds should be frozen as the report split?
 - Can `scenario.intended` be produced by the scenario definition itself (it knows which planets it hid)?
+
+## 7. Added 2026-11-21 (user idea): degradation ladders from perfect information
+
+The families in §2 start from a blank or partial belief and add evidence. The inverse is just as informative: start with the **truth map as the belief** and degrade it one factor at a time, measuring how targeting falls apart. This isolates which kind and size of error actually costs hits.
+
+Evidence that the baseline is sound (viewer session, captures 41–44, disclosed maps): re-simulating each observed shot under the disclosed map reproduces the observed path to median 0.000 and max 1.3 units RMSE (311 of 312 shots under 1 unit), and 53 of 56 predicted victims did not move between decision and impact. So with perfect information, path prediction is exact and targets are almost always static: perfect-map targeting should be near-perfect, limited by search coverage (the policy on the disclosed map still returns `Approach` instead of `Hit` for 15 of 72 decisions) and by players that relocate (3 of 56).
+
+Proposed measurement (oracle-evaluated hit): choose a shot with the **degraded** belief, then simulate that shot on the **true** map with the real player positions; it hits only if the true path reaches a player. No live run needed, fully deterministic.
+
+| ID | `defect_class` | Degradation applied to the true map | Sweep |
+| --- | --- | --- | --- |
+| D1 | `drop_planet` | remove one planet (nearest to the shot, farthest, largest, smallest) | which planet; number removed 1..k |
+| D2 | `displace_planet` | move one planet | d = 2, 5, 10, 20, 40 units, several directions |
+| D3 | `resize_planet` | change radius (mass follows radius³) | ±2, ±5, ±10 units |
+| D4 | `phantom_planet` | add a planet that does not exist | distance from path, radius |
+| D5 | `stale_player` | targets move after the decision (positions from before) | displacement, delay |
+| D6 | `noisy_map` | jitter every planet's position/radius with a given σ | σ ladder |
+| D7 | `residual_only` | replace planets with the local residual correction fitted to the true field near observed paths | support radius, path count |
+
+Per rung report: oracle-evaluated hit rate over a fixed set of target configurations, median miss distance, path RMSE of the chosen shot, and whether the policy still claims a hit (predicted-hit rate minus real-hit rate is the overconfidence gap, which is the number that matters for exploration).
+
+Ownership follows §5: runner and metrics stay with the estimator session; the viewer session can add the same experiment to the shot review (select a decision, degrade the disclosed map, show the resulting path and miss) because it already has the repair machinery in the other direction.
