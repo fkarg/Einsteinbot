@@ -22,6 +22,8 @@ use std::path::PathBuf;
 mod degrade;
 #[path = "map_viewer/review.rs"]
 mod review;
+#[path = "map_viewer/scenario.rs"]
+mod scenario;
 
 const PAGE: &str = include_str!("../../web/map_viewer.html");
 const SCRIPT: &str = include_str!("../../web/map_viewer.js");
@@ -278,6 +280,26 @@ fn capture_overview(path: &PathBuf) -> Result<Value, String> {
             "last": last,
         }));
     }
+    // Synthetic scenarios are regenerated per code revision; only the newest of each name is current.
+    let mut newest: BTreeMap<String, i64> = BTreeMap::new();
+    for capture in &captures {
+        if capture["kind"] == "scenario" {
+            let (name, id) = (
+                capture["name"].to_string(),
+                capture["id"].as_i64().unwrap_or(0),
+            );
+            newest
+                .entry(name)
+                .and_modify(|best| *best = (*best).max(id))
+                .or_insert(id);
+        }
+    }
+    for capture in &mut captures {
+        capture["latest_revision"] = json!(
+            capture["kind"] != "scenario"
+                || newest.get(&capture["name"].to_string()) == capture["id"].as_i64().as_ref()
+        );
+    }
     Ok(json!({"captures": captures}))
 }
 
@@ -298,6 +320,7 @@ fn list_decisions(path: &PathBuf, capture_id: i64) -> Result<Value, String> {
                 "sequence": sequence,
                 "timestamp_unix_ms": row.get::<_, i64>(1)?,
                 "bot_name": row.get::<_, String>(2)?,
+                "own_id": data["bot_state"]["own_id"],
                 "accuracy": accuracy,
                 "energy": data["energy"],
                 "choice": data["choice"],
@@ -345,6 +368,7 @@ fn disclosed_maps(
 fn capture_timeline(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Result<Value, String> {
     let capture_id = required_id(parameters, "id")?;
     let connection = open_database(path)?;
+    let roles = scenario::ShotRoles::load(&connection, capture_id)?;
     let mut statement = connection.prepare("SELECT sequence, timestamp_unix_ms, event_type, event_json FROM events WHERE capture_id=?1 ORDER BY sequence")
         .map_err(|error| error.to_string())?;
     let events = statement.query_map([capture_id], |row| {
@@ -359,6 +383,11 @@ fn capture_timeline(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Result
             "player_position" => format!("player {} at ({:.0}, {:.0})", e["player_id"], e["x"].as_f64().unwrap_or(0.0), e["y"].as_f64().unwrap_or(0.0)),
             "shot_begin" => format!("player {} fired v{} at {}°", e["player_id"], e["velocity"], e["angle"]),
             other => other.to_owned(),
+        };
+        let detail = if event_type == "shot_fin" {
+            roles.label(sequence, e).map_or(detail.clone(), |label| format!("{label} · {detail}"))
+        } else {
+            detail
         };
         Ok(json!({"sequence":sequence,"timestamp_unix_ms":row.get::<_,i64>(1)?,"kind":event_type,"detail":detail}))
     }).map_err(|error| error.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|error|error.to_string())?;
@@ -419,6 +448,8 @@ fn world_state(events: &[(i64, Value)], decision_own_id: Option<u64>) -> Value {
     let mut players: BTreeMap<u64, Value> = BTreeMap::new();
     let mut in_flight: BTreeMap<u64, Value> = BTreeMap::new();
     let mut own_id = None;
+    // Distinct earlier positions of each player, so a move reads as a move rather than a respawn.
+    let mut earlier: BTreeMap<u64, Vec<Value>> = BTreeMap::new();
     for (_, record) in events {
         let event = &record["event"];
         let Some(id) = event["player_id"].as_u64() else {
@@ -426,10 +457,19 @@ fn world_state(events: &[(i64, Value)], decision_own_id: Option<u64>) -> Value {
         };
         match event["type"].as_str() {
             Some("player_position") => {
+                let moved = players.get(&id).is_none_or(|old| {
+                    (old["x"].as_f64().unwrap_or(0.0) - event["x"].as_f64().unwrap_or(0.0)).hypot(
+                        old["y"].as_f64().unwrap_or(0.0) - event["y"].as_f64().unwrap_or(0.0),
+                    ) > 0.5
+                });
+                if moved && let Some(old) = players.get(&id) {
+                    earlier.entry(id).or_default().push(old.clone());
+                }
                 players.insert(id, json!({"x": event["x"], "y": event["y"]}));
             }
             Some("player_leave") => {
                 players.remove(&id);
+                earlier.remove(&id);
                 in_flight.remove(&id);
             }
             Some("shot_begin") => {
@@ -448,6 +488,10 @@ fn world_state(events: &[(i64, Value)], decision_own_id: Option<u64>) -> Value {
     json!({
         "players": players.iter().map(|(id, position)| (id.to_string(), position.clone())).collect::<BTreeMap<_, _>>(),
         "own_id": decision_own_id.or(own_id),
+        "ghosts": earlier
+            .into_iter()
+            .map(|(id, positions)| (id.to_string(), positions.into_iter().rev().take(3).rev().collect::<Vec<_>>()))
+            .collect::<BTreeMap<_, _>>(),
         "in_flight": in_flight.into_values().collect::<Vec<_>>(),
     })
 }
@@ -633,6 +677,7 @@ fn selected_snapshot(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Resul
         view,
         display_field,
     )?;
+    let roles = scenario::ShotRoles::load(&connection, capture_id)?;
     let selected_shot = selection.strip_prefix("event:").and_then(|_| {
         events
                 .iter()
@@ -640,7 +685,7 @@ fn selected_snapshot(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Resul
                     *event_sequence == sequence && record["event"]["type"] == "shot_fin"
                 })
                 .map(|(event_sequence, record)| {
-                    json!({"sequence":event_sequence,"event":record["event"]})
+                    json!({"sequence":event_sequence,"event":record["event"],"label":roles.label(*event_sequence, &record["event"])})
                 })
     });
     let trace_map = decode_belief(&data["map_belief"])
@@ -669,7 +714,12 @@ fn selected_snapshot(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Resul
                     trajectory_residual_samples_in_epoch(*sequence, map_epoch_start, &points, map)
                 })
                 .unwrap_or_default();
-            json!({"sequence": sequence, "record": record, "residual_samples": residual_samples})
+            json!({
+                "sequence": sequence,
+                "record": record,
+                "residual_samples": residual_samples,
+                "label": roles.label(*sequence, &record["event"]),
+            })
         })
         .collect::<Vec<_>>();
     // Compare only a belief with the disclosed map it was built against: a `Planets` message newer
@@ -1396,6 +1446,8 @@ mod tests {
         assert_eq!(world["in_flight"].as_array().unwrap().len(), 1);
         assert_eq!(world["in_flight"][0]["velocity"], 8.0);
         assert_eq!(world_state(&events, Some(2))["own_id"], 2);
+        // Player 1 moved once, so its first position is remembered; player 2 left, so it has none.
+        assert_eq!(world["ghosts"], json!({"1": [{"x": 200.0, "y": 400.0}]}));
     }
 
     #[test]

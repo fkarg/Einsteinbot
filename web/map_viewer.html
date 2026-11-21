@@ -67,7 +67,7 @@
   </header>
   <section id="overview" class="overview">
     <div class="toolbar">
-      <label>Show <select id="overviewKind"><option value="all">all captures</option><option value="live">live runs</option><option value="scenario">synthetic scenarios</option></select></label>
+      <label>Show <select id="overviewKind"><option value="all">live runs and current scenarios</option><option value="live">live runs</option><option value="scenario">synthetic scenarios (latest revision)</option><option value="history">scenario history (every revision)</option></select></label>
       <span class="note">Click a column to sort, a row to open that capture at its latest state. Error columns need a disclosed map (<code>sendplanets 1</code> live, always present in scenarios).</span>
     </div>
     <div id="globalMetrics" class="metrics"></div>
@@ -106,6 +106,7 @@
           <li>Disclosed planets are the game's own map, for diagnosis only. A disclosed planet is a <b>close match</b> when an estimate lies within 10 units and 5 units of radius; <b>center off</b> / <b>size off</b> exceed one threshold; <b>missing</b> has no estimate within 80 units. Pairs are one-to-one, closest first.</li>
           <li>Contacts are path endpoints the estimator accepted as surface hits, not every collision. The pink diamond is a field-only source: a gravity explanation, never collision geometry.</li>
           <li><b>Shot review</b> re-simulates the decision's chosen shot under the recorded belief and compares it with the shot that actually followed. Outcomes are read off the observed endpoint and are inferences, not server reports. The green timeline line is each decision's belief scored against the next 5 observed shots (median path error), which needs no disclosed map. Repairs change one planet of the belief to the disclosed one and re-simulate: a sensitivity, not proof of cause.</li>
+          <li>Faded dots are where a player stood before it moved. Scenario shots are labelled from what the scenario generator recorded: <b>training</b> shots build the baseline information, the <b>trial</b> shot is the policy's shot (muted versus bold lines).</li>
           <li>“Map events pending” in the decision panel means the snapshot may lag the latest observations.</li>
         </ul>
       </details>

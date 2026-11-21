@@ -3,13 +3,15 @@
   const $=id=>document.getElementById(id);
   const canvas=$('map'),ctx=canvas.getContext('2d');
   let captureId=null, decisions=[], snapshot=null, simulations=[],timeline=[],sel=null,selScope=null,snapshotRequest=0;
-  let position='none',layer='gravity',corrections=true;
+  let position='none',layer='gravity',corrections=true,botNames=new Map();
   const GRID_STEP=3,LAYER_NAMES={gravity:'Gravity',uncertainty:'Field uncertainty',evidence:'Residual evidence',error:'Error vs disclosed'};
   const STATUS_LABEL={unknown:'no comparable belief',ok:'close match',location:'center off',size:'size off',both:'center and size off',missing:'missing'},LOCATION_TOL=10,SIZE_TOL=5,STATUS_COLORS={unknown:'#60dcff',ok:'#60dcff',location:'#ff9d4d',size:'#e8d96d',both:'#ff7a5c',missing:'#ff4d6a'};
   let view={x:0,y:0,width:W,height:H}, viewDrag=null, panned=false;
   const colors=['#54c8ff','#ffb45c','#b791ff','#7de3a1','#ff7899','#e8d96d','#88a7ff','#ffa1dc'];
   function setStatus(s){ $('status').textContent=s||''; }
   function fmt(v,n=2){ return v===null||v===undefined||v===''?'—':Number.isFinite(Number(v))?Number(v).toFixed(n):'—'; }
+  // The protocol identifies players by id only; our bots' names come from the decisions they recorded.
+  const pname=id=>botNames.has(String(id))?`${id} ${botNames.get(String(id))}`:String(id);
   function selected(){ return Number(position); }
   function q(v){return encodeURIComponent(v);}
   async function api(path){const r=await fetch(path,{cache:'no-store'});const data=await r.json();if(!r.ok||data.error)throw new Error(data.error||r.statusText);return data;}
@@ -17,12 +19,12 @@
   async function fillCaptureSelect(){
     setStatus('Loading captures…');
     const data=await api('/api/captures'); const select=$('capture'); select.replaceChildren();
-    for(const c of data.captures){const option=document.createElement('option');option.value=c.id;const date=new Date(c.started_at_unix_ms).toLocaleString();const kind=c.metadata?.host==='synthetic-scenario'?'scenario':'live',revision=c.metadata?.build?.git_revision;option.textContent=`#${c.id} · ${kind} · ${c.metadata?.client_name||'capture'}${revision?` · ${revision.slice(0,8)}`:''} · ${date}`;select.append(option);}
+    for(const c of data.captures){const option=document.createElement('option');option.value=c.id;const date=new Date(c.started_at_unix_ms).toLocaleString();const kind=c.metadata?.host==='synthetic-scenario'?'scenario':'live',revision=c.metadata?.build?.git_revision,older=kind==='scenario'&&data.captures.some(o=>o.metadata?.host==='synthetic-scenario'&&o.metadata?.client_name===c.metadata?.client_name&&o.id>c.id);option.textContent=`#${c.id} · ${kind}${older?' (older revision)':''} · ${c.metadata?.client_name||'capture'}${revision?` · ${revision.slice(0,8)}`:''} · ${date}`;select.append(option);}
     if(!data.captures.length){setStatus('No captures in this database');return false;}
     setStatus('');return true;
   }
   async function loadDecisions(preferredBot=null){
-    captureId=Number($('capture').value);timeline=[];drawScrub(); const id=captureId,data=await api(`/api/decisions?id=${id}`); if(id!==captureId)return; decisions=data.decisions;
+    captureId=Number($('capture').value);timeline=[];drawScrub(); const id=captureId,data=await api(`/api/decisions?id=${id}`); if(id!==captureId)return; decisions=data.decisions;botNames=new Map(decisions.filter(d=>d.own_id!=null&&d.bot_name!=='scenario').map(d=>[String(d.own_id),d.bot_name]));
     const bots=[...new Set(decisions.map(d=>d.bot_name))]; const bot=$('bot');const old=preferredBot||bot.value;bot.replaceChildren();
     for(const name of ['all',...bots]){const op=document.createElement('option');op.value=name;op.textContent=name==='all'?'All bots':name;bot.append(op);}
     bot.value=bots.includes(old)?old:'all'; fillDecisionList();
@@ -63,12 +65,13 @@
     for(const p of samples){const raw=heatValue(p);if(!Number.isFinite(raw))continue;const t=Math.max(0,Math.min(1,(raw-lo)/(hi-lo)));ctx.fillStyle=l==='evidence'?(p.supported?'rgba(42,170,140,.35)':'rgba(0,0,0,.22)'):heatColor(t);ctx.fillRect(p.x,p.y,snapshot.field_grid.step,snapshot.field_grid.step);}
     if(!values.length){ctx.save();ctx.setTransform(1,0,0,1,0,0);ctx.fillStyle='#ffc66d';ctx.font='14px system-ui';ctx.fillText(l==='uncertainty'?'Uncertainty unavailable: this snapshot has no fit covariance (rank-deficient, too few paths, or not converged).':l==='evidence'?'No residual evidence in this snapshot.':'No field values for this layer in this snapshot.',16,28);ctx.restore();}
     if($('pathResiduals').checked){const residuals=(snapshot.events||[]).flatMap(e=>e.residual_samples||[]),mags=residuals.map(r=>Math.hypot(r[2],r[3])).sort((a,b)=>a-b),cap=mags.length?mags[Math.floor((mags.length-1)*.95)]:null;$('pathScale').style.display=residuals.length?'grid':'none';$('pathMax').textContent=Number.isFinite(cap)?fmt(cap,4):'no data';$('pathScaleBar').title=`Path residual magnitude, colors clip at the 95th percentile (${fmt(cap,6)})`;for(const r of residuals){const t=Math.max(0,Math.min(1,Math.hypot(r[2],r[3])/(cap||1)));ctx.beginPath();ctx.arc(r[0],r[1],1.7,0,Math.PI*2);ctx.fillStyle=heatColor(t);ctx.fill();}}else $('pathScale').style.display='none';
-    if($('paths').checked){const paths=(snapshot.events||[]).filter(e=>e.record?.event?.type==='shot_fin');for(const item of paths){const e=item.record.event;if(!e.points?.length)continue;ctx.beginPath();ctx.moveTo(e.points[0].x,e.points[0].y);for(const p of e.points)ctx.lineTo(p.x,p.y);ctx.strokeStyle=colors[e.player_id%colors.length]+(newerThanBelief(item)?'99':'55');ctx.lineWidth=1.2;ctx.setLineDash(newerThanBelief(item)?[5,4]:[]);ctx.stroke();ctx.setLineDash([]);const end=e.points.at(-1);ctx.beginPath();ctx.arc(end.x,end.y,2.8,0,Math.PI*2);ctx.fillStyle=colors[e.player_id%colors.length]+'bb';ctx.fill();}}
+    if($('paths').checked){const paths=(snapshot.events||[]).filter(e=>e.record?.event?.type==='shot_fin');for(const item of paths){const e=item.record.event;if(!e.points?.length)continue;ctx.beginPath();ctx.moveTo(e.points[0].x,e.points[0].y);for(const p of e.points)ctx.lineTo(p.x,p.y);ctx.strokeStyle=colors[e.player_id%colors.length]+(item.label==='trial'?'ee':item.label?.startsWith('training')?'33':newerThanBelief(item)?'99':'55');ctx.lineWidth=item.label==='trial'?2.6:item.label?1:1.2;ctx.setLineDash(newerThanBelief(item)?[5,4]:[]);ctx.stroke();ctx.setLineDash([]);const end=e.points.at(-1);ctx.beginPath();ctx.arc(end.x,end.y,2.8,0,Math.PI*2);ctx.fillStyle=colors[e.player_id%colors.length]+'bb';ctx.fill();if(item.label){ctx.fillStyle='#cfd8e6';ctx.font='12px system-ui';ctx.fillText(item.label,e.points[0].x+8,e.points[0].y+16);}}}
     if($('beliefPlanets').checked){for(const p of snapshot.diagnostic?.map_belief?.planets||[])circle(p,'#ffc45b',true);}
     if($('actualPlanets').checked){const status=disclosedStatuses();(snapshot.actual_planets||[]).forEach((p,i)=>{const s=status[i]?.status||'ok';circle(p,STATUS_COLORS[s],false);if(s!=='ok'&&s!=='unknown'){ctx.fillStyle=STATUS_COLORS[s];ctx.font='12px system-ui';ctx.fillText(`#${i}`,p.x+p.radius*.7,p.y-p.radius*.7-3);}});}
     drawHypothesis();
     if($('contacts').checked){ctx.fillStyle='#c58cff';for(const p of snapshot.diagnostic?.map_belief?.contact_points||[]){ctx.beginPath();ctx.arc(p.x,p.y,3,0,Math.PI*2);ctx.fill();}}
-    const players=snapshot.world?.players||{};for(const [id,p] of Object.entries(players)){ctx.beginPath();ctx.arc(p.x,p.y,id===String(snapshot.world?.own_id)?8:6,0,Math.PI*2);ctx.fillStyle=id===String(snapshot.world?.own_id)?'#f4f7ff':colors[Number(id)%colors.length];ctx.fill();ctx.strokeStyle='#080d13';ctx.lineWidth=2;ctx.stroke();ctx.fillStyle='#fff';ctx.font='12px system-ui';ctx.fillText(id,p.x+8,p.y-8);}
+    for(const [id,list] of Object.entries(snapshot.world?.ghosts||{}))list.forEach((g,k)=>{ctx.beginPath();ctx.arc(g.x,g.y,6,0,Math.PI*2);ctx.globalAlpha=.12+.1*k;ctx.fillStyle=colors[Number(id)%colors.length];ctx.fill();ctx.globalAlpha=1;});
+    const players=snapshot.world?.players||{};for(const [id,p] of Object.entries(players)){ctx.beginPath();ctx.arc(p.x,p.y,id===String(snapshot.world?.own_id)?8:6,0,Math.PI*2);ctx.fillStyle=id===String(snapshot.world?.own_id)?'#f4f7ff':colors[Number(id)%colors.length];ctx.fill();ctx.strokeStyle='#080d13';ctx.lineWidth=2;ctx.stroke();ctx.fillStyle='#fff';ctx.font='12px system-ui';ctx.fillText(pname(id),p.x+8,p.y-8);}
     for(const sim of simulations){const pts=sim.data.points||[];if(!pts.length)continue;ctx.beginPath();ctx.moveTo(pts[0].x,pts[0].y);for(const p of pts)ctx.lineTo(p.x,p.y);ctx.strokeStyle=sim.color;ctx.lineWidth=3;ctx.stroke();}
     if(sel?.kind==='shot'&&sel.event?.points?.length){const pts=sel.event.points;ctx.beginPath();ctx.moveTo(pts[0].x,pts[0].y);for(const p of pts)ctx.lineTo(p.x,p.y);ctx.strokeStyle='#fff2a8';ctx.lineWidth=3;ctx.stroke();const end=pts.at(-1);ctx.beginPath();ctx.arc(end.x,end.y,6,0,Math.PI*2);ctx.strokeStyle='#fff2a8';ctx.lineWidth=2;ctx.stroke();}
     drawReview();
@@ -136,7 +139,7 @@
   function middle(values){const a=values.filter(Number.isFinite).sort((x,y)=>x-y);if(!a.length)return null;const m=a.length>>1;return a.length%2?a[m]:(a[m-1]+a[m])/2;}
   async function loadOverview(){try{overviewRows=(await api('/api/overview')).captures;renderOverview();}catch(e){setStatus(e.message);}}
   function renderOverview(){
-    const kind=$('overviewKind').value,rows=overviewRows.filter(r=>kind==='all'||r.kind===kind);
+    const kind=$('overviewKind').value,rows=overviewRows.filter(r=>kind==='history'?r.kind==='scenario':r.latest_revision&&(kind==='all'||r.kind===kind));
     const sortValue=overviewValue[overviewSort.key];
     rows.sort((a,b)=>{const x=sortValue(a),y=sortValue(b);if(x==null&&y==null)return 0;if(x==null)return 1;if(y==null)return -1;return (x<y?-1:x>y?1:0)*overviewSort.dir;});
     const withTruth=rows.filter(r=>r.last?.accuracy);
@@ -175,7 +178,7 @@
   function terminationText(t){
     switch(t?.kind){
       case 'planet_collision':return `planet #${t.planet_index}`;
-      case 'player_collision':return `player ${t.player_id}`;
+      case 'player_collision':return `player ${pname(t.player_id)}`;
       case 'battlefield_margin':return 'left the battlefield';
       case 'sample_limit':return 'sample limit';
       default:return '—';
@@ -183,7 +186,7 @@
   }
   function outcomeText(o){
     switch(o?.kind){
-      case 'player':return `player ${o.player_id} (${fmt(o.distance,1)} units)`;
+      case 'player':return `player ${pname(o.player_id)} (${fmt(o.distance,1)} units)`;
       case 'planet':return `${o.source} planet #${o.index} surface`;
       case 'battlefield_margin':return 'left the battlefield';
       case 'sample_limit':return 'sample limit';
@@ -207,7 +210,7 @@
     if(!review){kv(summary,[['Select a decision to review its shot.',null]]);return;}
     if(review.loading){kv(summary,[['Loading shot review…',null]]);return;}
     if(review.error){kv(summary,[[review.error,null]]);return;}
-    const d=review.decision,chosen=d.velocity==null?'no shot chosen':`v${d.velocity} at ${d.angle_degrees}° by player ${d.own_id}`;
+    const d=review.decision,chosen=d.velocity==null?'no shot chosen':`v${d.velocity} at ${d.angle_degrees}° by player ${pname(d.own_id)}`;
     const predicted=d.velocity==null?'—':`${d.reason||'shot'}${d.predicted_victim!=null?` on player ${d.predicted_victim}`:''} · center miss ${fmt(d.miss_distance)} units`;
     if(!review.shot){kv(summary,[['Chosen shot',chosen],['Predicted',predicted],[review.reason,null]]);return;}
     const s=review.shot;
@@ -273,7 +276,7 @@
       const f=r.perfect_shot_on_damaged_map,c=r.claimed,re=r.real;
       const fixed=f.hit?'still hits':`closest approach ${fmt(f.closest_approach,1)}`;
       const chose=!c?'no shot':`${c.reason} v${c.velocity}@${c.angle_degrees}°${c.predicted_victim!=null?` → ${c.predicted_victim}`:''}`;
-      const real=!re?'—':re.hit_intended?'hits':re.hit_player!=null?`hits player ${re.hit_player}${c?.predicted_victim==null?' (the bot expected no hit)':' (not the intended target)'}`:`${re.closest_approach==null?'no target':`closest approach ${fmt(re.closest_approach,1)}`} (${terminationText(re.termination)})`;
+      const real=!re?'—':re.hit_intended?'hits':re.hit_player!=null?`hits player ${pname(re.hit_player)}${c?.predicted_victim==null?' (the bot expected no hit)':' (not the intended target)'}`:`${re.closest_approach==null?'no target':`closest approach ${fmt(re.closest_approach,1)}`} (${terminationText(re.termination)})`;
       table.append(row([r.label,fixed,chose,real],`row${degrade.selected===i?' pinned':''}`,()=>{degrade.selected=i;renderDegrade();render();}));
     });
     const note=document.createElement('div');note.className='note';note.textContent=`${degrade.note} Distances are center to center (a player's radius is 4). Click a row to draw it: orange dashed is the path the bot expected, blue is what happens on the true map.`;
@@ -367,7 +370,7 @@
   }
   function scrubTip(i){
     const item=timeline[i],d=item.kind==='decision'?decisionAt(item.sequence):null;
-    const lines=[`#${item.sequence} ${item.kind} · ${item.detail}`,new Date(item.timestamp_unix_ms).toLocaleTimeString()];
+    const lines=[`#${item.sequence} ${item.kind} · ${item.detail.replace(/player (\d+)/g,(m,id)=>`player ${pname(id)}`)}`,new Date(item.timestamp_unix_ms).toLocaleTimeString()];
     if(d)lines.push(`${d.bot_name} · ${d.map_planets} planets · fit RMSE ${fmt(d.fit_rmse)} · ${d.fit_converged?'converged':'not converged'}`);
     const pr=d&&predictive.get(d.sequence);if(pr?.shots)lines.push(`next ${predictiveHorizon} shots: median path error ${fmt(pr.median_rmse,1)} (${pr.shots} observed)`);
     if(d?.accuracy)lines.push(`${d.accuracy.missing_planets} of ${d.accuracy.actual_planets} disclosed planets missing · median center error ${fmt(d.accuracy.median_center_error,1)}`);
@@ -414,8 +417,8 @@
     if($('actualPlanets').checked){const index=nearestPlanetIndex(x,y,tol,snapshot.actual_planets||[]);if(index>=0)return {kind:'actual',index};}
     if($('paths').checked){
       let best=null;
-      for(const item of snapshot.events||[]){const e=item.record?.event;if(e?.type!=='shot_fin')continue;let dist=Infinity;for(let i=1;i<(e.points?.length||0);i++)dist=Math.min(dist,segmentDistance(x,y,e.points[i-1],e.points[i]));if(dist<=tol&&(!best||dist<best.dist))best={dist,sequence:item.sequence,event:e};}
-      if(best)return {kind:'shot',sequence:best.sequence,event:best.event};
+      for(const item of snapshot.events||[]){const e=item.record?.event;if(e?.type!=='shot_fin')continue;let dist=Infinity;for(let i=1;i<(e.points?.length||0);i++)dist=Math.min(dist,segmentDistance(x,y,e.points[i-1],e.points[i]));if(dist<=tol&&(!best||dist<best.dist))best={dist,sequence:item.sequence,event:e,label:item.label};}
+      if(best)return {kind:'shot',sequence:best.sequence,event:best.event,label:best.label};
     }
     return null;
   }
@@ -446,7 +449,7 @@
     if(o.kind==='player'){
       const p=snapshot.world?.players?.[o.id];if(!p)return null;
       const flying=(snapshot.world?.in_flight||[]).filter(s=>String(s.player_id)===String(o.id)).map(s=>`v${fmt(s.velocity,0)} @ ${fmt(s.angle_degrees,0)}°`);
-      return {title:`Player ${o.id}${String(snapshot.world?.own_id)===String(o.id)?' (this bot)':''}`,rows:[['Last known position',`(${fmt(p.x,1)}, ${fmt(p.y,1)})`],['Shots in flight',flying.join(', ')||'none']]};
+      return {title:`Player ${pname(o.id)}${String(snapshot.world?.own_id)===String(o.id)?' (this bot)':''}`,rows:[['Last known position',`(${fmt(p.x,1)}, ${fmt(p.y,1)})`],['Shots in flight',flying.join(', ')||'none']]};
     }
     if(o.kind==='contact'){
       const c=b.contact_points?.[o.index];if(!c)return null;
@@ -456,7 +459,7 @@
     if(o.kind==='shot'){
       const e=o.event,pts=e.points||[],end=pts.at(-1);if(!end)return null;
       const est=nearestSurface(end,b.planets),act=nearestSurface(end,actual);
-      return {title:`Trajectory · event #${o.sequence}`,rows:[['Player',String(e.player_id)],['Shot',`v${fmt(e.velocity,0)} at ${fmt(e.angle,1)}°`],['Samples',String(pts.length)],['Endpoint',`(${fmt(end.x,1)}, ${fmt(end.y,1)})`],['Nearest estimated planet',est?`#${est.index} · surface residual ${fmt(est.residual,2)}`:'none'],['Nearest disclosed planet',act?`#${act.index} · surface residual ${fmt(act.residual,2)}${act.residual<1?' · on surface (likely impact)':''}`:'unavailable'],['Belief snapshot',`#${snapshot.diagnostic_sequence??'unavailable'}${d?.map_updating?' · map update pending':''}`]]};
+      return {title:`Trajectory${o.label?` (${o.label})`:''} · event #${o.sequence}`,rows:[['Player',pname(e.player_id)],...(o.label?[['Scenario role',o.label]]:[]),['Shot',`v${fmt(e.velocity,0)} at ${fmt(e.angle,1)}°`],['Samples',String(pts.length)],['Endpoint',`(${fmt(end.x,1)}, ${fmt(end.y,1)})`],['Nearest estimated planet',est?`#${est.index} · surface residual ${fmt(est.residual,2)}`:'none'],['Nearest disclosed planet',act?`#${act.index} · surface residual ${fmt(act.residual,2)}${act.residual<1?' · on surface (likely impact)':''}`:'unavailable'],['Belief snapshot',`#${snapshot.diagnostic_sequence??'unavailable'}${d?.map_updating?' · map update pending':''}`]]};
     }
     if(o.kind==='point')return {title:'Map point',rows:pointRows(o.x,o.y)};
     return null;
