@@ -47,21 +47,12 @@ impl MapBelief {
         let Some(covariance) = &self.parameter_covariance else {
             return None;
         };
-        let Ok(jacobian) = self.map.acceleration_parameter_jacobian(position) else {
+        let Ok(covariance) = self.map.acceleration_covariance(position, covariance) else {
             return None;
         };
-        if covariance.nrows() != jacobian.ncols() || covariance.ncols() != jacobian.ncols() {
-            return None;
-        }
-        // Use only marginal parameter variances for this ranking proxy. Full
-        // covariance propagation is quadratic in planet count and this path
-        // evaluates many candidate trajectories.
-        let variance = (0..jacobian.ncols())
-            .map(|parameter| {
-                (jacobian[(0, parameter)].powi(2) + jacobian[(1, parameter)].powi(2))
-                    * covariance[(parameter, parameter)].max(0.0)
-            })
-            .sum::<f64>();
+        // Include parameter correlations: center/mass uncertainty can reinforce or
+        // cancel in the predicted acceleration at this point.
+        let variance = covariance.xx + covariance.yy;
         Some(variance.max(0.0).sqrt())
     }
 }
@@ -851,6 +842,30 @@ mod tests {
             y: 100.0,
         });
         state
+    }
+
+    #[test]
+    fn gravity_uncertainty_propagates_parameter_correlations() {
+        let map = PlanetMap {
+            planets: vec![crate::protocol::Planet {
+                x: 0.0,
+                y: 0.0,
+                radius: 1.0,
+                mass: 8.0,
+            }],
+        };
+        let mut parameter_covariance = DMatrix::zeros(3, 3);
+        // Perfectly correlated center-x and mass errors reinforce at (2, 0).
+        parameter_covariance[(0, 0)] = 1.0;
+        parameter_covariance[(2, 2)] = 64.0;
+        parameter_covariance[(0, 2)] = 8.0;
+        parameter_covariance[(2, 0)] = 8.0;
+        let belief = MapBelief::new(map, Some(parameter_covariance));
+
+        let uncertainty = belief
+            .field_uncertainty(Vec2::new(2.0, 0.0))
+            .expect("matching covariance");
+        assert!((uncertainty - 4.0).abs() < 1e-12);
     }
 
     fn observed_shot(launch: (f32, f32), velocity: f64, angle_degrees: i32) -> ServerEvent {
