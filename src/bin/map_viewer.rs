@@ -202,6 +202,7 @@ fn list_decisions(path: &PathBuf, capture_id: i64) -> Result<Value, String> {
                 "bot_name": row.get::<_, String>(2)?,
                 "energy": data["energy"],
                 "choice": data["choice"],
+                "scenario": data["scenario"],
                 "map_updating": data["map_updating"],
                 "map_planets": belief["planets"].as_array().map_or(0, Vec::len),
                 "fit_rmse": belief["model_position_rmse"],
@@ -241,7 +242,12 @@ fn capture_timeline(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Result
         let sequence: i64 = row.get(0)?; let timestamp: i64 = row.get(1)?; let bot: String = row.get(2)?;
         let data: String = row.get(3)?; let data: Value = serde_json::from_str(&data).unwrap_or(Value::Null);
         let choice = &data["choice"];
-        Ok(json!({"sequence":sequence,"timestamp_unix_ms":timestamp,"kind":"decision","detail":format!("{bot} chose v{} at {}° ({})", choice["velocity"], choice["angle_degrees"], choice["reason"].as_str().unwrap_or("no shot"))}))
+        let stage = data["scenario"]["stage"].as_str();
+        let detail = stage.map_or_else(
+            || format!("{bot} chose v{} at {}° ({})", choice["velocity"], choice["angle_degrees"], choice["reason"].as_str().unwrap_or("no shot")),
+            |stage| format!("{stage} · {} estimated planets", data["map_belief"]["planets"].as_array().map_or(0, Vec::len)),
+        );
+        Ok(json!({"sequence":sequence,"timestamp_unix_ms":timestamp,"kind":"decision","detail":detail}))
     }).map_err(|error| error.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|error|error.to_string())?;
     let mut timeline = events;
     timeline.extend(decisions);
@@ -952,5 +958,40 @@ mod tests {
         let parameters = parse_query("id=42&seq=1171&velocity=8&angle=-12");
         assert_eq!(required_id(&parameters, "id").unwrap(), 42);
         assert_eq!(required_number(&parameters, "angle").unwrap(), -12.0);
+    }
+
+    #[test]
+    fn selecting_a_timeline_shot_returns_its_recorded_endpoint() {
+        let path = std::env::temp_dir().join(format!(
+            "einsteinbot-viewer-event-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let metadata = einsteinbot::event_store::CaptureMetadata {
+            started_at_unix_ms: 1,
+            process_id: std::process::id(),
+            host: "localhost".into(),
+            port: 3490,
+            client_name: "viewer-test".into(),
+            protocol_version: 8,
+        };
+        let mut log = einsteinbot::event_store::EventLog::create(&path, &metadata).unwrap();
+        log.append_server_event(
+            2,
+            &ServerEvent::ShotFin {
+                player_id: 1,
+                angle: 0.0,
+                velocity: 2.0,
+                points: vec![Point { x: 10.0, y: 20.0 }],
+            },
+        )
+        .unwrap();
+        let parameters = BTreeMap::from([("id", "1"), ("seq", "event:0"), ("step", "25")]);
+        let snapshot = selected_snapshot(&path, &parameters).unwrap();
+        assert_eq!(snapshot["selection_kind"], "timeline_event");
+        assert_eq!(snapshot["selected_shot"]["sequence"], 0);
+        assert_eq!(snapshot["selected_shot"]["event"]["points"][0]["x"], 10.0);
+        drop(log);
+        std::fs::remove_file(path).unwrap();
     }
 }

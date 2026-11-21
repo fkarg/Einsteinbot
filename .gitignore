@@ -28,3 +28,4 @@ rustc-ice-*.txt
 
 /target
 /einsteinbot.sqlite3
+/learning-scenarios.sqlite3

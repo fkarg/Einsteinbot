@@ -1,14 +1,17 @@
 //! Deterministic offline learning experiments. Ground truth generates observations and scores
 //! choices; it is never sent to OnlineEstimator or the learned-map targeting policy.
+use einsteinbot::event_store::{CaptureMetadata, EventLog};
 use einsteinbot::map::{PlanetMap, Vec2};
 use einsteinbot::online_map::OnlineEstimator;
-use einsteinbot::protocol::{Planet, Point, ServerEvent};
+use einsteinbot::protocol::{Planet, Point, RecordedEvent, ServerEvent};
 use einsteinbot::simulation::{
     ShotObservation, Termination, WorldParameters, simulate_shot, simulate_targeting_shot,
 };
 use einsteinbot::strategy::{BotState, MapBelief, TargetingPolicy};
+use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Copy)]
 struct Launch {
@@ -17,12 +20,95 @@ struct Launch {
     angle: i32,
     speed: i32,
 }
+#[derive(Clone)]
 struct Scenario {
     name: &'static str,
     truth: PlanetMap,
     observations: Vec<(Launch, Termination)>,
     trial: Launch,
     target_tick: usize,
+}
+
+struct ScenarioCapture {
+    log: EventLog,
+    timestamp_ms: i64,
+}
+
+impl ScenarioCapture {
+    fn event(&mut self, event: &ServerEvent, bot: Option<&str>) {
+        self.log
+            .append_for_bot(
+                self.timestamp_ms,
+                bot,
+                &RecordedEvent::Inbound(event.clone()),
+            )
+            .expect("write scenario event");
+        self.timestamp_ms += 1;
+    }
+
+    fn decision(
+        &mut self,
+        scenario: &Scenario,
+        state: &BotState,
+        belief: Option<&MapBelief>,
+        choice: Option<einsteinbot::strategy::ShotChoice>,
+        stage: &str,
+        observations_seen: usize,
+    ) {
+        let belief_json = belief.map(|belief| serde_json::json!({
+            "planets": belief.map.planets,
+            "local_field": belief.local_field,
+            "field_hypothesis": belief.field_hypothesis,
+            "hypothesis_local_field": belief.hypothesis_local_field,
+            "contact_points": belief.contact_points,
+            "covariance": belief.parameter_covariance.as_ref().map(|matrix| {
+                (0..matrix.nrows()).map(|row| (0..matrix.ncols()).map(|col| matrix[(row, col)]).collect::<Vec<_>>()).collect::<Vec<_>>()
+            }),
+            "model_position_rmse": belief.model_position_rmse,
+            "fit_converged": belief.fit_converged,
+            "planet_contact_counts": belief.planet_contact_counts,
+            "uncertain_associations": belief.uncertain_associations,
+        }));
+        let choice_json = choice.map(|choice| {
+            serde_json::json!({
+                "reason": format!("{:?}", choice.reason),
+                "velocity": choice.velocity,
+                "angle_degrees": choice.angle_degrees,
+                "miss_distance": choice.miss_distance,
+                "predicted_hit": choice.predicted_hit,
+                "predicted_victim": choice.predicted_victim,
+                "used_field_hypothesis": choice.used_field_hypothesis,
+                "contact_before_target": choice.contact_before_target,
+            })
+        });
+        self.log
+            .append_diagnostic(
+                self.timestamp_ms,
+                "scenario",
+                "target_decision",
+                &serde_json::json!({
+                    "energy": 20.0,
+                    "map_updating": false,
+                    "map_epoch": 0,
+                    "map_submitted_watermark": observations_seen,
+                    "map_processed_watermark": observations_seen,
+                    "map_pending_events": 0,
+                    "map_source": "online",
+                    "map_belief": belief_json,
+                    "bot_state": state.diagnostic_snapshot(),
+                    "scenario": {"name": scenario.name, "stage": stage, "truth_planets": scenario.truth.planets},
+                    "choice": choice_json,
+                }),
+            )
+            .expect("write scenario diagnostic");
+        self.timestamp_ms += 1;
+    }
+
+    fn finish(mut self) {
+        self.log
+            .finish(self.timestamp_ms)
+            .expect("finish scenario capture");
+    }
 }
 
 fn planet(x: f64, y: f64, radius: f64) -> Planet {
@@ -57,8 +143,22 @@ fn observe_launch(
     truth: &PlanetMap,
     launch: Launch,
     expected: Termination,
+    mut capture: Option<&mut ScenarioCapture>,
+    scenario: &Scenario,
+    stage: usize,
 ) {
     let source = position(1, launch.x, launch.y);
+    if let Some(capture) = capture.as_deref_mut() {
+        capture.event(&source, None);
+        capture.event(
+            &ServerEvent::ShotBegin {
+                player_id: 1,
+                angle: f64::from(launch.angle),
+                velocity: f64::from(launch.speed),
+            },
+            Some("scenario"),
+        );
+    }
     estimator.observe(&source, &AtomicBool::new(false));
     state.observe(&source);
     // The observed source is the only player in the field during these training shots.
@@ -87,6 +187,17 @@ fn observe_launch(
     let belief = estimator
         .observe(&event, &AtomicBool::new(false))
         .expect("new observation yields belief");
+    if let Some(capture) = capture {
+        capture.event(&event, Some("scenario"));
+        capture.decision(
+            scenario,
+            state,
+            Some(&belief),
+            None,
+            &format!("training_{stage}"),
+            stage,
+        );
+    }
     println!(
         "  training angle={} speed={} termination={:?} samples={} fit_ms={} inferred_planets={} converged={:?} rmse={:?} covariance={}",
         launch.angle,
@@ -153,12 +264,12 @@ fn evaluate(
     truth: &PlanetMap,
     start: Point,
     target: Point,
-) {
+) -> Option<einsteinbot::strategy::ShotChoice> {
     state.set_map_belief(belief.clone());
     let started = Instant::now();
     let Some(choice) = TargetingPolicy::default().choose(state, 20.0) else {
         println!("  {label}: NO_CHOICE");
-        return;
+        return None;
     };
     let elapsed = started.elapsed().as_millis();
     let candidate = ShotObservation {
@@ -227,7 +338,7 @@ fn evaluate(
                 Ok(predicted) => predicted,
                 Err(error) => {
                     println!("    selected_model_prediction_error={error}");
-                    return;
+                    return Some(choice);
                 }
             };
             let residual = einsteinbot::simulation::compare_trajectories(
@@ -241,19 +352,35 @@ fn evaluate(
             );
         }
     }
+    Some(choice)
 }
-fn run(scenario: Scenario) {
+
+fn run(scenario: Scenario, mut capture: Option<ScenarioCapture>) {
     println!("scenario={}", scenario.name);
     let mut estimator = OnlineEstimator::default();
     let mut state = BotState::default();
+    if let Some(capture) = &mut capture {
+        capture.event(
+            &ServerEvent::Planets {
+                planets: scenario.truth.planets.clone(),
+            },
+            None,
+        );
+    }
     state.observe(&ServerEvent::OwnId { player_id: 1 });
-    for (observation, expected) in scenario.observations {
+    if let Some(capture) = &mut capture {
+        capture.event(&ServerEvent::OwnId { player_id: 1 }, Some("scenario"));
+    }
+    for (stage, (observation, expected)) in scenario.observations.iter().copied().enumerate() {
         observe_launch(
             &mut estimator,
             &mut state,
             &scenario.truth,
             observation,
             expected,
+            capture.as_mut(),
+            &scenario,
+            stage + 1,
         );
     }
     let trial_path = simulate_shot(
@@ -275,6 +402,17 @@ fn run(scenario: Scenario) {
     let target = trial_path.points[scenario.target_tick].clone();
     state.observe(&position(1, start.x, start.y));
     state.observe(&position(2, target.x, target.y));
+    if let Some(capture) = &mut capture {
+        capture.event(&position(1, start.x, start.y), None);
+        capture.event(&position(2, target.x, target.y), None);
+        capture.event(
+            &ServerEvent::OwnEnergy {
+                player_id: 1,
+                energy: 20.0,
+            },
+            Some("scenario"),
+        );
+    }
     println!(
         "  trial start=({:.1},{:.1}) target=({:.1},{:.1}) witness_angle={} witness_speed={} witness_tick={} true_planets={}",
         start.x,
@@ -403,14 +541,62 @@ fn run(scenario: Scenario) {
         start.clone(),
         target.clone(),
     );
-    evaluate(
+    let learned_choice = evaluate(
         "learned",
         &mut state,
-        learned,
+        learned.clone(),
         &scenario.truth,
         start.clone(),
         target.clone(),
     );
+    if let Some(capture) = &mut capture {
+        capture.decision(
+            &scenario,
+            &state,
+            learned.as_ref(),
+            learned_choice,
+            "target",
+            scenario.observations.len(),
+        );
+        if let Some(choice) = learned_choice {
+            let trial = ShotObservation {
+                player_id: 1,
+                angle_degrees: f64::from(choice.angle_degrees),
+                velocity: f64::from(choice.velocity),
+                points: vec![start.clone()],
+            };
+            let players = [
+                (1, Vec2::new(f64::from(start.x), f64::from(start.y))),
+                (2, Vec2::new(f64::from(target.x), f64::from(target.y))),
+            ];
+            if let Ok(path) = simulate_targeting_shot(
+                &scenario.truth,
+                &trial,
+                WorldParameters::default(),
+                2000,
+                &players,
+                4.0,
+            ) {
+                capture.event(
+                    &ServerEvent::ShotBegin {
+                        player_id: 1,
+                        angle: trial.angle_degrees,
+                        velocity: trial.velocity,
+                    },
+                    Some("scenario"),
+                );
+                capture.event(
+                    &ServerEvent::ShotFin {
+                        player_id: 1,
+                        angle: trial.angle_degrees,
+                        velocity: trial.velocity,
+                        points: path.points,
+                    },
+                    Some("scenario"),
+                );
+            }
+        }
+    }
     evaluate(
         "oracle",
         &mut state,
@@ -419,6 +605,9 @@ fn run(scenario: Scenario) {
         start,
         target,
     );
+    if let Some(capture) = capture {
+        capture.finish();
+    }
 }
 fn scenarios() -> Vec<Scenario> {
     let launch = |x, y, angle, speed| Launch { x, y, angle, speed };
@@ -596,6 +785,61 @@ fn scenarios() -> Vec<Scenario> {
             target_tick: 130,
         },
         Scenario {
+            name: "three_planets_partial_swerve",
+            truth: PlanetMap {
+                planets: vec![
+                    planet(600.0, 500.0, 30.0),
+                    planet(1000.0, 350.0, 35.0),
+                    planet(1300.0, 700.0, 25.0),
+                ],
+            },
+            observations: vec![
+                (launch(200.0, 500.0, 0, 8), Termination::PlanetCollision(0)),
+                (
+                    launch(600.0, 100.0, -90, 8),
+                    Termination::PlanetCollision(0),
+                ),
+                (
+                    launch(1000.0, 100.0, -90, 8),
+                    Termination::PlanetCollision(1),
+                ),
+                (
+                    launch(1500.0, 350.0, 180, 8),
+                    Termination::PlanetCollision(1),
+                ),
+            ],
+            trial: launch(200.0, 350.0, 0, 8),
+            target_tick: 120,
+        },
+        Scenario {
+            name: "four_planets_four_contact_map",
+            truth: PlanetMap {
+                planets: vec![
+                    planet(500.0, 400.0, 25.0),
+                    planet(850.0, 600.0, 35.0),
+                    planet(1200.0, 350.0, 30.0),
+                    planet(1500.0, 700.0, 40.0),
+                ],
+            },
+            observations: vec![
+                (launch(200.0, 400.0, 0, 8), Termination::PlanetCollision(0)),
+                (
+                    launch(850.0, 100.0, -90, 8),
+                    Termination::PlanetCollision(1),
+                ),
+                (
+                    launch(1200.0, 100.0, -90, 8),
+                    Termination::PlanetCollision(2),
+                ),
+                (
+                    launch(1500.0, 100.0, -90, 8),
+                    Termination::PlanetCollision(3),
+                ),
+            ],
+            trial: launch(200.0, 700.0, 0, 8),
+            target_tick: 50,
+        },
+        Scenario {
             name: "two_planets_established",
             truth: two(),
             observations: vec![
@@ -619,10 +863,176 @@ fn scenarios() -> Vec<Scenario> {
     ]
 }
 
-fn main() {
-    for scenario in scenarios() {
-        run(scenario);
+fn scenario_capture_exists(path: &Path, scenario: &str, revision: &str) -> Result<bool, String> {
+    if !path.exists() {
+        return Ok(false);
     }
+    let connection =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| error.to_string())?;
+    let has_captures = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='captures')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !has_captures {
+        return Ok(false);
+    }
+    let mut statement = connection
+        .prepare("SELECT ended_at_unix_ms, metadata_json FROM captures")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| error.to_string())?;
+    for row in rows {
+        let (ended_at, text) = row.map_err(|e| e.to_string())?;
+        if ended_at.is_none() {
+            continue;
+        }
+        let metadata: serde_json::Value =
+            serde_json::from_str(&text).map_err(|error| error.to_string())?;
+        if metadata["host"] == "synthetic-scenario"
+            && metadata["client_name"] == scenario
+            && metadata["build"]["git_revision"] == revision
+            && metadata["build"]["source_changes"] == false
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn discard_incomplete_scenario_captures(
+    path: &Path,
+    scenario: &str,
+    revision: &str,
+) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut connection = rusqlite::Connection::open(path).map_err(|error| error.to_string())?;
+    let has_captures = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='captures')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !has_captures {
+        return Ok(());
+    }
+    let mut statement = connection
+        .prepare("SELECT id, ended_at_unix_ms, metadata_json FROM captures")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?;
+    let mut incomplete = Vec::new();
+    for row in rows {
+        let (id, ended_at, text) = row.map_err(|error| error.to_string())?;
+        let metadata: serde_json::Value =
+            serde_json::from_str(&text).map_err(|error| error.to_string())?;
+        if ended_at.is_none()
+            && metadata["host"] == "synthetic-scenario"
+            && metadata["client_name"] == scenario
+            && metadata["build"]["git_revision"] == revision
+            && metadata["build"]["source_changes"] == false
+        {
+            incomplete.push(id);
+        }
+    }
+    drop(statement);
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    for id in incomplete {
+        transaction
+            .execute("DELETE FROM events WHERE capture_id=?1", [id])
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute("DELETE FROM diagnostics WHERE capture_id=?1", [id])
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute("DELETE FROM captures WHERE id=?1", [id])
+            .map_err(|error| error.to_string())?;
+    }
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+fn create_scenario_capture(path: &Path, scenario: &str) -> Result<ScenarioCapture, String> {
+    let started_at_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_millis() as i64;
+    let metadata = CaptureMetadata {
+        started_at_unix_ms,
+        process_id: std::process::id(),
+        host: "synthetic-scenario".into(),
+        port: 0,
+        client_name: scenario.into(),
+        protocol_version: 8,
+    };
+    let log = EventLog::create(path, &metadata).map_err(|error| error.to_string())?;
+    Ok(ScenarioCapture {
+        log,
+        timestamp_ms: started_at_unix_ms,
+    })
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut db_path = std::path::PathBuf::from("learning-scenarios.sqlite3");
+    let mut record_captures = true;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--db-path" => db_path = args.next().ok_or("--db-path requires a value")?.into(),
+            "--no-captures" => record_captures = false,
+            "--help" | "-h" => {
+                println!(
+                    "Usage: learning_scenarios [--db-path PATH] [--no-captures]\nRuns deterministic learning scenarios and, once per scenario per clean git revision, stores an inspectable SQLite capture."
+                );
+                return Ok(());
+            }
+            other => return Err(format!("unknown argument {other}").into()),
+        }
+    }
+    let revision = option_env!("EINSTEINBOT_GIT_REVISION");
+    let source_clean = option_env!("EINSTEINBOT_GIT_DIRTY") == Some("false");
+    if record_captures && (revision.is_none() || !source_clean) {
+        eprintln!(
+            "Not writing scenario captures without a known clean git revision; commit the version first or use --no-captures."
+        );
+        record_captures = false;
+    }
+    let revision = revision.unwrap_or_default();
+    for scenario in scenarios() {
+        let capture = if record_captures {
+            discard_incomplete_scenario_captures(&db_path, scenario.name, revision)?;
+            if scenario_capture_exists(&db_path, scenario.name, revision)? {
+                println!(
+                    "scenario_capture={} revision={} already exists; reusing",
+                    scenario.name, revision
+                );
+                None
+            } else {
+                Some(create_scenario_capture(&db_path, scenario.name)?)
+            }
+        } else {
+            None
+        };
+        run(scenario, capture);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -656,7 +1066,7 @@ mod tests {
     #[test]
     fn training_and_witness_paths_are_physically_valid() {
         for scenario in scenarios() {
-            for (launch, expected) in scenario.observations {
+            for (launch, expected) in scenario.observations.iter().copied() {
                 let players = [(1, Vec2::new(f64::from(launch.x), f64::from(launch.y)))];
                 let trajectory = simulate_targeting_shot(
                     &scenario.truth,
@@ -707,6 +1117,62 @@ mod tests {
     }
 
     #[test]
+    fn scenario_captures_are_deduplicated_by_name_and_revision() {
+        let path = std::env::temp_dir().join(format!(
+            "einsteinbot-scenario-index-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE captures(id INTEGER PRIMARY KEY, ended_at_unix_ms INTEGER, metadata_json TEXT NOT NULL);
+                 CREATE TABLE events(capture_id INTEGER);
+                 CREATE TABLE diagnostics(capture_id INTEGER);",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO captures(ended_at_unix_ms, metadata_json) VALUES (100, ?1)",
+                [serde_json::json!({
+                    "host": "synthetic-scenario",
+                    "client_name": "flat_direct",
+                    "build": {"git_revision": "rev-a", "source_changes": false}
+                })
+                .to_string()],
+            )
+            .unwrap();
+        assert!(scenario_capture_exists(&path, "flat_direct", "rev-a").unwrap());
+        connection
+            .execute(
+                "INSERT INTO captures(ended_at_unix_ms, metadata_json) VALUES (NULL, ?1)",
+                [serde_json::json!({
+                    "host": "synthetic-scenario",
+                    "client_name": "flat_direct",
+                    "build": {"git_revision": "rev-a", "source_changes": false}
+                })
+                .to_string()],
+            )
+            .unwrap();
+        let incomplete_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO events(capture_id) VALUES (?1)",
+                [incomplete_id],
+            )
+            .unwrap();
+        discard_incomplete_scenario_captures(&path, "flat_direct", "rev-a").unwrap();
+        let remaining: i64 = connection
+            .query_row("SELECT COUNT(*) FROM captures", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 1);
+        assert!(!scenario_capture_exists(&path, "flat_direct", "rev-b").unwrap());
+        assert!(!scenario_capture_exists(&path, "one_planet", "rev-a").unwrap());
+        drop(connection);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn noncontact_flyby_helps_next_shot_approach_target() {
         let scenario = scenarios()
             .into_iter()
@@ -715,13 +1181,16 @@ mod tests {
         let mut estimator = OnlineEstimator::default();
         let mut state = BotState::default();
         state.observe(&ServerEvent::OwnId { player_id: 1 });
-        for (launch, expected) in scenario.observations {
+        for (stage, (launch, expected)) in scenario.observations.iter().copied().enumerate() {
             observe_launch(
                 &mut estimator,
                 &mut state,
                 &scenario.truth,
                 launch,
                 expected,
+                None,
+                &scenario,
+                stage + 1,
             );
         }
         let trial = shot(scenario.trial);
@@ -768,13 +1237,16 @@ mod tests {
         let mut estimator = OnlineEstimator::default();
         let mut state = BotState::default();
         state.observe(&ServerEvent::OwnId { player_id: 1 });
-        for (launch, expected) in scenario.observations {
+        for (stage, (launch, expected)) in scenario.observations.iter().copied().enumerate() {
             observe_launch(
                 &mut estimator,
                 &mut state,
                 &scenario.truth,
                 launch,
                 expected,
+                None,
+                &scenario,
+                stage + 1,
             );
         }
         assert!(estimator.belief().unwrap().map.planets.is_empty());
