@@ -3,11 +3,12 @@
   const $=id=>document.getElementById(id);
   const canvas=$('map'),ctx=canvas.getContext('2d');
   let captureId=null, decisions=[], snapshot=null, simulations=[],timeline=[],sel=null,selScope=null,fieldAutoFallback=null,snapshotRequest=0;
+  let position='none';
   let view={x:0,y:0,width:W,height:H}, viewDrag=null, panned=false;
   const colors=['#54c8ff','#ffb45c','#b791ff','#7de3a1','#ff7899','#e8d96d','#88a7ff','#ffa1dc'];
   function setStatus(s){ $('status').textContent=s||''; }
   function fmt(v,n=2){ return v===null||v===undefined||v===''?'—':Number.isFinite(Number(v))?Number(v).toFixed(n):'—'; }
-  function selected(){ return Number($('decision').value); }
+  function selected(){ return Number(position); }
   function q(v){return encodeURIComponent(v);}
   async function api(path){const r=await fetch(path,{cache:'no-store'});const data=await r.json();if(!r.ok||data.error)throw new Error(data.error||r.statusText);return data;}
   async function loadCaptures(){
@@ -23,20 +24,14 @@
     for(const name of ['all',...bots]){const op=document.createElement('option');op.value=name;op.textContent=name==='all'?'All bots':name;bot.append(op);}
     bot.value=bots.includes(old)?old:'all'; fillDecisionList();
   }
-  function fillDecisionList(){
-    const chosenBot=$('bot').value;const filtered=decisions.filter(d=>chosenBot==='all'||d.bot_name===chosenBot);const sel=$('decision');sel.replaceChildren();
-    const none=document.createElement('option');none.value='none';none.textContent='No decision · latest capture state';sel.append(none);
-    for(const d of filtered){const op=document.createElement('option');op.value=d.sequence;const c=d.choice||{};const label=d.scenario?.stage||`${c.reason||'no shot'} v${c.velocity??'–'} @ ${c.angle_degrees??'–'}°`;op.textContent=`#${d.sequence} ${d.bot_name} · ${label}`;sel.append(op);}
-    sel.value='none'; loadSnapshot(); loadTimeline();
-  }
+  function fillDecisionList(){position='none';loadSnapshot();loadTimeline();}
   async function loadSnapshot(){
-    if(!$('decision').value)return;
-    const request=++snapshotRequest,requestCapture=captureId,requestDecision=$('decision').value,requestField=$('field').value,requestView={...view};
+    const request=++snapshotRequest,requestCapture=captureId,requestDecision=position,requestField=$('field').value,requestView={...view};
     setStatus('Loading captured state…');simulations=[];
-    try{const step=gridStepForView(),params=`id=${requestCapture}&seq=${requestDecision}&step=${step}&field=${requestField}&x=${requestView.x}&y=${requestView.y}&width=${requestView.width}&height=${requestView.height}`;const result=await api(`/api/snapshot?${params}`);if(request!==snapshotRequest||requestCapture!==captureId||requestDecision!==$('decision').value||requestField!==$('field').value||requestView.x!==view.x||requestView.y!==view.y||requestView.width!==view.width||requestView.height!==view.height)return;snapshot=result;const scope=`${captureId}|${requestDecision}`;if(scope!==selScope){selScope=scope;sel=snapshot.selected_shot?{kind:'shot',...snapshot.selected_shot}:null;}const needsActual=requestField==='delta'||requestField==='hypothesis_delta';if(!snapshot.actual_planets&&needsActual){fieldAutoFallback=requestField;$('field').value=requestField==='delta'?'total':'hypothesis_total';return loadSnapshot();}else if(snapshot.actual_planets&&fieldAutoFallback){$('field').value=fieldAutoFallback;fieldAutoFallback=null;return loadSnapshot();}const g=snapshot.field_grid;g.samples=g.samples.map(s=>{const pair=(x,y)=>Number.isFinite(x)&&Number.isFinite(y)?{x,y}:null,vector=pair(s[2],s[3]),total=pair(s[4],s[5]),physical=pair(s[6],s[7]),residual=pair(s[8],s[9]),oracle=pair(s[10],s[11]),delta=total&&oracle?{x:total.x-oracle.x,y:total.y-oracle.y}:null;return {x:s[0],y:s[1],vector,total,physical,residual,oracle,delta,sigma:s[12],supported:s[13],gravity:total?Math.hypot(total.x,total.y):null,actual_gravity:oracle?Math.hypot(oracle.x,oracle.y):null};});const c=currentDecision().choice||{};$('velocity').value=c.velocity||8;$('angle').value=c.angle_degrees||0;setStatus(step===Number($('resolution').value)?'':`Showing ${step}-unit samples to fit this viewport`);render();}
+    try{const step=gridStepForView(),params=`id=${requestCapture}&seq=${requestDecision}&step=${step}&field=${requestField}&x=${requestView.x}&y=${requestView.y}&width=${requestView.width}&height=${requestView.height}`;const result=await api(`/api/snapshot?${params}`);if(request!==snapshotRequest||requestCapture!==captureId||requestDecision!==position||requestField!==$('field').value||requestView.x!==view.x||requestView.y!==view.y||requestView.width!==view.width||requestView.height!==view.height)return;snapshot=result;const scope=`${captureId}|${requestDecision}`;if(scope!==selScope){selScope=scope;sel=snapshot.selected_shot?{kind:'shot',...snapshot.selected_shot}:null;}const needsActual=requestField==='delta'||requestField==='hypothesis_delta';if(!snapshot.actual_planets&&needsActual){fieldAutoFallback=requestField;$('field').value=requestField==='delta'?'total':'hypothesis_total';return loadSnapshot();}else if(snapshot.actual_planets&&fieldAutoFallback){$('field').value=fieldAutoFallback;fieldAutoFallback=null;return loadSnapshot();}const g=snapshot.field_grid;g.samples=g.samples.map(s=>{const pair=(x,y)=>Number.isFinite(x)&&Number.isFinite(y)?{x,y}:null,vector=pair(s[2],s[3]),total=pair(s[4],s[5]),physical=pair(s[6],s[7]),residual=pair(s[8],s[9]),oracle=pair(s[10],s[11]),delta=total&&oracle?{x:total.x-oracle.x,y:total.y-oracle.y}:null;return {x:s[0],y:s[1],vector,total,physical,residual,oracle,delta,sigma:s[12],supported:s[13],gravity:total?Math.hypot(total.x,total.y):null,actual_gravity:oracle?Math.hypot(oracle.x,oracle.y):null};});const c=currentDecision().choice||{};$('velocity').value=c.velocity||8;$('angle').value=c.angle_degrees||0;setStatus(step===Number($('resolution').value)?'':`Showing ${step}-unit samples to fit this viewport`);render();}
     catch(e){setStatus(e.message);}
   }
-  async function loadTimeline(){try{const data=await api(`/api/timeline?id=${captureId}`);timeline=data.timeline;const el=$('timeline');el.replaceChildren();for(const item of timeline){const b=document.createElement('button');b.textContent=`#${item.sequence} ${item.kind} · ${item.detail}`;b.title=new Date(item.timestamp_unix_ms).toLocaleString();b.className=String(snapshot?.sequence)===String(item.sequence)?'active':'';b.addEventListener('click',()=>{const select=$('decision'),value=item.kind==='decision'&&decisions.some(d=>d.sequence===item.sequence)?String(item.sequence):`event:${item.sequence}`;if(![...select.options].some(option=>option.value===value)){const option=document.createElement('option');option.value=value;option.textContent=`#${item.sequence} · ${item.kind} · ${item.detail}`;select.append(option);}select.value=value;loadSnapshot();});el.append(b);}}catch(e){setStatus(e.message);}}
+  async function loadTimeline(){try{const data=await api(`/api/timeline?id=${captureId}`);timeline=data.timeline;drawScrub();}catch(e){setStatus(e.message);}}
   function currentDecision(){return decisions.find(d=>d.sequence===selected())||{};}
   function sampleCountForStep(step){const startX=Math.floor(view.x/step)*step,startY=Math.floor(view.y/step)*step,endX=Math.ceil(view.x+view.width),endY=Math.ceil(view.y+view.height),columns=Math.floor((endX-startX)/step)+1,rows=Math.floor((endY-startY)/step)+1;return columns*rows;}
   function gridStepForView(){const desired=Number($('resolution').value);return [1,2,3,5,10,25].find(step=>step>=desired&&sampleCountForStep(step)<=300000)||25;}
@@ -66,7 +61,7 @@
     for(const sim of simulations){const pts=sim.data.points||[];if(!pts.length)continue;ctx.beginPath();ctx.moveTo(pts[0].x,pts[0].y);for(const p of pts)ctx.lineTo(p.x,p.y);ctx.strokeStyle=sim.color;ctx.lineWidth=3;ctx.stroke();}
     if(sel?.kind==='shot'&&sel.event?.points?.length){const pts=sel.event.points;ctx.beginPath();ctx.moveTo(pts[0].x,pts[0].y);for(const p of pts)ctx.lineTo(p.x,p.y);ctx.strokeStyle='#fff2a8';ctx.lineWidth=3;ctx.stroke();const end=pts.at(-1);ctx.beginPath();ctx.arc(end.x,end.y,6,0,Math.PI*2);ctx.strokeStyle='#fff2a8';ctx.lineWidth=2;ctx.stroke();}
     drawSelection();
-    const decision=currentDecision(),choice=decision.choice||{};$('decisionLabel').textContent=snapshot.selection_kind==='decision'?`Capture ${captureId}, decision ${decision.sequence} · ${decision.bot_name} · ${new Date(decision.timestamp_unix_ms||0).toLocaleTimeString()} · map updating: ${decision.map_updating?'yes':'no'}`:`Capture ${captureId}, no decision selected · showing capture events through #${snapshot.sequence}; last belief snapshot #${snapshot.diagnostic_sequence??'unavailable'}`;
+    const decision=currentDecision(),choice=decision.choice||{};$('decisionLabel').textContent=snapshot.selection_kind==='decision'?`Decision #${decision.sequence} · ${decision.bot_name} · ${new Date(decision.timestamp_unix_ms||0).toLocaleTimeString()} · map updating: ${decision.map_updating?'yes':'no'}`:snapshot.selection_kind==='timeline_event'?`Event #${snapshot.sequence} · belief as of decision snapshot #${snapshot.diagnostic_sequence??'unavailable'}`:`Latest state · events through #${snapshot.sequence} · belief snapshot #${snapshot.diagnostic_sequence??'unavailable'}`;
     renderMetrics(decision);renderChoice(choice);renderPlanetList();renderSelection();
   }
   function circle(p,color,fill){ctx.beginPath();ctx.arc(p.x,p.y,Math.max(3,p.radius||3),0,Math.PI*2);ctx.lineWidth=2;ctx.strokeStyle=color;if(fill){ctx.fillStyle=color+'26';ctx.fill();}else ctx.setLineDash([7,5]);ctx.stroke();ctx.setLineDash([]);}
@@ -92,7 +87,7 @@
       setStatus('Green: belief · orange: recorded shot on actual map · yellow: current policy on actual map');render();
     }catch(e){$('comparison').textContent=e.message;setStatus(e.message);}}
   async function audit(){const d=currentDecision();try{setStatus('Replaying observed paths…');const result=await api(`/api/physics-audit?id=${captureId}&seq=${d.sequence}`);simulations=[{data:{points:result.worst_observed_points},color:'#d7e2ff'},{data:{points:result.worst_rust_points},color:'#ff4da6'}];kv($('comparison'),[['Audited shots',String(result.audited_shots)],['Planets in map',String(result.map_planets)],['Timed samples',String(result.timed_samples)],['Coordinate RMSE',fmt(result.coordinate_rmse)],['Median / p95 / max position error',`${fmt(result.median_position_error)} / ${fmt(result.p95_position_error)} / ${fmt(result.max_position_error)}`],['Worst shot',(w=>w?`event #${w.shot_sequence} · player ${w.player_id} · v${fmt(w.velocity,0)} @ ${fmt(w.angle,1)}° · RMSE ${fmt(w.coordinate_rmse)} · max ${fmt(w.max_position_error)} · Rust: ${String(w.rust_termination?.kind||'—').replaceAll('_',' ')}`:'—')(result.worst_shot)],...(result.note?[[result.note,null]]:[])]);setStatus(`Rust path replay: coordinate RMSE ${fmt(result.coordinate_rmse)} units · worst shot overlaid`);render();}catch(e){$('comparison').textContent=e.message;setStatus(e.message);}}
-  $('capture').addEventListener('change',()=>{resetView();loadDecisions();});$('bot').addEventListener('change',fillDecisionList);$('decision').addEventListener('change',loadSnapshot);$('latest').addEventListener('click',()=>{$('decision').value='none';loadSnapshot();});$('refresh').addEventListener('click',()=>loadDecisions($('bot').value));$('heat').addEventListener('change',render);$('scale').addEventListener('change',render);$('field').addEventListener('change',()=>{fieldAutoFallback=null;loadSnapshot();});$('arrows').addEventListener('change',render);$('resolution').addEventListener('change',loadSnapshot);for(const id of ['paths','pathResiduals','coverage','beliefPlanets','actualPlanets','contacts'])$(id).addEventListener('change',render);$('simulate').addEventListener('click',simulate);$('compare').addEventListener('click',compare);$('audit').addEventListener('click',audit);window.addEventListener('resize',render);
+  $('capture').addEventListener('change',()=>{resetView();loadDecisions();});$('bot').addEventListener('change',drawScrub);$('refresh').addEventListener('click',()=>loadDecisions($('bot').value));$('heat').addEventListener('change',render);$('scale').addEventListener('change',render);$('field').addEventListener('change',()=>{fieldAutoFallback=null;loadSnapshot();});$('arrows').addEventListener('change',render);$('resolution').addEventListener('change',loadSnapshot);for(const id of ['paths','pathResiduals','coverage','beliefPlanets','actualPlanets','contacts'])$(id).addEventListener('change',render);$('simulate').addEventListener('click',simulate);$('compare').addEventListener('click',compare);$('audit').addEventListener('click',audit);window.addEventListener('resize',()=>{render();drawScrub();});
   let viewportTimer=null;function refreshViewport(){clearTimeout(viewportTimer);viewportTimer=setTimeout(loadSnapshot,120);}
   function zoomAt(factor,px=W/2,py=H/2){const width=Math.max(40,Math.min(W,view.width*factor)),height=width*H/W,cx=view.x+px/W*view.width,cy=view.y+py/H*view.height;view={x:Math.max(0,Math.min(W-width,cx-px/W*width)),y:Math.max(0,Math.min(H-height,cy-py/H*height)),width,height};refreshViewport();}
   function resetView(){view={x:0,y:0,width:W,height:H};loadSnapshot();}
@@ -100,6 +95,80 @@
   canvas.addEventListener('dblclick',resetView);
   canvas.addEventListener('pointerdown',e=>{panned=false;if(!e.shiftKey&&e.button!==1)return;const rect=canvas.getBoundingClientRect();viewDrag={clientX:e.clientX,clientY:e.clientY,rect,view:{...view}};canvas.setPointerCapture(e.pointerId);});
   canvas.addEventListener('pointermove',e=>{if(!viewDrag)return;const dx=(e.clientX-viewDrag.clientX)/viewDrag.rect.width*viewDrag.view.width,dy=(e.clientY-viewDrag.clientY)/viewDrag.rect.height*viewDrag.view.height;view={...viewDrag.view,x:Math.max(0,Math.min(W-viewDrag.view.width,viewDrag.view.x-dx)),y:Math.max(0,Math.min(H-viewDrag.view.height,viewDrag.view.y-dy))};render();});canvas.addEventListener('pointerup',()=>{if(viewDrag){viewDrag=null;panned=true;refreshViewport();}});
+  // ---- Time navigation: one scrubber over every event and decision in the capture ----
+  const scrub=$('scrub'),scrubCtx=scrub.getContext('2d'),SCRUB_H=104,PAD_L=8,PAD_R=8,TREND_B=56;
+  let scrubDrag=false;
+  const decisionAt=seq=>decisions.find(d=>d.sequence===seq);
+  const botVisible=d=>$('bot').value==='all'||d?.bot_name===$('bot').value;
+  const positionFor=item=>item.kind==='decision'&&decisionAt(item.sequence)?String(item.sequence):`event:${item.sequence}`;
+  function headIndex(){
+    if(position==='none')return timeline.length-1;
+    const seq=Number(position.replace('event:',''));
+    return timeline.findIndex(item=>item.sequence===seq);
+  }
+  const scrubX=(i,w)=>PAD_L+(i+.5)/Math.max(1,timeline.length)*(w-PAD_L-PAD_R);
+  function scrubIndexAt(clientX){
+    const rect=scrub.getBoundingClientRect(),w=rect.width;
+    return Math.max(0,Math.min(timeline.length-1,Math.floor((clientX-rect.left-PAD_L)/(w-PAD_L-PAD_R)*timeline.length)));
+  }
+  function goto(target){
+    position=target==='none'?'none':positionFor(timeline[target]);
+    drawScrub();refreshViewport();
+  }
+  function stepEvent(dir){if(!timeline.length)return;const i=headIndex()+dir;if(i>=0&&i<timeline.length)goto(i);}
+  function stepDecision(dir){
+    for(let i=headIndex()+dir;i>=0&&i<timeline.length;i+=dir)
+      if(timeline[i].kind==='decision'&&botVisible(decisionAt(timeline[i].sequence))){goto(i);return;}
+  }
+  function drawScrub(){
+    const dpr=window.devicePixelRatio||1,rect=scrub.getBoundingClientRect(),w=rect.width;
+    scrub.width=Math.round(w*dpr);scrub.height=Math.round(SCRUB_H*dpr);
+    const c=scrubCtx;c.setTransform(dpr,0,0,dpr,0,0);c.fillStyle='#080d13';c.fillRect(0,0,w,SCRUB_H);
+    if(!timeline.length){c.fillStyle='#8799af';c.font='12px system-ui';c.fillText('No events in this capture',PAD_L,SCRUB_H/2);return;}
+    const bots=[...new Set(decisions.map(d=>d.bot_name))];
+    // Trend strip: estimated planet count and fit RMSE at each (visible) decision.
+    const points=timeline.map((item,i)=>({item,i,d:item.kind==='decision'?decisionAt(item.sequence):null})).filter(p=>p.d&&botVisible(p.d));
+    const maxPlanets=Math.max(1,...points.map(p=>p.d.map_planets||0)),maxRmse=Math.max(1e-9,...points.map(p=>p.d.fit_rmse||0));
+    const yPlanets=v=>TREND_B-2-v/maxPlanets*(TREND_B-18),yRmse=v=>TREND_B-2-v/maxRmse*(TREND_B-18);
+    c.lineWidth=1.5;
+    c.strokeStyle='#ffc45b';c.beginPath();points.forEach((p,k)=>{const x=scrubX(p.i,w),y=yPlanets(p.d.map_planets||0);if(k)c.lineTo(x,yPlanets(points[k-1].d.map_planets||0));k?c.lineTo(x,y):c.moveTo(x,y);});c.stroke();
+    c.strokeStyle='#6ec8ff';c.beginPath();let pen=false;for(const p of points){if(!Number.isFinite(p.d.fit_rmse)){pen=false;continue;}const x=scrubX(p.i,w),y=yRmse(p.d.fit_rmse);pen?c.lineTo(x,y):c.moveTo(x,y);pen=true;}c.stroke();
+    for(const p of points){if(!Number.isFinite(p.d.fit_rmse))continue;c.beginPath();c.arc(scrubX(p.i,w),yRmse(p.d.fit_rmse),2.5,0,Math.PI*2);if(p.d.fit_converged){c.fillStyle='#6ec8ff';c.fill();}else{c.strokeStyle='#6ec8ff';c.lineWidth=1;c.stroke();c.lineWidth=1.5;}}
+    c.font='10px ui-monospace,monospace';c.fillStyle='#ffc45b';c.fillText(`planets ≤${maxPlanets}`,PAD_L,11);c.fillStyle='#6ec8ff';c.fillText(`fit RMSE ≤${fmt(maxRmse,0)} (● converged ○ not)`,PAD_L+86,11);
+    // Event ticks: decisions tall and colored by bot, shot ends medium, map resets red, everything else faint.
+    for(let i=0;i<timeline.length;i++){
+      const item=timeline[i],x=scrubX(i,w);let top=TREND_B+22,color='#2c3a4d';
+      if(item.kind==='decision'){const d=decisionAt(item.sequence);top=TREND_B+4;color=colors[Math.max(0,bots.indexOf(d?.bot_name))%colors.length]+(botVisible(d)?'':'44');}
+      else if(item.kind==='shot_fin'){top=TREND_B+14;color='#7a8ea8';}
+      else if(item.kind==='planets'){top=4;color='#ff6b6b';}
+      c.strokeStyle=color;c.lineWidth=item.kind==='decision'||item.kind==='planets'?2:1;c.beginPath();c.moveTo(x,top);c.lineTo(x,SCRUB_H-6);c.stroke();
+    }
+    const h=headIndex();if(h>=0){const x=scrubX(h,w);c.strokeStyle='#ffe27a';c.lineWidth=2;c.beginPath();c.moveTo(x,0);c.lineTo(x,SCRUB_H);c.stroke();c.fillStyle='#ffe27a';c.beginPath();c.moveTo(x-5,0);c.lineTo(x+5,0);c.lineTo(x,7);c.fill();}
+  }
+  function scrubTip(i){
+    const item=timeline[i],d=item.kind==='decision'?decisionAt(item.sequence):null;
+    const lines=[`#${item.sequence} ${item.kind} · ${item.detail}`,new Date(item.timestamp_unix_ms).toLocaleTimeString()];
+    if(d)lines.push(`${d.bot_name} · ${d.map_planets} planets · fit RMSE ${fmt(d.fit_rmse)} · ${d.fit_converged?'converged':'not converged'}`);
+    return lines;
+  }
+  scrub.addEventListener('pointerdown',e=>{if(!timeline.length)return;scrubDrag=true;scrub.setPointerCapture(e.pointerId);goto(scrubIndexAt(e.clientX));});
+  scrub.addEventListener('pointermove',e=>{
+    if(!timeline.length)return;const i=scrubIndexAt(e.clientX);
+    if(scrubDrag&&i!==headIndex())goto(i);
+    tip.replaceChildren(...scrubTip(i).map((t,k)=>{const d=document.createElement('div');if(!k)d.style.fontWeight='600';d.textContent=t;return d;}));
+    tip.style.display='block';tip.style.left=`${Math.min(e.clientX+14,window.innerWidth-340)}px`;tip.style.top=`${e.clientY+16}px`;
+  });
+  scrub.addEventListener('pointerup',()=>{scrubDrag=false;});
+  scrub.addEventListener('mouseleave',()=>{tip.style.display='none';});
+  $('prevDecision').addEventListener('click',()=>stepDecision(-1));$('nextDecision').addEventListener('click',()=>stepDecision(1));
+  $('prevEvent').addEventListener('click',()=>stepEvent(-1));$('nextEvent').addEventListener('click',()=>stepEvent(1));
+  $('latest').addEventListener('click',()=>{position='none';drawScrub();loadSnapshot();});
+  document.addEventListener('keydown',e=>{
+    if(['INPUT','SELECT','TEXTAREA'].includes(document.activeElement?.tagName)||e.metaKey||e.ctrlKey||e.altKey)return;
+    if(e.key==='ArrowLeft'||e.key==='ArrowRight'){e.preventDefault();(e.shiftKey?stepDecision:stepEvent)(e.key==='ArrowLeft'?-1:1);}
+    else if(e.key==='Home'&&timeline.length){e.preventDefault();goto(0);}
+    else if(e.key==='End'){e.preventDefault();position='none';drawScrub();loadSnapshot();}
+  });
   // ---- Object inspection: hit testing, tooltip, pinned selection, planet list ----
   const tip=$('tip');
   const sgn=v=>Number.isFinite(v)?(v>0?'+':'')+v.toFixed(2):'—';

@@ -210,6 +210,8 @@ fn list_decisions(path: &PathBuf, capture_id: i64) -> Result<Value, String> {
                 "map_updating": data["map_updating"],
                 "map_planets": belief["planets"].as_array().map_or(0, Vec::len),
                 "fit_rmse": belief["model_position_rmse"],
+                "fit_converged": belief["fit_converged"],
+                "contacts": belief["contact_points"].as_array().map_or(0, Vec::len),
                 "covariance": belief["covariance"].is_array(),
             }))
         })
