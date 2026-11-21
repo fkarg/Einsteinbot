@@ -19,6 +19,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 
 const PAGE: &str = include_str!("../../web/map_viewer.html");
+const SCRIPT: &str = include_str!("../../web/map_viewer.js");
 const DEFAULT_PORT: u16 = 8765;
 const PLAYER_RADIUS: f64 = 4.0;
 const FIELD_GRID_STEP: usize = 3;
@@ -80,6 +81,9 @@ fn handle(mut stream: TcpStream, db_path: &PathBuf) -> Result<(), Box<dyn Error>
     }
     if target == "/" || target == "/index.html" {
         return respond(&mut stream, 200, "text/html; charset=utf-8", PAGE);
+    }
+    if target == "/map_viewer.js" {
+        return respond(&mut stream, 200, "text/javascript; charset=utf-8", SCRIPT);
     }
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     let parameters = parse_query(query);
@@ -1048,6 +1052,12 @@ mod tests {
         let planets = latest_actual_planets(&events).unwrap();
         assert_eq!(planets[0].x, 5.0);
         assert_eq!(planets[0].mass, 8.0);
+    }
+
+    #[test]
+    fn page_loads_the_script_the_server_serves() {
+        assert!(PAGE.contains(r#"<script src="/map_viewer.js"></script>"#));
+        assert!(!SCRIPT.is_empty());
     }
 
     #[test]
