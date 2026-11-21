@@ -70,13 +70,16 @@ impl PlanetMap {
         for (planet_index, planet) in self.planets.iter().enumerate() {
             let dx = planet.x - position.x;
             let dy = planet.y - position.y;
-            let distance_squared = dx * dx + dy * dy;
-            if distance_squared == 0.0 {
+            let distance = (dx * dx + dy * dy).sqrt();
+            if distance == 0.0 {
                 return Err(SingularFieldError { planet_index });
             }
-            let scale = planet.mass / (distance_squared * distance_squared.sqrt());
-            result.x += scale * dx;
-            result.y += scale * dy;
+            // Keep NewtonWars' arithmetic order: normalize the direction, then
+            // multiply by mass / distance². Long close approaches amplify tiny
+            // floating-point differences into different collision outcomes.
+            let magnitude = planet.mass / (distance * distance);
+            result.x += (dx / distance) * magnitude;
+            result.y += (dy / distance) * magnitude;
         }
         Ok(result)
     }
@@ -270,5 +273,28 @@ mod tests {
         let minus = moved_mass.acceleration(position).unwrap();
         assert!((((plus.x - minus.x) / (2.0 * h)) - jacobian[(0, 2)]).abs() < 1e-8);
         assert!((((plus.y - minus.y) / (2.0 * h)) - jacobian[(1, 2)]).abs() < 1e-8);
+    }
+
+    #[test]
+    fn acceleration_uses_newtonwars_normalized_direction_order() {
+        let map = PlanetMap {
+            planets: vec![
+                planet(983.183926, 847.778123, 27.0, 1879.638293),
+                planet(517.832951, 671.921335, 36.0, 4767.032950),
+            ],
+        };
+        let position = Vec2::new(834.3642578125, 952.4937133789062);
+        let mut expected = Vec2::default();
+        for source in &map.planets {
+            let dx = source.x - position.x;
+            let dy = source.y - position.y;
+            let distance = (dx * dx + dy * dy).sqrt();
+            let magnitude = source.mass / (distance * distance);
+            expected.x += (dx / distance) * magnitude;
+            expected.y += (dy / distance) * magnitude;
+        }
+
+        let actual = map.acceleration(position).unwrap();
+        assert_eq!(actual, expected);
     }
 }
