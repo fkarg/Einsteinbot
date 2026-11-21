@@ -273,7 +273,7 @@
       const f=r.perfect_shot_on_damaged_map,c=r.claimed,re=r.real;
       const fixed=f.hit?'still hits':`closest approach ${fmt(f.closest_approach,1)}`;
       const chose=!c?'no shot':`${c.reason} v${c.velocity}@${c.angle_degrees}°${c.predicted_victim!=null?` → ${c.predicted_victim}`:''}`;
-      const real=!re?'—':re.hit_intended?'hits':re.hit_player!=null?`hits player ${re.hit_player} (not the intended target)`:`${re.closest_approach==null?'no target':`closest approach ${fmt(re.closest_approach,1)}`} (${terminationText(re.termination)})`;
+      const real=!re?'—':re.hit_intended?'hits':re.hit_player!=null?`hits player ${re.hit_player}${c?.predicted_victim==null?' (the bot expected no hit)':' (not the intended target)'}`:`${re.closest_approach==null?'no target':`closest approach ${fmt(re.closest_approach,1)}`} (${terminationText(re.termination)})`;
       table.append(row([r.label,fixed,chose,real],`row${degrade.selected===i?' pinned':''}`,()=>{degrade.selected=i;renderDegrade();render();}));
     });
     const note=document.createElement('div');note.className='note';note.textContent=`${degrade.note} Distances are center to center (a player's radius is 4). Click a row to draw it: orange dashed is the path the bot expected, blue is what happens on the true map.`;
