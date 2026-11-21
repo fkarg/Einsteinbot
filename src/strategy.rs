@@ -136,14 +136,14 @@ impl BotState {
                 self.covered_cells.clear();
                 self.map_belief = None;
                 self.in_flight.clear();
-                // NewtonWars may report freshly initialized player positions just before
-                // sending Planets. Treat current positions as the new epoch's observed
-                // candidates while discarding the prior map's history.
+                // During map reinitialization, NewtonWars sends each player's new position
+                // immediately before that player's Planets message. Other entries may still
+                // be stale because those players' updates can arrive after this boundary.
                 self.observed_spawn_locations.clear();
-                for position in self.player_positions.values() {
-                    if !self.observed_spawn_locations.contains(position) {
-                        self.observed_spawn_locations.push(position.clone());
-                    }
+                if let Some(own_id) = self.own_id
+                    && let Some(position) = self.player_positions.get(&own_id)
+                {
+                    self.observed_spawn_locations.push(position.clone());
                 }
             }
             ServerEvent::OwnId { player_id } => self.own_id = Some(*player_id),
@@ -1049,8 +1049,9 @@ mod tests {
     }
 
     #[test]
-    fn map_epoch_keeps_positions_announced_before_planets_as_new_spawn_candidates() {
+    fn map_epoch_keeps_own_fresh_position_and_discards_other_stale_positions() {
         let mut state = BotState::default();
+        state.observe(&ServerEvent::OwnId { player_id: 1 });
         state.observe(&ServerEvent::PlayerPosition {
             player_id: 1,
             x: 100.0,
@@ -1066,13 +1067,20 @@ mod tests {
             x: 500.0,
             y: 500.0,
         });
+        // During reinitialize, this player's fresh position is sent immediately before
+        // its Planets event, while other players' stored positions may still be stale.
+        state.observe(&ServerEvent::PlayerPosition {
+            player_id: 1,
+            x: 300.0,
+            y: 300.0,
+        });
 
         state.observe(&ServerEvent::Planets { planets: vec![] });
 
         assert_eq!(
             state.observed_spawn_locations(),
-            vec![Point { x: 300.0, y: 300.0 }, Point { x: 500.0, y: 500.0 },],
-            "Planets can follow the new map's respawn positions, so retain current positions but drop older anchors"
+            vec![Point { x: 300.0, y: 300.0 }],
+            "retain the own position just refreshed for this boundary, not other stale map positions"
         );
     }
 
