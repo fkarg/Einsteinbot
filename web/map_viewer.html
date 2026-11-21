@@ -43,6 +43,8 @@
     details.explain { color:#b6c5d8; background:#111a27; border:1px solid #263244; border-radius:6px; padding:8px 10px; font-size:12px; }
     details.explain summary { color:#d9e5f4; cursor:pointer; font-weight:600; }
     details.explain p { margin:7px 0; }
+    .layers { display:flex; } .layer { background:#172334; border-color:#34445a; border-radius:0; } .layer:first-child { border-radius:5px 0 0 5px; } .layer:last-child { border-radius:0 5px 5px 0; } .layer.active { background:#21476a; border-color:#ffe27a; color:#ffe27a; } .layer:disabled { opacity:.45; cursor:not-allowed; }
+    details.explain ul { margin:6px 0; padding-left:18px; }
     .scrubbar { display:flex; gap:6px; align-items:center; flex-wrap:wrap; } .scrubbar button { padding:3px 9px; }
     #scrub { width:100%; height:104px; background:#080d13; border:1px solid #263244; border-radius:5px; cursor:ew-resize; touch-action:none; }
     .table { width:100%; border-collapse:collapse; font:11px/1.4 ui-monospace,monospace; color:#b6c5d8; }
@@ -68,25 +70,28 @@
       </div>
       <canvas id="scrub" aria-label="Capture timeline"></canvas>
       <div class="toolbar">
-        <label>Vector field <select id="field">
-          <optgroup label="Learned map"><option value="delta" selected>Belief − actual</option><option value="total">Belief · planets + residual</option><option value="physical">Fitted planets only</option><option value="residual">Observed local residual</option></optgroup>
+        <div class="layers" role="group" aria-label="Map layer">
+          <button type="button" class="layer" data-layer="gravity" title="Belief gravity: fitted planets plus observed local residual">Gravity</button><button type="button" class="layer" data-layer="uncertainty" title="Field uncertainty propagated from the fit covariance (unavailable without a full-rank fit)">Uncertainty</button><button type="button" class="layer" data-layer="evidence" title="Where recorded paths support a local residual">Evidence</button><button type="button" class="layer" data-layer="error" id="errorLayer">Error vs disclosed</button>
+        </div>
+        <label><input type="checkbox" id="beliefPlanets" checked> Estimated planets</label>
+        <label id="actualPlanetsLabel"><input type="checkbox" id="actualPlanets" checked> Disclosed planets</label>
+        <label><input type="checkbox" id="paths"> Trajectories</label>
+        <label><input type="checkbox" id="contacts"> Contacts</label>
+        <button id="zoomIn" type="button">Zoom in</button><button id="zoomOut" type="button">Zoom out</button><button id="resetView" type="button">Full map</button>
+      </div>
+      <details class="explain"><summary>Advanced</summary>
+        <div class="toolbar">
+          <label>Vector field <select id="field">
+          <optgroup label="Learned map"><option value="delta" >Belief − actual</option><option value="total" selected>Belief · planets + residual</option><option value="physical">Fitted planets only</option><option value="residual">Observed local residual</option></optgroup>
           <optgroup label="Residual hypothesis"><option value="hypothesis_source">Field-only source</option><option value="hypothesis_residual">Hypothesis local residual</option><option value="hypothesis_total">Belief + hypothesis</option><option value="hypothesis_delta">Hypothesis − actual</option></optgroup>
           <optgroup label="Oracle"><option value="oracle">Disclosed actual</option></optgroup>
         </select></label>
-        <label>Color by <select id="heat"><option value="magnitude">Field strength</option><option value="x">X component</option><option value="y">Y component</option><option value="sigma">Parameter uncertainty</option><option value="support">Residual evidence coverage</option></select></label>
-        <button id="zoomIn" type="button">Zoom in</button><button id="zoomOut" type="button">Zoom out</button><button id="resetView" type="button">Full map</button>
-      </div>
-      <details class="explain"><summary>Display and model layers</summary>
-        <div class="toolbar">
+          <label>Color by <select id="heat"><option value="magnitude">Field strength</option><option value="x">X component</option><option value="y">Y component</option><option value="sigma">Parameter uncertainty</option><option value="support">Residual evidence coverage</option></select></label>
           <label>Grid <select id="resolution"><option value="1">1 unit</option><option value="2">2 units</option><option value="3" selected>3 units</option><option value="5">5 units</option><option value="10">10 units</option><option value="25">25 units</option></select></label>
           <label>Color scale <select id="scale"><option value="percentile" selected>Robust percentiles</option><option value="log">Logarithmic</option><option value="linear">Linear</option></select></label>
           <label><input type="checkbox" id="arrows"> Vector arrows</label>
-          <label><input type="checkbox" id="paths"> Recorded trajectories</label>
           <label><input type="checkbox" id="pathResiduals"> Raw gravity residuals along paths</label>
           <label><input type="checkbox" id="coverage"> Bot coverage</label>
-          <label><input type="checkbox" id="beliefPlanets" checked> Estimated planets</label>
-          <label><input type="checkbox" id="actualPlanets" checked> Actual planets</label>
-          <label><input type="checkbox" id="contacts"> Contact evidence</label>
         </div>
       </details>
       <div id="tip"></div>
@@ -94,18 +99,16 @@
       <div class="scale-legend"><span id="scaleMin">—</span><div class="scale-bar" id="scaleBar"></div><span id="scaleMax">—</span></div>
       <div class="scale-legend path-scale" id="pathScale"><b>Path residual |r|</b><span id="pathMin">0</span><div class="scale-bar" id="pathScaleBar"></div><span id="pathMax">—</span></div>
       <div class="legend">
-        <span><i class="dot" style="background:#ffc45b"></i>estimated planet</span><span><i class="dot" style="background:#60dcff"></i>disclosed planet</span>
-        <span>raw trajectory samples use their own scale above</span>
+        <span><i class="dot" style="background:#ffc45b"></i>estimated planet</span><span id="actualLegend"><i class="dot" style="background:#60dcff"></i>disclosed planet</span>
       </div>
-      <details class="explain"><summary>What these layers mean</summary>
-        <p><b>Arrows</b> point in the selected field direction and are skipped on estimated planet disks. Their length grows logarithmically with strength. The color bar shows the numeric range used for this view; robust colors clip at the 5th/95th percentiles. The full map now defaults to 3-unit samples; zoom buttons and shift-drag are available, and scrolling does not zoom.</p>
-        <p><b>Estimated planets</b> are fitted collision disks in the bot’s belief. <b>Disclosed planets</b> are the game’s oracle map, shown only for diagnosis and never used by belief simulations.</p>
-        <p><b>Local residual</b> is observed gravity left over after the fitted planets, interpolated near recorded paths. <b>Field-only source</b> and its residual are alternate gravity explanations; they do not create collision disks. Support is spatially local, not a confidence probability.</p>
-        <p><b>Belief</b> combines fitted-planet gravity with the observed local residual. <b>Belief + hypothesis</b> adds a tentative field-only source and its local residual. <b>Belief − actual</b> and <b>Hypothesis − actual</b> are vector differences; they require a disclosed map. X/Y coloring is signed and uses a symmetric log transform if logarithmic scaling is selected.</p>
-        <p><b>Raw gravity residuals along paths</b> show reconstructed trajectory curvature minus the fitted planet field at each usable sample. They are not independent data from the path and can include numerical or quantization error; use them to locate patterns, then validate corrections against held-out shots.</p>
-        <p><b>Trajectories</b> are colored by player id; click one to inspect its endpoint. The protocol records the sampled path but no termination reason. Purple contact dots are endpoints accepted by the contact estimator, not every physical collision. Missing dots can mean the selected belief snapshot has not caught up; “map updating” flags that it is still working. The timeline shows when each event arrived.</p>
-        <p><b>Gravity error</b> colors the magnitude of estimated minus actual acceleration. The RMS and p95 values use the visible grid, including samples inside planet disks; they describe field-vector error, not path error. <b>Uncertainty</b> comes from fitted planet covariance when available and does not include omitted planets or all model error.</p>
-        <p><b>Dark cells</b> mean the selected layer has no value there: for example, no fitted covariance for uncertainty, or no trajectory support for residual coverage. They do not mean zero gravity.</p>
+      <details class="explain"><summary>Help</summary>
+        <ul>
+          <li><b>Gravity</b> is fitted planets plus the observed local residual; <b>Evidence</b> marks where recorded paths support that residual; <b>Error</b> is belief minus the disclosed map and exists only for captures that have one.</li>
+          <li>Dark cells have no value for the layer (not zero gravity). Uncertainty ignores omitted planets and model error.</li>
+          <li>Estimated planets are fitted collision disks. Disclosed planets are the game’s own map, for diagnosis only.</li>
+          <li>Contacts are path endpoints the estimator accepted as surface hits, not every collision.</li>
+          <li>Advanced hypothesis fields are alternate gravity explanations, never collision geometry. “Map updating: yes” means the snapshot may lag the latest observations.</li>
+        </ul>
       </details>
     </section>
     <aside>
@@ -113,20 +116,22 @@
       <h2>Captured belief</h2>
       <div id="metrics" class="metrics"></div>
       <h2>Estimated planets</h2><div id="planetList"></div>
-      <p class="note">A decision shows the latest published map snapshot available at that moment. “Map updating: yes” means newer observations may still be queued or fitting; the snapshot may not include every earlier-looking path yet. Parameter-derived uncertainty does not include missing planets or model error. The field-hypothesis distance proxy is not a probability or standard deviation.</p>
-      <h2>Targeting simulation</h2>
-      <div class="controls">
-        <label>Gravity model<select id="model"><option value="belief">Recorded physical map + local residual</option><option value="hypothesis">Recorded map + field hypothesis</option><option value="actual">Disclosed actual map</option></select></label>
-        <label>Velocity<input id="velocity" type="number" min="2" max="50" step="1" value="8"></label>
-        <label>Angle (degrees)<input id="angle" type="number" min="-180" max="180" step="1" value="0"></label>
-        <button id="simulate">Simulate this shot</button>
-        <button id="compare">Compare recorded choice with actual-map targeting</button>
-        <button id="audit">Audit Rust physics against recorded paths</button>
+      <div id="decisionPanel" hidden>
+        <h2>Decision</h2>
+        <div id="choice" class="metrics"></div>
+        <details class="explain"><summary>Targeting simulation</summary>
+          <div class="controls">
+            <label>Gravity model<select id="model"><option value="belief">Recorded physical map + local residual</option><option value="hypothesis">Recorded map + field hypothesis</option><option value="actual">Disclosed actual map</option></select></label>
+            <label>Velocity<input id="velocity" type="number" min="2" max="50" step="1" value="8"></label>
+            <label>Angle (degrees)<input id="angle" type="number" min="-180" max="180" step="1" value="0"></label>
+            <button id="simulate">Simulate this shot</button>
+            <button id="compare">Compare recorded choice with actual-map targeting</button>
+            <button id="audit">Audit Rust physics against recorded paths</button>
+          </div>
+          <p class="note">Runs use the current Rust engine on a stationary snapshot of the captured players. The actual-map result is a counterfactual from current code, not the policy that made the recorded choice.</p>
+          <div id="comparison" class="metrics"></div>
+        </details>
       </div>
-      <p class="note">Simulation uses the Rust engine model, a stationary snapshot of captured players, and the selected gravity model. The actual-map policy result is a counterfactual from the current code, not the policy version that made the recorded choice.</p>
-      <div id="comparison" class="metrics">Choose a decision to inspect its map, state, and selected shot.</div>
-      <h2>Decision details</h2>
-      <div id="choice" class="metrics"></div>
     </aside>
   </main>
   <script src="/map_viewer.js"></script>
