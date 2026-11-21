@@ -330,8 +330,20 @@ fn selected_snapshot(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Resul
     let events = read_events_before(&connection, capture_id, sequence.saturating_add(1))?;
     let actual_planets = latest_actual_planets(&events);
     let display_field = parameters.get("field").copied().unwrap_or("delta");
-    if !["delta", "total", "physical", "residual", "oracle"].contains(&display_field) {
-        return Err("field must be delta, total, physical, residual, or oracle".to_owned());
+    if ![
+        "delta",
+        "total",
+        "physical",
+        "residual",
+        "oracle",
+        "hypothesis_source",
+        "hypothesis_residual",
+        "hypothesis_total",
+        "hypothesis_delta",
+    ]
+    .contains(&display_field)
+    {
+        return Err("unknown vector field".to_owned());
     }
     let grid_step = parameters.get("step").map_or(Ok(FIELD_GRID_STEP), |step| {
         step.parse::<usize>()
@@ -580,6 +592,40 @@ fn make_field_grid(
             let delta = gravity
                 .zip(actual_vector)
                 .map(|(estimate, oracle)| (estimate.0 - oracle.x, estimate.1 - oracle.y));
+            let wants_source = matches!(
+                display_field,
+                "hypothesis_source" | "hypothesis_total" | "hypothesis_delta"
+            );
+            let wants_hypothesis_residual = matches!(
+                display_field,
+                "hypothesis_residual" | "hypothesis_total" | "hypothesis_delta"
+            );
+            let hypothesis_source = wants_source
+                .then(|| {
+                    belief
+                        .field_hypothesis
+                        .as_ref()
+                        .and_then(|hypothesis| hypothesis.acceleration(position))
+                })
+                .flatten();
+            let hypothesis_residual = wants_hypothesis_residual
+                .then(|| {
+                    belief
+                        .hypothesis_local_field
+                        .as_ref()
+                        .and_then(|field| field.residual(position))
+                })
+                .flatten();
+            let hypothesis_total = physical.zip(hypothesis_source).map(|(physical, source)| {
+                let residual = hypothesis_residual.unwrap_or_default();
+                (
+                    physical.x + source.x + residual.x,
+                    physical.y + source.y + residual.y,
+                )
+            });
+            let hypothesis_delta = hypothesis_total
+                .zip(actual_vector)
+                .map(|(estimate, oracle)| (estimate.0 - oracle.x, estimate.1 - oracle.y));
             let sigma = covariance
                 .and_then(|matrix| belief.map.acceleration_covariance(position, matrix).ok())
                 .map(|covariance| (covariance.xx + covariance.yy).max(0.0).sqrt());
@@ -589,6 +635,10 @@ fn make_field_grid(
                 "physical" => physical.map(|v| (v.x, v.y)),
                 "residual" => residual_observed.map(|v| (v.x, v.y)),
                 "oracle" => actual_vector.map(|v| (v.x, v.y)),
+                "hypothesis_source" => hypothesis_source.map(|v| (v.x, v.y)),
+                "hypothesis_residual" => hypothesis_residual.map(|v| (v.x, v.y)),
+                "hypothesis_total" => hypothesis_total,
+                "hypothesis_delta" => hypothesis_delta,
                 _ => unreachable!("display field is validated by selected_snapshot"),
             };
             samples.push(json!([
@@ -1100,5 +1150,39 @@ mod tests {
         assert_eq!(sample[2], 0.0);
         assert_eq!(sample[3], 0.0);
         assert_eq!(sample[13], false);
+    }
+
+    #[test]
+    fn field_grid_can_select_a_field_only_hypothesis_vector() {
+        let data = json!({
+            "map_belief": {
+                "planets": [],
+                "local_field": {"samples": []},
+                "field_hypothesis": {
+                    "x": 5.0,
+                    "y": 5.0,
+                    "mass": 100.0,
+                    "support": [],
+                    "baseline_continuation_rmse": 10.0,
+                    "continuation_rmse": 1.0
+                }
+            }
+        });
+        let grid = make_field_grid(
+            &data,
+            None,
+            1,
+            Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+            "hypothesis_source",
+        )
+        .unwrap();
+        let sample = &grid["samples"][0];
+        assert!(sample[2].as_f64().is_some_and(|x| x > 0.0));
+        assert!(sample[3].as_f64().is_some_and(|y| y > 0.0));
     }
 }
