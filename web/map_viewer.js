@@ -192,17 +192,19 @@
   async function loadReview(repairs=false){
     const request=++reviewRequest,id=captureId,seq=position;
     if(snapshot?.selection_kind!=='decision'){review=null;renderReview();return;}
+    if(!repairs){review={loading:true};renderReview();render();}
     try{
       const data=await api(`/api/shot-review?id=${id}&seq=${seq}${repairs?'&repairs=1':''}`);
       if(request!==reviewRequest||id!==captureId||seq!==position)return;
       if(!repairs||!review)reviewVisible=new Set(['observed',...(data.variants||[]).filter(v=>v.as_used||v.key==='actual').map(v=>v.key)]);
       review=data;renderReview();render();
-    }catch(e){review={error:e.message};renderReview();}
+    }catch(e){if(request===reviewRequest){review={error:e.message};renderReview();}}
   }
   function renderReview(){
     const summary=$('reviewSummary'),paths=$('reviewPaths'),note=$('reviewNote'),repairs=$('reviewRepairs');
     paths.replaceChildren();note.textContent='';repairs.replaceChildren();
     if(!review){kv(summary,[['Select a decision to review its shot.',null]]);return;}
+    if(review.loading){kv(summary,[['Loading shot review…',null]]);return;}
     if(review.error){kv(summary,[[review.error,null]]);return;}
     const d=review.decision,chosen=d.velocity==null?'no shot chosen':`v${d.velocity} at ${d.angle_degrees}° by player ${d.own_id}`;
     const predicted=d.velocity==null?'—':`${d.reason||'shot'}${d.predicted_victim!=null?` on player ${d.predicted_victim}`:''} · center miss ${fmt(d.miss_distance)} units`;
@@ -220,7 +222,7 @@
     }
     paths.append(table);
     const div=review.divergence,est=div?.nearest_estimated,act=div?.nearest_disclosed;
-    note.textContent=`★ is the model the bot used. RMSE is in world units over the shared timed samples; “parts at” is the first sample more than 10 units from the observed path. ${div?`The model used leaves the path at (${fmt(div.point.x,0)}, ${fmt(div.point.y,0)}); the nearest estimated planet is #${est?.index} (${fmt(est?.gap,0)} from its surface)${act?`, the nearest disclosed planet #${act.index} (${fmt(act.gap,0)})`:''}. Distance is not cause: a far planet can bend a path.`:''}`;
+    note.textContent=`★ is the model the bot used. RMSE is the per-coordinate path error in world units over the timed samples; a path that stops earlier than the other is held at its last point, so an early stop counts as error. “parts at” is the first sample more than 10 units from the observed path. ${div?`The model used leaves the path at (${fmt(div.point.x,0)}, ${fmt(div.point.y,0)}); the nearest estimated planet is #${est?.index} (${fmt(est?.gap,0)} from its surface)${act?`, the nearest disclosed planet #${act.index} (${fmt(act.gap,0)})`:''}. Distance is not cause: a far planet can bend a path.`:''}`;
     if(snapshot?.actual_planets){
       if(review.repairs?.rows){
         const r=review.repairs,t=document.createElement('table');t.className='table';
@@ -234,7 +236,7 @@
     }
   }
   function drawReview(){
-    if(!review?.shot||snapshot?.selection_kind!=='decision')return;
+    if(!review?.shot||snapshot?.selection_kind!=='decision'||String(review.decision.sequence)!==position)return;
     const line=(points,color,width,dash)=>{if(!points?.length)return;ctx.beginPath();ctx.moveTo(points[0].x,points[0].y);for(const p of points)ctx.lineTo(p.x,p.y);ctx.strokeStyle=color;ctx.lineWidth=width;ctx.setLineDash(dash);ctx.stroke();ctx.setLineDash([]);};
     for(const v of review.variants)if(v.available&&reviewVisible.has(v.key))line(v.points,REVIEW_COLORS[v.key],v.as_used?3:2,[7,5]);
     if(reviewVisible.has('observed'))line(review.shot.points,REVIEW_COLORS.observed,3,[]);
@@ -247,8 +249,10 @@
   }
   function predictiveRows(){
     const p=predictive.get(selected());if(!p)return [];
-    return [[`Next ${predictiveHorizon} observed shots`,p.shots?`median path error ${fmt(p.median_rmse,1)} · worst ${fmt(p.max_rmse,1)} (${p.shots} shots)`:'none observed after this decision']];
+    const why={no_belief:'no belief recorded yet',no_later_shots:'no observed shots after this decision in the same map epoch',model_unavailable:'the model this decision used is not recorded',too_short_to_score:'observed shots too short to score'};
+    return [[`Next ${predictiveHorizon} observed shots`,p.status==='scored'?`median path error ${fmt(p.median_rmse,1)} · worst ${fmt(p.max_rmse,1)} (${p.shots} shots)`:(why[p.status]||'unavailable')]];
   }
+
   $('worstPrediction').addEventListener('click',()=>{
     let worst=null;for(const [sequence,p] of predictive)if(p.shots>=1&&Number.isFinite(p.median_rmse)&&botVisible(decisionAt(sequence))&&(!worst||p.median_rmse>worst.median_rmse))worst={sequence,median_rmse:p.median_rmse};
     if(!worst)return;const i=timeline.findIndex(item=>item.sequence===worst.sequence);if(i>=0)goto(i);

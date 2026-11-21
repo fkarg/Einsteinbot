@@ -16,6 +16,8 @@ const CONTACT_TOLERANCE: f64 = 2.0;
 /// Observed shots scored per decision for the held-out prediction error.
 const HORIZON_SHOTS: usize = 5;
 const MAX_SAMPLES: usize = 2000;
+/// An endpoint within this distance of the margin that ends shots counts as leaving the field.
+const MARGIN_SLACK: f64 = 30.0;
 
 /// A completed shot, with where every player stood when it began.
 struct ObservedShot {
@@ -41,7 +43,7 @@ impl ObservedShot {
 
 /// Pairs every `ShotBegin` with its `ShotFin` (same player, angle and velocity; the begin whose
 /// player was launched nearest the first observed point wins).
-fn observed_shots(events: Vec<(i64, Value)>) -> Result<Vec<ObservedShot>, String> {
+fn observed_shots(events: Vec<(i64, Value)>) -> Vec<ObservedShot> {
     struct Pending {
         sequence: i64,
         player_id: u32,
@@ -119,7 +121,7 @@ fn observed_shots(events: Vec<(i64, Value)>) -> Result<Vec<ObservedShot>, String
         }
     }
     shots.sort_by_key(|shot| shot.begin_sequence);
-    Ok(shots)
+    shots
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -147,6 +149,22 @@ impl Model {
             Self::Hypothesis => "Planets + field-only source",
         }
     }
+}
+
+/// The model the bot's own search used for this decision.
+fn model_used(data: &Value) -> Model {
+    if data["choice"]["used_field_hypothesis"].as_bool() == Some(true) {
+        Model::Hypothesis
+    } else if local_field_recorded(data) {
+        Model::Local
+    } else {
+        Model::Physical
+    }
+}
+
+/// Older records may lack the residual correction entirely; that is not an empty correction.
+fn local_field_recorded(data: &Value) -> bool {
+    !data["map_belief"]["local_field"].is_null()
 }
 
 /// Simulates `shot` under a recorded belief; `Ok(None)` when the belief lacks what the model needs.
@@ -199,21 +217,27 @@ struct PathScore {
     diverges_at: Option<usize>,
 }
 
-/// Coordinate RMSE over the timed samples both paths share (the launch is the shared start; the
-/// final point is excluded when a collision appended it mid-tick), and where they first part.
+/// Per-coordinate RMSE over the timed samples (the project's usual path error), and where the
+/// paths first part by more than `DIVERGENCE_DISTANCE`. A collision appends its last point
+/// mid-tick on either side, so that point is not a timed sample. A path that stops earlier than
+/// the other is held at its last timed point, so a prediction that ends early is penalized.
 fn score_path(observed: &[Point], predicted: &PredictedTrajectory) -> Option<PathScore> {
-    let timed_predicted = predicted.points.len().saturating_sub(usize::from(matches!(
+    let timed_predicted = predicted.points.len().saturating_sub(usize::from(!matches!(
         predicted.termination,
-        Termination::PlanetCollision(_) | Termination::BattlefieldMargin
+        Termination::SampleLimit
     )));
-    let count = observed.len().saturating_sub(1).min(timed_predicted);
-    if count == 0 {
+    let timed_observed = observed.len().saturating_sub(1);
+    // One timed sample is the shared launch point; it says nothing about the model.
+    if timed_observed < 2 || timed_predicted == 0 {
         return None;
     }
-    let errors = observed[..count]
-        .iter()
-        .zip(&predicted.points[..count])
-        .map(|(o, p)| f64::from(o.x - p.x).hypot(f64::from(o.y - p.y)))
+    let count = timed_observed.max(timed_predicted);
+    let errors = (0..count)
+        .map(|i| {
+            let o = &observed[i.min(timed_observed - 1)];
+            let p = &predicted.points[i.min(timed_predicted - 1)];
+            f64::from(o.x - p.x).hypot(f64::from(o.y - p.y))
+        })
         .collect::<Vec<_>>();
     Some(PathScore {
         rmse: (errors.iter().map(|e| e * e).sum::<f64>() / (2 * errors.len()) as f64).sqrt(),
@@ -265,10 +289,10 @@ fn infer_outcome(
         return json!({"kind": "planet", "source": source, "index": surface["index"], "gap": surface["gap"]});
     }
     let (x, y) = (f64::from(end.x), f64::from(end.y));
-    if x <= -world.margin + 30.0
-        || y <= -world.margin + 30.0
-        || x >= world.battlefield_width + world.margin - 30.0
-        || y >= world.battlefield_height + world.margin - 30.0
+    if x <= -world.margin + MARGIN_SLACK
+        || y <= -world.margin + MARGIN_SLACK
+        || x >= world.battlefield_width + world.margin - MARGIN_SLACK
+        || y >= world.battlefield_height + world.margin - MARGIN_SLACK
     {
         return json!({"kind": "battlefield_margin"});
     }
@@ -278,14 +302,6 @@ fn infer_outcome(
     json!({"kind": "unexplained"})
 }
 
-fn decision_belief(data: &Value) -> Result<Option<MapBelief>, String> {
-    decode_belief(&data["map_belief"])
-}
-
-fn path_json(points: &[Point]) -> Value {
-    json!(points)
-}
-
 /// `GET /api/shot-review?id=&seq=[&repairs=1]` for a decision `seq`.
 pub fn shot_review(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Result<Value, String> {
     let capture_id = required_id(parameters, "id")?;
@@ -293,7 +309,7 @@ pub fn shot_review(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Result<
     let want_repairs = parameters.get("repairs") == Some(&"1");
     let connection = open_database(path)?;
     let data = read_decision(&connection, capture_id, sequence)?;
-    let belief = decision_belief(&data)?;
+    let belief = decode_belief(&data["map_belief"])?;
     let bot_state = BotState::from_diagnostic_snapshot(&data["bot_state"])
         .map_err(|error| error.to_string())?;
     let own_id = bot_state
@@ -326,9 +342,27 @@ pub fn shot_review(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Result<
         .rev()
         .find(|(planets_sequence, _)| *planets_sequence < sequence)
         .map(|(_, planets)| planets.clone());
-    let shots = observed_shots(events)?;
+    let shots = observed_shots(events);
+    // The decision's shot began before this bot's next decision and within the same map epoch.
+    let next_decision: Option<i64> = connection
+        .query_row(
+            "SELECT MIN(sequence) FROM diagnostics WHERE capture_id=?1 AND kind='target_decision' AND bot_name=(SELECT bot_name FROM diagnostics WHERE capture_id=?1 AND sequence=?2) AND sequence>?2",
+            params![capture_id, sequence],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let epoch_end = actual_maps
+        .iter()
+        .map(|(planets_sequence, _)| *planets_sequence)
+        .find(|planets_sequence| *planets_sequence > sequence);
+    let window_end = [next_decision, epoch_end]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(i64::MAX);
     let matched = shots.iter().find(|shot| {
         shot.begin_sequence > sequence
+            && shot.begin_sequence < window_end
             && shot.player_id == own_id
             && (shot.velocity - velocity).abs() < 1e-6
             && (shot.angle - angle).abs() < 1e-6
@@ -351,24 +385,24 @@ pub fn shot_review(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Result<
         .map(|b| b.map.planets.clone())
         .unwrap_or_default();
     let observation = shot.observation();
-    let used = if choice["used_field_hypothesis"].as_bool() == Some(true) {
-        Model::Hypothesis
-    } else {
-        Model::Local
-    };
+    let used = model_used(&data);
     let samples = shot.points.len() + 2;
     let mut variants = Vec::new();
     let mut divergence = Value::Null;
     if let Some(belief) = &belief {
         for model in [Model::Physical, Model::Local, Model::Hypothesis] {
-            let predicted = predict(
-                belief,
-                &belief.map,
-                model,
-                &observation,
-                &shot.players,
-                samples,
-            )?;
+            let predicted = if model == Model::Local && !local_field_recorded(&data) {
+                None
+            } else {
+                predict(
+                    belief,
+                    &belief.map,
+                    model,
+                    &observation,
+                    &shot.players,
+                    samples,
+                )?
+            };
             variants.push(variant_json(
                 model.key(),
                 model.label(),
@@ -419,7 +453,7 @@ pub fn shot_review(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Result<
         "shot": {
             "begin_sequence": shot.begin_sequence,
             "end_sequence": shot.end_sequence,
-            "points": path_json(&shot.points),
+            "points": json!(&shot.points),
             "launch_offset": launch_offset,
             "outcome": infer_outcome(shot, &belief_planets, actual.as_deref()),
         },
@@ -450,7 +484,7 @@ fn variant_json(
         "label": label,
         "as_used": as_used,
         "available": true,
-        "points": path_json(&predicted.points),
+        "points": json!(&predicted.points),
         "termination": termination_name(predicted.termination),
         "rmse": score.as_ref().map(|s| s.rmse),
         "compared_samples": score.as_ref().map(|s| s.compared),
@@ -499,7 +533,7 @@ fn repair_experiments(
     let mut all = belief.map.clone();
     for (i, truth) in actual.iter().enumerate() {
         let pair = pairs.iter().find(|pair| pair.1 == i);
-        let (kind, mut map) = match pair {
+        let (kind, map) = match pair {
             None => {
                 let mut map = belief.map.clone();
                 map.planets.push(truth.clone());
@@ -517,7 +551,6 @@ fn repair_experiments(
                 ("correct_estimate", map)
             }
         };
-        map.planets.shrink_to_fit();
         let rmse = rmse_with(&map)?;
         rows.push(json!({
             "disclosed_index": i,
@@ -541,7 +574,8 @@ fn repair_experiments(
     }))
 }
 
-type PredictiveCache = Mutex<HashMap<(PathBuf, i64, i64), Value>>;
+/// One entry per capture, replaced when the capture's newest sequence moves (live recording).
+type PredictiveCache = Mutex<HashMap<(PathBuf, i64), (i64, Value)>>;
 
 /// `GET /api/predictive?id=`: per decision, the path error of its belief against the next shots
 /// that were actually observed (no disclosed map needed).
@@ -554,14 +588,16 @@ pub fn predictive_error(
     let connection = open_database(path)?;
     let last_sequence: i64 = connection
         .query_row(
-            "SELECT COALESCE(MAX(sequence), 0) FROM events WHERE capture_id=?1",
+            "SELECT COALESCE(MAX(sequence), 0) FROM (SELECT sequence FROM events WHERE capture_id=?1 UNION ALL SELECT sequence FROM diagnostics WHERE capture_id=?1)",
             [capture_id],
             |row| row.get(0),
         )
         .map_err(|error| error.to_string())?;
-    let key = (path.clone(), capture_id, last_sequence);
+    let key = (path.clone(), capture_id);
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(cached) = cache.lock().map_err(|_| "cache poisoned")?.get(&key) {
+    if let Some((cached_sequence, cached)) = cache.lock().map_err(|_| "cache poisoned")?.get(&key)
+        && *cached_sequence == last_sequence
+    {
         return Ok(cached.clone());
     }
     let events = read_events_before(&connection, capture_id, i64::MAX)?;
@@ -569,7 +605,7 @@ pub fn predictive_error(
         .into_iter()
         .map(|(sequence, _)| sequence)
         .collect::<Vec<_>>();
-    let shots = observed_shots(events)?;
+    let shots = observed_shots(events);
     let mut statement = connection
         .prepare("SELECT sequence, data_json FROM diagnostics WHERE capture_id=?1 AND kind='target_decision' ORDER BY sequence")
         .map_err(|error| error.to_string())?;
@@ -582,27 +618,25 @@ pub fn predictive_error(
     for row in rows {
         let (sequence, text) = row.map_err(|error| error.to_string())?;
         let data: Value = serde_json::from_str(&text).map_err(|error| error.to_string())?;
-        let Some(belief) = decision_belief(&data)? else {
-            decisions.push(json!({"sequence": sequence, "shots": 0, "median_rmse": null}));
+        let Some(belief) = decode_belief(&data["map_belief"])? else {
+            decisions.push(json!({"sequence": sequence, "shots": 0, "median_rmse": null, "status": "no_belief"}));
             continue;
         };
-        let model = if data["choice"]["used_field_hypothesis"].as_bool() == Some(true) {
-            Model::Hypothesis
-        } else {
-            Model::Local
-        };
+        let model = model_used(&data);
         // Shots after a new disclosed map belong to another map epoch.
         let epoch_end = planets_sequences
             .iter()
             .copied()
             .find(|planets| *planets > sequence);
         let mut errors = Vec::new();
+        let (mut later_shots, mut modelled) = (0, 0);
         for shot in shots
             .iter()
             .filter(|shot| shot.begin_sequence > sequence)
             .filter(|shot| epoch_end.is_none_or(|end| shot.begin_sequence < end))
             .take(HORIZON_SHOTS)
         {
+            later_shots += 1;
             let predicted = predict(
                 &belief,
                 &belief.map,
@@ -611,13 +645,24 @@ pub fn predictive_error(
                 &shot.players,
                 shot.points.len() + 2,
             )?;
+            modelled += usize::from(predicted.is_some());
             if let Some(score) = predicted.and_then(|p| score_path(&shot.points, &p)) {
                 errors.push(score.rmse);
             }
         }
         errors.sort_by(f64::total_cmp);
+        let status = if later_shots == 0 {
+            "no_later_shots"
+        } else if modelled == 0 {
+            "model_unavailable"
+        } else if errors.is_empty() {
+            "too_short_to_score"
+        } else {
+            "scored"
+        };
         decisions.push(json!({
             "sequence": sequence,
+            "status": status,
             "shots": errors.len(),
             "median_rmse": median(&errors),
             "max_rmse": errors.last(),
@@ -627,7 +672,7 @@ pub fn predictive_error(
     cache
         .lock()
         .map_err(|_| "cache poisoned")?
-        .insert(key, result.clone());
+        .insert(key, (last_sequence, result.clone()));
     Ok(result)
 }
 
@@ -668,7 +713,7 @@ mod tests {
                 json!({"type": "shot_begin", "player_id": 2, "angle": 90.0, "velocity": 3.0}),
             ),
         ];
-        let shots = observed_shots(events).unwrap();
+        let shots = observed_shots(events);
         assert_eq!(shots.len(), 1, "an unfinished shot is not an observed shot");
         let shot = &shots[0];
         assert_eq!(
@@ -693,7 +738,7 @@ mod tests {
                 point(2.0, 15.0),
                 point(3.0, 30.0),
             ],
-            termination: Termination::SampleLimit,
+            termination: Termination::PlanetCollision(0),
         };
         let score = score_path(&observed, &predicted).unwrap();
         assert_eq!(score.compared, 3);
@@ -701,9 +746,27 @@ mod tests {
         assert!((score.rmse - (225.0_f64 / 6.0).sqrt()).abs() < 1e-9);
         let identical = PredictedTrajectory {
             points: observed.clone(),
-            termination: Termination::SampleLimit,
+            termination: Termination::PlanetCollision(0),
         };
-        assert_eq!(score_path(&observed, &identical).unwrap().diverges_at, None);
+        let perfect = score_path(&observed, &identical).unwrap();
+        assert_eq!((perfect.diverges_at, perfect.rmse), (None, 0.0));
+    }
+
+    #[test]
+    fn a_prediction_that_stops_early_is_penalized_and_trivial_shots_are_not_scored() {
+        let observed = (0..6)
+            .map(|i| point(20.0 * i as f32, 0.0))
+            .collect::<Vec<_>>();
+        let stops_early = PredictedTrajectory {
+            points: vec![point(0.0, 0.0), point(20.0, 0.0), point(40.0, 0.0)],
+            termination: Termination::PlanetCollision(0),
+        };
+        // Held at its last timed sample (20, 0) while the observed shot flies on.
+        let score = score_path(&observed, &stops_early).unwrap();
+        assert_eq!(score.diverges_at, Some(2));
+        assert_eq!(score.compared, 5);
+        let launch_only = vec![point(0.0, 0.0), point(1.0, 0.0)];
+        assert!(score_path(&launch_only, &stops_early).is_none());
     }
 
     #[test]
