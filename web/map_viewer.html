@@ -77,37 +77,24 @@
         <label id="actualPlanetsLabel"><input type="checkbox" id="actualPlanets" checked> Disclosed planets</label>
         <label><input type="checkbox" id="paths"> Trajectories</label>
         <label><input type="checkbox" id="contacts"> Contacts</label>
+        <label title="Dots at recorded path samples: observed path curvature minus the gravity of the fitted planets. A diagnostic that can include numerical noise; large clusters hint at a missing or misplaced planet."><input type="checkbox" id="pathResiduals"> Path residuals</label>
+        <label id="correctionsLabel" title="On: fitted planets plus the observed local residual correction (what the bot uses). Off: fitted planets only, which shows where corrections mask missing planets."><input type="checkbox" id="corrections" checked> Local corrections</label>
         <button id="zoomIn" type="button">Zoom in</button><button id="zoomOut" type="button">Zoom out</button><button id="resetView" type="button">Full map</button>
       </div>
-      <details class="explain"><summary>Advanced</summary>
-        <div class="toolbar">
-          <label>Vector field <select id="field">
-          <optgroup label="Learned map"><option value="delta" >Belief − actual</option><option value="total" selected>Belief · planets + residual</option><option value="physical">Fitted planets only</option><option value="residual">Observed local residual</option></optgroup>
-          <optgroup label="Residual hypothesis"><option value="hypothesis_source">Field-only source</option><option value="hypothesis_residual">Hypothesis local residual</option><option value="hypothesis_total">Belief + hypothesis</option><option value="hypothesis_delta">Hypothesis − actual</option></optgroup>
-          <optgroup label="Oracle"><option value="oracle">Disclosed actual</option></optgroup>
-        </select></label>
-          <label>Color by <select id="heat"><option value="magnitude">Field strength</option><option value="x">X component</option><option value="y">Y component</option><option value="sigma">Parameter uncertainty</option><option value="support">Residual evidence coverage</option></select></label>
-          <label>Grid <select id="resolution"><option value="1">1 unit</option><option value="2">2 units</option><option value="3" selected>3 units</option><option value="5">5 units</option><option value="10">10 units</option><option value="25">25 units</option></select></label>
-          <label>Color scale <select id="scale"><option value="percentile" selected>Robust percentiles</option><option value="log">Logarithmic</option><option value="linear">Linear</option></select></label>
-          <label><input type="checkbox" id="arrows"> Vector arrows</label>
-          <label><input type="checkbox" id="pathResiduals"> Raw gravity residuals along paths</label>
-          <label><input type="checkbox" id="coverage"> Bot coverage</label>
-        </div>
-      </details>
       <div id="tip"></div>
       <canvas id="map" width="1200" height="675" aria-label="Gravity and trajectory map"></canvas>
       <div class="scale-legend"><span id="scaleMin">—</span><div class="scale-bar" id="scaleBar"></div><span id="scaleMax">—</span></div>
       <div class="scale-legend path-scale" id="pathScale"><b>Path residual |r|</b><span id="pathMin">0</span><div class="scale-bar" id="pathScaleBar"></div><span id="pathMax">—</span></div>
       <div class="legend">
-        <span><i class="dot" style="background:#ffc45b"></i>estimated planet</span><span id="actualLegend"><i class="dot" style="background:#60dcff"></i>disclosed planet</span>
+        <span><i class="dot" style="background:#ffc45b"></i>estimated planet</span><span id="actualLegend"><i class="dot" style="background:#60dcff"></i>disclosed: close match <i class="dot" style="background:#ff9d4d"></i>center off <i class="dot" style="background:#e8d96d"></i>size off <i class="dot" style="background:#ff4d6a"></i>missing</span>
       </div>
       <details class="explain"><summary>Help</summary>
         <ul>
-          <li><b>Gravity</b> is fitted planets plus the observed local residual; <b>Evidence</b> marks where recorded paths support that residual; <b>Error</b> is belief minus the disclosed map and exists only for captures that have one.</li>
-          <li>Dark cells have no value for the layer (not zero gravity). Uncertainty ignores omitted planets and model error.</li>
-          <li>Estimated planets are fitted collision disks. Disclosed planets are the game’s own map, for diagnosis only.</li>
-          <li>Contacts are path endpoints the estimator accepted as surface hits, not every collision.</li>
-          <li>Advanced hypothesis fields are alternate gravity explanations, never collision geometry. “Map updating: yes” means the snapshot may lag the latest observations.</li>
+          <li><b>Gravity</b> is the bot's gravity belief; <b>Local corrections</b> adds the observed residual to the fitted planets (off shows the planets alone). <b>Evidence</b> marks where recorded paths support a residual. <b>Error</b> is belief minus the disclosed map and exists only when the capture has one.</li>
+          <li>Dark cells have no value for the layer (not zero gravity). Uncertainty comes from the fit covariance and ignores omitted planets and model error.</li>
+          <li>Disclosed planets are the game's own map, for diagnosis only. A disclosed planet is a <b>close match</b> when an estimate lies within 10 units and 5 units of radius; <b>center off</b> / <b>size off</b> exceed one threshold; <b>missing</b> has no estimate within 80 units. Pairs are one-to-one, closest first.</li>
+          <li>Contacts are path endpoints the estimator accepted as surface hits, not every collision. The pink diamond is a field-only source: a gravity explanation, never collision geometry.</li>
+          <li>“Map events pending” in the decision panel means the snapshot may lag the latest observations.</li>
         </ul>
       </details>
     </section>
@@ -115,6 +102,7 @@
       <h2>Selection</h2><div id="selection" class="metrics">Hover the map for a summary; click a planet, player, contact or trajectory to pin it.</div>
       <h2>Captured belief</h2>
       <div id="metrics" class="metrics"></div>
+      <div id="disclosedPanel"><h2>Disclosed planets</h2><div id="disclosedList"></div></div>
       <h2>Estimated planets</h2><div id="planetList"></div>
       <div id="decisionPanel" hidden>
         <h2>Decision</h2>

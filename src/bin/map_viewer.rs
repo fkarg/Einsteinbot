@@ -24,6 +24,8 @@ const DEFAULT_PORT: u16 = 8765;
 const PLAYER_RADIUS: f64 = 4.0;
 const FIELD_GRID_STEP: usize = 3;
 const MAX_FIELD_SAMPLES: usize = 300_000;
+/// Largest center distance at which an estimated planet may be paired with a disclosed one.
+const MATCH_DISTANCE: f64 = 80.0;
 
 fn main() {
     if let Err(error) = run() {
@@ -195,15 +197,35 @@ fn list_decisions(path: &PathBuf, capture_id: i64) -> Result<Value, String> {
     let mut statement = connection
         .prepare("SELECT sequence, timestamp_unix_ms, bot_name, data_json FROM diagnostics WHERE capture_id=?1 AND kind='target_decision' ORDER BY sequence")
         .map_err(|error| error.to_string())?;
+    let disclosed = disclosed_maps(&connection, capture_id)?;
     let rows = statement
         .query_map([capture_id], |row| {
             let data: String = row.get(3)?;
             let data: Value = serde_json::from_str(&data).unwrap_or(Value::Null);
             let belief = &data["map_belief"];
+            let sequence: i64 = row.get(0)?;
+            let accuracy = disclosed
+                .iter()
+                .rev()
+                .find(|(planets_sequence, _)| *planets_sequence < sequence)
+                .map(|(_, actual)| {
+                    let estimated: Vec<Planet> =
+                        serde_json::from_value(belief["planets"].clone()).unwrap_or_default();
+                    let pairs = match_planets(&estimated, actual);
+                    let mut errors: Vec<f64> = pairs.iter().map(|pair| pair.2).collect();
+                    errors.sort_by(f64::total_cmp);
+                    json!({
+                        "actual_planets": actual.len(),
+                        "matched_planets": pairs.len(),
+                        "missing_planets": actual.len() - pairs.len(),
+                        "median_center_error": errors.get(errors.len() / 2),
+                    })
+                });
             Ok(json!({
-                "sequence": row.get::<_, i64>(0)?,
+                "sequence": sequence,
                 "timestamp_unix_ms": row.get::<_, i64>(1)?,
                 "bot_name": row.get::<_, String>(2)?,
+                "accuracy": accuracy,
                 "energy": data["energy"],
                 "choice": data["choice"],
                 "scenario": data["scenario"],
@@ -219,6 +241,30 @@ fn list_decisions(path: &PathBuf, capture_id: i64) -> Result<Value, String> {
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
     Ok(json!({"capture_id": capture_id, "decisions": decisions}))
+}
+
+/// Every disclosed-planets message of a capture as `(sequence, planets)`, in sequence order.
+fn disclosed_maps(
+    connection: &Connection,
+    capture_id: i64,
+) -> Result<Vec<(i64, Vec<Planet>)>, String> {
+    let mut statement = connection
+        .prepare("SELECT sequence, event_json FROM events WHERE capture_id=?1 AND event_type='planets' ORDER BY sequence")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([capture_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| error.to_string())?;
+    let mut maps = Vec::new();
+    for row in rows {
+        let (sequence, text) = row.map_err(|error| error.to_string())?;
+        let value: Value = serde_json::from_str(&text).map_err(|error| error.to_string())?;
+        if let Ok(planets) = serde_json::from_value(value["event"]["planets"].clone()) {
+            maps.push((sequence, planets));
+        }
+    }
+    Ok(maps)
 }
 
 fn capture_timeline(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Result<Value, String> {
@@ -298,6 +344,55 @@ fn latest_actual_planets(events: &[(i64, Value)]) -> Option<Vec<Planet>> {
         (event["type"] == "planets")
             .then(|| serde_json::from_value(event["planets"].clone()).ok())
             .flatten()
+    })
+}
+
+/// Pairs estimated with disclosed planets one-to-one, closest pair first, within `MATCH_DISTANCE`.
+/// Returns `(estimated index, actual index, center distance)`.
+fn match_planets(estimated: &[Planet], actual: &[Planet]) -> Vec<(usize, usize, f64)> {
+    let mut candidates = Vec::new();
+    for (k, estimate) in estimated.iter().enumerate() {
+        for (i, truth) in actual.iter().enumerate() {
+            let distance = (estimate.x - truth.x).hypot(estimate.y - truth.y);
+            if distance <= MATCH_DISTANCE {
+                candidates.push((k, i, distance));
+            }
+        }
+    }
+    candidates.sort_by(|a, b| a.2.total_cmp(&b.2));
+    let (mut used_estimated, mut used_actual) =
+        (vec![false; estimated.len()], vec![false; actual.len()]);
+    let mut pairs = Vec::new();
+    for (k, i, distance) in candidates {
+        if !used_estimated[k] && !used_actual[i] {
+            used_estimated[k] = true;
+            used_actual[i] = true;
+            pairs.push((k, i, distance));
+        }
+    }
+    pairs.sort_by_key(|pair| pair.1);
+    pairs
+}
+
+fn planet_match_json(estimated: &[Planet], actual: &[Planet]) -> Value {
+    let pairs = match_planets(estimated, actual);
+    let missing_actual = (0..actual.len())
+        .filter(|i| pairs.iter().all(|pair| pair.1 != *i))
+        .collect::<Vec<_>>();
+    let unmatched_estimated = (0..estimated.len())
+        .filter(|k| pairs.iter().all(|pair| pair.0 != *k))
+        .collect::<Vec<_>>();
+    json!({
+        "threshold": MATCH_DISTANCE,
+        "pairs": pairs.iter().map(|&(k, i, distance)| json!({
+            "estimated": k,
+            "actual": i,
+            "center_error": distance,
+            "radius_error": estimated[k].radius - actual[i].radius,
+            "mass_ratio": estimated[k].mass / actual[i].mass,
+        })).collect::<Vec<_>>(),
+        "missing_actual": missing_actual,
+        "unmatched_estimated": unmatched_estimated,
     })
 }
 
@@ -440,6 +535,10 @@ fn selected_snapshot(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Resul
         "selection_kind": if is_decision {"decision"} else if selection.starts_with("event:") {"timeline_event"} else {"latest_capture_state"},
         "events": trajectories,
         "actual_planets": actual_planets,
+        "planet_match": actual_planets.as_deref().map(|actual| {
+            let estimated: Vec<Planet> = serde_json::from_value(data["map_belief"]["planets"].clone()).unwrap_or_default();
+            planet_match_json(&estimated, actual)
+        }),
         "field_grid": field_grid,
         "view": {"x":view.x,"y":view.y,"width":view.width,"height":view.height},
     }))
@@ -1053,6 +1152,31 @@ mod tests {
         let planets = latest_actual_planets(&events).unwrap();
         assert_eq!(planets[0].x, 5.0);
         assert_eq!(planets[0].mass, 8.0);
+    }
+
+    #[test]
+    fn planet_matching_is_one_to_one_closest_first_within_the_threshold() {
+        let planet = |x: f64| Planet {
+            x,
+            y: 0.0,
+            radius: 20.0,
+            mass: 1000.0,
+        };
+        // Estimate 0 is nearer to actual 1 than actual 0; estimate 1 (far) must not steal it.
+        let pairs = match_planets(
+            &[planet(98.0), planet(10.0), planet(500.0)],
+            &[planet(0.0), planet(100.0), planet(900.0)],
+        );
+        assert_eq!(
+            pairs.iter().map(|p| (p.0, p.1)).collect::<Vec<_>>(),
+            vec![(1, 0), (0, 1)]
+        );
+        let report = planet_match_json(
+            &[planet(98.0), planet(10.0), planet(500.0)],
+            &[planet(0.0), planet(100.0), planet(900.0)],
+        );
+        assert_eq!(report["missing_actual"], json!([2]));
+        assert_eq!(report["unmatched_estimated"], json!([2]));
     }
 
     #[test]

@@ -75,8 +75,8 @@ Terms (from the user's decomposition; they stay separate diagnostics first, and 
 
 | ID | Item | Status |
 | --- | --- | --- |
-| V-MATCH | one planet matching (global nearest-first, ≤ 80 units) shared by metrics, planet list, trend strip; per-planet status `ok / location / size / both / missing` with thresholds shown next to the numbers | in progress |
-| V-TREND | error-over-time lines in the timeline strip (missing planets, fit RMSE, planet count) | in progress |
+| V-MATCH | one planet matching in `map_viewer.rs` (global nearest-first, ≤ 80 units) shared by `/api/snapshot` (`planet_match`), the decisions list (`accuracy`), metrics, planet lists; per-planet status `close / center off / size off / both / missing` (center > 10 units, radius > 5 units) with the numbers beside it | displayed |
+| V-TREND | error-over-time lines in the timeline strip (estimated planets, missing disclosed planets, fit RMSE) | displayed |
 | V-TABLE | captures table with global session metrics (missing planets, median center error, final fit RMSE, scenario/live labels); no single combined score | proposed |
 | V-LAYERS | layer registry: each layer = one library method + a label + an availability message; adding Q-EV/Q-RU/Q-FU is one row each | proposed |
 
@@ -98,4 +98,5 @@ Terms (from the user's decomposition; they stay separate diagnostics first, and 
 
 | Date | Session | Change | Breaking? |
 | --- | --- | --- | --- |
+| 2026-11-21 | viewer | `/api/decisions` gains `accuracy` (disclosed-map comparison, null without a disclosed map) and `/api/snapshot` gains `planet_match`; both additive. | no |
 | 2026-11-21 | viewer | Created this contract. Viewer removes the `field`/`heat`/`scale`/`resolution` controls; `/api/snapshot` keeps accepting `field` and `step` for compatibility. | no |
