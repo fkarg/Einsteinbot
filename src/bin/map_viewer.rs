@@ -920,7 +920,8 @@ fn make_field_grid(
                     oracle.map(|v| v.x),
                     oracle.map(|v| v.y),
                     Option::<f64>::None,
-                    false
+                    false,
+                    Option::<f64>::None
                 ]));
                 continue;
             };
@@ -999,7 +1000,8 @@ fn make_field_grid(
                 actual_vector.map(|v| v.x),
                 actual_vector.map(|v| v.y),
                 sigma,
-                has_residual
+                has_residual,
+                belief.model_disagreement_at(position)
             ]));
         }
     }
@@ -1597,10 +1599,12 @@ mod tests {
         )
         .unwrap();
         let sample = &grid["samples"][0];
-        assert_eq!(sample.as_array().unwrap().len(), 14);
+        assert_eq!(sample.as_array().unwrap().len(), 15);
         assert_eq!(sample[2], 0.0);
         assert_eq!(sample[3], 0.0);
         assert_eq!(sample[13], false);
+        // No validated field-only source: model disagreement is unavailable, not zero.
+        assert!(sample[14].is_null());
     }
 
     #[test]

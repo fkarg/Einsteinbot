@@ -60,7 +60,7 @@ Terms (from the user's decomposition; they stay separate diagnostics first, and 
 
 | ID | Quantity | Granularity | Viewer use | Status |
 | --- | --- | --- | --- | --- |
-| Q-MD | `model_disagreement_at(Vec2) -> Option<f64>`: gravity spread between the no-source and validated source models, weighted by held-out improvement and independent validation count; `None` without a validated source | per location | inspect broad-area model-choice uncertainty separately from physical parameter covariance and residual uncertainty | library method implemented; viewer endpoint pending |
+| Q-MD | `model_disagreement_at(Vec2) -> Option<f64>`: gravity spread between the no-source and validated source models, weighted by held-out improvement and independent validation count; `None` without a validated source | per location | inspect broad-area model-choice uncertainty separately from physical parameter covariance and residual uncertainty | library method implemented; viewer layer displayed (`/api/snapshot` field rows carry it as element 14) |
 | Q-EV | evidence availability `evidence_availability_at(Vec2) -> Option<f64>` reflecting global parameter sensitivity of observed paths, not a fixed-distance tube; `None` when no evidence model exists | per location | replaces the current binary "Evidence" layer (viewer currently uses only the 40-unit residual support) | planned after Q-COV |
 | Q-RU | residual uncertainty `residual_uncertainty_at(Vec2) -> Option<f64>` | per location | separate layer from residual mean | later: requires residual dispersion and independent-path support in `LocalField` |
 | Q-FU | `epistemic_field_uncertainty_at(Vec2) -> Option<FieldUncertainty>` derived from the model mixture, with separate components; not a sum of independently rendered scores | per location | combined view plus per-cause attribution | later, after Q-EV/Q-RU and more than one credible map alternative |
@@ -104,7 +104,7 @@ Terms (from the user's decomposition; they stay separate diagnostics first, and 
 
 | File | Session | Why | Since |
 | --- | --- | --- | --- |
-| *(none)* | | | |
+| `src/bin/learning_scenarios.rs`, `src/bin/learning_scenarios/` | estimator / scenario_w7 | Extract reusable scenario interface and add deterministic W7 scale-24 capture generation | 2026-11-21 |
 
 ## 5. Open requests
 
@@ -119,6 +119,7 @@ Terms (from the user's decomposition; they stay separate diagnostics first, and 
 
 | Date | Session | Change | Breaking? |
 | --- | --- | --- | --- |
+| 2026-11-21 | viewer | Viewer consumes `MapBelief::model_disagreement_at` (new Model disagreement layer; unavailable when it returns `None`) and `bot_state.observed_spawn_locations` (optional Spawn samples overlay, drawn as samples, never as a complete set). `/api/snapshot` field rows gain a 15th element; `/api/decisions` rows gain `own_id`; `/api/overview` rows gain `latest_revision`; `/api/snapshot` trajectories and `selected_shot` gain a scenario-role `label`; `world` gains `ghosts`. All additive. | no |
 | 2026-11-21 | viewer | New read-only `/api/degrade` (degradation experiments on the disclosed map; runs `TargetingPolicy::choose` from the library with `MapBelief::new(damaged_map, None)`). No new diagnostic fields consumed. | no |
 | 2026-11-21 | viewer | New read-only endpoints `/api/shot-review` (decision's chosen shot vs observed vs re-simulated variants, optional disclosed-map repair experiments) and `/api/predictive` (per-decision path error against the next 5 observed shots). They consume only recorded `map_belief` fields (`planets`, `local_field`, `field_hypothesis`, `hypothesis_local_field`). | no |
 | 2026-11-21 | viewer | `/api/snapshot` gains `world` (players, own id, shots in flight derived from events up to the selected point) and `planet_match`; `/api/overview` and `accuracy` in `/api/decisions` added. All additive. | no |
