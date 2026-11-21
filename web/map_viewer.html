@@ -122,6 +122,15 @@
           <div id="reviewNote" class="note"></div>
           <div id="reviewRepairs"></div>
         </div>
+        <div id="degradePanel" class="review" hidden>
+          <h2>Degrade the disclosed map</h2>
+          <div class="note">Starts from perfect information, damages the map one way, lets the bot choose a shot on the damaged map, and flies it on the true map. The last column shows what the perfect-information shot itself would do if the damaged map were the real world.</div>
+          <div class="controls">
+            <label>Damage<select id="degradeKind"><option value="drop">Drop a planet near the path</option><option value="displace">Move the nearest planet</option><option value="resize">Resize the nearest planet</option><option value="phantom">Add a planet that is not there</option><option value="noise">Jitter every planet</option></select></label>
+            <button id="degradeRun" type="button">Run</button>
+          </div>
+          <div id="degradeResult"></div>
+        </div>
         <details class="explain"><summary>Free simulation and audits</summary>
           <div class="controls">
             <label>Gravity model<select id="model"><option value="belief">Recorded physical map + local residual</option><option value="hypothesis">Recorded map + field hypothesis</option><option value="actual">Disclosed actual map</option></select></label>

@@ -27,11 +27,11 @@
     for(const name of ['all',...bots]){const op=document.createElement('option');op.value=name;op.textContent=name==='all'?'All bots':name;bot.append(op);}
     bot.value=bots.includes(old)?old:'all'; fillDecisionList();
   }
-  function fillDecisionList(){position='none';selScope=null;review=null;loadSnapshot();loadTimeline();loadPredictive();}
+  function fillDecisionList(){position='none';selScope=null;review=null;degrade=null;loadSnapshot();loadTimeline();loadPredictive();}
   async function loadSnapshot(){
     const request=++snapshotRequest,requestCapture=captureId,requestDecision=position,requestView={...view};
     setStatus('Loading captured state…');simulations=[];
-    try{const step=gridStepForView(),params=`id=${requestCapture}&seq=${requestDecision}&step=${step}&field=total&x=${requestView.x}&y=${requestView.y}&width=${requestView.width}&height=${requestView.height}`;const result=await api(`/api/snapshot?${params}`);if(request!==snapshotRequest||requestCapture!==captureId||requestDecision!==position||requestView.x!==view.x||requestView.y!==view.y||requestView.width!==view.width||requestView.height!==view.height)return;snapshot=result;const scope=`${captureId}|${requestDecision}`;if(scope!==selScope){selScope=scope;sel=snapshot.selected_shot?{kind:'shot',...snapshot.selected_shot}:null;loadReview();}const g=snapshot.field_grid;g.samples=g.samples.map(s=>{const pair=(x,y)=>Number.isFinite(x)&&Number.isFinite(y)?{x,y}:null,vector=pair(s[2],s[3]),total=pair(s[4],s[5]),physical=pair(s[6],s[7]),residual=pair(s[8],s[9]),oracle=pair(s[10],s[11]),delta=total&&oracle?{x:total.x-oracle.x,y:total.y-oracle.y}:null;return {x:s[0],y:s[1],vector,total,physical,residual,oracle,delta,sigma:s[12],supported:s[13],gravity:total?Math.hypot(total.x,total.y):null,actual_gravity:oracle?Math.hypot(oracle.x,oracle.y):null};});const c=currentDecision().choice||{};$('velocity').value=c.velocity||8;$('angle').value=c.angle_degrees||0;setStatus(step===GRID_STEP?'':`Showing ${step}-unit samples to fit this viewport`);render();}
+    try{const step=gridStepForView(),params=`id=${requestCapture}&seq=${requestDecision}&step=${step}&field=total&x=${requestView.x}&y=${requestView.y}&width=${requestView.width}&height=${requestView.height}`;const result=await api(`/api/snapshot?${params}`);if(request!==snapshotRequest||requestCapture!==captureId||requestDecision!==position||requestView.x!==view.x||requestView.y!==view.y||requestView.width!==view.width||requestView.height!==view.height)return;snapshot=result;const scope=`${captureId}|${requestDecision}`;if(scope!==selScope){selScope=scope;sel=snapshot.selected_shot?{kind:'shot',...snapshot.selected_shot}:null;degrade=null;loadReview();}const g=snapshot.field_grid;g.samples=g.samples.map(s=>{const pair=(x,y)=>Number.isFinite(x)&&Number.isFinite(y)?{x,y}:null,vector=pair(s[2],s[3]),total=pair(s[4],s[5]),physical=pair(s[6],s[7]),residual=pair(s[8],s[9]),oracle=pair(s[10],s[11]),delta=total&&oracle?{x:total.x-oracle.x,y:total.y-oracle.y}:null;return {x:s[0],y:s[1],vector,total,physical,residual,oracle,delta,sigma:s[12],supported:s[13],gravity:total?Math.hypot(total.x,total.y):null,actual_gravity:oracle?Math.hypot(oracle.x,oracle.y):null};});const c=currentDecision().choice||{};$('velocity').value=c.velocity||8;$('angle').value=c.angle_degrees||0;setStatus(step===GRID_STEP?'':`Showing ${step}-unit samples to fit this viewport`);render();}
     catch(e){setStatus(e.message);}
   }
   async function loadTimeline(){try{const id=captureId,data=await api(`/api/timeline?id=${id}`);if(id!==captureId)return;timeline=data.timeline;drawScrub();}catch(e){setStatus(e.message);}}
@@ -72,9 +72,10 @@
     for(const sim of simulations){const pts=sim.data.points||[];if(!pts.length)continue;ctx.beginPath();ctx.moveTo(pts[0].x,pts[0].y);for(const p of pts)ctx.lineTo(p.x,p.y);ctx.strokeStyle=sim.color;ctx.lineWidth=3;ctx.stroke();}
     if(sel?.kind==='shot'&&sel.event?.points?.length){const pts=sel.event.points;ctx.beginPath();ctx.moveTo(pts[0].x,pts[0].y);for(const p of pts)ctx.lineTo(p.x,p.y);ctx.strokeStyle='#fff2a8';ctx.lineWidth=3;ctx.stroke();const end=pts.at(-1);ctx.beginPath();ctx.arc(end.x,end.y,6,0,Math.PI*2);ctx.strokeStyle='#fff2a8';ctx.lineWidth=2;ctx.stroke();}
     drawReview();
+    drawDegrade();
     drawSelection();
     const decision=currentDecision(),choice=decision.choice||{};$('decisionLabel').textContent=snapshot.selection_kind==='decision'?`Decision #${decision.sequence} · ${decision.bot_name} · ${new Date(decision.timestamp_unix_ms||0).toLocaleTimeString()} · map updating: ${decision.map_updating?'yes':'no'}`:snapshot.selection_kind==='timeline_event'?`Event #${snapshot.sequence} · belief as of decision snapshot #${snapshot.diagnostic_sequence??'unavailable'}${newerPathsNote()}`:`Latest state · events through #${snapshot.sequence} · belief snapshot #${snapshot.diagnostic_sequence??'unavailable'}${newerPathsNote()}`;
-    renderMetrics(decision);renderChoice(choice);renderDisclosedList();renderPlanetList();renderSelection();syncLayerButtons();
+    renderMetrics(decision);renderChoice(choice);renderDisclosedList();renderPlanetList();renderSelection();renderDegrade();syncLayerButtons();
   }
   // A path the recorded belief has not seen: it ended after the belief's snapshot (or no belief exists yet).
   function newerPathsNote(){const n=(snapshot.events||[]).filter(item=>item.record?.event?.type==='shot_fin'&&newerThanBelief(item)).length;return n?` · ${n} path${n===1?'':'s'} newer than the belief (dashed)`:'';}
@@ -242,6 +243,47 @@
     if(reviewVisible.has('observed'))line(review.shot.points,REVIEW_COLORS.observed,3,[]);
     const div=review.divergence;if(div&&reviewVisible.has((review.variants.find(v=>v.as_used)||{}).key)){ctx.beginPath();ctx.arc(div.point.x,div.point.y,9,0,Math.PI*2);ctx.strokeStyle='#ffe27a';ctx.lineWidth=2.5;ctx.stroke();}
   }
+  // ---- Degradation experiment: damage the disclosed map, let the policy choose, fly the shot on the truth ----
+  let degrade=null,degradeRequest=0;
+  async function runDegrade(){
+    const request=++degradeRequest,id=captureId,seq=position,kind=$('degradeKind').value;
+    degrade={loading:true};renderDegrade();
+    try{
+      const data=await api(`/api/degrade?id=${id}&seq=${seq}&kind=${kind}`);
+      if(request!==degradeRequest||id!==captureId||seq!==position)return;
+      degrade={...data,selected:null};renderDegrade();render();
+    }catch(e){if(request===degradeRequest){degrade={error:e.message};renderDegrade();}}
+  }
+  function renderDegrade(){
+    const panel=$('degradePanel'),out=$('degradeResult');
+    panel.hidden=!(snapshot?.selection_kind==='decision'&&snapshot.actual_planets);
+    out.replaceChildren();$('degradeRun').disabled=Boolean(degrade?.loading);
+    if(!degrade)return;
+    if(degrade.loading){out.textContent='Running the policy on each damaged map…';return;}
+    if(degrade.error){out.textContent=degrade.error;return;}
+    const rows=degrade.rows,damaged=rows.slice(1);
+    const claimedHit=damaged.filter(r=>r.claimed?.predicted_hit).length,reallyHit=damaged.filter(r=>r.real?.hit_victim).length,perfectStillHits=damaged.filter(r=>r.perfect_shot_on_damaged_map?.hit).length;
+    const summary=document.createElement('div');summary.className='note';
+    summary.textContent=`${damaged.length} damaged maps: the bot claimed a hit on ${claimedHit}, really hit on ${reallyHit}; the perfect-information shot would still hit on ${perfectStillHits}.`;
+    const table=document.createElement('table');table.className='table';
+    const row=(cells,cls,onclick)=>{const tr=document.createElement('tr');if(cls)tr.className=cls;for(const c of cells){const td=document.createElement(cls==='head'?'th':'td');td.textContent=c;tr.append(td);}if(onclick)tr.addEventListener('click',onclick);return tr;};
+    table.append(row(['damage','perfect shot if map were real','bot chose (on damaged map)','on the true map'],'head'));
+    rows.forEach((r,i)=>{
+      const f=r.perfect_shot_on_damaged_map,c=r.claimed,re=r.real;
+      const fixed=!f?'—':f.hit?'still hits':`misses by ${fmt(f.closest_to_victim,1)}`;
+      const chose=!c?'no shot':`${c.reason} v${c.velocity}@${c.angle_degrees}°${c.predicted_victim!=null?` → ${c.predicted_victim}`:''}`;
+      const real=!re?'—':re.hit_victim?'hits':`${re.closest_to_victim==null?'no target':`misses by ${fmt(re.closest_to_victim,1)}`} (${terminationText(re.termination)})`;
+      table.append(row([r.label,fixed,chose,real],`row${degrade.selected===i?' pinned':''}`,()=>{degrade.selected=i;renderDegrade();render();}));
+    });
+    const note=document.createElement('div');note.className='note';note.textContent=`${degrade.note} Click a row to draw it: orange dashed is the path the bot expected, blue is what happens on the true map.`;
+    out.append(summary,table,note);
+  }
+  function drawDegrade(){
+    const r=degrade?.rows?.[degrade.selected];if(!r?.claimed||snapshot?.selection_kind!=='decision')return;
+    const line=(points,color,dash)=>{if(!points?.length)return;ctx.beginPath();ctx.moveTo(points[0].x,points[0].y);for(const p of points)ctx.lineTo(p.x,p.y);ctx.strokeStyle=color;ctx.lineWidth=3;ctx.setLineDash(dash);ctx.stroke();ctx.setLineDash([]);};
+    line(r.claimed_points,'#ffb45c',[7,5]);line(r.real_points,'#6ec8ff',[]);
+  }
+  $('degradeRun').addEventListener('click',runDegrade);
   // Held-out belief quality: each decision's belief scored on the next observed shots (needs no disclosed map).
   async function loadPredictive(){
     const id=captureId;predictive=new Map();

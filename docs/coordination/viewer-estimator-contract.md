@@ -108,6 +108,7 @@ Terms (from the user's decomposition; they stay separate diagnostics first, and 
 
 | Date | Session | Change | Breaking? |
 | --- | --- | --- | --- |
+| 2026-11-21 | viewer | New read-only `/api/degrade` (degradation experiments on the disclosed map; runs `TargetingPolicy::choose` from the library with `MapBelief::new(damaged_map, None)`). No new diagnostic fields consumed. | no |
 | 2026-11-21 | viewer | New read-only endpoints `/api/shot-review` (decision's chosen shot vs observed vs re-simulated variants, optional disclosed-map repair experiments) and `/api/predictive` (per-decision path error against the next 5 observed shots). They consume only recorded `map_belief` fields (`planets`, `local_field`, `field_hypothesis`, `hypothesis_local_field`). | no |
 | 2026-11-21 | viewer | `/api/snapshot` gains `world` (players, own id, shots in flight derived from events up to the selected point) and `planet_match`; `/api/overview` and `accuracy` in `/api/decisions` added. All additive. | no |
 | 2026-11-21 | viewer | `/api/decisions` gains `accuracy` (disclosed-map comparison, null without a disclosed map) and `/api/snapshot` gains `planet_match`; both additive. | no |

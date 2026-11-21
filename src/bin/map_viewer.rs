@@ -18,6 +18,8 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 
+#[path = "map_viewer/degrade.rs"]
+mod degrade;
 #[path = "map_viewer/review.rs"]
 mod review;
 
@@ -99,6 +101,7 @@ fn handle(mut stream: TcpStream, db_path: &PathBuf) -> Result<(), Box<dyn Error>
     let result = match path {
         "/api/captures" => list_captures(db_path),
         "/api/overview" => capture_overview(db_path),
+        "/api/degrade" => degrade::degrade(db_path, &parameters),
         "/api/shot-review" => review::shot_review(db_path, &parameters),
         "/api/predictive" => review::predictive_error(db_path, &parameters),
         "/api/decisions" => {
