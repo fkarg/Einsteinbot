@@ -9,7 +9,7 @@ use einsteinbot::simulation::{
 };
 use einsteinbot::strategy::{BotState, MapBelief, ShotChoice, TargetingPolicy, TargetingSettings};
 use nalgebra::DMatrix;
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::env;
@@ -196,24 +196,16 @@ fn list_captures(path: &PathBuf) -> Result<Value, String> {
 /// One summary row per capture for the landing table. Only each capture's last decision is parsed.
 fn capture_overview(path: &PathBuf) -> Result<Value, String> {
     let connection = open_database(path)?;
-    let mut counts: BTreeMap<(i64, String), i64> = BTreeMap::new();
+    let mut shots: BTreeMap<i64, i64> = BTreeMap::new();
     let mut statement = connection
-        .prepare(
-            "SELECT capture_id, event_type, COUNT(*) FROM events GROUP BY capture_id, event_type",
-        )
+        .prepare("SELECT capture_id, COUNT(*) FROM events WHERE event_type='shot_fin' GROUP BY capture_id")
         .map_err(|error| error.to_string())?;
     for row in statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        })
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
         .map_err(|error| error.to_string())?
     {
-        let (id, kind, count) = row.map_err(|error| error.to_string())?;
-        counts.insert((id, kind), count);
+        let (id, count) = row.map_err(|error| error.to_string())?;
+        shots.insert(id, count);
     }
     let mut captures = Vec::new();
     let mut statement = connection
@@ -232,7 +224,6 @@ fn capture_overview(path: &PathBuf) -> Result<Value, String> {
     for row in rows {
         let (id, started, ended, metadata) = row.map_err(|error| error.to_string())?;
         let metadata: Value = serde_json::from_str(&metadata).unwrap_or(Value::Null);
-        let count = |kind: &str| counts.get(&(id, kind.to_owned())).copied().unwrap_or(0);
         let decisions: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM diagnostics WHERE capture_id=?1 AND kind='target_decision'",
@@ -246,18 +237,21 @@ fn capture_overview(path: &PathBuf) -> Result<Value, String> {
                 [id],
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
             )
-            .ok()
+            .optional()
+            .map_err(|error| error.to_string())?
             .and_then(|(sequence, text)| {
                 let data: Value = serde_json::from_str(&text).ok()?;
                 let belief = &data["map_belief"];
-                let disclosed = disclosed_maps(&connection, id).ok()?;
+                let accuracy = disclosed_maps(&connection, id)
+                    .ok()
+                    .and_then(|disclosed| decision_accuracy(&disclosed, sequence, belief));
                 Some(json!({
                     "sequence": sequence,
                     "stage": data["scenario"]["stage"],
                     "planets": belief["planets"].as_array().map(Vec::len),
                     "fit_rmse": belief["model_position_rmse"],
                     "fit_converged": belief["fit_converged"],
-                    "accuracy": decision_accuracy(&disclosed, sequence, belief),
+                    "accuracy": accuracy,
                 }))
             });
         captures.push(json!({
@@ -267,8 +261,7 @@ fn capture_overview(path: &PathBuf) -> Result<Value, String> {
             "kind": if metadata["host"] == "synthetic-scenario" { "scenario" } else { "live" },
             "name": metadata["client_name"],
             "revision": metadata["build"]["git_revision"],
-            "shots": count("shot_fin"),
-            "events": counts.range((id, String::new())..).take_while(|((capture, _), _)| *capture == id).map(|(_, n)| n).sum::<i64>(),
+            "shots": shots.get(&id).copied().unwrap_or(0),
             "decisions": decisions,
             "last": last,
         }));

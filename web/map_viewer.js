@@ -13,12 +13,13 @@
   function selected(){ return Number(position); }
   function q(v){return encodeURIComponent(v);}
   async function api(path){const r=await fetch(path,{cache:'no-store'});const data=await r.json();if(!r.ok||data.error)throw new Error(data.error||r.statusText);return data;}
-  async function loadCaptures(){
+  // Fills the capture select; returns false when the database has no captures.
+  async function fillCaptureSelect(){
     setStatus('Loading captures…');
     const data=await api('/api/captures'); const select=$('capture'); select.replaceChildren();
     for(const c of data.captures){const option=document.createElement('option');option.value=c.id;const date=new Date(c.started_at_unix_ms).toLocaleString();const kind=c.metadata?.host==='synthetic-scenario'?'scenario':'live',revision=c.metadata?.build?.git_revision;option.textContent=`#${c.id} · ${kind} · ${c.metadata?.client_name||'capture'}${revision?` · ${revision.slice(0,8)}`:''} · ${date}`;select.append(option);}
-    if(!data.captures.length){setStatus('No captures in this database');return;}
-    captureId=Number(select.value); await loadDecisions();
+    if(!data.captures.length){setStatus('No captures in this database');return false;}
+    setStatus('');return true;
   }
   async function loadDecisions(preferredBot=null){
     captureId=Number($('capture').value);timeline=[];drawScrub(); const id=captureId,data=await api(`/api/decisions?id=${id}`); if(id!==captureId)return; decisions=data.decisions;
@@ -109,7 +110,7 @@
       setStatus('Green: belief · orange: recorded shot on actual map · yellow: current policy on actual map');render();
     }catch(e){$('comparison').textContent=e.message;setStatus(e.message);}}
   async function audit(){const d=currentDecision();try{setStatus('Replaying observed paths…');const result=await api(`/api/physics-audit?id=${captureId}&seq=${d.sequence}`);simulations=[{data:{points:result.worst_observed_points},color:'#d7e2ff'},{data:{points:result.worst_rust_points},color:'#ff4da6'}];kv($('comparison'),[['Audited shots',String(result.audited_shots)],['Planets in map',String(result.map_planets)],['Timed samples',String(result.timed_samples)],['Coordinate RMSE',fmt(result.coordinate_rmse)],['Median / p95 / max position error',`${fmt(result.median_position_error)} / ${fmt(result.p95_position_error)} / ${fmt(result.max_position_error)}`],['Worst shot',(w=>w?`event #${w.shot_sequence} · player ${w.player_id} · v${fmt(w.velocity,0)} @ ${fmt(w.angle,1)}° · RMSE ${fmt(w.coordinate_rmse)} · max ${fmt(w.max_position_error)} · Rust: ${String(w.rust_termination?.kind||'—').replaceAll('_',' ')}`:'—')(result.worst_shot)],...(result.note?[[result.note,null]]:[])]);setStatus(`Rust path replay: coordinate RMSE ${fmt(result.coordinate_rmse)} units · worst shot overlaid`);render();}catch(e){$('comparison').textContent=e.message;setStatus(e.message);}}
-  $('capture').addEventListener('change',()=>{resetView();loadDecisions();});$('bot').addEventListener('change',drawScrub);$('refresh').addEventListener('click',()=>loadDecisions($('bot').value));for(const id of ['paths','pathResiduals','beliefPlanets','actualPlanets','contacts'])$(id).addEventListener('change',render);$('simulate').addEventListener('click',simulate);$('compare').addEventListener('click',compare);$('audit').addEventListener('click',audit);window.addEventListener('resize',()=>{render();drawScrub();});
+  $('capture').addEventListener('change',()=>{showCaptureView();resetView();loadDecisions();});$('bot').addEventListener('change',drawScrub);$('refresh').addEventListener('click',()=>{if(!$('overview').hidden)loadOverview();else loadDecisions($('bot').value);});for(const id of ['paths','pathResiduals','beliefPlanets','actualPlanets','contacts'])$(id).addEventListener('change',render);$('simulate').addEventListener('click',simulate);$('compare').addEventListener('click',compare);$('audit').addEventListener('click',audit);window.addEventListener('resize',()=>{render();drawScrub();});
   let viewportTimer=null;function refreshViewport(){clearTimeout(viewportTimer);viewportTimer=setTimeout(loadSnapshot,120);}
   function zoomAt(factor,px=W/2,py=H/2){const width=Math.max(40,Math.min(W,view.width*factor)),height=width*H/W,cx=view.x+px/W*view.width,cy=view.y+py/H*view.height;view={x:Math.max(0,Math.min(W-width,cx-px/W*width)),y:Math.max(0,Math.min(H-height,cy-py/H*height)),width,height};refreshViewport();}
   function resetView(){view={x:0,y:0,width:W,height:H};loadSnapshot();}
@@ -133,14 +134,14 @@
     const sortValue=overviewValue[overviewSort.key];
     rows.sort((a,b)=>{const x=sortValue(a),y=sortValue(b);if(x==null&&y==null)return 0;if(x==null)return 1;if(y==null)return -1;return (x<y?-1:x>y?1:0)*overviewSort.dir;});
     const withTruth=rows.filter(r=>r.last?.accuracy);
-    const pct=v=>Number.isFinite(v)?`${fmt(v*100,0)}%`:'—';
+    const pct=v=>Number.isFinite(v)?`${fmt(v*100,0)}%`:'—',units=v=>Number.isFinite(v)?`${fmt(v)} units`:'—';
     kv($('globalMetrics'),[
       ['Captures shown',`${rows.length} · ${rows.filter(r=>r.kind==='live').length} live, ${rows.filter(r=>r.kind==='scenario').length} scenario`],
       ['Shots · decisions',`${rows.reduce((s,r)=>s+r.shots,0)} · ${rows.reduce((s,r)=>s+r.decisions,0)}`],
       ['With a disclosed map and a decision',String(withTruth.length)],
       ['Median final missing share',pct(middle(withTruth.map(overviewValue.missingShare)))],
-      ['Median final center error',Number.isFinite(middle(withTruth.map(overviewValue.centerError)))?`${fmt(middle(withTruth.map(overviewValue.centerError)))} units`:'—'],
-      ['Median final fit RMSE',Number.isFinite(middle(rows.map(overviewValue.rmse)))?`${fmt(middle(rows.map(overviewValue.rmse)))} units`:'—'],
+      ['Median final center error',units(middle(withTruth.map(overviewValue.centerError)))],
+      ['Median final fit RMSE',units(middle(rows.map(overviewValue.rmse)))],
     ]);
     const table=$('overviewTable');table.replaceChildren();
     const head=document.createElement('tr');
@@ -154,8 +155,12 @@
       tr.addEventListener('click',()=>openCapture(r.id));table.append(tr);
     }
   }
-  function openCapture(id){$('capture').value=String(id);$('overview').hidden=true;document.querySelector('main').hidden=false;resetView();loadDecisions();}
-  $('overviewBtn').addEventListener('click',()=>{const showing=!$('overview').hidden;$('overview').hidden=showing;document.querySelector('main').hidden=!showing;if(!showing)loadOverview();else{render();drawScrub();}});
+  async function openCapture(id){
+    if(![...$('capture').options].some(o=>o.value===String(id)))await fillCaptureSelect();
+    $('capture').value=String(id);showCaptureView();resetView();loadDecisions();
+  }
+  function showCaptureView(){$('overview').hidden=true;document.querySelector('main').hidden=false;}
+  $('overviewBtn').addEventListener('click',()=>{if($('overview').hidden){$('overview').hidden=false;document.querySelector('main').hidden=true;loadOverview();}else if(captureId!==null){showCaptureView();render();drawScrub();}});
   $('overviewKind').addEventListener('change',renderOverview);
 
   // ---- Layers: Gravity, Uncertainty, Evidence and Error are self-contained modes; the client derives every vector from the per-sample fields ----
@@ -240,7 +245,7 @@
   $('prevEvent').addEventListener('click',()=>stepEvent(-1));$('nextEvent').addEventListener('click',()=>stepEvent(1));
   $('latest').addEventListener('click',()=>{position='none';drawScrub();loadSnapshot();});
   document.addEventListener('keydown',e=>{
-    if(['INPUT','SELECT','TEXTAREA'].includes(document.activeElement?.tagName)||e.metaKey||e.ctrlKey||e.altKey)return;
+    if(!$('overview').hidden||['INPUT','SELECT','TEXTAREA'].includes(document.activeElement?.tagName)||e.metaKey||e.ctrlKey||e.altKey)return;
     if(e.key==='ArrowLeft'||e.key==='ArrowRight'){e.preventDefault();(e.shiftKey?stepDecision:stepEvent)(e.key==='ArrowLeft'?-1:1);}
     else if(e.key==='Home'&&timeline.length){e.preventDefault();goto(0);}
     else if(e.key==='End'){e.preventDefault();position='none';drawScrub();loadSnapshot();}
@@ -383,5 +388,5 @@
   canvas.addEventListener('mouseleave',()=>{tip.style.display='none';});
   canvas.addEventListener('click',e=>{if(panned){panned=false;return;}if(!snapshot||viewDrag)return;const m=mapPoint(e);sel=hitTest(m.x,m.y,m.tol)||{kind:'point',x:m.x,y:m.y};render();});
   loadOverview();
-  loadCaptures().catch(e=>setStatus(e.message));
+  fillCaptureSelect().catch(e=>setStatus(e.message));
 })();
