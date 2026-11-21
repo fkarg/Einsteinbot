@@ -8,6 +8,7 @@ use levenberg_marquardt::{LeastSquaresProblem, LevenbergMarquardt};
 use nalgebra::{DMatrix, DVector, Dyn, U1, VecStorage, linalg::SVD};
 use std::error::Error;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const PARAMETERS_PER_PLANET: usize = 3;
 /// Position observations are f32; exact synthetic fits still need a nonzero noise floor.
@@ -111,8 +112,35 @@ pub fn seed_planet_from_residuals(
     radius_prior: f64,
     grid_spacing: f64,
 ) -> Result<Planet, FitError> {
-    try_seed_planet_from_residuals(current_map, observations, world, radius_prior, grid_spacing)?
-        .ok_or_else(|| FitError("no positive point-source residual fit found".to_owned()))
+    try_seed_planet_from_residuals(
+        current_map,
+        observations,
+        world,
+        radius_prior,
+        grid_spacing,
+        &mut || false,
+    )?
+    .ok_or_else(|| FitError("no positive point-source residual fit found".to_owned()))
+}
+
+/// As `seed_planet_from_residuals`, but cooperatively stops during sample and grid processing.
+pub fn seed_planet_from_residuals_cancellable(
+    current_map: &PlanetMap,
+    observations: &[ShotObservation],
+    world: WorldParameters,
+    radius_prior: f64,
+    grid_spacing: f64,
+    cancelled: &AtomicBool,
+) -> Result<Planet, FitError> {
+    try_seed_planet_from_residuals(
+        current_map,
+        observations,
+        world,
+        radius_prior,
+        grid_spacing,
+        &mut || cancelled.load(Ordering::Relaxed),
+    )?
+    .ok_or_else(|| FitError("no positive point-source residual fit found".to_owned()))
 }
 
 fn try_seed_planet_from_residuals(
@@ -121,7 +149,11 @@ fn try_seed_planet_from_residuals(
     world: WorldParameters,
     radius_prior: f64,
     grid_spacing: f64,
+    cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<Option<Planet>, FitError> {
+    if cancelled() {
+        return Err(FitError("residual seed cancelled".to_owned()));
+    }
     if observations.is_empty() {
         return Err(FitError(
             "at least one shot observation is required".to_owned(),
@@ -145,6 +177,9 @@ fn try_seed_planet_from_residuals(
         .iter()
         .flat_map(|observation| reconstruct_acceleration(&observation.points))
         .map(|(position, observed)| {
+            if cancelled() {
+                return Err(FitError("residual seed cancelled".to_owned()));
+            }
             let predicted = current_map
                 .acceleration(position)
                 .map_err(|error| FitError(error.to_string()))?;
@@ -165,9 +200,15 @@ fn try_seed_planet_from_residuals(
     while center_x <= world.battlefield_width - radius_prior {
         let mut center_y = radius_prior;
         while center_y <= world.battlefield_height - radius_prior {
+            if cancelled() {
+                return Err(FitError("residual seed cancelled".to_owned()));
+            }
             let mut numerator = 0.0;
             let mut denominator = 0.0;
             for (position, residual) in &samples {
+                if cancelled() {
+                    return Err(FitError("residual seed cancelled".to_owned()));
+                }
                 let dx = center_x - position.x;
                 let dy = center_y - position.y;
                 let distance_squared = dx * dx + dy * dy;
@@ -249,6 +290,7 @@ pub fn fit_greedy_source_counts(
             world,
             radius_prior,
             grid_spacing,
+            &mut || false,
         )?
         else {
             stop_reason = SourceCountStopReason::NoPositiveResidual;
@@ -644,6 +686,45 @@ mod tests {
         };
         shot.points = simulate_sampled_path(map, &shot, WorldParameters::default(), 40).unwrap();
         shot
+    }
+
+    #[test]
+    fn residual_seed_stops_when_cancelled_before_search() {
+        let map = PlanetMap { planets: vec![] };
+        let shot = observation(&map, (200.0, 200.0), 0.0, 8.0);
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        let error = seed_planet_from_residuals_cancellable(
+            &map,
+            &[shot],
+            WorldParameters::default(),
+            30.0,
+            50.0,
+            &cancelled,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "residual seed cancelled");
+    }
+
+    #[test]
+    fn residual_seed_checks_cancellation_during_grid_search() {
+        let map = PlanetMap { planets: vec![] };
+        let shot = observation(&map, (200.0, 200.0), 0.0, 8.0);
+        let extraction_checks = reconstruct_acceleration(&shot.points).len();
+        let mut checks = 0;
+        let error = try_seed_planet_from_residuals(
+            &map,
+            &[shot],
+            WorldParameters::default(),
+            30.0,
+            50.0,
+            &mut || {
+                checks += 1;
+                checks > extraction_checks + 10
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "residual seed cancelled");
+        assert!(checks > extraction_checks + 1, "must enter grid search");
     }
 
     #[test]

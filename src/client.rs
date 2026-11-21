@@ -276,11 +276,18 @@ fn run_session(
                                 bot_state.set_map_belief(map_belief.clone());
                             }
                             let started = Instant::now();
-                            let choice = target_policy.choose(&bot_state, energy);
+                            let choice =
+                                target_policy.choose_while_running(&bot_state, energy, running);
+                            if !running.load(Ordering::SeqCst) {
+                                break 'session;
+                            }
                             let search_duration_ms = started.elapsed().as_millis();
                             if let Some(log) = &event_log {
                                 let belief = map_belief.as_ref().map(|belief| serde_json::json!({
                                     "planets": belief.map.planets,
+                                    "local_field": belief.local_field,
+                                    "field_hypothesis": belief.field_hypothesis,
+                                    "hypothesis_local_field": belief.hypothesis_local_field,
                                     "contact_points": belief.contact_points,
                                     "covariance": belief.parameter_covariance.as_ref().map(|matrix| {
                                         (0..matrix.nrows()).map(|row| (0..matrix.ncols()).map(|col| matrix[(row, col)]).collect::<Vec<_>>()).collect::<Vec<_>>()
@@ -297,6 +304,11 @@ fn run_session(
                                         "angle_degrees": choice.angle_degrees,
                                         "miss_distance": choice.miss_distance,
                                     "predicted_hit": choice.predicted_hit,
+                                        "used_field_hypothesis": choice.used_field_hypothesis,
+                                        "predicted_victim": choice.predicted_victim,
+                                        "alternative_agrees": choice.alternative_agrees,
+                                        "hypothesis_uncertainty_proxy": choice.hypothesis_uncertainty_proxy,
+                                        "local_support_fraction": choice.local_support_fraction,
                                         "information_score": choice.information_score,
                                         "uncertainty_available": choice.uncertainty_available,
                                         "covered_fraction": choice.covered_fraction,

@@ -1,13 +1,21 @@
 use crate::coverage::path_cells;
 use crate::map::{PlanetMap, Vec2};
 use crate::protocol::{Point, ServerEvent};
-use crate::simulation::{ShotObservation, Termination, WorldParameters, simulate_targeting_shot};
+use crate::simulation::{
+    ShotObservation, Termination, WorldParameters, simulate_targeting_shot,
+    simulate_targeting_shot_with_hypothesis, simulate_targeting_shot_with_local_field,
+};
 use nalgebra::DMatrix;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug)]
 pub struct MapBelief {
     pub map: PlanetMap,
+    pub local_field: crate::local_field::LocalField,
+    /// An uncertain field-only explanation, never a collision obstacle.
+    pub field_hypothesis: Option<crate::field_hypothesis::FieldHypothesis>,
+    /// Local residuals recomputed against the physical field plus that hypothesis.
+    pub hypothesis_local_field: Option<crate::local_field::LocalField>,
     /// Covariance ordered by `[center_x, center_y, mass]` for each planet.
     pub parameter_covariance: Option<DMatrix<f64>>,
     /// Observed contact points, retained even before radius is identifiable.
@@ -23,6 +31,9 @@ impl MapBelief {
     pub fn new(map: PlanetMap, parameter_covariance: Option<DMatrix<f64>>) -> Self {
         Self {
             map,
+            local_field: crate::local_field::LocalField::default(),
+            field_hypothesis: None,
+            hypothesis_local_field: None,
             parameter_covariance,
             contact_points: Vec::new(),
             model_position_rmse: None,
@@ -225,6 +236,14 @@ pub struct ShotChoice {
     pub contact_before_target: bool,
     pub reason: ShotReason,
     pub predicted_hit: bool,
+    pub used_field_hypothesis: bool,
+    pub predicted_victim: Option<u32>,
+    /// Whether the no-hypothesis alternative predicts the same hit; None when untested.
+    pub alternative_agrees: Option<bool>,
+    /// Largest relative uncertainty proxy along the predicted path; uncalibrated.
+    pub hypothesis_uncertainty_proxy: Option<f64>,
+    /// Fraction of sampled trajectory near observed residual gravity, when available.
+    pub local_support_fraction: Option<f64>,
 }
 
 pub struct TargetingPolicy {
@@ -247,6 +266,26 @@ impl TargetingPolicy {
     }
 
     pub fn choose(&self, state: &BotState, energy: f64) -> Option<ShotChoice> {
+        self.choose_with_check(state, energy, || true)
+    }
+
+    pub fn choose_while_running(
+        &self,
+        state: &BotState,
+        energy: f64,
+        running: &std::sync::atomic::AtomicBool,
+    ) -> Option<ShotChoice> {
+        self.choose_with_check(state, energy, || {
+            running.load(std::sync::atomic::Ordering::Relaxed)
+        })
+    }
+
+    fn choose_with_check(
+        &self,
+        state: &BotState,
+        energy: f64,
+        mut running: impl FnMut() -> bool,
+    ) -> Option<ShotChoice> {
         let own_id = state.own_id?;
         let start = state.player_positions.get(&own_id)?;
         let targets = state
@@ -281,21 +320,51 @@ impl TargetingPolicy {
             .iter()
             .map(|(&id, position)| (id, Vec2::new(f64::from(position.x), f64::from(position.y))))
             .collect::<Vec<_>>();
-        let evaluate = |velocity: i32, angle: i32| -> Option<ShotChoice> {
+        let evaluate = |velocity: i32, angle: i32, use_hypothesis: bool| -> Option<ShotChoice> {
             let shot = ShotObservation {
                 player_id: own_id,
                 angle_degrees: f64::from(angle),
                 velocity: f64::from(velocity),
                 points: vec![start.clone()],
             };
-            let Ok(trajectory) = simulate_targeting_shot(
-                map,
-                &shot,
-                self.world,
-                self.settings.max_simulation_ticks.max(2),
-                &players,
-                self.settings.target_radius,
-            ) else {
+            let result = if let Some(belief) = &state.map_belief {
+                if let (true, Some(hypothesis), Some(field)) = (
+                    use_hypothesis,
+                    &belief.field_hypothesis,
+                    &belief.hypothesis_local_field,
+                ) {
+                    simulate_targeting_shot_with_hypothesis(
+                        map,
+                        field,
+                        hypothesis,
+                        &shot,
+                        self.world,
+                        self.settings.max_simulation_ticks.max(2),
+                        &players,
+                        self.settings.target_radius,
+                    )
+                } else {
+                    simulate_targeting_shot_with_local_field(
+                        map,
+                        &belief.local_field,
+                        &shot,
+                        self.world,
+                        self.settings.max_simulation_ticks.max(2),
+                        &players,
+                        self.settings.target_radius,
+                    )
+                }
+            } else {
+                simulate_targeting_shot(
+                    map,
+                    &shot,
+                    self.world,
+                    self.settings.max_simulation_ticks.max(2),
+                    &players,
+                    self.settings.target_radius,
+                )
+            };
+            let Ok(trajectory) = result else {
                 return None;
             };
             let (miss_distance, contact_before_target) = targets
@@ -353,6 +422,21 @@ impl TargetingPolicy {
                 }
                 _ => miss_distance,
             };
+            let local_support_fraction = state.map_belief.as_ref().and_then(|belief| {
+                (!belief.local_field.is_empty()).then(|| {
+                    trajectory
+                        .points
+                        .iter()
+                        .filter(|point| {
+                            belief
+                                .local_field
+                                .residual(Vec2::new(f64::from(point.x), f64::from(point.y)))
+                                .is_some()
+                        })
+                        .count() as f64
+                        / trajectory.points.len() as f64
+                })
+            });
             Some(ShotChoice {
                 velocity,
                 angle_degrees: angle,
@@ -363,6 +447,14 @@ impl TargetingPolicy {
                 contact_before_target,
                 reason: ShotReason::Approach,
                 predicted_hit,
+                used_field_hypothesis: use_hypothesis,
+                predicted_victim: match trajectory.termination {
+                    Termination::PlayerCollision(id) if id != own_id => Some(id),
+                    _ => None,
+                },
+                alternative_agrees: None,
+                hypothesis_uncertainty_proxy: None,
+                local_support_fraction,
             })
         };
         let mut candidates = Vec::new();
@@ -372,8 +464,21 @@ impl TargetingPolicy {
                 angles.push(180);
             }
             for angle in angles {
-                if let Some(candidate) = evaluate(velocity, angle) {
-                    candidates.push(candidate);
+                for use_hypothesis in [false, true] {
+                    if !running() {
+                        return None;
+                    }
+                    if use_hypothesis
+                        && !state.map_belief.as_ref().is_some_and(|belief| {
+                            belief.field_hypothesis.is_some()
+                                && belief.hypothesis_local_field.is_some()
+                        })
+                    {
+                        continue;
+                    }
+                    if let Some(candidate) = evaluate(velocity, angle, use_hypothesis) {
+                        candidates.push(candidate);
+                    }
                 }
             }
         }
@@ -391,24 +496,35 @@ impl TargetingPolicy {
         seeds.sort_by(|a, b| a.miss_distance.total_cmp(&b.miss_distance));
         let mut sampled = candidates
             .iter()
-            .map(|c| (c.velocity, c.angle_degrees))
+            .map(|c| (c.velocity, c.angle_degrees, c.used_field_hypothesis))
             .collect::<BTreeSet<_>>();
         let mut seed_counts = BTreeMap::new();
-        for seed in seeds
-            .into_iter()
-            .filter(|seed| {
-                let count = seed_counts.entry(seed.angle_degrees).or_insert(0);
-                *count += 1;
-                *count <= 2
-            })
-            .take(12)
-        {
+        let mut refined_per_model = BTreeMap::new();
+        for seed in seeds.into_iter().filter(|seed| {
+            let count = seed_counts
+                .entry((seed.angle_degrees, seed.used_field_hypothesis))
+                .or_insert(0);
+            *count += 1;
+            if *count > 2 {
+                return false;
+            }
+            let refined = refined_per_model
+                .entry(seed.used_field_hypothesis)
+                .or_insert(0);
+            *refined += 1;
+            *refined <= 12
+        }) {
             for angle in (seed.angle_degrees - angle_step as i32 + 1)
                 ..(seed.angle_degrees + angle_step as i32)
             {
+                if !running() {
+                    return None;
+                }
                 let angle = (angle + 180).rem_euclid(360) - 180;
-                if sampled.insert((seed.velocity, angle)) {
-                    if let Some(candidate) = evaluate(seed.velocity, angle) {
+                if sampled.insert((seed.velocity, angle, seed.used_field_hypothesis)) {
+                    if let Some(candidate) =
+                        evaluate(seed.velocity, angle, seed.used_field_hypothesis)
+                    {
                         candidates.push(candidate);
                     }
                 }
@@ -433,22 +549,134 @@ impl TargetingPolicy {
             pool = candidates.clone();
         }
 
-        if let Some(best_hit) = pool
+        let decorate = |mut choice: ShotChoice| {
+            if let Some(belief) = state.map_belief.as_ref() {
+                if let Some(hypothesis) = &belief.field_hypothesis {
+                    let shot = ShotObservation {
+                        player_id: own_id,
+                        angle_degrees: f64::from(choice.angle_degrees),
+                        velocity: f64::from(choice.velocity),
+                        points: vec![start.clone()],
+                    };
+                    let path = if choice.used_field_hypothesis {
+                        belief.hypothesis_local_field.as_ref().and_then(|field| {
+                            simulate_targeting_shot_with_hypothesis(
+                                &belief.map,
+                                field,
+                                hypothesis,
+                                &shot,
+                                self.world,
+                                self.settings.max_simulation_ticks.max(2),
+                                &players,
+                                self.settings.target_radius,
+                            )
+                            .ok()
+                        })
+                    } else {
+                        simulate_targeting_shot_with_local_field(
+                            &belief.map,
+                            &belief.local_field,
+                            &shot,
+                            self.world,
+                            self.settings.max_simulation_ticks.max(2),
+                            &players,
+                            self.settings.target_radius,
+                        )
+                        .ok()
+                    };
+                    choice.hypothesis_uncertainty_proxy = path.and_then(|path| {
+                        path.points
+                            .iter()
+                            .map(|point| {
+                                hypothesis.relative_uncertainty_proxy(Vec2::new(
+                                    f64::from(point.x),
+                                    f64::from(point.y),
+                                ))
+                            })
+                            .reduce(f64::max)
+                    });
+                }
+            }
+            choice
+        };
+
+        let mut hits = pool
             .iter()
             .filter(|candidate| candidate.predicted_hit)
-            .min_by(|left, right| {
-                left.velocity
-                    .cmp(&right.velocity)
-                    .then_with(|| left.miss_distance.total_cmp(&right.miss_distance))
-            })
-        {
-            return Some(ShotChoice {
+            .copied()
+            .collect::<Vec<_>>();
+        hits.sort_by(|left, right| {
+            left.velocity
+                .cmp(&right.velocity)
+                .then_with(|| left.miss_distance.total_cmp(&right.miss_distance))
+        });
+        if let Some(mut best_hit) = hits.first().copied() {
+            if let Some(belief) = state
+                .map_belief
+                .as_ref()
+                .filter(|belief| belief.field_hypothesis.is_some())
+            {
+                // A small shortlist is checked against a separate plausible field without the
+                // extrapolated hypothesis. Agreement is evidence of robustness, not probability.
+                for mut candidate in hits.iter().copied().take(12) {
+                    if !running() {
+                        return None;
+                    }
+                    let shot = ShotObservation {
+                        player_id: own_id,
+                        angle_degrees: f64::from(candidate.angle_degrees),
+                        velocity: f64::from(candidate.velocity),
+                        points: vec![start.clone()],
+                    };
+                    let alternative = if candidate.used_field_hypothesis {
+                        simulate_targeting_shot_with_local_field(
+                            &belief.map,
+                            &belief.local_field,
+                            &shot,
+                            self.world,
+                            self.settings.max_simulation_ticks.max(2),
+                            &players,
+                            self.settings.target_radius,
+                        )
+                    } else if let (Some(hypothesis), Some(field)) =
+                        (&belief.field_hypothesis, &belief.hypothesis_local_field)
+                    {
+                        simulate_targeting_shot_with_hypothesis(
+                            &belief.map,
+                            field,
+                            hypothesis,
+                            &shot,
+                            self.world,
+                            self.settings.max_simulation_ticks.max(2),
+                            &players,
+                            self.settings.target_radius,
+                        )
+                    } else {
+                        continue;
+                    };
+                    candidate.alternative_agrees = alternative.ok().map(|path| matches!(path.termination, Termination::PlayerCollision(id) if Some(id) == candidate.predicted_victim));
+                    if candidate.velocity == best_hit.velocity
+                        && candidate.angle_degrees == best_hit.angle_degrees
+                        && candidate.used_field_hypothesis == best_hit.used_field_hypothesis
+                    {
+                        best_hit = candidate;
+                    }
+                    if candidate.alternative_agrees == Some(true) {
+                        best_hit = candidate;
+                        break;
+                    }
+                }
+            }
+            return Some(decorate(ShotChoice {
                 reason: ShotReason::Hit,
-                ..*best_hit
-            });
+                ..best_hit
+            }));
         }
 
         for candidate in pool.iter_mut() {
+            if !running() {
+                return None;
+            }
             if !candidate.uncertainty_available || candidate.miss_distance >= 1.0e9 {
                 continue;
             }
@@ -457,19 +685,40 @@ impl TargetingPolicy {
                 .map_belief
                 .as_ref()
                 .map(|belief| {
-                    let Ok(trajectory) = simulate_targeting_shot(
-                        &belief.map,
-                        &ShotObservation {
-                            player_id: own_id,
-                            angle_degrees: f64::from(candidate.angle_degrees),
-                            velocity: f64::from(candidate.velocity),
-                            points: vec![start.clone()],
-                        },
-                        self.world,
-                        self.settings.max_simulation_ticks.max(2),
-                        &players,
-                        self.settings.target_radius,
-                    ) else {
+                    let shot = ShotObservation {
+                        player_id: own_id,
+                        angle_degrees: f64::from(candidate.angle_degrees),
+                        velocity: f64::from(candidate.velocity),
+                        points: vec![start.clone()],
+                    };
+                    let trajectory = if candidate.used_field_hypothesis {
+                        match (&belief.field_hypothesis, &belief.hypothesis_local_field) {
+                            (Some(hypothesis), Some(field)) => {
+                                simulate_targeting_shot_with_hypothesis(
+                                    &belief.map,
+                                    field,
+                                    hypothesis,
+                                    &shot,
+                                    self.world,
+                                    self.settings.max_simulation_ticks.max(2),
+                                    &players,
+                                    self.settings.target_radius,
+                                )
+                            }
+                            _ => return 0.0,
+                        }
+                    } else {
+                        simulate_targeting_shot_with_local_field(
+                            &belief.map,
+                            &belief.local_field,
+                            &shot,
+                            self.world,
+                            self.settings.max_simulation_ticks.max(2),
+                            &players,
+                            self.settings.target_radius,
+                        )
+                    };
+                    let Ok(trajectory) = trajectory else {
                         return 0.0;
                     };
                     let uncertainty_sum = trajectory.points.iter().try_fold(0.0, |sum, point| {
@@ -506,20 +755,22 @@ impl TargetingPolicy {
                 )
             })
         {
-            return Some(ShotChoice {
+            return Some(decorate(ShotChoice {
                 reason: ShotReason::Information,
                 ..*best_information
-            });
+            }));
         }
 
-        pool.into_iter().min_by(|left, right| {
-            (left.miss_distance + self.settings.coverage_penalty * left.covered_fraction)
-                .total_cmp(
-                    &(right.miss_distance
-                        + self.settings.coverage_penalty * right.covered_fraction),
-                )
-                .then_with(|| left.velocity.cmp(&right.velocity))
-        })
+        pool.into_iter()
+            .min_by(|left, right| {
+                (left.miss_distance + self.settings.coverage_penalty * left.covered_fraction)
+                    .total_cmp(
+                        &(right.miss_distance
+                            + self.settings.coverage_penalty * right.covered_fraction),
+                    )
+                    .then_with(|| left.velocity.cmp(&right.velocity))
+            })
+            .map(decorate)
     }
 }
 
@@ -634,6 +885,40 @@ mod tests {
             !contact_before_target(&planet, &points, passage),
             "a later planet cannot undo an earlier hit"
         );
+    }
+
+    #[test]
+    fn targeting_search_stops_when_cancelled() {
+        let state = flat_field_state();
+        let mut calls = 0;
+        let choice = TargetingPolicy::default().choose_with_check(&state, 50.0, || {
+            calls += 1;
+            calls < 10
+        });
+        assert!(choice.is_none());
+        assert_eq!(calls, 10);
+    }
+
+    #[test]
+    fn singular_hypothesis_does_not_hide_a_clear_alternative_hit() {
+        let mut state = flat_field_state();
+        let mut belief = MapBelief::new(PlanetMap { planets: vec![] }, None);
+        belief.field_hypothesis = Some(crate::field_hypothesis::FieldHypothesis {
+            x: 100.0,
+            y: 100.0,
+            mass: 2700.0,
+            support: vec![Point { x: 100.0, y: 100.0 }, Point { x: 110.0, y: 100.0 }],
+            baseline_continuation_rmse: 10.0,
+            continuation_rmse: 1.0,
+        });
+        belief.hypothesis_local_field = Some(crate::local_field::LocalField::default());
+        state.set_map_belief(Some(belief));
+        let choice = TargetingPolicy::default()
+            .choose(&state, 8.0)
+            .expect("clear alternative shot");
+        assert_eq!(choice.reason, ShotReason::Hit);
+        assert_eq!(choice.angle_degrees, 0);
+        assert_eq!(choice.alternative_agrees, None);
     }
 
     #[test]

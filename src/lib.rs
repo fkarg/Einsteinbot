@@ -15,3 +15,7 @@ pub mod strategy;
 mod live_map;
 
 pub mod online_map;
+
+pub mod local_field;
+
+pub mod field_hypothesis;

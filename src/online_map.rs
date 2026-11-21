@@ -14,6 +14,9 @@ pub struct OnlineEstimator {
     players: BTreeMap<u32, Point>,
     observations: Vec<ShotObservation>,
     belief: Option<MapBelief>,
+    field_hypothesis: Option<crate::field_hypothesis::FieldHypothesis>,
+    pending_field_hypotheses: Vec<crate::field_hypothesis::FieldHypothesis>,
+    attempted_hypothesis_shots: usize,
 }
 
 impl OnlineEstimator {
@@ -136,8 +139,155 @@ impl OnlineEstimator {
             .filter(|h| h.association_ambiguous)
             .count();
         belief.contact_points = self.contacts.contact_points().to_vec();
+        belief.local_field =
+            crate::local_field::LocalField::from_observations(&belief.map, &self.observations);
+        if !self.update_field_hypotheses(&belief.map, cancelled) {
+            return None;
+        }
+        if let Some(hypothesis) = &self.field_hypothesis {
+            let mut gravity_sources = belief.map.clone();
+            gravity_sources.planets.push(crate::protocol::Planet {
+                x: hypothesis.x,
+                y: hypothesis.y,
+                radius: 0.0,
+                mass: hypothesis.mass,
+            });
+            belief.hypothesis_local_field =
+                Some(crate::local_field::LocalField::from_observations(
+                    &gravity_sources,
+                    &self.observations,
+                ));
+            belief.field_hypothesis = Some(hypothesis.clone());
+        }
+        if cancelled.load(Ordering::SeqCst) {
+            return None;
+        }
         self.belief = Some(belief.clone());
         Some(belief)
+    }
+
+    /// Keep uncontradicted proposals until a separate path corroborates them.
+    fn update_field_hypotheses(&mut self, baseline: &PlanetMap, cancelled: &AtomicBool) -> bool {
+        use crate::field_hypothesis::{FieldHypothesis, propose_field, propose_residual_field};
+        #[derive(PartialEq)]
+        enum Assessment {
+            Accepted,
+            Pending,
+            Rejected,
+        }
+        let assess = |hypothesis: &FieldHypothesis| -> Option<Assessment> {
+            let mut proposed = baseline.clone();
+            proposed.planets.push(crate::protocol::Planet {
+                x: hypothesis.x,
+                y: hypothesis.y,
+                radius: 0.0,
+                mass: hypothesis.mass,
+            });
+            let mut corroborated = false;
+            for shot in &self.observations {
+                if cancelled.load(Ordering::Relaxed) {
+                    return None;
+                }
+                if shot.points.len() < 3 {
+                    continue;
+                }
+                let is_support = shot
+                    .points
+                    .len()
+                    .checked_sub(1)
+                    .is_some_and(|n| shot.points[..n] == hypothesis.support);
+                let base = crate::estimator::shot_position_rmse(
+                    baseline,
+                    shot,
+                    WorldParameters::default(),
+                );
+                let candidate = crate::estimator::shot_position_rmse(
+                    &proposed,
+                    shot,
+                    WorldParameters::default(),
+                );
+                match (base, candidate) {
+                    (Ok(Some(base)), Ok(Some(candidate)))
+                        if base.is_finite() && candidate.is_finite() =>
+                    {
+                        if candidate > base * 1.2 + 0.01 {
+                            return Some(Assessment::Rejected);
+                        }
+                        if !is_support && base > 0.01 && candidate < base * 0.8 {
+                            corroborated = true;
+                        }
+                    }
+                    // Insufficient samples convey no evidence. A real simulation failure
+                    // is not evidence of safety and must reject this proposal.
+                    (Ok(None), Ok(None)) => continue,
+                    _ => return Some(Assessment::Rejected),
+                }
+            }
+            Some(if baseline.planets.is_empty() || corroborated {
+                Assessment::Accepted
+            } else {
+                Assessment::Pending
+            })
+        };
+
+        if let Some(hypothesis) = &self.field_hypothesis {
+            match assess(hypothesis) {
+                None => return false,
+                Some(Assessment::Rejected) => self.field_hypothesis = None,
+                Some(Assessment::Pending) => self
+                    .pending_field_hypotheses
+                    .push(self.field_hypothesis.take().unwrap()),
+                Some(Assessment::Accepted) => {}
+            }
+        }
+        let mut index = 0;
+        while index < self.pending_field_hypotheses.len() {
+            match assess(&self.pending_field_hypotheses[index]) {
+                None => return false,
+                Some(Assessment::Rejected) => {
+                    self.pending_field_hypotheses.remove(index);
+                }
+                Some(Assessment::Accepted) if self.field_hypothesis.is_none() => {
+                    self.field_hypothesis = Some(self.pending_field_hypotheses.remove(index));
+                }
+                _ => index += 1,
+            }
+        }
+        while self.field_hypothesis.is_none()
+            && self.attempted_hypothesis_shots < self.observations.len()
+        {
+            if cancelled.load(Ordering::Relaxed) {
+                return false;
+            }
+            let index = self.attempted_hypothesis_shots;
+            let candidate = if baseline.planets.is_empty() {
+                propose_field(
+                    &self.observations[index],
+                    WorldParameters::default(),
+                    cancelled,
+                )
+            } else {
+                propose_residual_field(
+                    &self.observations[index],
+                    baseline,
+                    WorldParameters::default(),
+                    cancelled,
+                )
+            };
+            if cancelled.load(Ordering::Relaxed) {
+                return false;
+            }
+            self.attempted_hypothesis_shots += 1;
+            if let Some(candidate) = candidate {
+                match assess(&candidate) {
+                    None => return false,
+                    Some(Assessment::Accepted) => self.field_hypothesis = Some(candidate),
+                    Some(Assessment::Pending) => self.pending_field_hypotheses.push(candidate),
+                    Some(Assessment::Rejected) => {}
+                }
+            }
+        }
+        !cancelled.load(Ordering::Relaxed)
     }
     /// Sequential replay fits after each event, preserving the historical decision boundary.
     pub fn observe(&mut self, event: &ServerEvent, cancelled: &AtomicBool) -> Option<MapBelief> {
@@ -185,6 +335,340 @@ mod tests {
             velocity: 3.0,
             points: path.points,
         }
+    }
+
+    #[test]
+    fn residual_hypothesis_waits_for_independent_corroboration() {
+        let known = PlanetMap {
+            planets: vec![Planet {
+                x: 600.0,
+                y: 500.0,
+                radius: 30.0,
+                mass: 2700.0,
+            }],
+        };
+        let truth = PlanetMap {
+            planets: vec![
+                known.planets[0].clone(),
+                Planet {
+                    x: 1000.0,
+                    y: 350.0,
+                    radius: 35.0,
+                    mass: 4287.5,
+                },
+            ],
+        };
+        let observe = |y| {
+            let mut shot = ShotObservation {
+                player_id: 1,
+                angle_degrees: 0.0,
+                velocity: 8.0,
+                points: vec![Point { x: 200.0, y }],
+            };
+            shot.points = simulate_shot(&truth, &shot, WorldParameters::default(), 2000)
+                .unwrap()
+                .points;
+            shot
+        };
+        let mut estimator = OnlineEstimator::default();
+        let cancelled = AtomicBool::new(false);
+        estimator.observations.push(observe(400.0));
+        estimator.update_field_hypotheses(&known, &cancelled);
+        assert!(
+            estimator.field_hypothesis.is_none(),
+            "uncorroborated source must not be published"
+        );
+        assert_eq!(
+            estimator.pending_field_hypotheses.len(),
+            1,
+            "retain the viable candidate"
+        );
+        let first_support = estimator.pending_field_hypotheses[0].support.clone();
+        estimator.observations.push(observe(350.0));
+        estimator.update_field_hypotheses(&known, &cancelled);
+        let selected = estimator
+            .field_hypothesis
+            .as_ref()
+            .expect("later path corroborates original candidate");
+        assert_eq!(selected.support, first_support);
+    }
+
+    #[test]
+    fn contradictory_path_discards_pending_hypothesis() {
+        let known = PlanetMap {
+            planets: vec![Planet {
+                x: 600.0,
+                y: 500.0,
+                radius: 30.0,
+                mass: 2700.0,
+            }],
+        };
+        let truth = PlanetMap {
+            planets: vec![
+                known.planets[0].clone(),
+                Planet {
+                    x: 1000.0,
+                    y: 350.0,
+                    radius: 35.0,
+                    mass: 4287.5,
+                },
+            ],
+        };
+        let observe = |map: &PlanetMap, y| {
+            let mut shot = ShotObservation {
+                player_id: 1,
+                angle_degrees: 0.0,
+                velocity: 8.0,
+                points: vec![Point { x: 200.0, y }],
+            };
+            shot.points = simulate_shot(map, &shot, WorldParameters::default(), 2000)
+                .unwrap()
+                .points;
+            shot
+        };
+        let mut estimator = OnlineEstimator::default();
+        let cancelled = AtomicBool::new(false);
+        estimator.observations.push(observe(&truth, 400.0));
+        estimator.update_field_hypotheses(&known, &cancelled);
+        assert_eq!(estimator.pending_field_hypotheses.len(), 1);
+        estimator.observations.push(observe(&known, 350.0));
+        estimator.update_field_hypotheses(&known, &cancelled);
+        assert!(estimator.field_hypothesis.is_none());
+        assert!(estimator.pending_field_hypotheses.is_empty());
+    }
+
+    #[test]
+    fn physical_map_rejects_a_redundant_hypothesis_on_its_support_path() {
+        let truth = PlanetMap {
+            planets: vec![Planet {
+                x: 600.0,
+                y: 500.0,
+                radius: 30.0,
+                mass: 2700.0,
+            }],
+        };
+        let mut shot = ShotObservation {
+            player_id: 1,
+            angle_degrees: 0.0,
+            velocity: 8.0,
+            points: vec![Point { x: 200.0, y: 400.0 }],
+        };
+        shot.points = simulate_shot(&truth, &shot, WorldParameters::default(), 2000)
+            .unwrap()
+            .points;
+        let cancel = AtomicBool::new(false);
+        let hypothesis =
+            crate::field_hypothesis::propose_field(&shot, WorldParameters::default(), &cancel)
+                .unwrap();
+        let mut estimator = OnlineEstimator {
+            observations: vec![shot],
+            field_hypothesis: Some(hypothesis),
+            attempted_hypothesis_shots: 1,
+            ..Default::default()
+        };
+        assert!(estimator.update_field_hypotheses(&truth, &cancel));
+        assert!(estimator.field_hypothesis.is_none());
+        assert!(estimator.pending_field_hypotheses.is_empty());
+    }
+
+    #[test]
+    fn contradicted_hypothesis_can_be_replaced_from_a_later_path() {
+        // A rejected candidate must not cause every later update to retry the same seed.
+        let truth = PlanetMap {
+            planets: vec![Planet {
+                x: 600.0,
+                y: 500.0,
+                radius: 30.0,
+                mass: 2700.0,
+            }],
+        };
+        let make_event = |y: f32| {
+            let launch = ShotObservation {
+                player_id: 1,
+                angle_degrees: 0.0,
+                velocity: 8.0,
+                points: vec![Point { x: 200.0, y }],
+            };
+            let path = simulate_shot(&truth, &launch, WorldParameters::default(), 2000).unwrap();
+            assert_eq!(
+                path.termination,
+                crate::simulation::Termination::BattlefieldMargin
+            );
+            ServerEvent::ShotFin {
+                player_id: 1,
+                angle: 0.0,
+                velocity: 8.0,
+                points: path.points,
+            }
+        };
+        let cancel = AtomicBool::new(false);
+        let mut estimator = OnlineEstimator::default();
+        estimator.observe(
+            &ServerEvent::PlayerPosition {
+                player_id: 1,
+                x: 200.0,
+                y: 400.0,
+            },
+            &cancel,
+        );
+        let first = estimator.observe(&make_event(400.0), &cancel).unwrap();
+        assert!(first.field_hypothesis.is_some());
+        // Model a previously accepted but inaccurate field; a later independent flight
+        // supplies evidence to reject it and also supplies a new candidate.
+        let wrong = estimator.field_hypothesis.as_mut().unwrap();
+        wrong.x = 250.0;
+        wrong.y = 350.0;
+        estimator.observe(
+            &ServerEvent::PlayerPosition {
+                player_id: 1,
+                x: 200.0,
+                y: 300.0,
+            },
+            &cancel,
+        );
+        let replacement = estimator
+            .observe(&make_event(300.0), &cancel)
+            .unwrap()
+            .field_hypothesis
+            .expect("later path can propose a better field");
+        assert!((replacement.x - 600.0).hypot(replacement.y - 500.0) < 20.0);
+    }
+
+    #[test]
+    fn short_path_does_not_discard_previously_learned_field_hypothesis() {
+        // A terminal path without two timed positions cannot contradict a learned field.
+        let truth = PlanetMap {
+            planets: vec![Planet {
+                x: 600.0,
+                y: 500.0,
+                radius: 30.0,
+                mass: 2700.0,
+            }],
+        };
+        let launch = ShotObservation {
+            player_id: 1,
+            angle_degrees: 0.0,
+            velocity: 8.0,
+            points: vec![Point { x: 200.0, y: 400.0 }],
+        };
+        let path = simulate_shot(&truth, &launch, WorldParameters::default(), 2000).unwrap();
+        let mut estimator = OnlineEstimator::default();
+        let cancel = AtomicBool::new(false);
+        estimator.observe(
+            &ServerEvent::PlayerPosition {
+                player_id: 1,
+                x: 200.0,
+                y: 400.0,
+            },
+            &cancel,
+        );
+        let belief = estimator
+            .observe(
+                &ServerEvent::ShotFin {
+                    player_id: 1,
+                    angle: 0.0,
+                    velocity: 8.0,
+                    points: path.points,
+                },
+                &cancel,
+            )
+            .unwrap();
+        assert!(
+            belief.field_hypothesis.is_some(),
+            "flyby must create hypothesis"
+        );
+        let short = ServerEvent::ShotFin {
+            player_id: 1,
+            angle: 90.0,
+            velocity: 2.0,
+            points: vec![Point { x: 200.0, y: 400.0 }, Point { x: 200.0, y: 399.0 }],
+        };
+        let updated = estimator.observe(&short, &cancel).unwrap();
+        assert!(
+            updated.field_hypothesis.is_some(),
+            "unscorable path is not contrary evidence"
+        );
+    }
+
+    #[test]
+    fn flyby_supplies_local_gravity_for_nearby_prediction_without_planet_contact() {
+        use crate::simulation::{
+            simulate_sampled_positions, simulate_sampled_positions_with_local_field,
+        };
+        let truth = PlanetMap {
+            planets: vec![Planet {
+                x: 600.0,
+                y: 500.0,
+                radius: 30.0,
+                mass: 2700.0,
+            }],
+        };
+        let training = ShotObservation {
+            player_id: 1,
+            angle_degrees: 0.0,
+            velocity: 8.0,
+            points: vec![Point { x: 200.0, y: 400.0 }],
+        };
+        let trajectory =
+            simulate_shot(&truth, &training, WorldParameters::default(), 2000).unwrap();
+        assert_eq!(
+            trajectory.termination,
+            crate::simulation::Termination::BattlefieldMargin
+        );
+        let mut estimator = OnlineEstimator::default();
+        let cancel = AtomicBool::new(false);
+        estimator.observe(
+            &ServerEvent::PlayerPosition {
+                player_id: 1,
+                x: 200.0,
+                y: 400.0,
+            },
+            &cancel,
+        );
+        let belief = estimator
+            .observe(
+                &ServerEvent::ShotFin {
+                    player_id: 1,
+                    angle: 0.0,
+                    velocity: 8.0,
+                    points: trajectory.points,
+                },
+                &cancel,
+            )
+            .unwrap();
+        assert!(belief.map.planets.is_empty());
+        let heldout = ShotObservation {
+            player_id: 1,
+            angle_degrees: 0.0,
+            velocity: 8.0,
+            points: vec![Point { x: 200.0, y: 410.0 }],
+        };
+        let observed =
+            simulate_sampled_positions(&truth, &heldout, WorldParameters::default(), 70).unwrap();
+        let flat =
+            simulate_sampled_positions(&belief.map, &heldout, WorldParameters::default(), 70)
+                .unwrap();
+        let learned = simulate_sampled_positions_with_local_field(
+            &belief.map,
+            &belief.local_field,
+            &heldout,
+            WorldParameters::default(),
+            70,
+        )
+        .unwrap();
+        let error = |prediction: &[crate::map::Vec2]| {
+            prediction
+                .iter()
+                .zip(&observed)
+                .map(|(a, b)| (a.x - b.x).powi(2) + (a.y - b.y).powi(2))
+                .sum::<f64>()
+        };
+        assert!(
+            error(&learned) < error(&flat) * 0.25,
+            "learned={} flat={}",
+            error(&learned),
+            error(&flat)
+        );
     }
 
     #[test]
