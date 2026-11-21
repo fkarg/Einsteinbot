@@ -5,7 +5,7 @@
   let captureId=null, decisions=[], snapshot=null, simulations=[],timeline=[],sel=null,selScope=null,snapshotRequest=0;
   let position='none',layer='gravity',corrections=true;
   const GRID_STEP=3,LAYER_NAMES={gravity:'Gravity',uncertainty:'Field uncertainty',evidence:'Residual evidence',error:'Error vs disclosed'};
-  const STATUS_LABEL={ok:'close match',location:'center off',size:'size off',both:'center and size off',missing:'missing'},LOCATION_TOL=10,SIZE_TOL=5,STATUS_COLORS={ok:'#60dcff',location:'#ff9d4d',size:'#e8d96d',both:'#ff7a5c',missing:'#ff4d6a'};
+  const STATUS_LABEL={unknown:'no comparable belief',ok:'close match',location:'center off',size:'size off',both:'center and size off',missing:'missing'},LOCATION_TOL=10,SIZE_TOL=5,STATUS_COLORS={unknown:'#60dcff',ok:'#60dcff',location:'#ff9d4d',size:'#e8d96d',both:'#ff7a5c',missing:'#ff4d6a'};
   let view={x:0,y:0,width:W,height:H}, viewDrag=null, panned=false;
   const colors=['#54c8ff','#ffb45c','#b791ff','#7de3a1','#ff7899','#e8d96d','#88a7ff','#ffa1dc'];
   function setStatus(s){ $('status').textContent=s||''; }
@@ -26,7 +26,7 @@
     for(const name of ['all',...bots]){const op=document.createElement('option');op.value=name;op.textContent=name==='all'?'All bots':name;bot.append(op);}
     bot.value=bots.includes(old)?old:'all'; fillDecisionList();
   }
-  function fillDecisionList(){position='none';loadSnapshot();loadTimeline();}
+  function fillDecisionList(){position='none';selScope=null;loadSnapshot();loadTimeline();}
   async function loadSnapshot(){
     const request=++snapshotRequest,requestCapture=captureId,requestDecision=position,requestView={...view};
     setStatus('Loading captured state…');simulations=[];
@@ -64,7 +64,7 @@
     if($('pathResiduals').checked){const residuals=(snapshot.events||[]).flatMap(e=>e.residual_samples||[]),mags=residuals.map(r=>Math.hypot(r[2],r[3])).sort((a,b)=>a-b),cap=mags.length?mags[Math.floor((mags.length-1)*.95)]:null;$('pathScale').style.display=residuals.length?'grid':'none';$('pathMax').textContent=Number.isFinite(cap)?fmt(cap,4):'no data';$('pathScaleBar').title=`Path residual magnitude, colors clip at the 95th percentile (${fmt(cap,6)})`;for(const r of residuals){const t=Math.max(0,Math.min(1,Math.hypot(r[2],r[3])/(cap||1)));ctx.beginPath();ctx.arc(r[0],r[1],1.7,0,Math.PI*2);ctx.fillStyle=heatColor(t);ctx.fill();}}else $('pathScale').style.display='none';
     if($('paths').checked){const paths=(snapshot.events||[]).filter(e=>e.record?.event?.type==='shot_fin');for(const item of paths){const e=item.record.event;if(!e.points?.length)continue;ctx.beginPath();ctx.moveTo(e.points[0].x,e.points[0].y);for(const p of e.points)ctx.lineTo(p.x,p.y);ctx.strokeStyle=colors[e.player_id%colors.length]+'55';ctx.lineWidth=1.2;ctx.stroke();const end=e.points.at(-1);ctx.beginPath();ctx.arc(end.x,end.y,2.8,0,Math.PI*2);ctx.fillStyle=colors[e.player_id%colors.length]+'bb';ctx.fill();}}
     if($('beliefPlanets').checked){for(const p of snapshot.diagnostic?.map_belief?.planets||[])circle(p,'#ffc45b',true);}
-    if($('actualPlanets').checked){const status=disclosedStatuses();(snapshot.actual_planets||[]).forEach((p,i)=>{const s=status[i]?.status||'ok';circle(p,STATUS_COLORS[s],false);if(s!=='ok'){ctx.fillStyle=STATUS_COLORS[s];ctx.font='12px system-ui';ctx.fillText(`#${i}`,p.x+p.radius*.7,p.y-p.radius*.7-3);}});}
+    if($('actualPlanets').checked){const status=disclosedStatuses();(snapshot.actual_planets||[]).forEach((p,i)=>{const s=status[i]?.status||'ok';circle(p,STATUS_COLORS[s],false);if(s!=='ok'&&s!=='unknown'){ctx.fillStyle=STATUS_COLORS[s];ctx.font='12px system-ui';ctx.fillText(`#${i}`,p.x+p.radius*.7,p.y-p.radius*.7-3);}});}
     drawHypothesis();
     if($('contacts').checked){ctx.fillStyle='#c58cff';for(const p of snapshot.diagnostic?.map_belief?.contact_points||[]){ctx.beginPath();ctx.arc(p.x,p.y,3,0,Math.PI*2);ctx.fill();}}
     const players=snapshot.diagnostic?.bot_state?.player_positions||{};for(const [id,p] of Object.entries(players)){ctx.beginPath();ctx.arc(p.x,p.y,id===String(snapshot.diagnostic?.bot_state?.own_id)?8:6,0,Math.PI*2);ctx.fillStyle=id===String(snapshot.diagnostic?.bot_state?.own_id)?'#f4f7ff':colors[Number(id)%colors.length];ctx.fill();ctx.strokeStyle='#080d13';ctx.lineWidth=2;ctx.stroke();ctx.fillStyle='#fff';ctx.font='12px system-ui';ctx.fillText(id,p.x+8,p.y-8);}
@@ -80,11 +80,12 @@
     const b=snapshot.diagnostic?.map_belief||{},g=snapshot.field_grid||{},cov=b.covariance;
     const sigmas=g.samples?.map(p=>p.sigma).filter(Number.isFinite)||[];const sorted=[...sigmas].sort((a,b)=>a-b);const median=sorted.length?sorted[Math.floor(sorted.length/2)]:null;
     const local=b.local_field?.samples?.length||0;
-    const delta=snapshot.field_grid?.samples?.map(p=>p.delta).filter(v=>v&&Number.isFinite(v.x)&&Number.isFinite(v.y))||[],errors=delta.map(v=>Math.hypot(v.x,v.y)).sort((a,b)=>a-b),fieldRmse=delta.length?Math.sqrt(delta.reduce((sum,v)=>sum+v.x*v.x+v.y*v.y,0)/delta.length):null;
+    const delta=snapshot.field_grid?.samples?.map(p=>{const base=corrections?p.total:p.physical;return base&&p.oracle?{x:base.x-p.oracle.x,y:base.y-p.oracle.y}:null;}).filter(v=>v&&Number.isFinite(v.x)&&Number.isFinite(v.y))||[],errors=delta.map(v=>Math.hypot(v.x,v.y)).sort((a,b)=>a-b),fieldRmse=delta.length?Math.sqrt(delta.reduce((sum,v)=>sum+v.x*v.x+v.y*v.y,0)/delta.length):null;
+    const middle=a=>{if(!a.length)return null;const m=a.length>>1;return a.length%2?a[m]:(a[m-1]+a[m])/2;};
     const matches=planetMatches();const centerErrors=matches.map(m=>m.distance).sort((a,b)=>a-b),radiusErrors=matches.map(m=>Math.abs(m.radiusError)).sort((a,b)=>a-b);
     const stale=d.map_updating===true;
     const oracle=Boolean(snapshot.actual_planets);
-    kv($('metrics'),[['Map state',stale?'stale · fitting newer shots':'latest available'],['Estimated planets',oracle?`${b.planets?.length??0} of ${snapshot.actual_planets.length} disclosed`:String(b.planets?.length??0)],...(oracle?[['Disclosed planets missing',String(snapshot.planet_match?.missing_actual?.length??'—')],['Estimates matching nothing',String(snapshot.planet_match?.unmatched_estimated?.length??'—')],['Median center / radius error',matches.length?`${fmt(centerErrors[Math.floor(centerErrors.length/2)])} / ${fmt(radiusErrors[Math.floor(radiusErrors.length/2)])} units`:'—'],['Gravity error · RMS / p95 (viewport)',errors.length?`${fmt(fieldRmse)} / ${fmt(errors[Math.floor(errors.length*.95)])}`:'—']]:[]),['Fit trajectory RMSE',Number.isFinite(b.model_position_rmse)?`${fmt(b.model_position_rmse)} units`:'—'],['Accepted impact points',String(b.contact_points?.length??0)],['Local residual samples',String(local)],['Fit converged',b.fit_converged===null||b.fit_converged===undefined?'—':b.fit_converged?'yes':'no'],['Ambiguous associations',String(b.uncertain_associations??0)],['Fit covariance',g.has_covariance?'available':'unavailable']]);
+    kv($('metrics'),[['Map state',stale?'stale · fitting newer shots':'latest available'],['Estimated planets',oracle?`${b.planets?.length??0} of ${snapshot.actual_planets.length} disclosed`:String(b.planets?.length??0)],...(oracle?[['Disclosed planets missing',String(snapshot.planet_match?.missing_actual?.length??'—')],['Estimates matching nothing',String(snapshot.planet_match?.unmatched_estimated?.length??'—')],['Median center / radius error',matches.length?`${fmt(middle(centerErrors))} / ${fmt(middle(radiusErrors))} units`:'—'],['Gravity error · RMS / p95 (viewport)',errors.length?`${fmt(fieldRmse)} / ${fmt(errors[Math.floor(errors.length*.95)])}`:'—']]:[]),['Fit trajectory RMSE',Number.isFinite(b.model_position_rmse)?`${fmt(b.model_position_rmse)} units`:'—'],['Accepted impact points',String(b.contact_points?.length??0)],['Local residual samples',String(local)],['Fit converged',b.fit_converged===null||b.fit_converged===undefined?'—':b.fit_converged?'yes':'no'],['Ambiguous associations',String(b.uncertain_associations??0)],['Fit covariance',g.has_covariance?'available':'unavailable']]);
   }
   function renderChoice(c){kv($('choice'),[['Reason',String(c.reason||'—')],['Selected velocity',String(c.velocity??'—')],['Selected angle',`${c.angle_degrees??'—'}°`],['Predicted victim',String(c.predicted_victim??'—')],['Predicted center miss',`${fmt(c.miss_distance)} units`],['Alternative model agrees',String(c.alternative_agrees??'untested')],['Field hypothesis used',String(c.used_field_hypothesis??false)],['Covered path fraction',fmt(c.covered_fraction,3)],...mapAgeRows()]);}
   // Pairs come from the server's single matching (closest first, one-to-one, within the threshold).
@@ -95,7 +96,7 @@
   function matchStatus(m){const loc=m.distance>LOCATION_TOL,size=Math.abs(m.radiusError)>SIZE_TOL;return loc&&size?'both':loc?'location':size?'size':'ok';}
   // One record per disclosed planet: {status, match}; missing planets have no match.
   function disclosedStatuses(){
-    const matches=planetMatches(),out=(snapshot?.actual_planets||[]).map(()=>({status:'missing',match:null}));
+    const matches=planetMatches(),out=(snapshot?.actual_planets||[]).map(()=>({status:snapshot.planet_match?'missing':'unknown',match:null}));
     for(const m of matches)out[m.index]={status:matchStatus(m),match:m};
     return out;
   }
@@ -117,7 +118,7 @@
   canvas.addEventListener('dblclick',resetView);
   canvas.addEventListener('pointerdown',e=>{panned=false;if(!e.shiftKey&&e.button!==1)return;const rect=canvas.getBoundingClientRect();viewDrag={clientX:e.clientX,clientY:e.clientY,rect,view:{...view}};canvas.setPointerCapture(e.pointerId);});
   canvas.addEventListener('pointermove',e=>{if(!viewDrag)return;const dx=(e.clientX-viewDrag.clientX)/viewDrag.rect.width*viewDrag.view.width,dy=(e.clientY-viewDrag.clientY)/viewDrag.rect.height*viewDrag.view.height;view={...viewDrag.view,x:Math.max(0,Math.min(W-viewDrag.view.width,viewDrag.view.x-dx)),y:Math.max(0,Math.min(H-viewDrag.view.height,viewDrag.view.y-dy))};render();});canvas.addEventListener('pointerup',()=>{if(viewDrag){viewDrag=null;panned=true;refreshViewport();}});
-  // ---- Layers: four named presets over the field/color selects (full lists live under Advanced) ----
+  // ---- Layers: Gravity, Uncertainty, Evidence and Error are self-contained modes; the client derives every vector from the per-sample fields ----
   function syncLayerButtons(){
     const hasOracle=Boolean(snapshot?.actual_planets),shown=shownLayer();
     for(const b of document.querySelectorAll('.layer'))b.classList.toggle('active',b.dataset.layer===shown);
@@ -299,6 +300,7 @@
   function renderDisclosedList(){
     const el=$('disclosedList');el.replaceChildren();
     const actual=snapshot?.actual_planets;if(!actual)return;
+    if(!snapshot.planet_match){el.textContent='No belief from this map epoch to compare with at this point.';return;}
     const statuses=disclosedStatuses(),rank={missing:0,both:1,location:2,size:3,ok:4};
     const order=actual.map((p,i)=>i).sort((a,b)=>rank[statuses[a].status]-rank[statuses[b].status]||(statuses[b].match?.distance??0)-(statuses[a].match?.distance??0)||a-b);
     const count=s=>statuses.filter(x=>x.status===s).length;
