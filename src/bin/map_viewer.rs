@@ -21,7 +21,7 @@ use std::path::PathBuf;
 const PAGE: &str = include_str!("../../web/map_viewer.html");
 const DEFAULT_PORT: u16 = 8765;
 const PLAYER_RADIUS: f64 = 4.0;
-const FIELD_GRID_STEP: usize = 50;
+const FIELD_GRID_STEP: usize = 25;
 
 fn main() {
     if let Err(error) = run() {
@@ -88,6 +88,7 @@ fn handle(mut stream: TcpStream, db_path: &PathBuf) -> Result<(), Box<dyn Error>
             required_id(&parameters, "id").and_then(|id| list_decisions(db_path, id))
         }
         "/api/snapshot" => selected_snapshot(db_path, &parameters),
+        "/api/timeline" => capture_timeline(db_path, &parameters),
         "/api/simulate" => simulate_request(db_path, &parameters),
         "/api/compare" => compare_request(db_path, &parameters),
         "/api/physics-audit" => physics_audit(db_path, &parameters),
@@ -213,6 +214,40 @@ fn list_decisions(path: &PathBuf, capture_id: i64) -> Result<Value, String> {
     Ok(json!({"capture_id": capture_id, "decisions": decisions}))
 }
 
+fn capture_timeline(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Result<Value, String> {
+    let capture_id = required_id(parameters, "id")?;
+    let connection = open_database(path)?;
+    let mut statement = connection.prepare("SELECT sequence, timestamp_unix_ms, event_type, event_json FROM events WHERE capture_id=?1 ORDER BY sequence")
+        .map_err(|error| error.to_string())?;
+    let events = statement.query_map([capture_id], |row| {
+        let sequence: i64 = row.get(0)?;
+        let event_type: String = row.get(2)?;
+        let event: String = row.get(3)?;
+        let event: Value = serde_json::from_str(&event).unwrap_or(Value::Null);
+        let e = &event["event"];
+        let detail = match event_type.as_str() {
+            "planets" => format!("{} disclosed planets", e["planets"].as_array().map_or(0, Vec::len)),
+            "shot_fin" => format!("player {} shot ended · {} points", e["player_id"], e["points"].as_array().map_or(0, Vec::len)),
+            "player_position" => format!("player {} at ({:.0}, {:.0})", e["player_id"], e["x"].as_f64().unwrap_or(0.0), e["y"].as_f64().unwrap_or(0.0)),
+            "shot_begin" => format!("player {} fired v{} at {}°", e["player_id"], e["velocity"], e["angle"]),
+            other => other.to_owned(),
+        };
+        Ok(json!({"sequence":sequence,"timestamp_unix_ms":row.get::<_,i64>(1)?,"kind":event_type,"detail":detail}))
+    }).map_err(|error| error.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|error|error.to_string())?;
+    let mut statement = connection.prepare("SELECT sequence, timestamp_unix_ms, bot_name, data_json FROM diagnostics WHERE capture_id=?1 AND kind='target_decision' ORDER BY sequence")
+        .map_err(|error| error.to_string())?;
+    let decisions = statement.query_map([capture_id], |row| {
+        let sequence: i64 = row.get(0)?; let timestamp: i64 = row.get(1)?; let bot: String = row.get(2)?;
+        let data: String = row.get(3)?; let data: Value = serde_json::from_str(&data).unwrap_or(Value::Null);
+        let choice = &data["choice"];
+        Ok(json!({"sequence":sequence,"timestamp_unix_ms":timestamp,"kind":"decision","detail":format!("{bot} chose v{} at {}° ({})", choice["velocity"], choice["angle_degrees"], choice["reason"].as_str().unwrap_or("no shot"))}))
+    }).map_err(|error| error.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|error|error.to_string())?;
+    let mut timeline = events;
+    timeline.extend(decisions);
+    timeline.sort_by_key(|event| event["sequence"].as_i64().unwrap_or(0));
+    Ok(json!({"capture_id":capture_id,"timeline":timeline}))
+}
+
 fn read_decision(connection: &Connection, capture_id: i64, sequence: i64) -> Result<Value, String> {
     connection
         .query_row(
@@ -256,10 +291,36 @@ fn latest_actual_planets(events: &[(i64, Value)]) -> Option<Vec<Planet>> {
 
 fn selected_snapshot(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Result<Value, String> {
     let capture_id = required_id(parameters, "id")?;
-    let sequence = required_id(parameters, "seq")?;
     let connection = open_database(path)?;
-    let data = read_decision(&connection, capture_id, sequence)?;
-    let events = read_events_before(&connection, capture_id, sequence)?;
+    let selection = parameters.get("seq").copied().unwrap_or("none");
+    let is_decision = selection.parse::<i64>().is_ok();
+    let sequence = if is_decision {
+        selection
+            .parse::<i64>()
+            .map_err(|_| "invalid seq".to_owned())?
+    } else if let Some(event_seq) = selection.strip_prefix("event:") {
+        event_seq
+            .parse::<i64>()
+            .map_err(|_| "invalid event sequence".to_owned())?
+    } else {
+        connection
+            .query_row(
+                "SELECT COALESCE(MAX(sequence),0) FROM events WHERE capture_id=?1",
+                [capture_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?
+    };
+    let (data, diagnostic_sequence) = if is_decision {
+        (
+            read_decision(&connection, capture_id, sequence)?,
+            Some(sequence),
+        )
+    } else {
+        connection.query_row("SELECT sequence,data_json FROM diagnostics WHERE capture_id=?1 AND kind='target_decision' AND sequence<=?2 ORDER BY sequence DESC LIMIT 1", params![capture_id,sequence], |row| Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?)))
+            .ok().and_then(|(seq,text)| serde_json::from_str(&text).ok().map(|data|(data,Some(seq)))).unwrap_or((Value::Null,None))
+    };
+    let events = read_events_before(&connection, capture_id, sequence.saturating_add(1))?;
     let actual_planets = latest_actual_planets(&events);
     let field_grid = make_field_grid(&data, actual_planets.as_deref())?;
     let trajectories = events
@@ -276,6 +337,8 @@ fn selected_snapshot(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Resul
         "capture_id": capture_id,
         "sequence": sequence,
         "diagnostic": data,
+        "diagnostic_sequence": diagnostic_sequence,
+        "selection_kind": if is_decision {"decision"} else if selection.starts_with("event:") {"timeline_event"} else {"latest_capture_state"},
         "events": trajectories,
         "actual_planets": actual_planets,
         "field_grid": field_grid,
@@ -367,11 +430,14 @@ fn make_field_grid(data: &Value, actual: Option<&[Planet]>) -> Result<Value, Str
         for x in (0..=world.battlefield_width as usize).step_by(FIELD_GRID_STEP) {
             let position = Vec2::new(x as f64, y as f64);
             let Some(belief) = &belief else {
-                samples.push(json!({"x":x,"y":y,"gravity":null,"sigma":null,"supported":false,"hypothesis_proxy":null,"actual_gravity":actual_map.as_ref().and_then(|map| map.acceleration(position).ok()).map(|v| v.x.hypot(v.y))}));
+                let oracle = actual_map
+                    .as_ref()
+                    .and_then(|map| map.acceleration(position).ok());
+                samples.push(json!({"x":x,"y":y,"gravity":null,"total":null,"oracle":oracle.map(|v|json!({"x":v.x,"y":v.y})),"sigma":null,"supported":false,"hypothesis_proxy":null,"actual_gravity":oracle.map(|v| v.x.hypot(v.y))}));
                 continue;
             };
             let physical = belief.map.acceleration(position).ok();
-            let residual = belief.local_field.residual(position);
+            let residual_observed = belief.local_field.residual(position);
             let hypothesis = belief.field_hypothesis.as_ref().and_then(|hypothesis| {
                 hypothesis.acceleration(position).map(|gravity| {
                     let local = belief
@@ -382,13 +448,34 @@ fn make_field_grid(data: &Value, actual: Option<&[Planet]>) -> Result<Value, Str
                     (gravity.x + local.x, gravity.y + local.y)
                 })
             });
-            let gravity = physical.map(|physical| {
-                let residual = residual.unwrap_or_default();
-                (physical.x + residual.x, physical.y + residual.y)
+            let has_residual = residual_observed.is_some();
+            let residual = residual_observed.unwrap_or_default();
+            let gravity =
+                physical.map(|physical| (physical.x + residual.x, physical.y + residual.y));
+            let hypothesis_local = belief
+                .hypothesis_local_field
+                .as_ref()
+                .and_then(|field| field.residual(position))
+                .unwrap_or_default();
+            let hypothesis_source = belief
+                .field_hypothesis
+                .as_ref()
+                .and_then(|hypothesis| hypothesis.acceleration(position));
+            let hypothesis_extra = hypothesis_source.map(|source| {
+                Vec2::new(source.x + hypothesis_local.x, source.y + hypothesis_local.y)
             });
             let hypothesis_gravity = physical
                 .zip(hypothesis)
                 .map(|(physical, extra)| (physical.x + extra.0, physical.y + extra.1));
+            let actual_vector = actual_map
+                .as_ref()
+                .and_then(|map| map.acceleration(position).ok());
+            let delta = gravity
+                .zip(actual_vector)
+                .map(|(estimate, oracle)| Vec2::new(estimate.0 - oracle.x, estimate.1 - oracle.y));
+            let hypothesis_delta = hypothesis_gravity
+                .zip(actual_vector)
+                .map(|(estimate, oracle)| Vec2::new(estimate.0 - oracle.x, estimate.1 - oracle.y));
             let sigma = covariance
                 .and_then(|matrix| belief.map.acceleration_covariance(position, matrix).ok())
                 .map(|covariance| (covariance.xx + covariance.yy).max(0.0).sqrt());
@@ -398,10 +485,20 @@ fn make_field_grid(data: &Value, actual: Option<&[Planet]>) -> Result<Value, Str
                 .map(|hypothesis| hypothesis.relative_uncertainty_proxy(position));
             samples.push(json!({
                 "x":x,"y":y,
+                "physical":physical.map(|v|json!({"x":v.x,"y":v.y})),
+                "residual":json!({"x":residual.x,"y":residual.y}),
+                "total":gravity.map(|(x,y)|json!({"x":x,"y":y})),
+                "hypothesis_source":hypothesis_source.map(|v|json!({"x":v.x,"y":v.y})),
+                "hypothesis_residual":json!({"x":hypothesis_local.x,"y":hypothesis_local.y}),
+                "hypothesis_extra":hypothesis_extra.map(|v|json!({"x":v.x,"y":v.y})),
+                "hypothesis_total":hypothesis_gravity.map(|(x,y)|json!({"x":x,"y":y})),
+                "oracle":actual_vector.map(|v|json!({"x":v.x,"y":v.y})),
+                "delta":delta.map(|v|json!({"x":v.x,"y":v.y})),
+                "hypothesis_delta":hypothesis_delta.map(|v|json!({"x":v.x,"y":v.y})),
                 "gravity":gravity.map(|(ax,ay)| ax.hypot(ay)),
                 "hypothesis_gravity":hypothesis_gravity.map(|(ax,ay)| ax.hypot(ay)),
                 "sigma":sigma,
-                "supported":residual.is_some(),
+                "supported":has_residual,
                 "hypothesis_proxy":hypothesis_proxy,
                 "actual_gravity":actual_map.as_ref().and_then(|map| map.acceleration(position).ok()).map(|v| v.x.hypot(v.y)),
             }));

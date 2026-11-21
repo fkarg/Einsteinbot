@@ -35,6 +35,12 @@
     #decisionLabel { color:#d7e4f4; font-size:12px; padding:7px 0; }
     #cursor { font:12px ui-monospace,monospace; color:#a9c6dc; }
     .compare { border:1px solid #263244; border-radius:6px; padding:9px; color:#b6c5d8; font-size:12px; white-space:pre-wrap; }
+    .timeline { display:flex; gap:8px; align-items:center; overflow:auto; max-height:150px; flex-wrap:wrap; }
+    .timeline button { font-size:11px; padding:4px 7px; background:#172334; border-color:#34445a; }
+    .timeline button.active { border-color:#ffe27a; color:#ffe27a; }
+    .table { width:100%; border-collapse:collapse; font:11px/1.4 ui-monospace,monospace; color:#b6c5d8; }
+    .table th,.table td { text-align:right; border-bottom:1px solid #263244; padding:4px; }
+    .table th:first-child,.table td:first-child { text-align:left; }
     @media(max-width:950px) { main { grid-template-columns:1fr; } aside { border-left:0;border-top:1px solid #263244;max-height:none; } #map { max-height:none; } }
   </style>
 </head>
@@ -44,13 +50,16 @@
     <label>Capture <select id="capture"></select></label>
     <label>Bot <select id="bot"><option value="all">All bots</option></select></label>
     <label>Decision <select id="decision"></select></label>
+    <button id="latest">No decision · latest capture state</button>
     <button id="refresh">Refresh capture</button>
     <span id="status"></span>
   </header>
   <main>
     <section class="map-area">
       <div class="toolbar">
-        <label>Heat map <select id="heat"><option value="gravity">Belief gravity</option><option value="hypothesis_gravity">Belief + field hypothesis</option><option value="actual_gravity">Actual-map gravity</option><option value="sigma">Parameter-derived gravity uncertainty</option><option value="hypothesis_proxy">Hypothesis distance proxy</option><option value="support">Observed local-field support</option></select></label>
+        <label>Vector field <select id="field"><option value="total">Belief total</option><option value="physical">Physical planets</option><option value="residual">Local residual</option><option value="hypothesis_source">Field-only source</option><option value="hypothesis_residual">Hypothesis residual</option><option value="hypothesis_total">Belief + hypothesis</option><option value="oracle">Disclosed actual</option><option value="delta">Belief − actual</option><option value="hypothesis_delta">Hypothesis − actual</option></select></label>
+        <label>Color by <select id="heat"><option value="magnitude">Field strength</option><option value="sigma">Parameter-derived gravity uncertainty</option><option value="hypothesis_proxy">Hypothesis distance proxy</option><option value="support">Observed local-field support</option></select></label>
+        <label><input type="checkbox" id="arrows" checked> Vector arrows</label>
         <label><input type="checkbox" id="paths" checked> Recorded trajectories</label>
         <label><input type="checkbox" id="coverage"> Bot coverage</label>
         <label><input type="checkbox" id="beliefPlanets" checked> Estimated planets</label>
@@ -69,10 +78,14 @@
     <span><i class="dot" style="background:#ff4da6"></i>Rust replay of worst path</span>
       </div>
       <div id="decisionLabel"></div>
+      <h2>Information timeline</h2><div id="timeline" class="timeline"></div>
     </section>
     <aside>
       <h2>Captured belief</h2>
       <div id="metrics" class="metrics"></div>
+      <h2>Estimated planets vs disclosed map</h2><div id="planetCompare" class="compare"></div>
+      <h2>Impact point fit</h2><div id="contactCompare" class="compare"></div>
+      <h2>Selected map point</h2><div id="pointDetails" class="compare">Click the map to inspect vectors and nearby objects.</div>
       <p class="note">Gravity and uncertainty are evaluated from the captured belief. Parameter-derived uncertainty does not include missing planets or model error. The field-hypothesis distance proxy is not a probability or standard deviation.</p>
       <h2>Targeting simulation</h2>
       <div class="controls">
@@ -94,7 +107,7 @@
   const W=1885.618,H=1060.66;
   const $=id=>document.getElementById(id);
   const canvas=$('map'),ctx=canvas.getContext('2d');
-  let captureId=null, decisions=[], snapshot=null, simulations=[];
+  let captureId=null, decisions=[], snapshot=null, simulations=[],timeline=[];
   const colors=['#54c8ff','#ffb45c','#b791ff','#7de3a1','#ff7899','#e8d96d','#88a7ff','#ffa1dc'];
   function setStatus(s){ $('status').textContent=s||''; }
   function fmt(v,n=2){ return Number.isFinite(Number(v))?Number(v).toFixed(n):'—'; }
@@ -116,24 +129,29 @@
   }
   function fillDecisionList(){
     const chosenBot=$('bot').value;const filtered=decisions.filter(d=>chosenBot==='all'||d.bot_name===chosenBot);const sel=$('decision');sel.replaceChildren();
+    const none=document.createElement('option');none.value='none';none.textContent='No decision · latest capture state';sel.append(none);
     for(const d of filtered){const op=document.createElement('option');op.value=d.sequence;const c=d.choice||{};op.textContent=`#${d.sequence} ${d.bot_name} · ${c.reason||'no shot'} v${c.velocity??'–'} @ ${c.angle_degrees??'–'}°`;sel.append(op);}
-    if(filtered.length){sel.value=String(filtered[filtered.length-1].sequence);loadSnapshot();}else{snapshot=null;render();setStatus('No decisions for this bot');}
+    sel.value='none'; loadSnapshot(); loadTimeline();
   }
   async function loadSnapshot(){
     if(!$('decision').value)return;
-    setStatus('Loading decision state…');simulations=[];
+    setStatus('Loading captured state…');simulations=[];
     try{snapshot=await api(`/api/snapshot?id=${captureId}&seq=${$('decision').value}`);const c=currentDecision().choice||{};$('velocity').value=c.velocity||8;$('angle').value=c.angle_degrees||0;setStatus('');render();}
     catch(e){setStatus(e.message);}
   }
+  async function loadTimeline(){try{const data=await api(`/api/timeline?id=${captureId}`);timeline=data.timeline;const el=$('timeline');el.replaceChildren();for(const item of timeline){const b=document.createElement('button');b.textContent=`#${item.sequence} ${item.kind} · ${item.detail}`;b.title=new Date(item.timestamp_unix_ms).toLocaleString();b.className=String(snapshot?.sequence)===String(item.sequence)?'active':'';b.addEventListener('click',()=>{if(item.kind==='decision'&&decisions.some(d=>d.sequence===item.sequence))$('decision').value=String(item.sequence);else $('decision').value=`event:${item.sequence}`;loadSnapshot();});el.append(b);}}catch(e){setStatus(e.message);}}
   function currentDecision(){return decisions.find(d=>d.sequence===selected())||{};}
   function gridAt(x,y){const g=snapshot?.field_grid;if(!g)return null;return g.samples.reduce((best,p)=>!best||Math.hypot(p.x-x,p.y-y)<Math.hypot(best.x-x,best.y-y)?p:best,null);}
-  function heatValue(p){const mode=$('heat').value;if(mode==='support')return p.supported?1:0;if(mode==='sigma')return p.sigma;if(mode==='hypothesis_proxy')return p.hypothesis_proxy;if(mode==='actual_gravity')return p.actual_gravity;if(mode==='hypothesis_gravity')return p.hypothesis_gravity;return p.gravity;}
+  function fieldVector(p){const v=p?.[$('field').value];return Array.isArray(v)?{x:v[0],y:v[1]}:v&&Number.isFinite(v.x)?v:null;}
+  function heatValue(p){const mode=$('heat').value;if(mode==='support')return p.supported?1:0;if(mode==='sigma')return p.sigma;if(mode==='hypothesis_proxy')return p.hypothesis_proxy;const v=fieldVector(p);return v?Math.hypot(v.x,v.y):null;}
   function heatColor(t){const hue=240-240*Math.max(0,Math.min(1,t));return `hsla(${hue},85%,56%,.52)`;}
   function render(){
     const dpr=window.devicePixelRatio||1,rect=canvas.getBoundingClientRect();if(rect.width){canvas.width=Math.round(rect.width*dpr);canvas.height=Math.round(rect.width*H/W*dpr);}ctx.setTransform(canvas.width/W,0,0,canvas.width/W,0,0);ctx.fillStyle='#080d13';ctx.fillRect(0,0,W,H);
     if(!snapshot){return;}
+    const hasDecision=snapshot.selection_kind==='decision';for(const id of ['simulate','compare','audit'])$(id).disabled=!hasDecision;
     const samples=snapshot.field_grid?.samples||[];const values=samples.map(heatValue).filter(Number.isFinite);const lo=values.length?Math.min(...values):0,hi=values.length?Math.max(...values):0;
     for(const p of samples){const v=heatValue(p);if(!Number.isFinite(v))continue;const t=hi===lo?0.5:(v-lo)/(hi-lo);ctx.fillStyle=$('heat').value==='support'?(p.supported?'rgba(42,170,140,.28)':'rgba(0,0,0,.25)'):heatColor(t);ctx.fillRect(p.x,p.y, snapshot.field_grid.step,snapshot.field_grid.step);}
+    if($('arrows').checked){for(const p of samples){if(p.x%100||p.y%100)continue;const v=fieldVector(p);if(!v)continue;const mag=Math.hypot(v.x,v.y);if(!mag)continue;const len=Math.min(18,5+Math.log1p(mag)*4),ux=v.x/mag,uy=v.y/mag;ctx.strokeStyle='#eef6ffcc';ctx.fillStyle='#eef6ffcc';ctx.lineWidth=1.4;ctx.beginPath();ctx.moveTo(p.x-ux*len*.35,p.y-uy*len*.35);ctx.lineTo(p.x+ux*len*.65,p.y+uy*len*.65);ctx.stroke();ctx.beginPath();ctx.moveTo(p.x+ux*len*.65,p.y+uy*len*.65);ctx.lineTo(p.x+ux*len*.65-ux*5-uy*3,p.y+uy*len*.65-uy*5+ux*3);ctx.lineTo(p.x+ux*len*.65-ux*5+uy*3,p.y+uy*len*.65-uy*5-ux*3);ctx.fill();}}
     if($('coverage').checked){const cells=snapshot.diagnostic?.bot_state?.covered_cells||[];ctx.fillStyle='rgba(102,148,212,.2)';for(const c of cells)ctx.fillRect((Number(c[0])+.5)*20,(Number(c[1])+.5)*20,20,20);}
     if($('paths').checked){const paths=(snapshot.events||[]).filter(e=>e.record?.event?.type==='shot_fin');for(const item of paths){const e=item.record.event;if(!e.points?.length)continue;ctx.beginPath();ctx.moveTo(e.points[0].x,e.points[0].y);for(const p of e.points)ctx.lineTo(p.x,p.y);ctx.strokeStyle=colors[e.player_id%colors.length]+'55';ctx.lineWidth=1.2;ctx.stroke();}}
     if($('beliefPlanets').checked){for(const p of snapshot.diagnostic?.map_belief?.planets||[])circle(p,'#ffc45b',true);}
@@ -141,8 +159,8 @@
     if($('contacts').checked){ctx.fillStyle='#c58cff';for(const p of snapshot.diagnostic?.map_belief?.contact_points||[]){ctx.beginPath();ctx.arc(p.x,p.y,3,0,Math.PI*2);ctx.fill();}}
     const players=snapshot.diagnostic?.bot_state?.player_positions||{};for(const [id,p] of Object.entries(players)){ctx.beginPath();ctx.arc(p.x,p.y,id===String(snapshot.diagnostic?.bot_state?.own_id)?8:6,0,Math.PI*2);ctx.fillStyle=id===String(snapshot.diagnostic?.bot_state?.own_id)?'#f4f7ff':colors[Number(id)%colors.length];ctx.fill();ctx.strokeStyle='#080d13';ctx.lineWidth=2;ctx.stroke();ctx.fillStyle='#fff';ctx.font='12px system-ui';ctx.fillText(id,p.x+8,p.y-8);}
     for(const sim of simulations){const pts=sim.data.points||[];if(!pts.length)continue;ctx.beginPath();ctx.moveTo(pts[0].x,pts[0].y);for(const p of pts)ctx.lineTo(p.x,p.y);ctx.strokeStyle=sim.color;ctx.lineWidth=3;ctx.stroke();}
-    const decision=currentDecision(),choice=decision.choice||{};$('decisionLabel').textContent=`Capture ${captureId}, decision ${decision.sequence||''} · ${decision.bot_name||''} · ${new Date(decision.timestamp_unix_ms||0).toLocaleTimeString()} · map updating: ${decision.map_updating?'yes':'no'}`;
-    renderMetrics(decision);renderChoice(choice);
+    const decision=currentDecision(),choice=decision.choice||{};$('decisionLabel').textContent=snapshot.selection_kind==='decision'?`Capture ${captureId}, decision ${decision.sequence} · ${decision.bot_name} · ${new Date(decision.timestamp_unix_ms||0).toLocaleTimeString()} · map updating: ${decision.map_updating?'yes':'no'}`:`Capture ${captureId}, no decision selected · showing capture events through #${snapshot.sequence}; last belief snapshot #${snapshot.diagnostic_sequence??'unavailable'}`;
+    renderMetrics(decision);renderChoice(choice);renderPlanetComparison();renderContactComparison();
   }
   function circle(p,color,fill){ctx.beginPath();ctx.arc(p.x,p.y,Math.max(3,p.radius||3),0,Math.PI*2);ctx.lineWidth=2;ctx.strokeStyle=color;if(fill){ctx.fillStyle=color+'26';ctx.fill();}else ctx.setLineDash([7,5]);ctx.stroke();ctx.setLineDash([]);}
   function metric(rows){const el=$('metrics');el.replaceChildren();for(const [a,b] of rows){const x=document.createElement('span');x.textContent=a;const y=document.createElement('b');y.textContent=b;el.append(x,y);}}
@@ -153,7 +171,9 @@
     metric([['Inferred physical planets',String(b.planets?.length??0)],['Fit position RMSE',`${fmt(b.model_position_rmse)} units`],['Fit converged',String(b.fit_converged??'unknown')],['Covariance',g.has_covariance?`${cov.length}×${cov.length}`:'unavailable'],['Field σ min / median / max',sigmas.length?`${fmt(sorted[0])} / ${fmt(median)} / ${fmt(sorted.at(-1))}`:'unavailable'],['Contact points',String(b.contact_points?.length??0)],['Contacts by planet',Array.isArray(b.planet_contact_counts)?b.planet_contact_counts.join(', ')||'none':'—'],['Ambiguous associations',String(b.uncertain_associations??0)],['Local residual samples',String(local)],['Field-only hypothesis',hyp?`(${fmt(hyp.x,0)}, ${fmt(hyp.y,0)}) m=${fmt(hyp.mass,0)}`:'none'],['Disclosed map',snapshot.actual_planets?`${snapshot.actual_planets.length} planets available`:'not available']]);
   }
   function renderChoice(c){const el=$('choice');el.replaceChildren();for(const [a,b] of [['Reason',String(c.reason||'—')],['Selected velocity',String(c.velocity??'—')],['Selected angle',`${c.angle_degrees??'—'}°`],['Predicted victim',String(c.predicted_victim??'—')],['Predicted center miss',`${fmt(c.miss_distance)} units`],['Alternative model agrees',String(c.alternative_agrees??'untested')],['Field hypothesis used',String(c.used_field_hypothesis??false)],['Covered path fraction',fmt(c.covered_fraction,3)]]){const x=document.createElement('span');x.textContent=a;const y=document.createElement('b');y.textContent=b;el.append(x,y);}}
-  async function simulate(){const d=currentDecision();try{setStatus('Simulating…');const query=`id=${captureId}&seq=${d.sequence}&velocity=${q($('velocity').value)}&angle=${q($('angle').value)}&model=${$('model').value}`;const result=await api(`/api/simulate?${query}`);simulations=[{data:result,color:result.model==='actual'?'#ff8d68':'#8ee5a4'}];setStatus(`${result.termination.kind.replaceAll('_',' ')}${result.termination.player_id!==undefined?` · player ${result.termination.player_id}`:''}`);render();}catch(e){setStatus(e.message);}}
+  function renderPlanetComparison(){const b=snapshot?.diagnostic?.map_belief,actual=snapshot?.actual_planets,el=$('planetCompare');if(!b){el.textContent='No captured belief available at this point in the timeline.';return;}if(!actual){el.textContent='No disclosed map in this capture; estimated planets are shown without oracle comparison.';return;}const est=b.planets||[],used=new Set(),rows=[];for(let i=0;i<est.length;i++){const p=est[i];let j=-1,best=Infinity;actual.forEach((a,k)=>{const d=Math.hypot(p.x-a.x,p.y-a.y);if(!used.has(k)&&d<best){best=d;j=k;}});if(j>=0)used.add(j);const a=j>=0?actual[j]:null;rows.push(`estimate ${i} ↔ ${a?`oracle ${j}`:'unmatched'} | Δcenter ${a?fmt(best):'—'} | Δr ${a?fmt(p.radius-a.radius):'—'} | Δmass ${a?fmt(p.mass-a.mass):'—'} | est (${fmt(p.x,1)},${fmt(p.y,1)},r${fmt(p.radius,1)})`);}actual.forEach((a,j)=>{if(!used.has(j))rows.push(`oracle ${j} unmatched | (${fmt(a.x,1)},${fmt(a.y,1)},r${fmt(a.radius,1)})`);});el.textContent=`Matching: greedy nearest unmatched centers (diagnostic only) · ${est.length} estimates / ${actual.length} oracle planets\n${rows.join('\n')||'No planets'}\nDisplay samples: ${snapshot.field_grid?.step} units apart; simulation integrates at engine substeps.`;}
+  function renderContactComparison(){const b=snapshot?.diagnostic?.map_belief,actual=snapshot?.actual_planets,el=$('contactCompare');if(!b){el.textContent='No captured contact evidence.';return;}const contacts=b.contact_points||[],est=b.planets||[];el.textContent=contacts.map((c,i)=>{const nearest=(arr)=>arr.map((p,j)=>({j,d:Math.abs(Math.hypot(c.x-p.x,c.y-p.y)-p.radius)})).sort((a,b)=>a.d-b.d)[0];const e=nearest(est),a=actual?nearest(actual):null;return `contact ${i} (${fmt(c.x,1)}, ${fmt(c.y,1)}) · estimated surface residual ${e?fmt(e.d):'—'} (planet ${e?.j??'—'}) · oracle surface residual ${a?fmt(a.d):'—'} (planet ${a?.j??'—'})`;}).join('\n')||'No contact points captured in this belief snapshot.';}
+  async function simulate(){const d=currentDecision();if(!d.sequence)return;try{setStatus('Simulating…');const query=`id=${captureId}&seq=${d.sequence}&velocity=${q($('velocity').value)}&angle=${q($('angle').value)}&model=${$('model').value}`;const result=await api(`/api/simulate?${query}`);simulations=[{data:result,color:result.model==='actual'?'#ff8d68':'#8ee5a4'}];setStatus(`${result.termination.kind.replaceAll('_',' ')}${result.termination.player_id!==undefined?` · player ${result.termination.player_id}`:''}`);render();}catch(e){setStatus(e.message);}}
   async function compare(){const d=currentDecision();try{setStatus('Comparing with disclosed map…');const result=await api(`/api/compare?id=${captureId}&seq=${d.sequence}`);simulations=[];
       const recorded=result.recorded_choice, runs=[];const sim=(choice,model,color,label)=>api(`/api/simulate?id=${captureId}&seq=${d.sequence}&velocity=${choice.velocity}&angle=${choice.angle_degrees}&model=${model}`).then(data=>{simulations.push({data,color,label});runs.push({label,termination:data.termination});});
       if(recorded?.velocity){const model=recorded.used_field_hypothesis?'hypothesis':'belief';await sim(recorded,model,'#8ee5a4','Recorded shot, captured belief');await sim(recorded,'actual','#ff8d68','Recorded shot, disclosed map');}
@@ -162,8 +182,9 @@
       setStatus('Green: belief · orange: recorded shot on actual map · yellow: current policy on actual map');render();
     }catch(e){$('comparison').textContent=e.message;setStatus(e.message);}}
   async function audit(){const d=currentDecision();try{setStatus('Replaying observed paths…');const result=await api(`/api/physics-audit?id=${captureId}&seq=${d.sequence}`);simulations=[{data:{points:result.worst_observed_points},color:'#d7e2ff'},{data:{points:result.worst_rust_points},color:'#ff4da6'}];$('comparison').textContent=JSON.stringify({audited_shots:result.audited_shots,map_planets:result.map_planets,timed_samples:result.timed_samples,coordinate_rmse:result.coordinate_rmse,median_position_error:result.median_position_error,p95_position_error:result.p95_position_error,max_position_error:result.max_position_error,worst_shot:result.worst_shot,note:result.note},null,2);setStatus(`Rust path replay: coordinate RMSE ${fmt(result.coordinate_rmse)} units · worst shot overlaid`);render();}catch(e){$('comparison').textContent=e.message;setStatus(e.message);}}
-  $('capture').addEventListener('change',()=>loadDecisions());$('bot').addEventListener('change',fillDecisionList);$('decision').addEventListener('change',loadSnapshot);$('refresh').addEventListener('click',()=>loadDecisions($('bot').value));$('heat').addEventListener('change',render);for(const id of ['paths','coverage','beliefPlanets','actualPlanets','contacts'])$(id).addEventListener('change',render);$('simulate').addEventListener('click',simulate);$('compare').addEventListener('click',compare);$('audit').addEventListener('click',audit);window.addEventListener('resize',render);
-  canvas.addEventListener('mousemove',e=>{if(!snapshot)return;const rect=canvas.getBoundingClientRect(),x=(e.clientX-rect.left)/rect.width*W,y=(e.clientY-rect.top)/rect.height*H,p=gridAt(x,y);$('cursor').textContent=`x ${fmt(x,0)}, y ${fmt(y,0)} · g ${fmt(p?.gravity,4)} · σ ${fmt(p?.sigma,4)} · local support ${p?.supported?'yes':'no'} · oracle g ${fmt(p?.actual_gravity,4)}`;});
+  $('capture').addEventListener('change',()=>loadDecisions());$('bot').addEventListener('change',fillDecisionList);$('decision').addEventListener('change',loadSnapshot);$('latest').addEventListener('click',()=>{$('decision').value='none';loadSnapshot();});$('refresh').addEventListener('click',()=>loadDecisions($('bot').value));$('heat').addEventListener('change',render);$('field').addEventListener('change',render);$('arrows').addEventListener('change',render);for(const id of ['paths','coverage','beliefPlanets','actualPlanets','contacts'])$(id).addEventListener('change',render);$('simulate').addEventListener('click',simulate);$('compare').addEventListener('click',compare);$('audit').addEventListener('click',audit);window.addEventListener('resize',render);
+  canvas.addEventListener('mousemove',e=>{if(!snapshot)return;const rect=canvas.getBoundingClientRect(),x=(e.clientX-rect.left)/rect.width*W,y=(e.clientY-rect.top)/rect.height*H,p=gridAt(x,y),v=fieldVector(p),o=p?.oracle,d=p?.delta;$('cursor').textContent=`(${fmt(x,0)},${fmt(y,0)}) · ${$('field').value} (${fmt(v?.x,5)}, ${fmt(v?.y,5)}) |g| ${fmt(v?Math.hypot(v.x,v.y):null,5)} · σ ${fmt(p?.sigma,5)} · Δoracle (${fmt(d?.x,5)}, ${fmt(d?.y,5)}) · oracle (${fmt(o?.x,5)},${fmt(o?.y,5)})`;});
+  canvas.addEventListener('click',e=>{if(!snapshot)return;const rect=canvas.getBoundingClientRect(),x=(e.clientX-rect.left)/rect.width*W,y=(e.clientY-rect.top)/rect.height*H,p=gridAt(x,y),v=fieldVector(p);const nearest=(arr)=>arr.map((o,i)=>({o,i,d:Math.hypot(x-o.x,y-o.y)})).sort((a,b)=>a.d-b.d)[0];const ep=nearest(snapshot.diagnostic?.map_belief?.planets||[]),ap=nearest(snapshot.actual_planets||[]),desc=q=>q?`#${q.i} center (${fmt(q.o.x,1)},${fmt(q.o.y,1)}), r ${fmt(q.o.radius,1)}, mass ${fmt(q.o.mass,1)}; point center distance ${fmt(q.d,1)}, surface residual ${fmt(Math.abs(q.d-q.o.radius),2)}`:'none';$('pointDetails').textContent=`Point (${fmt(x,1)}, ${fmt(y,1)}) · nearest displayed sample (${p?.x},${p?.y})\n${$('field').value}: ax ${fmt(v?.x,7)}, ay ${fmt(v?.y,7)}, magnitude ${fmt(v?Math.hypot(v.x,v.y):null,7)}\nOracle: ax ${fmt(p?.oracle?.x,7)}, ay ${fmt(p?.oracle?.y,7)}\nBelief delta: (${fmt(p?.delta?.x,7)}, ${fmt(p?.delta?.y,7)})\nNearest estimated: ${desc(ep)}\nNearest oracle: ${desc(ap)}`;});
   loadCaptures().catch(e=>setStatus(e.message));
 })();
 </script>
