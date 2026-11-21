@@ -46,6 +46,7 @@
     .layers { display:flex; } .layer { background:#172334; border-color:#34445a; border-radius:0; } .layer:first-child { border-radius:5px 0 0 5px; } .layer:last-child { border-radius:0 5px 5px 0; } .layer.active { background:#21476a; border-color:#ffe27a; color:#ffe27a; } .layer:disabled { opacity:.45; cursor:not-allowed; }
     details.explain ul { margin:6px 0; padding-left:18px; }
     .overview { padding:12px 16px; display:flex; flex-direction:column; gap:10px; max-width:1500px; } .overview .table th { cursor:pointer; user-select:none; } .overview .table th:nth-child(-n+3), .overview .table td:nth-child(-n+3) { text-align:left; }
+    .review table { margin-top:6px; } .review td.sw { width:14px; padding:0 4px 0 0; } .review .off { color:#6e7d91; } .review button { margin-top:6px; }
     .scrubbar { display:flex; gap:6px; align-items:center; flex-wrap:wrap; } .scrubbar button { padding:3px 9px; }
     #scrub { width:100%; height:104px; background:#080d13; border:1px solid #263244; border-radius:5px; cursor:ew-resize; touch-action:none; }
     .table { width:100%; border-collapse:collapse; font:11px/1.4 ui-monospace,monospace; color:#b6c5d8; }
@@ -75,7 +76,7 @@
   <main hidden>
     <section class="map-area">
       <div class="scrubbar">
-        <button id="prevDecision" title="Previous decision (Shift+←)">⏮</button><button id="prevEvent" title="Previous event (←)">◀</button><button id="nextEvent" title="Next event (→)">▶</button><button id="nextDecision" title="Next decision (Shift+→)">⏭</button><button id="latest" title="Latest state (End)">Latest</button>
+        <button id="prevDecision" title="Previous decision (Shift+←)">⏮</button><button id="prevEvent" title="Previous event (←)">◀</button><button id="nextEvent" title="Next event (→)">▶</button><button id="nextDecision" title="Next decision (Shift+→)">⏭</button><button id="latest" title="Latest state (End)">Latest</button><button id="worstPrediction" title="Decision whose belief predicted the next observed shots worst">Worst predicted</button>
         <span id="decisionLabel"></span>
       </div>
       <canvas id="scrub" aria-label="Capture timeline"></canvas>
@@ -104,20 +105,24 @@
           <li>Dark cells have no value for the layer (not zero gravity). Uncertainty comes from the fit covariance and ignores omitted planets and model error.</li>
           <li>Disclosed planets are the game's own map, for diagnosis only. A disclosed planet is a <b>close match</b> when an estimate lies within 10 units and 5 units of radius; <b>center off</b> / <b>size off</b> exceed one threshold; <b>missing</b> has no estimate within 80 units. Pairs are one-to-one, closest first.</li>
           <li>Contacts are path endpoints the estimator accepted as surface hits, not every collision. The pink diamond is a field-only source: a gravity explanation, never collision geometry.</li>
+          <li><b>Shot review</b> re-simulates the decision's chosen shot under the recorded belief and compares it with the shot that actually followed. Outcomes are read off the observed endpoint and are inferences, not server reports. The green timeline line is each decision's belief scored against the next 5 observed shots (median path error), which needs no disclosed map. Repairs change one planet of the belief to the disclosed one and re-simulate: a sensitivity, not proof of cause.</li>
           <li>“Map events pending” in the decision panel means the snapshot may lag the latest observations.</li>
         </ul>
       </details>
     </section>
     <aside>
       <h2>Selection</h2><div id="selection" class="metrics">Hover the map for a summary; click a planet, player, contact or trajectory to pin it.</div>
-      <h2>Captured belief</h2>
-      <div id="metrics" class="metrics"></div>
-      <div id="disclosedPanel"><h2>Disclosed planets</h2><div id="disclosedList"></div></div>
-      <h2>Estimated planets</h2><div id="planetList"></div>
       <div id="decisionPanel" hidden>
         <h2>Decision</h2>
         <div id="choice" class="metrics"></div>
-        <details class="explain"><summary>Targeting simulation</summary>
+        <h2>Shot review</h2>
+        <div id="shotReview" class="review">
+          <div id="reviewSummary" class="metrics"></div>
+          <div id="reviewPaths"></div>
+          <div id="reviewNote" class="note"></div>
+          <div id="reviewRepairs"></div>
+        </div>
+        <details class="explain"><summary>Free simulation and audits</summary>
           <div class="controls">
             <label>Gravity model<select id="model"><option value="belief">Recorded physical map + local residual</option><option value="hypothesis">Recorded map + field hypothesis</option><option value="actual">Disclosed actual map</option></select></label>
             <label>Velocity<input id="velocity" type="number" min="2" max="50" step="1" value="8"></label>
@@ -130,6 +135,10 @@
           <div id="comparison" class="metrics"></div>
         </details>
       </div>
+      <h2>Captured belief</h2>
+      <div id="metrics" class="metrics"></div>
+      <div id="disclosedPanel"><h2>Disclosed planets</h2><div id="disclosedList"></div></div>
+      <h2>Estimated planets</h2><div id="planetList"></div>
     </aside>
   </main>
   <script src="/map_viewer.js"></script>

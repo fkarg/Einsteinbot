@@ -18,6 +18,9 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 
+#[path = "map_viewer/review.rs"]
+mod review;
+
 const PAGE: &str = include_str!("../../web/map_viewer.html");
 const SCRIPT: &str = include_str!("../../web/map_viewer.js");
 const DEFAULT_PORT: u16 = 8765;
@@ -58,9 +61,13 @@ fn run() -> Result<(), Box<dyn Error>> {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if let Err(error) = handle(stream, &db_path) {
-                    eprintln!("map_viewer request failed: {error}");
-                }
+                // One thread per request: a slow review must not block snapshots.
+                let db_path = db_path.clone();
+                std::thread::spawn(move || {
+                    if let Err(error) = handle(stream, &db_path) {
+                        eprintln!("map_viewer request failed: {error}");
+                    }
+                });
             }
             Err(error) => eprintln!("map_viewer connection failed: {error}"),
         }
@@ -92,6 +99,8 @@ fn handle(mut stream: TcpStream, db_path: &PathBuf) -> Result<(), Box<dyn Error>
     let result = match path {
         "/api/captures" => list_captures(db_path),
         "/api/overview" => capture_overview(db_path),
+        "/api/shot-review" => review::shot_review(db_path, &parameters),
+        "/api/predictive" => review::predictive_error(db_path, &parameters),
         "/api/decisions" => {
             required_id(&parameters, "id").and_then(|id| list_decisions(db_path, id))
         }
