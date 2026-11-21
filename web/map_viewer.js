@@ -63,21 +63,25 @@
     for(const p of samples){const raw=heatValue(p);if(!Number.isFinite(raw))continue;const t=Math.max(0,Math.min(1,(raw-lo)/(hi-lo)));ctx.fillStyle=l==='evidence'?(p.supported?'rgba(42,170,140,.35)':'rgba(0,0,0,.22)'):heatColor(t);ctx.fillRect(p.x,p.y,snapshot.field_grid.step,snapshot.field_grid.step);}
     if(!values.length){ctx.save();ctx.setTransform(1,0,0,1,0,0);ctx.fillStyle='#ffc66d';ctx.font='14px system-ui';ctx.fillText(l==='uncertainty'?'Uncertainty unavailable: this snapshot has no fit covariance (rank-deficient, too few paths, or not converged).':l==='evidence'?'No residual evidence in this snapshot.':'No field values for this layer in this snapshot.',16,28);ctx.restore();}
     if($('pathResiduals').checked){const residuals=(snapshot.events||[]).flatMap(e=>e.residual_samples||[]),mags=residuals.map(r=>Math.hypot(r[2],r[3])).sort((a,b)=>a-b),cap=mags.length?mags[Math.floor((mags.length-1)*.95)]:null;$('pathScale').style.display=residuals.length?'grid':'none';$('pathMax').textContent=Number.isFinite(cap)?fmt(cap,4):'no data';$('pathScaleBar').title=`Path residual magnitude, colors clip at the 95th percentile (${fmt(cap,6)})`;for(const r of residuals){const t=Math.max(0,Math.min(1,Math.hypot(r[2],r[3])/(cap||1)));ctx.beginPath();ctx.arc(r[0],r[1],1.7,0,Math.PI*2);ctx.fillStyle=heatColor(t);ctx.fill();}}else $('pathScale').style.display='none';
-    if($('paths').checked){const paths=(snapshot.events||[]).filter(e=>e.record?.event?.type==='shot_fin');for(const item of paths){const e=item.record.event;if(!e.points?.length)continue;ctx.beginPath();ctx.moveTo(e.points[0].x,e.points[0].y);for(const p of e.points)ctx.lineTo(p.x,p.y);ctx.strokeStyle=colors[e.player_id%colors.length]+'55';ctx.lineWidth=1.2;ctx.stroke();const end=e.points.at(-1);ctx.beginPath();ctx.arc(end.x,end.y,2.8,0,Math.PI*2);ctx.fillStyle=colors[e.player_id%colors.length]+'bb';ctx.fill();}}
+    if($('paths').checked){const paths=(snapshot.events||[]).filter(e=>e.record?.event?.type==='shot_fin');for(const item of paths){const e=item.record.event;if(!e.points?.length)continue;ctx.beginPath();ctx.moveTo(e.points[0].x,e.points[0].y);for(const p of e.points)ctx.lineTo(p.x,p.y);ctx.strokeStyle=colors[e.player_id%colors.length]+(newerThanBelief(item)?'99':'55');ctx.lineWidth=1.2;ctx.setLineDash(newerThanBelief(item)?[5,4]:[]);ctx.stroke();ctx.setLineDash([]);const end=e.points.at(-1);ctx.beginPath();ctx.arc(end.x,end.y,2.8,0,Math.PI*2);ctx.fillStyle=colors[e.player_id%colors.length]+'bb';ctx.fill();}}
     if($('beliefPlanets').checked){for(const p of snapshot.diagnostic?.map_belief?.planets||[])circle(p,'#ffc45b',true);}
     if($('actualPlanets').checked){const status=disclosedStatuses();(snapshot.actual_planets||[]).forEach((p,i)=>{const s=status[i]?.status||'ok';circle(p,STATUS_COLORS[s],false);if(s!=='ok'&&s!=='unknown'){ctx.fillStyle=STATUS_COLORS[s];ctx.font='12px system-ui';ctx.fillText(`#${i}`,p.x+p.radius*.7,p.y-p.radius*.7-3);}});}
     drawHypothesis();
     if($('contacts').checked){ctx.fillStyle='#c58cff';for(const p of snapshot.diagnostic?.map_belief?.contact_points||[]){ctx.beginPath();ctx.arc(p.x,p.y,3,0,Math.PI*2);ctx.fill();}}
-    const players=snapshot.diagnostic?.bot_state?.player_positions||{};for(const [id,p] of Object.entries(players)){ctx.beginPath();ctx.arc(p.x,p.y,id===String(snapshot.diagnostic?.bot_state?.own_id)?8:6,0,Math.PI*2);ctx.fillStyle=id===String(snapshot.diagnostic?.bot_state?.own_id)?'#f4f7ff':colors[Number(id)%colors.length];ctx.fill();ctx.strokeStyle='#080d13';ctx.lineWidth=2;ctx.stroke();ctx.fillStyle='#fff';ctx.font='12px system-ui';ctx.fillText(id,p.x+8,p.y-8);}
+    const players=snapshot.world?.players||{};for(const [id,p] of Object.entries(players)){ctx.beginPath();ctx.arc(p.x,p.y,id===String(snapshot.world?.own_id)?8:6,0,Math.PI*2);ctx.fillStyle=id===String(snapshot.world?.own_id)?'#f4f7ff':colors[Number(id)%colors.length];ctx.fill();ctx.strokeStyle='#080d13';ctx.lineWidth=2;ctx.stroke();ctx.fillStyle='#fff';ctx.font='12px system-ui';ctx.fillText(id,p.x+8,p.y-8);}
     for(const sim of simulations){const pts=sim.data.points||[];if(!pts.length)continue;ctx.beginPath();ctx.moveTo(pts[0].x,pts[0].y);for(const p of pts)ctx.lineTo(p.x,p.y);ctx.strokeStyle=sim.color;ctx.lineWidth=3;ctx.stroke();}
     if(sel?.kind==='shot'&&sel.event?.points?.length){const pts=sel.event.points;ctx.beginPath();ctx.moveTo(pts[0].x,pts[0].y);for(const p of pts)ctx.lineTo(p.x,p.y);ctx.strokeStyle='#fff2a8';ctx.lineWidth=3;ctx.stroke();const end=pts.at(-1);ctx.beginPath();ctx.arc(end.x,end.y,6,0,Math.PI*2);ctx.strokeStyle='#fff2a8';ctx.lineWidth=2;ctx.stroke();}
     drawSelection();
-    const decision=currentDecision(),choice=decision.choice||{};$('decisionLabel').textContent=snapshot.selection_kind==='decision'?`Decision #${decision.sequence} · ${decision.bot_name} · ${new Date(decision.timestamp_unix_ms||0).toLocaleTimeString()} · map updating: ${decision.map_updating?'yes':'no'}`:snapshot.selection_kind==='timeline_event'?`Event #${snapshot.sequence} · belief as of decision snapshot #${snapshot.diagnostic_sequence??'unavailable'}`:`Latest state · events through #${snapshot.sequence} · belief snapshot #${snapshot.diagnostic_sequence??'unavailable'}`;
+    const decision=currentDecision(),choice=decision.choice||{};$('decisionLabel').textContent=snapshot.selection_kind==='decision'?`Decision #${decision.sequence} · ${decision.bot_name} · ${new Date(decision.timestamp_unix_ms||0).toLocaleTimeString()} · map updating: ${decision.map_updating?'yes':'no'}`:snapshot.selection_kind==='timeline_event'?`Event #${snapshot.sequence} · belief as of decision snapshot #${snapshot.diagnostic_sequence??'unavailable'}${newerPathsNote()}`:`Latest state · events through #${snapshot.sequence} · belief snapshot #${snapshot.diagnostic_sequence??'unavailable'}${newerPathsNote()}`;
     renderMetrics(decision);renderChoice(choice);renderDisclosedList();renderPlanetList();renderSelection();syncLayerButtons();
   }
+  // A path the recorded belief has not seen: it ended after the belief's snapshot (or no belief exists yet).
+  function newerPathsNote(){const n=(snapshot.events||[]).filter(item=>item.record?.event?.type==='shot_fin'&&newerThanBelief(item)).length;return n?` · ${n} path${n===1?'':'s'} newer than the belief (dashed)`:'';}
+  const newerThanBelief=item=>item.sequence>(snapshot.diagnostic_sequence??-1);
   function circle(p,color,fill){ctx.beginPath();ctx.arc(p.x,p.y,Math.max(3,p.radius||3),0,Math.PI*2);ctx.lineWidth=2;ctx.strokeStyle=color;if(fill){ctx.fillStyle=color+'26';ctx.fill();}else ctx.setLineDash([7,5]);ctx.stroke();ctx.setLineDash([]);}
   function kv(el,rows){el.replaceChildren();for(const [a,b] of rows){if(b===null){const h=document.createElement('b');h.className='wide';h.textContent=a;el.append(h);continue;}const x=document.createElement('span');x.textContent=a;const y=document.createElement('b');y.textContent=b;el.append(x,y);}}
   function renderMetrics(d){
+    if(!snapshot.diagnostic){kv($('metrics'),[['No belief recorded yet at this point; the first targeting decision has not happened.',null]]);return;}
     const b=snapshot.diagnostic?.map_belief||{},g=snapshot.field_grid||{},cov=b.covariance;
     const sigmas=g.samples?.map(p=>p.sigma).filter(Number.isFinite)||[];const sorted=[...sigmas].sort((a,b)=>a-b);const median=sorted.length?sorted[Math.floor(sorted.length/2)]:null;
     const local=b.local_field?.samples?.length||0;
@@ -265,8 +269,8 @@
   function segmentDistance(x,y,a,b){const dx=b.x-a.x,dy=b.y-a.y,t=Math.max(0,Math.min(1,((x-a.x)*dx+(y-a.y)*dy)/(dx*dx+dy*dy||1)));return Math.hypot(x-(a.x+t*dx),y-(a.y+t*dy));}
   // Only layers that are currently drawn can be hovered or selected.
   function hitTest(x,y,tol){
-    const d=snapshot?.diagnostic,belief=d?.map_belief||{},bot=d?.bot_state||{};
-    for(const [id,p] of Object.entries(bot.player_positions||{}))if(Math.hypot(x-p.x,y-p.y)<=8+tol)return {kind:'player',id};
+    const d=snapshot?.diagnostic,belief=d?.map_belief||{};
+    for(const [id,p] of Object.entries(snapshot.world?.players||{}))if(Math.hypot(x-p.x,y-p.y)<=8+tol)return {kind:'player',id};
     if($('contacts').checked){const index=(belief.contact_points||[]).findIndex(p=>Math.hypot(x-p.x,y-p.y)<=3+tol);if(index>=0)return {kind:'contact',index};}
     const hypothesis=belief.field_hypothesis;if(hypothesis&&Math.hypot(x-hypothesis.x,y-hypothesis.y)<=9+tol)return {kind:'hypothesis'};
     if($('beliefPlanets').checked){const index=nearestPlanetIndex(x,y,tol,belief.planets||[]);if(index>=0)return {kind:'planet',index};}
@@ -286,7 +290,7 @@
   }
   // Returns {title, rows} for a selection, or null when the object is not in this snapshot.
   function describe(o){
-    const d=snapshot?.diagnostic,b=d?.map_belief||{},bot=d?.bot_state||{},actual=snapshot?.actual_planets;
+    const d=snapshot?.diagnostic,b=d?.map_belief||{},actual=snapshot?.actual_planets;
     if(o.kind==='planet'){
       const p=b.planets?.[o.index];if(!p)return null;
       const s=planetSigma(o.index),match=planetMatches().find(m=>m.estimatedIndex===o.index);
@@ -303,9 +307,9 @@
       return {title:'Field-only source hypothesis',rows:[['Position',`(${fmt(h.x,1)}, ${fmt(h.y,1)})`],['Mass',fmt(h.mass,0)],['Support points',String(h.support?.length??0)],['Continuation RMSE',`${fmt(h.continuation_rmse)} (baseline ${fmt(h.baseline_continuation_rmse)})`],['Meaning','a gravity explanation only, never collision geometry']]};
     }
     if(o.kind==='player'){
-      const p=bot.player_positions?.[o.id];if(!p)return null;
-      const flying=(bot.in_flight||[]).filter(s=>String(s.player_id)===String(o.id)).map(s=>`v${fmt(s.velocity,0)} @ ${fmt(s.angle_degrees,0)}°`);
-      return {title:`Player ${o.id}${String(bot.own_id)===String(o.id)?' (this bot)':''}`,rows:[['Last known position',`(${fmt(p.x,1)}, ${fmt(p.y,1)})`],['Shots in flight',flying.join(', ')||'none']]};
+      const p=snapshot.world?.players?.[o.id];if(!p)return null;
+      const flying=(snapshot.world?.in_flight||[]).filter(s=>String(s.player_id)===String(o.id)).map(s=>`v${fmt(s.velocity,0)} @ ${fmt(s.angle_degrees,0)}°`);
+      return {title:`Player ${o.id}${String(snapshot.world?.own_id)===String(o.id)?' (this bot)':''}`,rows:[['Last known position',`(${fmt(p.x,1)}, ${fmt(p.y,1)})`],['Shots in flight',flying.join(', ')||'none']]};
     }
     if(o.kind==='contact'){
       const c=b.contact_points?.[o.index];if(!c)return null;
@@ -327,12 +331,12 @@
   }
   function drawSelection(){
     if(!sel||!snapshot)return;
-    const b=snapshot.diagnostic?.map_belief||{},bot=snapshot.diagnostic?.bot_state||{};
+    const b=snapshot.diagnostic?.map_belief||{};
     const ring=(x,y,r)=>{ctx.beginPath();ctx.arc(x,y,r,0,Math.PI*2);ctx.strokeStyle='#ffe27a';ctx.lineWidth=3;ctx.stroke();};
     if(sel.kind==='planet'){const p=b.planets?.[sel.index];if(p)ring(p.x,p.y,p.radius+5);}
     else if(sel.kind==='actual'){const p=snapshot.actual_planets?.[sel.index];if(p)ring(p.x,p.y,p.radius+5);}
     else if(sel.kind==='hypothesis'){const h=b.field_hypothesis;if(h)ring(h.x,h.y,14);}
-    else if(sel.kind==='player'){const p=bot.player_positions?.[sel.id];if(p)ring(p.x,p.y,13);}
+    else if(sel.kind==='player'){const p=snapshot.world?.players?.[sel.id];if(p)ring(p.x,p.y,13);}
     else if(sel.kind==='contact'){const p=b.contact_points?.[sel.index];if(p)ring(p.x,p.y,8);}
     else if(sel.kind==='point')ring(sel.x,sel.y,5);
   }

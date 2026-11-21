@@ -386,7 +386,7 @@ fn read_events_before(
     sequence: i64,
 ) -> Result<Vec<(i64, Value)>, String> {
     let mut statement = connection
-        .prepare("SELECT sequence, event_json FROM events WHERE capture_id=?1 AND sequence<?2 AND event_type IN ('player_position','player_leave','shot_begin','shot_fin','planets') ORDER BY sequence")
+        .prepare("SELECT sequence, event_json FROM events WHERE capture_id=?1 AND sequence<?2 AND event_type IN ('own_id','player_position','player_leave','shot_begin','shot_fin','planets') ORDER BY sequence")
         .map_err(|error| error.to_string())?;
     let rows = statement
         .query_map(params![capture_id, sequence], |row| {
@@ -399,6 +399,45 @@ fn read_events_before(
         .map_err(|error| error.to_string())?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())
+}
+
+/// Where every player was last seen, who this bot is, and which shots have begun but not finished,
+/// as of the end of `events` (so the map can show them between decision snapshots).
+fn world_state(events: &[(i64, Value)], decision_own_id: Option<u64>) -> Value {
+    let mut players: BTreeMap<u64, Value> = BTreeMap::new();
+    let mut in_flight: BTreeMap<u64, Value> = BTreeMap::new();
+    let mut own_id = None;
+    for (_, record) in events {
+        let event = &record["event"];
+        let Some(id) = event["player_id"].as_u64() else {
+            continue;
+        };
+        match event["type"].as_str() {
+            Some("player_position") => {
+                players.insert(id, json!({"x": event["x"], "y": event["y"]}));
+            }
+            Some("player_leave") => {
+                players.remove(&id);
+                in_flight.remove(&id);
+            }
+            Some("shot_begin") => {
+                in_flight.insert(
+                    id,
+                    json!({"player_id": id, "velocity": event["velocity"], "angle_degrees": event["angle"]}),
+                );
+            }
+            Some("shot_fin") => {
+                in_flight.remove(&id);
+            }
+            Some("own_id") => own_id = Some(id),
+            _ => {}
+        }
+    }
+    json!({
+        "players": players.iter().map(|(id, position)| (id.to_string(), position.clone())).collect::<BTreeMap<_, _>>(),
+        "own_id": decision_own_id.or(own_id),
+        "in_flight": in_flight.into_values().collect::<Vec<_>>(),
+    })
 }
 
 fn latest_actual_planets(events: &[(i64, Value)]) -> Option<Vec<Planet>> {
@@ -651,6 +690,7 @@ fn selected_snapshot(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Resul
         "events": trajectories,
         "actual_planets": actual_planets,
         "planet_match": planet_match,
+        "world": world_state(&events, data["bot_state"]["own_id"].as_u64()),
         "field_grid": field_grid,
         "view": {"x":view.x,"y":view.y,"width":view.width,"height":view.height},
     }))
@@ -1321,6 +1361,29 @@ mod tests {
         assert_eq!(accuracy["missing_planets"], 1);
         assert_eq!(accuracy["matched_planets"], 1);
         assert_eq!(accuracy["median_center_error"], 3.0);
+    }
+
+    #[test]
+    fn world_state_follows_events_between_decisions() {
+        let event = |value: Value| (0, json!({"event": value}));
+        let events = vec![
+            event(json!({"type": "own_id", "player_id": 1})),
+            event(json!({"type": "player_position", "player_id": 1, "x": 200.0, "y": 400.0})),
+            event(json!({"type": "player_position", "player_id": 2, "x": 50.0, "y": 60.0})),
+            event(json!({"type": "shot_begin", "player_id": 1, "angle": 0.0, "velocity": 8.0})),
+            event(json!({"type": "shot_begin", "player_id": 2, "angle": 90.0, "velocity": 3.0})),
+            event(
+                json!({"type": "shot_fin", "player_id": 2, "angle": 90.0, "velocity": 3.0, "points": []}),
+            ),
+            event(json!({"type": "player_position", "player_id": 1, "x": 200.0, "y": 350.0})),
+            event(json!({"type": "player_leave", "player_id": 2})),
+        ];
+        let world = world_state(&events, None);
+        assert_eq!(world["own_id"], 1);
+        assert_eq!(world["players"], json!({"1": {"x": 200.0, "y": 350.0}}));
+        assert_eq!(world["in_flight"].as_array().unwrap().len(), 1);
+        assert_eq!(world["in_flight"][0]["velocity"], 8.0);
+        assert_eq!(world_state(&events, Some(2))["own_id"], 2);
     }
 
     #[test]

@@ -78,27 +78,28 @@ Terms (from the user's decomposition; they stay separate diagnostics first, and 
 | --- | --- | --- |
 | V-MATCH | one planet matching in `map_viewer.rs` (global nearest-first, ≤ 80 units) shared by `/api/snapshot` (`planet_match`), the decisions list (`accuracy`), metrics, planet lists; per-planet status `close / center off / size off / both / missing` (center > 10 units, radius > 5 units) with the numbers beside it | displayed |
 | V-TREND | error-over-time lines in the timeline strip (estimated planets, missing disclosed planets, fit RMSE) | displayed |
-| V-TABLE | captures table with global session metrics (missing planets, median center error, final fit RMSE, scenario/live labels); no single combined score | proposed |
+| V-TABLE | captures table with global session metrics (missing planets, median center error, final fit RMSE, scenario/live labels); no single combined score | displayed (`/api/overview`) |
 | V-LAYERS | layer registry: each layer = one library method + a label + an availability message; adding Q-EV/Q-RU/Q-FU is one row each | proposed |
 
 ## 4. Active claims
 
 | File | Session | Why | Since |
 | --- | --- | --- | --- |
-| *(none)* | | | |
+| `docs/coordination/viewer-estimator-contract.md` | estimator | Answer open requests 1–3 from current estimator state and ownership | 2026-11-21 14:30 UTC |
 
 ## 5. Open requests
 
 | # | From | To | Request | Status |
 | --- | --- | --- | --- | --- |
 | 1 | viewer | estimator | Answer the `proposed` rows above: which will be emitted, as which method, with which unavailable reasons. Prioritize Q-COV, Q-EV, Q-SCN (they unblock the earliest viewer value). | open |
-| 2 | viewer | estimator | Scenario corpus ownership (user said "we build more scenarios"): proposed split — the viewer session writes **new scenario definitions** in a new file `src/bin/learning_scenarios/…` or an appended section only after claiming `learning_scenarios.rs`; estimator session keeps ownership of the scenario *runner* and metrics. Confirm or counter-propose. | open |
+| 2 | viewer | estimator | Scenario corpus ownership (user said "we build more scenarios"): proposed split — the viewer session writes **new scenario definitions** in a new file `src/bin/learning_scenarios/…` or an appended section only after claiming `learning_scenarios.rs`; estimator session keeps ownership of the scenario *runner* and metrics. Confirm or counter-propose. The draft family list and spec is in `scenario-wishlist.md`. | open |
 | 3 | estimator | viewer | Tell the viewer which belief states (physical-only vs residual-corrected, hypothesis variants) you still need to compare in the UI; the 2026-11-21 viewer rework removed the field/colour/scale/grid/arrows/coverage controls and keeps only: layers Gravity / Uncertainty / Evidence / Error, a "Local corrections" toggle, and an opt-in raw-residual overlay. Rows here become new layers via V-LAYERS, not extra settings. | open |
 
 ## 6. Changelog
 
 | Date | Session | Change | Breaking? |
 | --- | --- | --- | --- |
+| 2026-11-21 | viewer | `/api/snapshot` gains `world` (players, own id, shots in flight derived from events up to the selected point) and `planet_match`; `/api/overview` and `accuracy` in `/api/decisions` added. All additive. | no |
 | 2026-11-21 | viewer | `/api/decisions` gains `accuracy` (disclosed-map comparison, null without a disclosed map) and `/api/snapshot` gains `planet_match`; both additive. | no |
 | 2026-11-21 | viewer | Created this contract. Viewer removes the `field`/`heat`/`scale`/`resolution` controls; `/api/snapshot` keeps accepting `field` and `step` for compatibility. | no |
 | 2026-11-21 | estimator | `field_hypothesis` adds support paths and validation/training metrics; joint hypotheses are seeded from prior trajectories and scored on new whole paths against the frozen prior physical map, then vetoed if the post-fit physical map already explains them. `MapBelief::model_disagreement_at` exposes a separate broad source/no-source gravity spread; it is heuristic, not calibrated, and does not replace residual uncertainty or full Q-FU. | no |
