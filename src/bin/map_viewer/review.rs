@@ -503,7 +503,11 @@ fn divergence_json(
     let Some(index) = score_path(observed, predicted).and_then(|score| score.diverges_at) else {
         return Value::Null;
     };
-    let point = &observed[index];
+    // The index can pass the observed end when the prediction flew on after the shot ended.
+    let point = observed
+        .get(index)
+        .or(observed.last())
+        .expect("scored paths are not empty");
     json!({
         "index": index,
         "point": {"x": point.x, "y": point.y},
@@ -767,6 +771,20 @@ mod tests {
         assert_eq!(score.compared, 5);
         let launch_only = vec![point(0.0, 0.0), point(1.0, 0.0)];
         assert!(score_path(&launch_only, &stops_early).is_none());
+    }
+
+    #[test]
+    fn divergence_past_the_observed_end_points_at_the_last_observed_sample() {
+        let observed = (0..3).map(|i| point(i as f32, 0.0)).collect::<Vec<_>>();
+        let flies_on = PredictedTrajectory {
+            points: (0..12)
+                .map(|i| point(if i <= 4 { i as f32 } else { 100.0 }, 0.0))
+                .collect(),
+            termination: Termination::SampleLimit,
+        };
+        let divergence = divergence_json(&observed, &flies_on, &[], None);
+        assert_eq!(divergence["index"], 5);
+        assert_eq!(divergence["point"]["x"], 2.0);
     }
 
     #[test]
