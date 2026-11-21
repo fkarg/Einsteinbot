@@ -15,6 +15,7 @@ pub mod strategy;
 mod live_map;
 
 pub mod online_map;
+pub mod online_profile;
 
 pub mod local_field;
 

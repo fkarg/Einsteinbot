@@ -3,11 +3,14 @@ use einsteinbot::estimator::{
 };
 use einsteinbot::event_store::EventLog;
 use einsteinbot::map::PlanetMap;
+use einsteinbot::online_map::OnlineStageProfile;
+use einsteinbot::online_profile::{ProfileSample, replay_capture};
 use einsteinbot::protocol::{RecordedEvent, ServerEvent};
 use einsteinbot::simulation::WorldParameters;
 use indicatif::ProgressBar;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::time::Instant;
 
 #[derive(Debug)]
 struct Options {
@@ -18,6 +21,9 @@ struct Options {
     grid_spacing: f64,
     validation_every: usize,
     use_oracle: bool,
+    online: bool,
+    profile_events: bool,
+    replay_speed: f64,
 }
 
 fn main() {
@@ -36,6 +42,9 @@ fn run() -> Result<(), String> {
     };
     let events = EventLog::read_capture(&options.db_path, options.capture_id)
         .map_err(|error| format!("cannot read capture {}: {error}", options.capture_id))?;
+    if options.online {
+        return run_online_profile(&events, &options);
+    }
     if options.use_oracle
         && events.iter().any(|event| {
             matches!(
@@ -116,6 +125,172 @@ fn run() -> Result<(), String> {
         "converged means the numerical optimizer stopped successfully, not that the map is correct."
     );
     Ok(())
+}
+
+fn run_online_profile(
+    events: &[einsteinbot::event_store::StoredEvent],
+    options: &Options,
+) -> Result<(), String> {
+    let started = Instant::now();
+    let samples = replay_capture(events, options.replay_speed)?;
+    let elapsed_ms = started.elapsed().as_millis();
+    let active_count = samples.iter().filter(|sample| !sample.stale).count();
+    let shot_fin_count = samples
+        .iter()
+        .filter(|sample| sample.event == "shot_fin")
+        .count();
+    let speed_label = if options.replay_speed == 0.0 {
+        "unpaced".to_owned()
+    } else {
+        format!("{}x", options.replay_speed)
+    };
+    println!(
+        "online_profile capture={} speed={} rows={} active={} shot_fin_rows={} elapsed_ms={elapsed_ms}",
+        options.capture_id,
+        speed_label,
+        samples.len(),
+        active_count,
+        shot_fin_count
+    );
+    print_profile_summary(&samples);
+    for sample in samples
+        .iter()
+        .filter(|sample| options.profile_events || sample.event == "shot_fin")
+    {
+        let stages = sample.stages;
+        let pending = if sample.stale {
+            "n/a".to_owned()
+        } else {
+            sample
+                .submitted
+                .saturating_sub(sample.processed)
+                .to_string()
+        };
+        let stage_sum = stages.prepare
+            + stages.planet_fit
+            + stages.local_residual
+            + stages.field_hypothesis
+            + stages.hypothesis_residual;
+        let other = sample.service_time.saturating_sub(stage_sum);
+        println!(
+            "  event seq={} recorded_unix_ms={} epoch={} watermark={} kind={} queue_ms={:.3} service_ms={:.3} prepare_ms={:.3} planet_fit_ms={:.3} local_residual_ms={:.3} field_hypothesis_ms={:.3} hypothesis_residual_ms={:.3} other_ms={:.3} backlog={} stale={}",
+            sample.sequence,
+            sample.recorded_at_unix_ms,
+            sample.epoch,
+            sample.watermark,
+            sample.event,
+            sample.queue_wait.as_secs_f64() * 1000.0,
+            sample.service_time.as_secs_f64() * 1000.0,
+            stages.prepare.as_secs_f64() * 1000.0,
+            stages.planet_fit.as_secs_f64() * 1000.0,
+            stages.local_residual.as_secs_f64() * 1000.0,
+            stages.field_hypothesis.as_secs_f64() * 1000.0,
+            stages.hypothesis_residual.as_secs_f64() * 1000.0,
+            other.as_secs_f64() * 1000.0,
+            pending,
+            sample.stale,
+        );
+    }
+    Ok(())
+}
+
+fn print_profile_summary(samples: &[ProfileSample]) {
+    let mut groups = BTreeMap::<&str, Vec<&ProfileSample>>::new();
+    for sample in samples {
+        groups.entry(sample.event).or_default().push(sample);
+    }
+    for (event, samples) in groups {
+        let active = samples
+            .iter()
+            .filter(|sample| !sample.stale)
+            .copied()
+            .collect::<Vec<_>>();
+        let mut service = active
+            .iter()
+            .map(|sample| sample.service_time.as_secs_f64() * 1000.0)
+            .collect::<Vec<_>>();
+        let mut queue = active
+            .iter()
+            .map(|sample| sample.queue_wait.as_secs_f64() * 1000.0)
+            .collect::<Vec<_>>();
+        service.sort_by(f64::total_cmp);
+        queue.sort_by(f64::total_cmp);
+        let max_backlog = active
+            .iter()
+            .map(|sample| sample.submitted.saturating_sub(sample.processed))
+            .max()
+            .unwrap_or_default();
+        let stale_rows = samples.iter().filter(|sample| sample.stale).count();
+        let stages = active.iter().map(|sample| sample.stages).fold(
+            OnlineStageProfile::default(),
+            |mut total, stage| {
+                total.prepare += stage.prepare;
+                total.planet_fit += stage.planet_fit;
+                total.local_residual += stage.local_residual;
+                total.field_hypothesis += stage.field_hypothesis;
+                total.hypothesis_residual += stage.hypothesis_residual;
+                total
+            },
+        );
+        let stage_sum = stages.prepare
+            + stages.planet_fit
+            + stages.local_residual
+            + stages.field_hypothesis
+            + stages.hypothesis_residual;
+        let service_total = active
+            .iter()
+            .map(|sample| sample.service_time)
+            .sum::<std::time::Duration>();
+        let stale_service = samples
+            .iter()
+            .filter(|sample| sample.stale)
+            .map(|sample| sample.service_time)
+            .sum::<std::time::Duration>();
+        let stale_queue = samples
+            .iter()
+            .filter(|sample| sample.stale)
+            .map(|sample| sample.queue_wait)
+            .sum::<std::time::Duration>();
+        println!(
+            "  summary kind={event} active={} stale_rows={} stale_service_ms={:.3} stale_queue_ms={:.3} service_ms[p50/p95/max]={}/{}/{} queue_ms[p50/p95/max]={}/{}/{} stage_total_ms[prepare/planet_fit/local_residual/field_hypothesis/hypothesis_residual/other]={:.3}/{:.3}/{:.3}/{:.3}/{:.3}/{:.3} max_backlog={}",
+            active.len(),
+            stale_rows,
+            stale_service.as_secs_f64() * 1000.0,
+            stale_queue.as_secs_f64() * 1000.0,
+            percentile_text(&service, 0.50),
+            percentile_text(&service, 0.95),
+            service
+                .last()
+                .map_or_else(|| "n/a".to_owned(), |value| format!("{value:.3}")),
+            percentile_text(&queue, 0.50),
+            percentile_text(&queue, 0.95),
+            queue
+                .last()
+                .map_or_else(|| "n/a".to_owned(), |value| format!("{value:.3}")),
+            stages.prepare.as_secs_f64() * 1000.0,
+            stages.planet_fit.as_secs_f64() * 1000.0,
+            stages.local_residual.as_secs_f64() * 1000.0,
+            stages.field_hypothesis.as_secs_f64() * 1000.0,
+            stages.hypothesis_residual.as_secs_f64() * 1000.0,
+            service_total.saturating_sub(stage_sum).as_secs_f64() * 1000.0,
+            max_backlog,
+        );
+    }
+}
+
+fn percentile(sorted: &[f64], quantile: f64) -> Option<f64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let position = (sorted.len() - 1) as f64 * quantile;
+    let lower = position.floor() as usize;
+    let upper = position.ceil() as usize;
+    let fraction = position - lower as f64;
+    Some(sorted[lower] + (sorted[upper] - sorted[lower]) * fraction)
+}
+
+fn percentile_text(sorted: &[f64], quantile: f64) -> String {
+    percentile(sorted, quantile).map_or_else(|| "n/a".to_owned(), |value| format!("{value:.3}"))
 }
 
 fn run_oracle_diagnostic(
@@ -289,6 +464,10 @@ where
     let mut grid_spacing = 80.0_f64;
     let mut validation_every = 5;
     let mut use_oracle = true;
+    let mut online = false;
+    let mut profile_events = false;
+    let mut replay_speed = 1.0_f64;
+    let mut replay_speed_explicit = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => {
@@ -314,6 +493,12 @@ where
                 validation_every = parse_value(&value(&mut args, &arg)?, &arg)?;
             }
             "--no-oracle" => use_oracle = false,
+            "--online" => online = true,
+            "--profile-events" => profile_events = true,
+            "--speed" => {
+                replay_speed = parse_value(&value(&mut args, &arg)?, &arg)?;
+                replay_speed_explicit = true;
+            }
             _ => return Err(format!("unknown option {arg}\n\n{}", help_text())),
         }
     }
@@ -330,6 +515,12 @@ where
     if validation_every == 1 {
         return Err("--validation-every must be 0 or at least 2".to_owned());
     }
+    if !online && (profile_events || replay_speed_explicit) {
+        return Err("--speed and --profile-events require --online".to_owned());
+    }
+    if !replay_speed.is_finite() || replay_speed < 0.0 {
+        return Err("--speed must be finite and nonnegative".to_owned());
+    }
     Ok(Some(Options {
         db_path,
         capture_id,
@@ -338,6 +529,9 @@ where
         grid_spacing,
         validation_every,
         use_oracle,
+        online,
+        profile_events,
+        replay_speed,
     }))
 }
 
@@ -400,6 +594,9 @@ fn help_text() -> &'static str {
        --grid-spacing VALUE    Deterministic seed-grid spacing (default: 80)\n\
        --validation-every N    Hold out every Nth shot; 0 disables (default: 5)\n\
        --no-oracle             Ignore captured Planets maps\n\
+       --online                Replay through the live map worker and report timing\n\
+       --speed FACTOR          Timing factor: 1 uses recorded intervals, 0 is unpaced\n\
+       --profile-events        Print timing for every map event (default: ShotFin only)\n\
        -h, --help              Show this help\n"
 }
 
@@ -447,5 +644,53 @@ mod tests {
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[&(100, 200)].len(), 2);
         assert_eq!(groups[&(1000, 2000)].len(), 1);
+    }
+
+    #[test]
+    fn online_profile_replays_map_events_and_marks_reset_seeds() {
+        let event = |sequence, timestamp_unix_ms, event| einsteinbot::event_store::StoredEvent {
+            sequence,
+            timestamp_unix_ms,
+            bot_name: None,
+            event: RecordedEvent::Inbound(event),
+        };
+        let events = vec![
+            event(
+                1,
+                1000,
+                ServerEvent::PlayerPosition {
+                    player_id: 0,
+                    x: 100.0,
+                    y: 100.0,
+                },
+            ),
+            event(
+                2,
+                1001,
+                ServerEvent::OwnEnergy {
+                    player_id: 0,
+                    energy: 8.0,
+                },
+            ),
+            event(3, 1002, ServerEvent::Planets { planets: vec![] }),
+        ];
+
+        let samples = replay_capture(&events, 0.0).unwrap();
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0].event, "player_position");
+        assert_eq!(samples[1].event, "reset_seed_player_position");
+        assert_eq!(samples[1].epoch, 1);
+    }
+
+    #[test]
+    fn profile_percentiles_interpolate_and_report_empty_samples() {
+        assert_eq!(percentile(&[], 0.50), None);
+        assert_eq!(percentile(&[7.0], 0.95), Some(7.0));
+        assert_eq!(percentile(&[0.0, 10.0], 0.50), Some(5.0));
+    }
+
+    #[test]
+    fn online_profile_rejects_invalid_speed_before_starting_a_worker() {
+        assert!(replay_capture(&[], -1.0).is_err());
     }
 }
