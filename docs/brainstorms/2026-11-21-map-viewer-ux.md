@@ -59,3 +59,27 @@ P2 committed (aedf314): scrubber + trend strip + stepping/keys; server list_deci
 Deferred (owner: user, 'maybe later'): per-planet estimation history across snapshots.
 
 P2/P3 reviews: cross-model diff review (codex -> gpt-6-luna) found the one real defect (late /api/timeline response from a previous capture could overwrite the current one); same-model reviewer confirmed it and added: guard loadDecisions too, clear timeline on capture change, handle pointercancel for scrub drag (all fixed), RMSE label precision (fixed), dropped unused `contacts` field. Rejected: keyboard handling with focused buttons (arrows don't activate buttons, navigation must work after clicking one), zero-width canvas (not reproducible), scrub resize (already redrawn on window resize), uncertainty preset being rewritten by fallback (false). Skipped nits: missing belief plotted as 0 planets, duplicate debounced load on End, decisionAt linear scan. Fixes committed after review.
+
+## Round 2 (2026-11-21, after P1-P3 shipped)
+User feedback: "better", but wants a *substantial reduction first*: many Advanced options are not useful as options, least of all unexplained. Also: uncertainty map should carry information much earlier; consider building more test scenarios; wants to learn/explore where the biggest errors still happen and the interface lacks the controls for that.
+- Policy S3 (scope: viewer controls): default to REMOVING unexplained options rather than keeping them; keep only controls with a clear question they answer. Source: user reply above.
+- Scope note vs S2: more scenarios and earlier covariance are estimator/scenario work (`learning_scenarios`, `online_map`), owned by the other session. Q9 asks how to hand that over.
+- Other session (docs/brainstorms/2026-11-13..., Round 24) uses 'physical only vs residual-corrected' views and raw residual-sample overlay as debugging tools and plans hypothesis experiments; its follow-up list already names scenarios: displaced known planet, wrong radius, one extra unseen planet.
+
+Facts observed this round (capture 44, live, disclosed map present; planets matched greedily within 80 units):
+- Final belief: 18 estimated vs 24 disclosed; 6 missing (radii 20-32), median center error 3.4, worst matched center 41.4 (radius +1.9, mass x1.15), another match radius +10.1 / mass x2.39.
+- Over decisions: missing planets 21 -> 18 -> 16 -> 15 -> 11 -> 9 -> 8 -> 6 as decisions progress; median center error 70 -> 4.
+- fit covariance is null in every decision of capture 44 (and 42), so the Uncertainty layer has no data for the whole capture; fit_converged is false in 42, true at the end in 44; model_position_rmse is None for several mid-capture decisions and 267-315 late.
+- Existing viewer error aids: Gravity error layer (field vector), planet match counts in metrics, Audit button (engine vs observed, worst shot only), Compare. No per-planet error status on the map, no missing-planet highlight, no error-over-time series, no per-shot belief-prediction ranking, no cross-capture overview.
+
+Round 2 session assessment (before peer): see Q5-Q9 below; written before reading the peer result.
+- Q5 remove: grid selector (auto), color scale (fixed robust), color-by X/Y, vector arrows, bot coverage, path residual dots; replace 'physical only vs corrected' by one explained checkbox 'Local corrections'; hypothesis shown as a marker only when one exists. Contested = raw residuals + hypothesis fields (other session uses them).
+- Q6 error unit: planet status (matched/mislocated/size/missing), error over time, per-shot belief prediction error; field-error map stays as one layer.
+- Q7 cross-capture overview table: yes, it directly answers 'where are the biggest errors'.
+- Q8 merge Uncertainty+Evidence into 'Confidence': sigma where covariance exists, else distance-to-nearest-path proxy, labeled; ask other session why covariance is always null.
+- Q9 scenario wishlist from this session, scenarios built by the other session.
+
+Round 2 peer: cross-model codex -> gpt-6-luna; attempted_falsifications non-empty (5).
+- Peer: Q5 replace Advanced with few named diagnostic controls, keep raw residual dots as an explicitly named opt-in overlay (other session uses them), fold physical-only vs corrected into a model comparison, drop bot coverage/scale/grid/arrows/color-by from the normal path. Q6 order: per-planet status + missing highlight, field error map, ranked per-shot belief error, error over time; targeting outcome later/separate. Q7 capture table as landing page, no single aggregate score. Q8 keep Uncertainty and Evidence separate; do not present a proxy as calibrated; label heuristics, show ingredients. Q9 viewer-derived wishlist to the scenario owner. Missing alternatives: ranked list beside the map, jump-to-metric-peak, data availability/definitions next to each diagnostic.
+- Divergence: Q8 (I proposed a merged 'Confidence' layer with a distance proxy). Revised to peer's position: it conflicts with the project contract that missing covariance stays explicitly unavailable; keep Uncertainty strict, make Evidence richer instead. Q5: peer keeps raw residuals; I'd cut them; left as the user's call. Impact: changed my Q8 decision; added alternatives (ranked list, jump-to-peak); otherwise no decision impact.
+Matching policy decision (mine, small, reversible): one shared global-nearest matching (smallest distance first, <=80 units) replaces estimate-order greedy in metrics/list/trend.
