@@ -1145,6 +1145,18 @@ mod tests {
         );
         assert_eq!(first.observations.len(), 8);
         assert_eq!(first.observations.len(), second.observations.len());
+        assert!(first.observations.iter().all(|(launch, _)| {
+            simulate_shot(
+                &first.truth,
+                &shot(*launch),
+                WorldParameters::default(),
+                2000,
+            )
+            .unwrap()
+            .points
+            .len()
+                >= 40
+        }));
         assert_eq!(first.truth.planets.len(), 24);
         assert!(
             first

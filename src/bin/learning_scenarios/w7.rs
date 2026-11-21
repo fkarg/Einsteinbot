@@ -32,7 +32,7 @@ pub(super) fn scenario() -> Scenario {
     let mut observations = Vec::with_capacity(SHOT_BUDGET);
     let mut trial = None;
     let mut target_tick = 0;
-    for _ in 0..SHOT_BUDGET {
+    for _ in 0..(SHOT_BUDGET * 20) {
         let launch = Launch {
             x: rng.random_range(100.0..(world.battlefield_width as f32 - 100.0)),
             y: rng.random_range(100.0..(world.battlefield_height as f32 - 100.0)),
@@ -41,12 +41,23 @@ pub(super) fn scenario() -> Scenario {
         };
         let path = simulate_shot(&truth, &super::shot(launch), world, 2000)
             .expect("generated W7 shot is simulatable");
+        if path.points.len() < 40 {
+            continue;
+        }
         observations.push((launch, path.termination));
-        if trial.is_none() && path.points.len() >= 40 {
+        if trial.is_none() {
             trial = Some(launch);
             target_tick = path.points.len() / 2;
         }
+        if observations.len() == SHOT_BUDGET {
+            break;
+        }
     }
+    assert_eq!(
+        observations.len(),
+        SHOT_BUDGET,
+        "seeded W7 fixture did not produce enough long paths"
+    );
     let trial = trial.expect("seeded W7 fixture includes a sufficiently long path");
     Scenario {
         name: "w7_scale_24_seed_20261121",
