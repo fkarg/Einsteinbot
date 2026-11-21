@@ -251,31 +251,32 @@
     try{
       const data=await api(`/api/degrade?id=${id}&seq=${seq}&kind=${kind}`);
       if(request!==degradeRequest||id!==captureId||seq!==position)return;
-      degrade={...data,selected:null};renderDegrade();render();
+      degrade={...data,selected:null};render();
     }catch(e){if(request===degradeRequest){degrade={error:e.message};renderDegrade();}}
   }
   function renderDegrade(){
     const panel=$('degradePanel'),out=$('degradeResult');
     panel.hidden=!(snapshot?.selection_kind==='decision'&&snapshot.actual_planets);
-    out.replaceChildren();$('degradeRun').disabled=Boolean(degrade?.loading);
+    out.replaceChildren();$('degradeRun').disabled=Boolean(degrade?.loading)||String(snapshot?.sequence)!==position;
     if(!degrade)return;
     if(degrade.loading){out.textContent='Running the policy on each damaged map…';return;}
     if(degrade.error){out.textContent=degrade.error;return;}
-    const rows=degrade.rows,damaged=rows.slice(1);
-    const claimedHit=damaged.filter(r=>r.claimed?.predicted_hit).length,reallyHit=damaged.filter(r=>r.real?.hit_victim).length,perfectStillHits=damaged.filter(r=>r.perfect_shot_on_damaged_map?.hit).length;
+    const rows=degrade.rows,damaged=rows.slice(1).filter(r=>!r.error);
+    const claimedHit=damaged.filter(r=>r.claimed?.predicted_hit).length,reallyHit=damaged.filter(r=>r.real?.hit_player!=null).length,perfectStillHits=damaged.filter(r=>r.perfect_shot_on_damaged_map?.hit).length;
     const summary=document.createElement('div');summary.className='note';
-    summary.textContent=`${damaged.length} damaged maps: the bot claimed a hit on ${claimedHit}, really hit on ${reallyHit}; the perfect-information shot would still hit on ${perfectStillHits}.`;
+    summary.textContent=`${damaged.length} damaged maps: the bot claimed a hit on ${claimedHit} and really hit a player on ${reallyHit}; the perfect-information shot would still hit on ${perfectStillHits}.`;
     const table=document.createElement('table');table.className='table';
     const row=(cells,cls,onclick)=>{const tr=document.createElement('tr');if(cls)tr.className=cls;for(const c of cells){const td=document.createElement(cls==='head'?'th':'td');td.textContent=c;tr.append(td);}if(onclick)tr.addEventListener('click',onclick);return tr;};
     table.append(row(['damage','perfect shot if map were real','bot chose (on damaged map)','on the true map'],'head'));
     rows.forEach((r,i)=>{
+      if(r.error){table.append(row([r.label,r.error,'','']));return;}
       const f=r.perfect_shot_on_damaged_map,c=r.claimed,re=r.real;
-      const fixed=!f?'—':f.hit?'still hits':`misses by ${fmt(f.closest_to_victim,1)}`;
+      const fixed=f.hit?'still hits':`closest approach ${fmt(f.closest_approach,1)}`;
       const chose=!c?'no shot':`${c.reason} v${c.velocity}@${c.angle_degrees}°${c.predicted_victim!=null?` → ${c.predicted_victim}`:''}`;
-      const real=!re?'—':re.hit_victim?'hits':`${re.closest_to_victim==null?'no target':`misses by ${fmt(re.closest_to_victim,1)}`} (${terminationText(re.termination)})`;
+      const real=!re?'—':re.hit_intended?'hits':re.hit_player!=null?`hits player ${re.hit_player} (not the intended target)`:`${re.closest_approach==null?'no target':`closest approach ${fmt(re.closest_approach,1)}`} (${terminationText(re.termination)})`;
       table.append(row([r.label,fixed,chose,real],`row${degrade.selected===i?' pinned':''}`,()=>{degrade.selected=i;renderDegrade();render();}));
     });
-    const note=document.createElement('div');note.className='note';note.textContent=`${degrade.note} Click a row to draw it: orange dashed is the path the bot expected, blue is what happens on the true map.`;
+    const note=document.createElement('div');note.className='note';note.textContent=`${degrade.note} Distances are center to center (a player's radius is 4). Click a row to draw it: orange dashed is the path the bot expected, blue is what happens on the true map.`;
     out.append(summary,table,note);
   }
   function drawDegrade(){
