@@ -452,6 +452,11 @@ fn world_state(events: &[(i64, Value)], decision_own_id: Option<u64>) -> Value {
     let mut earlier: BTreeMap<u64, Vec<Value>> = BTreeMap::new();
     for (_, record) in events {
         let event = &record["event"];
+        if event["type"] == "planets" {
+            // A new map respawns everyone; earlier positions belong to the old map.
+            earlier.clear();
+            continue;
+        }
         let Some(id) = event["player_id"].as_u64() else {
             continue;
         };
@@ -463,7 +468,17 @@ fn world_state(events: &[(i64, Value)], decision_own_id: Option<u64>) -> Value {
                     ) > 0.5
                 });
                 if moved && let Some(old) = players.get(&id) {
-                    earlier.entry(id).or_default().push(old.clone());
+                    let spots = earlier.entry(id).or_default();
+                    let near = |a: &Value, b: &Value| {
+                        (a["x"].as_f64().unwrap_or(0.0) - b["x"].as_f64().unwrap_or(0.0))
+                            .hypot(a["y"].as_f64().unwrap_or(0.0) - b["y"].as_f64().unwrap_or(0.0))
+                            <= 0.5
+                    };
+                    spots.retain(|spot| !near(spot, old));
+                    spots.push(old.clone());
+                    if spots.len() > 3 {
+                        spots.remove(0);
+                    }
                 }
                 players.insert(id, json!({"x": event["x"], "y": event["y"]}));
             }
@@ -490,7 +505,18 @@ fn world_state(events: &[(i64, Value)], decision_own_id: Option<u64>) -> Value {
         "own_id": decision_own_id.or(own_id),
         "ghosts": earlier
             .into_iter()
-            .map(|(id, positions)| (id.to_string(), positions.into_iter().rev().take(3).rev().collect::<Vec<_>>()))
+            .map(|(id, positions)| {
+                let here = players.get(&id).cloned().unwrap_or(Value::Null);
+                let ghosts = positions
+                    .into_iter()
+                    .filter(|spot| {
+                        (spot["x"].as_f64().unwrap_or(0.0) - here["x"].as_f64().unwrap_or(0.0))
+                            .hypot(spot["y"].as_f64().unwrap_or(0.0) - here["y"].as_f64().unwrap_or(0.0))
+                            > 0.5
+                    })
+                    .collect::<Vec<_>>();
+                (id.to_string(), ghosts)
+            })
             .collect::<BTreeMap<_, _>>(),
         "in_flight": in_flight.into_values().collect::<Vec<_>>(),
     })
@@ -1448,6 +1474,17 @@ mod tests {
         assert_eq!(world_state(&events, Some(2))["own_id"], 2);
         // Player 1 moved once, so its first position is remembered; player 2 left, so it has none.
         assert_eq!(world["ghosts"], json!({"1": [{"x": 200.0, "y": 400.0}]}));
+        // Returning to an earlier spot shows no ghost under the player; a new map forgets them.
+        let mut back = events.clone();
+        back.push(event(
+            json!({"type": "player_position", "player_id": 1, "x": 200.0, "y": 400.0}),
+        ));
+        assert_eq!(
+            world_state(&back, None)["ghosts"],
+            json!({"1": [{"x": 200.0, "y": 350.0}]})
+        );
+        back.push(event(json!({"type": "planets", "planets": []})));
+        assert_eq!(world_state(&back, None)["ghosts"], json!({}));
     }
 
     #[test]

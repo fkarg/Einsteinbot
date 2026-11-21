@@ -88,26 +88,31 @@ impl ShotRoles {
         Ok(roles)
     }
 
-    /// "training 2", "trial", or `None` for a shot that is neither (or any live shot).
+    /// "training 2", "trial", or `None` for a shot that is neither (or any live shot or non-shot).
     pub fn label(&self, sequence: i64, shot: &Value) -> Option<String> {
-        if let Some(index) = self.training.iter().position(|launch| launch.matches(shot)) {
-            return Some(format!("training {}", index + 1));
+        if shot["type"] != "shot_fin" {
+            return None;
         }
-        // Stage names: a shot belongs to the `training_N` decision that follows it, and the shot
-        // after the `target` decision is the trial.
-        if let Some((_, stage)) = self
+        // The shot right after the `target` decision is the policy's trial, even when it repeats
+        // a training launch.
+        let latest_stage = self
             .stages
-            .iter()
-            .find(|(decision, stage)| *decision > sequence && stage.starts_with("training_"))
-        {
-            return Some(stage.replace('_', " "));
-        }
-        self.stages
             .iter()
             .rev()
             .find(|(decision, _)| *decision < sequence)
-            .filter(|(_, stage)| stage == "target")
-            .map(|_| "trial".to_owned())
+            .map(|(_, stage)| stage.as_str());
+        if latest_stage == Some("target") {
+            return Some("trial".to_owned());
+        }
+        if let Some(index) = self.training.iter().position(|launch| launch.matches(shot)) {
+            return Some(format!("training {}", index + 1));
+        }
+        // Stage names (older captures have no recorded launches): a shot belongs to the
+        // `training_N` decision that follows it.
+        self.stages
+            .iter()
+            .find(|(decision, stage)| *decision > sequence && stage.starts_with("training_"))
+            .map(|(_, stage)| stage.replace('_', " "))
     }
 }
 
@@ -116,7 +121,7 @@ mod tests {
     use super::*;
 
     fn shot(x: f64, y: f64, angle: f64, speed: f64) -> Value {
-        json!({"angle": angle, "velocity": speed, "points": [{"x": x, "y": y}]})
+        json!({"type": "shot_fin", "angle": angle, "velocity": speed, "points": [{"x": x, "y": y}]})
     }
 
     #[test]
