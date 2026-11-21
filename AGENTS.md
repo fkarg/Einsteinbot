@@ -33,6 +33,7 @@ The project target is to infer planet locations and gravity effects efficiently,
 
 ## Verification
 
+- The Cargo `dev` profile uses `opt-level = 1` for Einsteinbot and `opt-level = 2` for dependencies; debug information and incremental compilation retain their defaults. Use `cargo check` for quick compile feedback and `cargo test` for behavior checks. Use release builds for runtime and benchmark comparisons.
 - Run `cargo fmt --check` and `cargo test` for Rust changes.
 - Use `--release` for `cargo run` commands unless stated otherwise (the fitter's finite-difference optimizer is dramatically faster optimized; see the benchmark comparison in `Notes.md`).
 - Live client checks may use an already-running local NewtonWars listener on port 3490. Do not start a second server if one is already running.

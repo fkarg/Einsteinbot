@@ -2,6 +2,14 @@
 
 Rust client and eventual information-gathering bot for [NewtonWars](https://github.com/Draradech/NewtonWars).
 
+## Development builds
+
+The Cargo `dev` profile uses `opt-level = 1` for Einsteinbot and `opt-level = 2` for dependencies. This is a modest optimization intended to make local CPU-heavy fitting less sluggish without applying maximum optimization across the dependency graph; we have not benchmarked it against the previous profile yet. Debug information and incremental compilation keep Cargo's defaults. Cargo notes that higher optimization can improve runtime at the cost of compile time, and recommends measuring levels for the project rather than assuming level 3 wins ([profile reference](https://doc.rust-lang.org/cargo/reference/profiles.html)).
+
+Use `cargo check` for quick type and borrow checking, `cargo test` for behavior checks, and `cargo run --release ...` for timing or running the fitter and scenario tools. `cargo check` skips final code generation, so it is quicker but does not report every code-generation error ([command reference](https://doc.rust-lang.org/cargo/commands/cargo-check.html)). The dev profile is not a substitute for release-mode performance measurements.
+
+We have not added a faster linker or reduced debug information. This checkout runs on macOS, and neither build timing nor debugger needs have been measured well enough to justify those tradeoffs. If build latency becomes a problem, first separate clean-build, incremental-build, and link time. Reduced debug info (for example `debug = "line-tables-only"`) is a candidate if debug-info generation dominates, but it removes variable-level debugger detail. A platform-specific linker is worth trying only if linking is a measured bottleneck; don't add Linux-only `mold` settings to this macOS project. Keep `opt-level = 3` for a benchmarked case, not as a blanket dev default.
+
 ## Diagnostic client
 
 Each bot session opens one TCP connection. By default, one invocation starts one session; `--clients N` starts a local manager with N sessions. It reads the server's text welcome prompt, enters bot protocol 8, prints parsed game events, and requests energy once per second. By default it is passive; `--dummy` enables small randomized shots when reported energy is at least 2.
@@ -100,6 +108,8 @@ Run `cargo run --release --bin learning_scenarios` to compare flat, learned, and
 For a causal replay of an existing SQLite capture, run `cargo run --release --bin capture_learning_scenarios -- --capture-id 29 --checkpoints 0,1,4,8 --holdout 2`. It fits only completed shots at each checkpoint and scores shots launched afterward. `--benchmark-targeting` also compares the physical-only and full beliefs on one reconstructed checkpoint. These are synchronous offline replays, not the beliefs actually published during the recorded game.
 
 The oracle generates and scores synthetic paths; it is never passed to the online estimator. These cases share the bot's physics simulator, so they diagnose learning and targeting separately but cannot independently validate the simulator against the server. A single successful impact fixture does not imply every first shot identifies a planet.
+
+The scenario tools are not yet an autonomous code-optimization loop. That planned loop needs engine-checked fixtures, a fixed multi-seed scorecard, and a machine-readable result for each candidate revision. It should make one focused code change at a time, score it against frozen selection cases, and confirm any apparent improvement on untouched cases before keeping it. Core gates should include held-out trajectory error, planet/contact recovery, targeting outcomes and energy, and fitter latency/map age; a change should not win by improving one metric while breaking the others. The report set and thresholds must stay fixed while candidates are tuned. Existing synthetic scenarios currently test estimator/simulator consistency; they do not establish engine parity or real-game hit rate.
 
 ## Targeting capture diagnostics
 
