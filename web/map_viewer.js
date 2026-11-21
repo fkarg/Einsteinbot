@@ -19,7 +19,7 @@
     captureId=Number(select.value); await loadDecisions();
   }
   async function loadDecisions(preferredBot=null){
-    captureId=Number($('capture').value); const data=await api(`/api/decisions?id=${captureId}`); decisions=data.decisions;
+    captureId=Number($('capture').value);timeline=[];drawScrub(); const id=captureId,data=await api(`/api/decisions?id=${id}`); if(id!==captureId)return; decisions=data.decisions;
     const bots=[...new Set(decisions.map(d=>d.bot_name))]; const bot=$('bot');const old=preferredBot||bot.value;bot.replaceChildren();
     for(const name of ['all',...bots]){const op=document.createElement('option');op.value=name;op.textContent=name==='all'?'All bots':name;bot.append(op);}
     bot.value=bots.includes(old)?old:'all'; fillDecisionList();
@@ -31,7 +31,7 @@
     try{const step=gridStepForView(),params=`id=${requestCapture}&seq=${requestDecision}&step=${step}&field=${requestField}&x=${requestView.x}&y=${requestView.y}&width=${requestView.width}&height=${requestView.height}`;const result=await api(`/api/snapshot?${params}`);if(request!==snapshotRequest||requestCapture!==captureId||requestDecision!==position||requestField!==$('field').value||requestView.x!==view.x||requestView.y!==view.y||requestView.width!==view.width||requestView.height!==view.height)return;snapshot=result;const scope=`${captureId}|${requestDecision}`;if(scope!==selScope){selScope=scope;sel=snapshot.selected_shot?{kind:'shot',...snapshot.selected_shot}:null;}const needsActual=requestField==='delta'||requestField==='hypothesis_delta';if(!snapshot.actual_planets&&needsActual){fieldAutoFallback=requestField;$('field').value=requestField==='delta'?'total':'hypothesis_total';return loadSnapshot();}else if(snapshot.actual_planets&&fieldAutoFallback){$('field').value=fieldAutoFallback;fieldAutoFallback=null;return loadSnapshot();}const g=snapshot.field_grid;g.samples=g.samples.map(s=>{const pair=(x,y)=>Number.isFinite(x)&&Number.isFinite(y)?{x,y}:null,vector=pair(s[2],s[3]),total=pair(s[4],s[5]),physical=pair(s[6],s[7]),residual=pair(s[8],s[9]),oracle=pair(s[10],s[11]),delta=total&&oracle?{x:total.x-oracle.x,y:total.y-oracle.y}:null;return {x:s[0],y:s[1],vector,total,physical,residual,oracle,delta,sigma:s[12],supported:s[13],gravity:total?Math.hypot(total.x,total.y):null,actual_gravity:oracle?Math.hypot(oracle.x,oracle.y):null};});const c=currentDecision().choice||{};$('velocity').value=c.velocity||8;$('angle').value=c.angle_degrees||0;setStatus(step===Number($('resolution').value)?'':`Showing ${step}-unit samples to fit this viewport`);render();}
     catch(e){setStatus(e.message);}
   }
-  async function loadTimeline(){try{const data=await api(`/api/timeline?id=${captureId}`);timeline=data.timeline;drawScrub();}catch(e){setStatus(e.message);}}
+  async function loadTimeline(){try{const id=captureId,data=await api(`/api/timeline?id=${id}`);if(id!==captureId)return;timeline=data.timeline;drawScrub();}catch(e){setStatus(e.message);}}
   function currentDecision(){return decisions.find(d=>d.sequence===selected())||{};}
   function sampleCountForStep(step){const startX=Math.floor(view.x/step)*step,startY=Math.floor(view.y/step)*step,endX=Math.ceil(view.x+view.width),endY=Math.ceil(view.y+view.height),columns=Math.floor((endX-startX)/step)+1,rows=Math.floor((endY-startY)/step)+1;return columns*rows;}
   function gridStepForView(){const desired=Number($('resolution').value);return [1,2,3,5,10,25].find(step=>step>=desired&&sampleCountForStep(step)<=300000)||25;}
@@ -146,7 +146,7 @@
     c.strokeStyle='#ffc45b';c.beginPath();points.forEach((p,k)=>{const x=scrubX(p.i,w),y=yPlanets(p.d.map_planets||0);if(k)c.lineTo(x,yPlanets(points[k-1].d.map_planets||0));k?c.lineTo(x,y):c.moveTo(x,y);});c.stroke();
     c.strokeStyle='#6ec8ff';c.beginPath();let pen=false;for(const p of points){if(!Number.isFinite(p.d.fit_rmse)){pen=false;continue;}const x=scrubX(p.i,w),y=yRmse(p.d.fit_rmse);pen?c.lineTo(x,y):c.moveTo(x,y);pen=true;}c.stroke();
     for(const p of points){if(!Number.isFinite(p.d.fit_rmse))continue;c.beginPath();c.arc(scrubX(p.i,w),yRmse(p.d.fit_rmse),2.5,0,Math.PI*2);if(p.d.fit_converged){c.fillStyle='#6ec8ff';c.fill();}else{c.strokeStyle='#6ec8ff';c.lineWidth=1;c.stroke();c.lineWidth=1.5;}}
-    c.font='10px ui-monospace,monospace';c.fillStyle='#ffc45b';c.fillText(`planets ≤${maxPlanets}`,PAD_L,11);c.fillStyle='#6ec8ff';c.fillText(`fit RMSE ≤${fmt(maxRmse,0)} (● converged ○ not)`,PAD_L+86,11);
+    c.font='10px ui-monospace,monospace';c.fillStyle='#ffc45b';c.fillText(`planets ≤${maxPlanets}`,PAD_L,11);c.fillStyle='#6ec8ff';c.fillText(`fit RMSE ≤${fmt(maxRmse,maxRmse<10?2:0)} (● converged ○ not)`,PAD_L+86,11);
     // Event ticks: decisions tall and colored by bot, shot ends medium, map resets red, everything else faint.
     for(let i=0;i<timeline.length;i++){
       const item=timeline[i],x=scrubX(i,w);let top=TREND_B+22,color='#2c3a4d';
@@ -170,7 +170,7 @@
     tip.replaceChildren(...scrubTip(i).map((t,k)=>{const d=document.createElement('div');if(!k)d.style.fontWeight='600';d.textContent=t;return d;}));
     tip.style.display='block';tip.style.left=`${Math.min(e.clientX+14,window.innerWidth-340)}px`;tip.style.top=`${e.clientY+16}px`;
   });
-  scrub.addEventListener('pointerup',()=>{scrubDrag=false;});
+  for(const type of ['pointerup','pointercancel','lostpointercapture'])scrub.addEventListener(type,()=>{scrubDrag=false;});
   scrub.addEventListener('mouseleave',()=>{tip.style.display='none';});
   $('prevDecision').addEventListener('click',()=>stepDecision(-1));$('nextDecision').addEventListener('click',()=>stepDecision(1));
   $('prevEvent').addEventListener('click',()=>stepEvent(-1));$('nextEvent').addEventListener('click',()=>stepEvent(1));
