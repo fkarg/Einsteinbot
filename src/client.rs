@@ -18,7 +18,8 @@ const PROTOCOL_VERSION: u32 = 8;
 const ENERGY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const MAP_QUIET_PERIOD: Duration = Duration::from_millis(300);
-const MAX_MAP_WAIT: Duration = Duration::from_secs(10);
+// Games last about 30 seconds, so don't spend a large fraction of a match waiting on a fit.
+const MAX_MAP_WAIT: Duration = Duration::from_secs(5);
 
 type ClientResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -340,9 +341,7 @@ fn run_session(
         if let Some(pending) = &pending_energy {
             let now = Instant::now();
             let progress = map_feed.progress();
-            let ready = progress.processed >= progress.submitted
-                && now.duration_since(pending.last_map_event) >= MAP_QUIET_PERIOD;
-            let fallback = now.duration_since(pending.started) >= MAX_MAP_WAIT;
+            let (ready, fallback) = pending.map_wait_status(progress, now);
             if ready || fallback {
                 let pending = pending_energy.take().unwrap();
                 let (progress, belief) = map_feed.snapshot_with_progress();
@@ -403,6 +402,15 @@ struct PendingEnergy {
     energy: f64,
     started: Instant,
     last_map_event: Instant,
+}
+
+impl PendingEnergy {
+    fn map_wait_status(&self, progress: MapProgress, now: Instant) -> (bool, bool) {
+        let ready = progress.processed >= progress.submitted
+            && now.duration_since(self.last_map_event) >= MAP_QUIET_PERIOD;
+        let fallback = !ready && now.duration_since(self.started) >= MAX_MAP_WAIT;
+        (ready, fallback)
+    }
 }
 
 fn target_commands(
@@ -603,6 +611,49 @@ fn read_prompt(reader: &mut impl Read) -> ClientResult<Vec<u8>> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn map_wait_allows_slow_fits_but_has_a_five_second_maximum() {
+        let now = Instant::now();
+        let pending = PendingEnergy {
+            energy: 8.0,
+            started: now,
+            last_map_event: now,
+        };
+        let progress = MapProgress {
+            epoch: 1,
+            submitted: 2,
+            processed: 1,
+            pending: 1,
+        };
+
+        assert_eq!(
+            pending.map_wait_status(progress, now + Duration::from_secs(4)),
+            (false, false)
+        );
+        assert_eq!(
+            pending.map_wait_status(progress, now + MAX_MAP_WAIT),
+            (false, true)
+        );
+
+        let drained = MapProgress {
+            submitted: progress.processed,
+            pending: 0,
+            ..progress
+        };
+        assert_eq!(
+            pending.map_wait_status(drained, now + MAP_QUIET_PERIOD - Duration::from_millis(1)),
+            (false, false)
+        );
+        assert_eq!(
+            pending.map_wait_status(drained, now + MAP_QUIET_PERIOD),
+            (true, false)
+        );
+        assert_eq!(
+            pending.map_wait_status(drained, now + MAX_MAP_WAIT),
+            (true, false)
+        );
+    }
 
     #[test]
     fn targeting_defers_a_shot_until_submitted_map_work_finishes() {
