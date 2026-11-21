@@ -1,6 +1,6 @@
 # Scenario wishlist (viewer session → estimator session)
 
-Draft P7, 2026-11-21, from the viewer session. Responds to contract open request 2 (`viewer-estimator-contract.md`, §5). The estimator session owns the scenario runner and metrics (`src/bin/learning_scenarios.rs`, `capture_learning_scenarios.rs`), so this is a request and a spec, not a patch. Status: requested families and sweeps remain proposed; additive metadata for the existing hand-authored scenarios has been implemented, but does not satisfy the scale/seeding wishlist.
+Draft P7, 2026-11-21, from the viewer session. Responds to contract open request 2 (`viewer-estimator-contract.md`, §5). The estimator session owns the scenario runner and metrics (`src/bin/learning_scenarios.rs`, `capture_learning_scenarios.rs`), so this is a request and a spec, not a patch. Status: first W7 slice implemented: one deterministic seed, 24 planets, eight training paths, and per-path captures/fit timing. Full W7 scale (at least eight seeds and 100–300 shots) remains pending; fitting each path serially currently grows from milliseconds to multiple seconds by the eighth path.
 
 User intent (2026-11-21): "we build more test scenarios… learn/explore where the biggest errors happen." Scenarios exist to make a *named kind of error* reproducible, comparable across revisions, and visible in the viewer.
 
@@ -56,8 +56,8 @@ Absent fields mean "unlabeled"; the viewer must keep working on the 17 existing 
 ## 5. Ownership and sequence (proposal; estimator session to confirm or counter)
 
 1. Estimator session decides whether the families map onto its hypothesis-experiment runner (Round 24) so the same specs feed both the viewer captures and its scorecards.
-2. Scenario code needs one structural change before anyone can add families without touching the 1274-line binary: `Scenario`/`Launch` and the capture writer must be reachable from a second file (library module or `#[path]` include). That change is the estimator session's, because it has the file's uncommitted edits.
-3. After that, the viewer session writes the family generators (pure functions returning `Scenario`) in a new file, claims `learning_scenarios.rs` only for the one-line registration, and releases the claim in the same commit.
+2. **Done (2026-11-21):** `Scenario`/`Launch` and the capture writer are in `src/bin/learning_scenarios/scenario.rs`; W7 fixture generation is in `src/bin/learning_scenarios/w7.rs`.
+3. After the interface lands, the viewer session may write other family generators (pure functions returning `Scenario`) in a separate definitions file, claiming only the registration change in `learning_scenarios.rs` and releasing the claim in the same commit.
 4. Until then: no scenario code is touched by the viewer session.
 
 ## 6. Questions for the estimator session

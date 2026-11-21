@@ -1,9 +1,8 @@
 //! Deterministic offline learning experiments. Ground truth generates observations and scores
 //! choices; it is never sent to OnlineEstimator or the learned-map targeting policy.
-use einsteinbot::event_store::{CaptureMetadata, EventLog, ScenarioCaptureMetadata};
 use einsteinbot::map::{PlanetMap, Vec2};
 use einsteinbot::online_map::OnlineEstimator;
-use einsteinbot::protocol::{Planet, Point, RecordedEvent, ServerEvent};
+use einsteinbot::protocol::{Planet, Point, ServerEvent};
 use einsteinbot::simulation::{
     ShotObservation, Termination, WorldParameters, simulate_shot, simulate_targeting_shot,
 };
@@ -11,166 +10,12 @@ use einsteinbot::strategy::{BotState, MapBelief, TargetingPolicy};
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Clone, Copy)]
-struct Launch {
-    x: f32,
-    y: f32,
-    angle: i32,
-    speed: i32,
-}
-#[derive(Clone)]
-struct Scenario {
-    name: &'static str,
-    family: &'static str,
-    defect_class: &'static str,
-    /// Truth-map planet indices this decision is designed to clarify or evaluate.
-    truth_intended_planet_indices: &'static [usize],
-    truth: PlanetMap,
-    observations: Vec<(Launch, Termination)>,
-    trial: Launch,
-    target_tick: usize,
-}
-
-struct ScenarioCapture {
-    log: EventLog,
-    timestamp_ms: i64,
-}
-
-impl ScenarioCapture {
-    fn event(&mut self, event: &ServerEvent, bot: Option<&str>) {
-        self.log
-            .append_for_bot(
-                self.timestamp_ms,
-                bot,
-                &RecordedEvent::Inbound(event.clone()),
-            )
-            .expect("write scenario event");
-        self.timestamp_ms += 1;
-    }
-
-    fn decision(
-        &mut self,
-        scenario: &Scenario,
-        state: &BotState,
-        belief: Option<&MapBelief>,
-        choice: Option<einsteinbot::strategy::ShotChoice>,
-        stage: &str,
-        observations_seen: usize,
-    ) {
-        let belief_json = belief.map(|belief| serde_json::json!({
-            "planets": belief.map.planets,
-            "local_field": belief.local_field,
-            "field_hypothesis": belief.field_hypothesis,
-            "hypothesis_local_field": belief.hypothesis_local_field,
-            "contact_points": belief.contact_points,
-            "covariance": belief.parameter_covariance.as_ref().map(|matrix| {
-                (0..matrix.nrows()).map(|row| (0..matrix.ncols()).map(|col| matrix[(row, col)]).collect::<Vec<_>>()).collect::<Vec<_>>()
-            }),
-            "model_position_rmse": belief.model_position_rmse,
-            "fit_converged": belief.fit_converged,
-            "planet_contact_counts": belief.planet_contact_counts,
-            "uncertain_associations": belief.uncertain_associations,
-        }));
-        let choice_json = choice.map(|choice| {
-            serde_json::json!({
-                "reason": format!("{:?}", choice.reason),
-                "velocity": choice.velocity,
-                "angle_degrees": choice.angle_degrees,
-                "miss_distance": choice.miss_distance,
-                "predicted_hit": choice.predicted_hit,
-                "predicted_victim": choice.predicted_victim,
-                "used_field_hypothesis": choice.used_field_hypothesis,
-                "contact_before_target": choice.contact_before_target,
-            })
-        });
-        self.log
-            .append_diagnostic(
-                self.timestamp_ms,
-                "scenario",
-                "target_decision",
-                &serde_json::json!({
-                    "energy": 20.0,
-                    "map_updating": false,
-                    "map_epoch": 0,
-                    "map_submitted_watermark": observations_seen,
-                    "map_processed_watermark": observations_seen,
-                    "map_pending_events": 0,
-                    "map_source": "online",
-                    "map_belief": belief_json,
-                    "bot_state": state.diagnostic_snapshot(),
-                    "scenario": scenario.diagnostic_metadata(stage),
-                    "choice": choice_json,
-                }),
-            )
-            .expect("write scenario diagnostic");
-        self.timestamp_ms += 1;
-    }
-
-    fn finish(mut self) {
-        self.log
-            .finish(self.timestamp_ms)
-            .expect("finish scenario capture");
-    }
-}
-
-impl Scenario {
-    fn capture_metadata(&self) -> ScenarioCaptureMetadata {
-        let contacted_planets = self
-            .observations
-            .iter()
-            .filter_map(|(_, termination)| match termination {
-                Termination::PlanetCollision(index) => Some(*index),
-                _ => None,
-            })
-            .collect::<std::collections::BTreeSet<_>>();
-        ScenarioCaptureMetadata {
-            name: self.name.into(),
-            family: self.family.into(),
-            defect_class: self.defect_class.into(),
-            params: serde_json::json!({
-                "truth_planet_count": self.truth.planets.len(),
-                "training_path_count": self.observations.len(),
-                "contacted_planet_indices": contacted_planets,
-                "training_paths": self.observations.iter().map(|(launch, termination)| {
-                    serde_json::json!({
-                        "launch_x": launch.x,
-                        "launch_y": launch.y,
-                        "angle_degrees": launch.angle,
-                        "speed": launch.speed,
-                        "expected_termination": match termination {
-                            Termination::PlanetCollision(index) => serde_json::json!({"planet_collision": index}),
-                            Termination::PlayerCollision(player_id) => serde_json::json!({"player_collision": player_id}),
-                            Termination::BattlefieldMargin => serde_json::json!("battlefield_margin"),
-                            Termination::SampleLimit => serde_json::json!("sample_limit"),
-                        },
-                    })
-                }).collect::<Vec<_>>(),
-                "trial": {
-                    "launch_x": self.trial.x,
-                    "launch_y": self.trial.y,
-                    "angle_degrees": self.trial.angle,
-                    "speed": self.trial.speed,
-                    "target_tick": self.target_tick,
-                },
-            }),
-            // These fixtures are hand-authored and deterministic; the original source
-            // did not record an objective difficulty ranking.
-            seed: None,
-            difficulty: None,
-        }
-    }
-
-    fn diagnostic_metadata(&self, stage: &str) -> serde_json::Value {
-        serde_json::json!({
-            "name": self.name,
-            "stage": stage,
-            "intended": self.truth_intended_planet_indices,
-            "truth_planets": self.truth.planets,
-        })
-    }
-}
+#[path = "learning_scenarios/scenario.rs"]
+mod scenario;
+#[path = "learning_scenarios/w7.rs"]
+mod w7;
+use scenario::{Launch, Scenario, ScenarioCapture};
 
 fn planet(x: f64, y: f64, radius: f64) -> Planet {
     Planet {
@@ -263,6 +108,7 @@ fn observe_launch(
             None,
             &format!("training_{stage}"),
             stage,
+            Some(started.elapsed().as_millis()),
         );
     }
     println!(
@@ -624,6 +470,7 @@ fn run(scenario: Scenario, mut capture: Option<ScenarioCapture>) {
             learned_choice,
             "target",
             scenario.observations.len(),
+            None,
         );
         if let Some(choice) = learned_choice {
             let trial = ShotObservation {
@@ -979,6 +826,9 @@ fn scenarios() -> Vec<Scenario> {
             target_tick: 110,
         },
     ]
+    .into_iter()
+    .chain(std::iter::once(w7::scenario()))
+    .collect()
 }
 
 fn scenario_capture_exists(path: &Path, scenario: &str, revision: &str) -> Result<bool, String> {
@@ -1087,28 +937,6 @@ fn discard_incomplete_scenario_captures(
     transaction.commit().map_err(|error| error.to_string())
 }
 
-fn create_scenario_capture(path: &Path, scenario: &Scenario) -> Result<ScenarioCapture, String> {
-    let started_at_unix_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| error.to_string())?
-        .as_millis() as i64;
-    let metadata = CaptureMetadata {
-        started_at_unix_ms,
-        process_id: std::process::id(),
-        host: "synthetic-scenario".into(),
-        port: 0,
-        client_name: scenario.name.into(),
-        protocol_version: 8,
-    };
-    let scenario_metadata = scenario.capture_metadata();
-    let log = EventLog::create_with_scenario_metadata(path, &metadata, &scenario_metadata)
-        .map_err(|error| error.to_string())?;
-    Ok(ScenarioCapture {
-        log,
-        timestamp_ms: started_at_unix_ms,
-    })
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut db_path = std::path::PathBuf::from("learning-scenarios.sqlite3");
     let mut record_captures = true;
@@ -1145,7 +973,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 None
             } else {
-                Some(create_scenario_capture(&db_path, &scenario)?)
+                Some(ScenarioCapture::create(&db_path, &scenario)?)
             }
         } else {
             None
@@ -1248,10 +1076,7 @@ mod tests {
             assert_eq!(metadata.name, scenario.name);
             assert!(!metadata.family.is_empty());
             assert!(!metadata.defect_class.is_empty());
-            assert!(
-                metadata.seed.is_none(),
-                "all current fixtures are hand-authored"
-            );
+            assert_eq!(metadata.seed, (scenario.family == "W7").then_some(w7::SEED));
             assert!(
                 metadata.difficulty.is_none(),
                 "no objective difficulty ranking was recorded"
@@ -1307,6 +1132,39 @@ mod tests {
                 .truth_intended_planet_indices
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn w7_fixture_is_seeded_scale_24_and_records_a_learning_curve() {
+        let first = w7::scenario();
+        let second = w7::scenario();
+        assert_eq!(first.name, second.name);
+        assert_eq!(
+            first.capture_metadata().params,
+            second.capture_metadata().params
+        );
+        assert_eq!(first.observations.len(), 8);
+        assert_eq!(first.observations.len(), second.observations.len());
+        assert_eq!(first.truth.planets.len(), 24);
+        assert!(
+            first
+                .truth
+                .planets
+                .iter()
+                .all(|planet| (20.0..40.0).contains(&planet.radius))
+        );
+        let metadata = first.capture_metadata();
+        assert_eq!(metadata.family, "W7");
+        assert_eq!(metadata.seed, Some(w7::SEED));
+        assert_eq!(
+            metadata.params["training_path_count"],
+            first.observations.len()
+        );
+        assert_eq!(
+            metadata.params["training_paths"].as_array().unwrap().len(),
+            first.observations.len()
+        );
+        assert!(first.target_tick > 0);
     }
 
     #[test]

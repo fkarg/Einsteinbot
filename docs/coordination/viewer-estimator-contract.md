@@ -104,7 +104,7 @@ Terms (from the user's decomposition; they stay separate diagnostics first, and 
 
 | File | Session | Why | Since |
 | --- | --- | --- | --- |
-| `src/bin/learning_scenarios.rs`, `src/bin/learning_scenarios/` | estimator / scenario_w7 | Extract reusable scenario interface and add deterministic W7 scale-24 capture generation | 2026-11-21 |
+| *(none)* | | | |
 
 ## 5. Open requests
 
@@ -119,6 +119,7 @@ Terms (from the user's decomposition; they stay separate diagnostics first, and 
 
 | Date | Session | Change | Breaking? |
 | --- | --- | --- | --- |
+| 2026-11-21 | estimator | Extracted `Scenario`/`Launch` and the capture writer for reuse; added the first seeded W7 scale-24 fixture (one seed, eight paths). W7 captures include per-path fit time; full seed/shot sweep remains pending because refit cost rises sharply with accumulated paths. No estimator input receives oracle truth. | no |
 | 2026-11-21 | viewer | Viewer consumes `MapBelief::model_disagreement_at` (new Model disagreement layer; unavailable when it returns `None`) and `bot_state.observed_spawn_locations` (optional Spawn samples overlay, drawn as samples, never as a complete set). `/api/snapshot` field rows gain a 15th element; `/api/decisions` rows gain `own_id`; `/api/overview` rows gain `latest_revision`; `/api/snapshot` trajectories and `selected_shot` gain a scenario-role `label`; `world` gains `ghosts`. All additive. | no |
 | 2026-11-21 | viewer | New read-only `/api/degrade` (degradation experiments on the disclosed map; runs `TargetingPolicy::choose` from the library with `MapBelief::new(damaged_map, None)`). No new diagnostic fields consumed. | no |
 | 2026-11-21 | viewer | New read-only endpoints `/api/shot-review` (decision's chosen shot vs observed vs re-simulated variants, optional disclosed-map repair experiments) and `/api/predictive` (per-decision path error against the next 5 observed shots). They consume only recorded `map_belief` fields (`planets`, `local_field`, `field_hypothesis`, `hypothesis_local_field`). | no |
