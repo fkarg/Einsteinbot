@@ -14,3 +14,9 @@ toml = "1.2"
 nalgebra = "0.34"
 levenberg-marquardt = "0.15"
 indicatif = "0.18"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
