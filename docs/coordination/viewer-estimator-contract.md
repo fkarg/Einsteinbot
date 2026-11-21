@@ -43,6 +43,7 @@ Terms (from the user's decomposition; they stay separate diagnostics first, and 
 
 | Field | Where | Granularity | Notes |
 | --- | --- | --- | --- |
+| 2026-11-21 | viewer | Viewer UI only: layers regrouped and renamed (Gravity belief / Fit uncertainty / Observation coverage / Rival-model disagreement / Belief error), "disclosed" shown as "truth", direction arrows and a probe card added. Unavailable layers are dimmed from snapshot data, so Q-COV/Q-EV output lights them up with no viewer change. No API or diagnostic change. | no |
 | `planets[]` (`x,y,radius,mass`) | `map_belief` | per planet | collision disks |
 | `planet_contact_counts[]` | `map_belief` | per planet | surface contacts supporting it |
 | `uncertain_associations` | `map_belief` | per belief | ambiguous contact associations |

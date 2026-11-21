@@ -43,7 +43,7 @@
     details.explain { color:#b6c5d8; background:#111a27; border:1px solid #263244; border-radius:6px; padding:8px 10px; font-size:12px; }
     details.explain summary { color:#d9e5f4; cursor:pointer; font-weight:600; }
     details.explain p { margin:7px 0; }
-    .layers { display:flex; } .layer { background:#172334; border-color:#34445a; border-radius:0; } .layer:first-child { border-radius:5px 0 0 5px; } .layer:last-child { border-radius:0 5px 5px 0; } .layer.active { background:#21476a; border-color:#ffe27a; color:#ffe27a; } .layer:disabled { opacity:.45; cursor:not-allowed; }
+    .layergroups { display:flex; gap:12px; align-items:flex-end; } .lg { display:flex; flex-direction:column; gap:2px; } .lg small { font-size:10px; color:#7d8ea5; } .layer.unavailable { opacity:.5; } .layers { display:flex; } .layer { background:#172334; border-color:#34445a; border-radius:0; } .layer:first-child { border-radius:5px 0 0 5px; } .layer:last-child { border-radius:0 5px 5px 0; } .layer.active { background:#21476a; border-color:#ffe27a; color:#ffe27a; } .layer:disabled { opacity:.45; cursor:not-allowed; }
     details.explain ul { margin:6px 0; padding-left:18px; }
     .overview { padding:12px 16px; display:flex; flex-direction:column; gap:10px; max-width:1500px; } .overview .table th { cursor:pointer; user-select:none; } .overview .table th:nth-child(-n+3), .overview .table td:nth-child(-n+3) { text-align:left; }
     .review table { margin-top:6px; } .review td.sw { width:14px; padding:0 4px 0 0; } .review .off { color:#6e7d91; } .review button { margin-top:6px; }
@@ -68,7 +68,7 @@
   <section id="overview" class="overview">
     <div class="toolbar">
       <label>Show <select id="overviewKind"><option value="all">live runs and current scenarios</option><option value="live">live runs</option><option value="scenario">synthetic scenarios (latest revision)</option><option value="history">scenario history (every revision)</option></select></label>
-      <span class="note">Click a column to sort, a row to open that capture at its latest state. Error columns need a disclosed map (<code>sendplanets 1</code> live, always present in scenarios).</span>
+      <span class="note">Click a column to sort, a row to open that capture at its latest state. Error columns need a truth map (<code>sendplanets 1</code> live, always present in scenarios).</span>
     </div>
     <div id="globalMetrics" class="metrics"></div>
     <table id="overviewTable" class="table"></table>
@@ -81,15 +81,18 @@
       </div>
       <canvas id="scrub" aria-label="Capture timeline"></canvas>
       <div class="toolbar">
-        <div class="layers" role="group" aria-label="Map layer">
-          <button type="button" class="layer" data-layer="gravity" title="Belief gravity: fitted planets plus observed local residual">Gravity</button><button type="button" class="layer" data-layer="uncertainty" title="Field uncertainty propagated from the fit covariance (unavailable without a full-rank fit)">Uncertainty</button><button type="button" class="layer" data-layer="evidence" title="Where recorded paths support a local residual">Evidence</button><button type="button" class="layer" data-layer="disagreement" title="Gravity spread between the no-source model and the validated field-only source model (available only when a validated source exists)">Model disagreement</button><button type="button" class="layer" data-layer="error" id="errorLayer">Error vs disclosed</button>
+        <div class="layergroups" role="group" aria-label="Map layer">
+          <div class="lg"><small>What the bot believed</small><div class="layers"><button type="button" class="layer" data-layer="gravity" title="The bot's unified gravity belief: fitted planets plus the observed local correction (the field its simulator uses)">Gravity belief</button></div></div>
+          <div class="lg"><small>How sure it was</small><div class="layers"><button type="button" class="layer" data-layer="uncertainty" title="Field uncertainty propagated from the fit covariance">Fit uncertainty</button><button type="button" class="layer" data-layer="evidence" title="Where recorded paths support a local correction (teal) versus where the belief has no observation">Observation coverage</button><button type="button" class="layer" data-layer="disagreement" title="Where the no-source and the validated field-only source model would pull differently, weighted by how undecided the evidence is">Rival-model disagreement</button></div></div>
+          <div class="lg"><small>Versus truth</small><div class="layers"><button type="button" class="layer" data-layer="error" id="errorLayer">Belief error</button></div></div>
         </div>
         <label><input type="checkbox" id="beliefPlanets" checked> Estimated planets</label>
-        <label id="actualPlanetsLabel"><input type="checkbox" id="actualPlanets" checked> Disclosed planets</label>
+        <label id="actualPlanetsLabel"><input type="checkbox" id="actualPlanets" checked> Truth planets</label>
         <label><input type="checkbox" id="paths"> Trajectories</label>
         <label><input type="checkbox" id="contacts"> Contacts</label>
         <label title="Places players were seen to appear in this map epoch (recorded by the bot; older captures lack them). Samples only: the set is incomplete and new spawns elsewhere are possible."><input type="checkbox" id="spawns"> Spawn samples</label>
         <label title="Dots at recorded path samples: observed path curvature minus the gravity of the fitted planets. A diagnostic that can include numerical noise; large clusters hint at a missing or misplaced planet."><input type="checkbox" id="pathResiduals"> Path residuals</label>
+        <label id="arrowsLabel" title="Arrows show the direction of the layer's vector: for Gravity belief the pull, for Belief error the belief's extra pull compared with truth (belief − truth). Colour still shows magnitude."><input type="checkbox" id="arrows" checked> Direction arrows</label>
         <label id="correctionsLabel" title="On: fitted planets plus the observed local residual correction (what the bot uses). Off: fitted planets only, which shows where corrections mask missing planets."><input type="checkbox" id="corrections" checked> Local corrections</label>
         <button id="zoomIn" type="button">Zoom in</button><button id="zoomOut" type="button">Zoom out</button><button id="resetView" type="button">Full map</button>
       </div>
@@ -98,17 +101,18 @@
       <div class="scale-legend"><span id="scaleMin">—</span><div class="scale-bar" id="scaleBar"></div><span id="scaleMax">—</span></div>
       <div class="scale-legend path-scale" id="pathScale"><b>Path residual |r|</b><span id="pathMin">0</span><div class="scale-bar" id="pathScaleBar"></div><span id="pathMax">—</span></div>
       <div class="legend">
-        <span><i class="dot" style="background:#ffc45b"></i>estimated planet</span><span id="actualLegend"><i class="dot" style="background:#60dcff"></i>disclosed: close match <i class="dot" style="background:#ff9d4d"></i>center off <i class="dot" style="background:#e8d96d"></i>size off <i class="dot" style="background:#ff4d6a"></i>missing</span>
+        <span><i class="dot" style="background:#ffc45b"></i>estimated planet</span><span id="actualLegend"><i class="dot" style="background:#60dcff"></i>truth: close match <i class="dot" style="background:#ff9d4d"></i>center off <i class="dot" style="background:#e8d96d"></i>size off <i class="dot" style="background:#ff4d6a"></i>missing</span>
       </div>
       <details class="explain"><summary>Help</summary>
         <ul>
-          <li><b>Gravity</b> is the bot's gravity belief; <b>Local corrections</b> adds the observed residual to the fitted planets (off shows the planets alone). <b>Evidence</b> marks where recorded paths support a residual. <b>Error</b> is belief minus the disclosed map and exists only when the capture has one.</li>
+          <li><b>Gravity belief</b> is the field the bot simulates with: fitted planets plus the observed local correction (<b>Local corrections</b> off shows the planets alone). <b>Observation coverage</b> marks where recorded paths support a correction. <b>Belief error</b> is belief minus truth and exists only when the capture has a truth map.</li>
+          <li><b>Truth</b> is the planet list the server discloses when it runs with <code>sendplanets 1</code>. It is diagnosis only and never an estimator input. <b>Direction arrows</b> point along the layer's vector (angles: 0° right, 90° down); for Belief error they point to where the belief pulls extra. Belief error colours are on a log scale. Hover shows a compact probe; click pins the full one. Dimmed layers say why they are unavailable.</li>
           <li><b>Model disagreement</b> is how far the gravity of the no-source model and the validated field-only source model differ, weighted by held-out improvement; it exists only while a validated source does, and is a heuristic, not a probability. It says nothing about space where neither model has evidence.</li>
           <li>Dark cells have no value for the layer (not zero gravity). Uncertainty comes from the fit covariance and ignores omitted planets and model error.</li>
-          <li>Disclosed planets are the game's own map, for diagnosis only. A disclosed planet is a <b>close match</b> when an estimate lies within 10 units and 5 units of radius; <b>center off</b> / <b>size off</b> exceed one threshold; <b>missing</b> has no estimate within 80 units. Pairs are one-to-one, closest first.</li>
+          <li>Truth planets are the game's own map, for diagnosis only. A truth planet is a <b>close match</b> when an estimate lies within 10 units and 5 units of radius; <b>center off</b> / <b>size off</b> exceed one threshold; <b>missing</b> has no estimate within 80 units. Pairs are one-to-one, closest first.</li>
           <li>Spawn samples (blue squares) are positions where players were observed to appear in the current map epoch, as recorded by the bot. They are samples, not a complete set.</li>
           <li>Contacts are path endpoints the estimator accepted as surface hits, not every collision. The pink diamond is a field-only source: a gravity explanation, never collision geometry.</li>
-          <li><b>Shot review</b> re-simulates the decision's chosen shot under the recorded belief and compares it with the shot that actually followed. Outcomes are read off the observed endpoint and are inferences, not server reports. The green timeline line is each decision's belief scored against the next 5 observed shots (median path error), which needs no disclosed map. Repairs change one planet of the belief to the disclosed one and re-simulate: a sensitivity, not proof of cause.</li>
+          <li><b>Shot review</b> re-simulates the decision's chosen shot under the recorded belief and compares it with the shot that actually followed. Outcomes are read off the observed endpoint and are inferences, not server reports. The green timeline line is each decision's belief scored against the next 5 observed shots (median path error), which needs no truth map. Repairs change one planet of the belief to the truth one and re-simulate: a sensitivity, not proof of cause.</li>
           <li>Faded dots are where a player stood before it moved. Scenario shots are labelled from what the scenario generator recorded: <b>training</b> shots build the baseline information, the <b>trial</b> shot is the policy's shot (muted versus bold lines).</li>
           <li>“Map events pending” in the decision panel means the snapshot may lag the latest observations.</li>
         </ul>
@@ -127,7 +131,7 @@
           <div id="reviewRepairs"></div>
         </div>
         <div id="degradePanel" class="review" hidden>
-          <h2>Degrade the disclosed map</h2>
+          <h2>Degrade the truth map</h2>
           <div class="note">Starts from perfect information, damages the map one way, lets the bot choose a shot on the damaged map, and flies it on the true map. The last column shows what the perfect-information shot itself would do if the damaged map were the real world.</div>
           <div class="controls">
             <label>Damage<select id="degradeKind"><option value="drop">Drop a planet near the path</option><option value="displace">Move the nearest planet</option><option value="resize">Resize the nearest planet</option><option value="phantom">Add a planet that is not there</option><option value="noise">Jitter every planet</option></select></label>
@@ -137,7 +141,7 @@
         </div>
         <details class="explain"><summary>Free simulation and audits</summary>
           <div class="controls">
-            <label>Gravity model<select id="model"><option value="belief">Recorded physical map + local residual</option><option value="hypothesis">Recorded map + field hypothesis</option><option value="actual">Disclosed actual map</option></select></label>
+            <label>Gravity model<select id="model"><option value="belief">Recorded physical map + local residual</option><option value="hypothesis">Recorded map + field hypothesis</option><option value="actual">Truth map (actual)</option></select></label>
             <label>Velocity<input id="velocity" type="number" min="2" max="50" step="1" value="8"></label>
             <label>Angle (degrees)<input id="angle" type="number" min="-180" max="180" step="1" value="0"></label>
             <button id="simulate">Simulate this shot</button>
@@ -150,7 +154,7 @@
       </div>
       <h2>Captured belief</h2>
       <div id="metrics" class="metrics"></div>
-      <div id="disclosedPanel"><h2>Disclosed planets</h2><div id="disclosedList"></div></div>
+      <div id="disclosedPanel"><h2>Truth planets</h2><div id="disclosedList"></div></div>
       <h2>Estimated planets</h2><div id="planetList"></div>
     </aside>
   </main>
