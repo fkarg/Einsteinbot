@@ -87,20 +87,20 @@ impl ContactMap {
         self.hypotheses.clear();
         self.contacts.clear();
     }
-    /// Apply regular-path free-space evidence, then infer a probable contact under
+    /// Apply sampled-position free-space evidence, then infer a probable contact under
     /// the documented default server limits. `players` must contain all tracked
     /// pre-finish positions; an empty list cannot rule out player termination.
     pub fn observe(&mut self, points: &[Point], players: &[Point], world: WorldParameters) {
+        // Only recorded sample positions are guaranteed to lie on the actual curved
+        // trajectory. A straight chord between two samples can cut across a planet
+        // even when the simulated path bends safely around it.
         let regular = &points[..points.len().saturating_sub(1)];
         for hypothesis in &mut self.hypotheses {
             let radius = (hypothesis.planet.radius - 5.0).max(0.0);
-            if regular.windows(2).any(|segment| {
-                segment_distance_squared(
-                    &segment[0],
-                    &segment[1],
-                    hypothesis.planet.x,
-                    hypothesis.planet.y,
-                ) < radius * radius
+            if regular.iter().any(|point| {
+                (f64::from(point.x) - hypothesis.planet.x).powi(2)
+                    + (f64::from(point.y) - hypothesis.planet.y).powi(2)
+                    < radius * radius
             }) {
                 hypothesis.contradicted = true;
             }
@@ -367,20 +367,6 @@ fn fit_contacts(
         }
     }
     best
-}
-
-fn segment_distance_squared(start: &Point, end: &Point, x: f64, y: f64) -> f64 {
-    let dx = f64::from(end.x) - f64::from(start.x);
-    let dy = f64::from(end.y) - f64::from(start.y);
-    let length_squared = dx * dx + dy * dy;
-    let projection = if length_squared == 0.0 {
-        0.0
-    } else {
-        (((x - f64::from(start.x)) * dx + (y - f64::from(start.y)) * dy) / length_squared)
-            .clamp(0.0, 1.0)
-    };
-    (f64::from(start.x) + projection * dx - x).powi(2)
-        + (f64::from(start.y) + projection * dy - y).powi(2)
 }
 
 #[cfg(test)]
@@ -704,6 +690,10 @@ mod tests {
                 y: planet.y as f32,
             },
             Point {
+                x: planet.x as f32,
+                y: planet.y as f32,
+            },
+            Point {
                 x: (planet.x + 50.0) as f32,
                 y: planet.y as f32,
             },
@@ -717,5 +707,23 @@ mod tests {
         assert!(!map.hypotheses()[0].acceleration_samples.is_empty());
         map.reset();
         assert!(map.hypotheses().is_empty());
+    }
+
+    #[test]
+    fn curved_flyby_does_not_contradict_a_planet_based_on_its_chord() {
+        let mut map = ContactMap::default();
+        map.observe(&contact_path(), &players(), WorldParameters::default());
+        let planet = map.hypotheses()[0].planet.clone();
+        let radius = planet.radius * 1.1;
+        let arc = [(-radius, 0.0), (0.0, radius), (radius, 0.0)].map(|(dx, dy)| Point {
+            x: (planet.x + dx) as f32,
+            y: (planet.y + dy) as f32,
+        });
+        assert!(arc.iter().all(|point| {
+            (f64::from(point.x) - planet.x).hypot(f64::from(point.y) - planet.y)
+                > planet.radius - 5.0
+        }));
+        map.observe(&arc, &players(), WorldParameters::default());
+        assert!(!map.hypotheses()[0].contradicted);
     }
 }

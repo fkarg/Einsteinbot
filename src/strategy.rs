@@ -744,6 +744,7 @@ impl TargetingPolicy {
             .iter()
             .filter(|candidate| {
                 candidate.uncertainty_available
+                    && !candidate.contact_before_target
                     && candidate.information_score >= self.settings.information_threshold
             })
             .max_by(|left, right| {
@@ -763,11 +764,16 @@ impl TargetingPolicy {
 
         pool.into_iter()
             .min_by(|left, right| {
-                (left.miss_distance + self.settings.coverage_penalty * left.covered_fraction)
-                    .total_cmp(
-                        &(right.miss_distance
-                            + self.settings.coverage_penalty * right.covered_fraction),
-                    )
+                left.contact_before_target
+                    .cmp(&right.contact_before_target)
+                    .then_with(|| {
+                        (left.miss_distance
+                            + self.settings.coverage_penalty * left.covered_fraction)
+                            .total_cmp(
+                                &(right.miss_distance
+                                    + self.settings.coverage_penalty * right.covered_fraction),
+                            )
+                    })
                     .then_with(|| left.velocity.cmp(&right.velocity))
             })
             .map(decorate)
