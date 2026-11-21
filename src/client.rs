@@ -1,7 +1,7 @@
 use crate::config::AppConfig;
 use crate::dummy::commands_for_energy;
 use crate::event_store::{CaptureMetadata, EventLog};
-use crate::live_map::LiveMap;
+use crate::live_map::{LiveMap, MapProgress};
 use crate::map::PlanetMap;
 use crate::protocol::{ClientCommand, EventParser, RecordedEvent, ServerEvent};
 use crate::rate_limit::ByteRateLimiter;
@@ -17,6 +17,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const PROTOCOL_VERSION: u32 = 8;
 const ENERGY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(200);
+const MAP_QUIET_PERIOD: Duration = Duration::from_millis(300);
+const MAX_MAP_WAIT: Duration = Duration::from_secs(10);
 
 type ClientResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -204,6 +206,7 @@ fn run_session(
     )?;
     let mut last_energy_request = Instant::now();
     let mut buffer = [0u8; 4096];
+    let mut pending_energy: Option<PendingEnergy> = None;
     'session: loop {
         if !running.load(Ordering::SeqCst) {
             break;
@@ -244,11 +247,19 @@ fn run_session(
                                         y: position.y,
                                     })?;
                                 }
+                                if let Some(pending) = &mut pending_energy {
+                                    pending.last_map_event = Instant::now();
+                                }
                                 eprintln!("LiveMap reset: new map epoch");
                             }
                             ServerEvent::ShotFin { .. }
                             | ServerEvent::PlayerPosition { .. }
-                            | ServerEvent::PlayerLeave { .. } => map_feed.observe(&event)?,
+                            | ServerEvent::PlayerLeave { .. } => {
+                                map_feed.observe(&event)?;
+                                if let Some(pending) = &mut pending_energy {
+                                    pending.last_map_event = Instant::now();
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -262,96 +273,42 @@ fn run_session(
                         )?;
                     }
                     if let ServerEvent::OwnEnergy { energy, .. } = event {
-                        let mut rng = rand::rng();
-                        let (map_updating, map_belief) =
-                            if targeting && !dummy && !oracle_map_for_policy {
-                                map_feed.snapshot()
-                            } else {
-                                (false, oracle_belief.clone())
-                            };
                         let commands = if dummy {
-                            commands_for_energy(energy, &mut rng)
+                            commands_for_energy(energy, &mut rand::rng())
+                        } else if targeting && !oracle_map_for_policy {
+                            let now = Instant::now();
+                            let pending = pending_energy.get_or_insert(PendingEnergy {
+                                energy,
+                                started: now,
+                                last_map_event: now,
+                            });
+                            pending.energy = energy;
+                            None
                         } else if targeting {
-                            if !oracle_map_for_policy {
-                                bot_state.set_map_belief(map_belief.clone());
-                            }
-                            let started = Instant::now();
-                            let choice =
-                                target_policy.choose_while_running(&bot_state, energy, running);
-                            if !running.load(Ordering::SeqCst) {
-                                break 'session;
-                            }
-                            let search_duration_ms = started.elapsed().as_millis();
-                            if let Some(log) = &event_log {
-                                let belief = map_belief.as_ref().map(|belief| serde_json::json!({
-                                    "planets": belief.map.planets,
-                                    "local_field": belief.local_field,
-                                    "field_hypothesis": belief.field_hypothesis,
-                                    "hypothesis_local_field": belief.hypothesis_local_field,
-                                    "contact_points": belief.contact_points,
-                                    "covariance": belief.parameter_covariance.as_ref().map(|matrix| {
-                                        (0..matrix.nrows()).map(|row| (0..matrix.ncols()).map(|col| matrix[(row, col)]).collect::<Vec<_>>()).collect::<Vec<_>>()
-                                    }),
-                                    "model_position_rmse": belief.model_position_rmse,
-                                    "fit_converged": belief.fit_converged,
-                                    "planet_contact_counts": belief.planet_contact_counts,
-                                    "uncertain_associations": belief.uncertain_associations,
-                                }));
-                                let decision = choice.map(|choice| {
-                                    serde_json::json!({
-                                        "reason": format!("{:?}", choice.reason),
-                                        "velocity": choice.velocity,
-                                        "angle_degrees": choice.angle_degrees,
-                                        "miss_distance": choice.miss_distance,
-                                    "predicted_hit": choice.predicted_hit,
-                                        "used_field_hypothesis": choice.used_field_hypothesis,
-                                        "predicted_victim": choice.predicted_victim,
-                                        "alternative_agrees": choice.alternative_agrees,
-                                        "hypothesis_uncertainty_proxy": choice.hypothesis_uncertainty_proxy,
-                                        "local_support_fraction": choice.local_support_fraction,
-                                        "information_score": choice.information_score,
-                                        "uncertainty_available": choice.uncertainty_available,
-                                        "covered_fraction": choice.covered_fraction,
-                                        "contact_before_target": choice.contact_before_target,
-                                    })
-                                });
-                                log.lock().map_err(|_| "event log mutex poisoned")?.append_diagnostic(
-                                    now_unix_ms()?, name, "target_decision", &serde_json::json!({
-                                        "energy": energy,
-                                        "map_updating": map_updating,
-                                        "map_source": if oracle_map_for_policy { "oracle" } else { "online" },
-                                        "map_belief": belief,
-                                        "bot_state": bot_state.diagnostic_snapshot(),
-                                        "angle_step_degrees": targeting_settings.angle_step_degrees,
-                                        "search_duration_ms": search_duration_ms,
-                                        "choice": decision,
-                                    }),
-                                )?;
-                            }
-                            choice
-                                .map(|choice| {
-                                    println!(
-                                        "TargetChoice reason={:?} velocity={} angle={} miss={:.2} information={:.3} covariance={} covered={:.3} contact_before_target={} map_updating={}",
-                                        choice.reason,
-                                        choice.velocity,
-                                        choice.angle_degrees,
-                                        choice.miss_distance,
-                                        choice.information_score,
-                                    choice.uncertainty_available,
-                                    choice.covered_fraction,
-                                    choice.contact_before_target,
-                                    map_updating
-                                    );
-                                    [
-                                        ClientCommand::SetVelocity {
-                                            velocity: f64::from(choice.velocity),
-                                        },
-                                        ClientCommand::SetAngle {
-                                            angle: f64::from(choice.angle_degrees),
-                                        },
-                                    ]
-                                })
-                                .or_else(|| commands_for_energy(energy, &mut rng))
+                            let (progress, belief) = if oracle_map_for_policy {
+                                (map_feed.progress(), oracle_belief.clone())
+                            } else {
+                                map_feed.snapshot_with_progress()
+                            };
+                            target_commands(
+                                energy,
+                                &bot_state,
+                                belief.as_ref(),
+                                progress,
+                                false,
+                                0,
+                                &target_policy,
+                                targeting_settings.angle_step_degrees,
+                                &event_log,
+                                name,
+                                running,
+                                if oracle_map_for_policy {
+                                    "oracle"
+                                } else {
+                                    "online"
+                                },
+                            )?
+                            .or_else(|| commands_for_energy(energy, &mut rand::rng()))
                         } else {
                             None
                         };
@@ -380,7 +337,48 @@ fn run_session(
             Err(error) => return Err(error.into()),
         }
 
-        if last_energy_request.elapsed() >= ENERGY_POLL_INTERVAL {
+        if let Some(pending) = &pending_energy {
+            let now = Instant::now();
+            let progress = map_feed.progress();
+            let ready = progress.processed >= progress.submitted
+                && now.duration_since(pending.last_map_event) >= MAP_QUIET_PERIOD;
+            let fallback = now.duration_since(pending.started) >= MAX_MAP_WAIT;
+            if ready || fallback {
+                let pending = pending_energy.take().unwrap();
+                let (progress, belief) = map_feed.snapshot_with_progress();
+                let wait_ms = pending.started.elapsed().as_millis() as u64;
+                let commands = target_commands(
+                    pending.energy,
+                    &bot_state,
+                    belief.as_ref(),
+                    progress,
+                    fallback,
+                    wait_ms,
+                    &target_policy,
+                    targeting_settings.angle_step_degrees,
+                    &event_log,
+                    name,
+                    running,
+                    "online",
+                )?
+                .or_else(|| commands_for_energy(pending.energy, &mut rand::rng()));
+                for command in commands.into_iter().flatten() {
+                    if !running.load(Ordering::SeqCst) {
+                        break 'session;
+                    }
+                    send_command(
+                        stream,
+                        &event_log,
+                        name,
+                        &mut rate_limiter,
+                        running,
+                        command,
+                    )?;
+                }
+            }
+        }
+
+        if pending_energy.is_none() && last_energy_request.elapsed() >= ENERGY_POLL_INTERVAL {
             send_command(
                 stream,
                 &event_log,
@@ -399,6 +397,101 @@ fn run_session(
     }
 
     Ok(())
+}
+
+struct PendingEnergy {
+    energy: f64,
+    started: Instant,
+    last_map_event: Instant,
+}
+
+fn target_commands(
+    energy: f64,
+    bot_state: &BotState,
+    map_belief: Option<&MapBelief>,
+    progress: MapProgress,
+    fallback: bool,
+    wait_ms: u64,
+    policy: &TargetingPolicy,
+    angle_step_degrees: u16,
+    event_log: &Option<Arc<Mutex<EventLog>>>,
+    name: &str,
+    running: &AtomicBool,
+    map_source: &str,
+) -> ClientResult<Option<[ClientCommand; 2]>> {
+    let mut state = bot_state.clone();
+    state.set_map_belief(map_belief.cloned());
+    let started = Instant::now();
+    let choice = policy.choose_while_running(&state, energy, running);
+    if !running.load(Ordering::SeqCst) {
+        return Ok(None);
+    }
+    let search_duration_ms = started.elapsed().as_millis();
+    if let Some(log) = event_log {
+        let belief = map_belief.map(|belief| serde_json::json!({
+            "planets": belief.map.planets,
+            "local_field": belief.local_field,
+            "field_hypothesis": belief.field_hypothesis,
+            "hypothesis_local_field": belief.hypothesis_local_field,
+            "contact_points": belief.contact_points,
+            "covariance": belief.parameter_covariance.as_ref().map(|matrix| {
+                (0..matrix.nrows()).map(|row| (0..matrix.ncols()).map(|col| matrix[(row, col)]).collect::<Vec<_>>()).collect::<Vec<_>>()
+            }),
+            "model_position_rmse": belief.model_position_rmse,
+            "fit_converged": belief.fit_converged,
+            "planet_contact_counts": belief.planet_contact_counts,
+            "uncertain_associations": belief.uncertain_associations,
+        }));
+        let decision = choice.map(|choice| {
+            serde_json::json!({
+                "reason": format!("{:?}", choice.reason),
+                "velocity": choice.velocity,
+                "angle_degrees": choice.angle_degrees,
+                "miss_distance": choice.miss_distance,
+                "predicted_hit": choice.predicted_hit,
+                "used_field_hypothesis": choice.used_field_hypothesis,
+                "predicted_victim": choice.predicted_victim,
+                "alternative_agrees": choice.alternative_agrees,
+                "hypothesis_uncertainty_proxy": choice.hypothesis_uncertainty_proxy,
+                "local_support_fraction": choice.local_support_fraction,
+                "information_score": choice.information_score,
+                "uncertainty_available": choice.uncertainty_available,
+                "covered_fraction": choice.covered_fraction,
+                "contact_before_target": choice.contact_before_target,
+            })
+        });
+        log.lock()
+            .map_err(|_| "event log mutex poisoned")?
+            .append_diagnostic(
+                now_unix_ms()?,
+                name,
+                "target_decision",
+                &serde_json::json!({
+                    "energy": energy,
+                    "map_epoch": progress.epoch,
+                    "map_submitted_watermark": progress.submitted,
+                    "map_processed_watermark": progress.processed,
+                    "map_pending_events": progress.pending,
+                    "map_source": map_source,
+                    "map_belief": belief,
+                    "bot_state": bot_state.diagnostic_snapshot(),
+                    "angle_step_degrees": angle_step_degrees,
+                    "search_duration_ms": search_duration_ms,
+                    "map_wait_ms": wait_ms,
+                    "map_wait_fallback": fallback,
+                    "choice": decision,
+                }),
+            )?;
+    }
+    Ok(choice.map(|choice| {
+        println!("TargetChoice reason={:?} velocity={} angle={} miss={:.2} information={:.3} map_wait_ms={} fallback={}",
+            choice.reason, choice.velocity, choice.angle_degrees, choice.miss_distance,
+            choice.information_score, wait_ms, fallback);
+        [
+            ClientCommand::SetVelocity { velocity: f64::from(choice.velocity) },
+            ClientCommand::SetAngle { angle: f64::from(choice.angle_degrees) },
+        ]
+    }))
 }
 
 fn is_bot_specific(event: &ServerEvent) -> bool {
@@ -504,7 +597,7 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
-    fn targeting_keeps_firing_while_the_map_worker_is_busy() {
+    fn targeting_defers_a_shot_until_submitted_map_work_finishes() {
         use std::io::{BufRead, BufReader};
         use std::net::TcpListener;
         use std::sync::mpsc;
@@ -520,6 +613,7 @@ mod tests {
         started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
+        let (early_tx, early_rx) = mpsc::channel();
         let (shots_tx, shots_rx) = mpsc::channel();
         let server = std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
@@ -535,6 +629,8 @@ mod tests {
             reader.read_line(&mut line).unwrap();
             line.clear();
             reader.read_line(&mut line).unwrap();
+            line.clear();
+            reader.read_line(&mut line).unwrap(); // Initial energy request.
             let mut frames = Vec::new();
             frames.extend(1u32.to_ne_bytes());
             frames.extend(1u32.to_ne_bytes());
@@ -544,34 +640,48 @@ mod tests {
                 frames.extend(x.to_ne_bytes());
                 frames.extend(y.to_ne_bytes());
             }
-            for _ in 0..2 {
-                frames.extend(8u32.to_ne_bytes());
-                frames.extend(1u32.to_ne_bytes());
-                frames.extend(8f64.to_ne_bytes());
-            }
+            frames.extend(8u32.to_ne_bytes());
+            frames.extend(1u32.to_ne_bytes());
+            frames.extend(8f64.to_ne_bytes());
             socket.write_all(&frames).unwrap();
-            let mut shots = 0;
-            let mut polls = 0;
+
+            socket
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
+            let mut early_shots = 0;
             loop {
                 line.clear();
                 match reader.read_line(&mut line) {
                     Ok(0) | Err(_) => break,
-                    Ok(_) if line.trim().parse::<f64>().is_ok() => {
-                        shots += 1;
-                        if shots == 2 {
-                            break;
-                        }
+                    Ok(_) if line.trim().parse::<f64>().is_ok() || line.starts_with("v ") => {
+                        early_shots += 1
                     }
-                    Ok(_) if line.trim() == "u" => {
-                        polls += 1;
-                        if polls == 3 {
-                            break;
-                        }
+                    _ => {}
+                }
+            }
+            early_tx.send(early_shots).unwrap();
+
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut shots = early_shots;
+            while shots < 2 {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) if line.trim().parse::<f64>().is_ok() || line.starts_with("v ") => {
+                        shots += 1
                     }
                     _ => {}
                 }
             }
             shots_tx.send(shots).unwrap();
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+            }
         });
         let running = Arc::new(AtomicBool::new(true));
         let worker_running = Arc::clone(&running);
@@ -610,22 +720,29 @@ mod tests {
                 &worker_feed,
             )
         });
-        let shots = shots_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        running.store(false, Ordering::SeqCst);
+        assert_eq!(
+            early_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+            0,
+            "targeting should wait while earlier map evidence is fitting"
+        );
         release_tx.send(()).unwrap();
+        assert_eq!(shots_rx.recv_timeout(Duration::from_secs(5)).unwrap(), 2);
+        running.store(false, Ordering::SeqCst);
+        client.join().unwrap().unwrap();
         server.join().unwrap();
-        let _ = client.join().unwrap();
         drop(feed);
         fitter.join().unwrap();
-        assert_eq!(shots, 2, "fit work must not suppress energy-driven shots");
         let db = rusqlite::Connection::open(&path).unwrap();
-        let data: String = db.query_row("SELECT data_json FROM diagnostics WHERE kind = 'target_decision' ORDER BY sequence LIMIT 1", [], |row| row.get(0)).unwrap();
+        let data: String = db.query_row(
+            "SELECT data_json FROM diagnostics WHERE kind = 'target_decision' ORDER BY sequence LIMIT 1",
+            [], |row| row.get(0),
+        ).unwrap();
         let decision: serde_json::Value = serde_json::from_str(&data).unwrap();
         assert_eq!(decision["energy"], 8.0);
-        assert_eq!(decision["map_updating"], true);
-        assert_eq!(decision["map_belief"], serde_json::Value::Null);
-        assert_eq!(decision["bot_state"]["player_positions"]["2"]["x"], 200.0);
-        assert!(decision["choice"]["velocity"].is_number());
+        assert_eq!(decision["map_submitted_watermark"], 1);
+        assert_eq!(decision["map_processed_watermark"], 1);
+        assert_eq!(decision["map_wait_fallback"], false);
+        assert!(decision["map_wait_ms"].as_u64().unwrap() >= 300);
         drop(db);
         drop(log);
         std::fs::remove_file(path).unwrap();

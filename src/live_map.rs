@@ -9,6 +9,8 @@ use std::thread::{self, JoinHandle};
 #[derive(Default)]
 struct Published {
     epoch: u64,
+    submitted: u64,
+    processed: u64,
     belief: Option<MapBelief>,
     pending: usize,
     fit_cancel: Arc<AtomicBool>,
@@ -17,7 +19,15 @@ struct Published {
 #[derive(Clone)]
 pub(crate) struct LiveMap {
     published: Arc<Mutex<Published>>,
-    sender: mpsc::Sender<(u64, ServerEvent)>,
+    sender: mpsc::Sender<(u64, u64, ServerEvent)>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MapProgress {
+    pub epoch: u64,
+    pub submitted: u64,
+    pub processed: u64,
+    pub pending: usize,
 }
 
 impl LiveMap {
@@ -43,12 +53,12 @@ impl LiveMap {
         + 'static,
     ) -> (Self, JoinHandle<()>) {
         let published = Arc::new(Mutex::new(Published::default()));
-        let (sender, receiver) = mpsc::channel::<(u64, ServerEvent)>();
+        let (sender, receiver) = mpsc::channel::<(u64, u64, ServerEvent)>();
         let worker_state = Arc::clone(&published);
         let worker = thread::spawn(move || {
             let mut estimator = OnlineEstimator::default();
             let mut estimator_epoch = 0;
-            while let Ok((epoch, event)) = receiver.recv() {
+            while let Ok((epoch, watermark, event)) = receiver.recv() {
                 let cancelled = {
                     let state = worker_state.lock().unwrap();
                     if state.epoch != epoch {
@@ -66,6 +76,7 @@ impl LiveMap {
                 let mut state = worker_state.lock().unwrap();
                 if state.epoch == epoch {
                     state.pending -= 1;
+                    state.processed = watermark;
                     if let Some(belief) = belief {
                         state.belief = Some(belief);
                     }
@@ -80,6 +91,8 @@ impl LiveMap {
         state.fit_cancel.store(true, Ordering::SeqCst);
         state.fit_cancel = Arc::new(AtomicBool::new(false));
         state.epoch += 1;
+        state.submitted = 0;
+        state.processed = 0;
         state.belief = None;
         state.pending = 0;
     }
@@ -87,19 +100,51 @@ impl LiveMap {
     pub(crate) fn observe(
         &self,
         event: &ServerEvent,
-    ) -> Result<(), mpsc::SendError<(u64, ServerEvent)>> {
-        let epoch = {
-            let mut state = self.published.lock().unwrap();
-            state.pending += 1;
-            state.epoch
-        };
-        self.sender.send((epoch, event.clone()))
+    ) -> Result<u64, mpsc::SendError<(u64, u64, ServerEvent)>> {
+        // Keep watermark assignment and channel order atomic. Otherwise concurrent
+        // producers can enqueue watermark 2 before 1 and make `processed` regress.
+        let mut state = self.published.lock().unwrap();
+        state.pending += 1;
+        state.submitted += 1;
+        let (epoch, watermark) = (state.epoch, state.submitted);
+        match self.sender.send((epoch, watermark, event.clone())) {
+            Ok(()) => Ok(watermark),
+            Err(error) => {
+                state.pending = state.pending.saturating_sub(1);
+                state.submitted = state.submitted.saturating_sub(1);
+                Err(error)
+            }
+        }
     }
 
     /// Read readiness and its corresponding belief under one lock.
+    #[cfg(test)]
     pub(crate) fn snapshot(&self) -> (bool, Option<MapBelief>) {
         let state = self.published.lock().unwrap();
         (state.pending > 0, state.belief.clone())
+    }
+
+    pub(crate) fn snapshot_with_progress(&self) -> (MapProgress, Option<MapBelief>) {
+        let state = self.published.lock().unwrap();
+        (
+            MapProgress {
+                epoch: state.epoch,
+                submitted: state.submitted,
+                processed: state.processed,
+                pending: state.pending,
+            },
+            state.belief.clone(),
+        )
+    }
+
+    pub(crate) fn progress(&self) -> MapProgress {
+        let state = self.published.lock().unwrap();
+        MapProgress {
+            epoch: state.epoch,
+            submitted: state.submitted,
+            processed: state.processed,
+            pending: state.pending,
+        }
     }
 }
 
@@ -138,6 +183,43 @@ mod tests {
         feed.reset();
         assert!(feed.snapshot().1.is_none());
         release_tx.send(()).unwrap();
+        drop(feed);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn observation_watermark_advances_only_after_ordered_processing_finishes() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut fits = 0;
+        let (feed, worker) = LiveMap::spawn_with(move |_, _, _| {
+            fits += 1;
+            if fits == 1 {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            }
+            Some(MapBelief::new(PlanetMap { planets: vec![] }, None))
+        });
+        let event = |player_id| ServerEvent::PlayerLeave { player_id };
+        assert_eq!(feed.observe(&event(1)).unwrap(), 1);
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(feed.observe(&event(2)).unwrap(), 2);
+        assert_eq!(
+            feed.progress(),
+            MapProgress {
+                epoch: 0,
+                submitted: 2,
+                processed: 0,
+                pending: 2,
+            }
+        );
+        release_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while feed.progress().processed < 2 {
+            assert!(std::time::Instant::now() < deadline);
+            thread::yield_now();
+        }
+        assert_eq!(feed.progress().pending, 0);
         drop(feed);
         worker.join().unwrap();
     }
