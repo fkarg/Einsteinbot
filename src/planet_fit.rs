@@ -1,4 +1,5 @@
 //! Joint physical-planet fitting from regular trajectories and associated surface contacts.
+use crate::estimator::CovarianceUnavailableReason;
 use crate::map::PlanetMap;
 use crate::protocol::{Planet, Point};
 use crate::simulation::{ShotObservation, WorldParameters, simulate_sampled_positions};
@@ -21,9 +22,13 @@ pub struct PlanetFit {
     /// or inactive inequality rows. This remains a conservative local approximation,
     /// not a calibrated posterior over unknown planet configurations.
     pub covariance: Option<DMatrix<f64>>,
+    pub covariance_unavailable_reason: Option<CovarianceUnavailableReason>,
     pub position_rmse: f64,
     pub contact_rmse: f64,
     pub rank: usize,
+    pub independent_paths: usize,
+    pub evidence_resolution: Option<DMatrix<f64>>,
+    pub parameter_to_physical: Option<DMatrix<f64>>,
     pub converged: bool,
 }
 
@@ -157,7 +162,21 @@ pub fn fit_planet_map(
     let largest = svd.singular_values.get(0).copied().unwrap_or(0.0);
     let tolerance = largest * 1e-8;
     let rank = svd.rank(tolerance);
-    let covariance = if rank == problem.parameters.len() && independent_paths > rank {
+    let evidence_resolution = field_evidence_resolution(&svd, problem.parameters.len());
+    let parameter_to_physical = problem.physical_jacobian(&problem.parameters);
+    let covariance_unavailable_reason = if rank < problem.parameters.len() {
+        Some(CovarianceUnavailableReason::RankDeficient)
+    } else if independent_paths <= rank {
+        Some(CovarianceUnavailableReason::InsufficientIndependentPaths)
+    } else if parameter_to_physical.is_none() {
+        Some(CovarianceUnavailableReason::ParameterTransformUnavailable)
+    } else {
+        None
+    };
+    let covariance = if let (None, Some(parameter_to_physical)) = (
+        covariance_unavailable_reason,
+        parameter_to_physical.as_ref(),
+    ) {
         let inverse = svd
             .pseudo_inverse(tolerance)
             .map_err(|error| error.to_string())?;
@@ -165,10 +184,8 @@ pub fn fit_planet_map(
         let parameter_covariance = &inverse * inverse.transpose() * variance;
         // Centers depend on both their bounded coordinate and radius. Propagate
         // the full nonlinear decoding Jacobian, including those cross terms.
-        let transform = problem
-            .physical_jacobian(&problem.parameters)
-            .ok_or("cannot transform fitted covariance")?;
-        let covariance = &transform * parameter_covariance * transform.transpose();
+        let covariance =
+            parameter_to_physical * parameter_covariance * parameter_to_physical.transpose();
         Some(covariance)
     } else {
         None
@@ -209,6 +226,7 @@ pub fn fit_planet_map(
     Ok(PlanetFit {
         map,
         covariance,
+        covariance_unavailable_reason,
         position_rmse: if coordinates == 0 {
             0.0
         } else {
@@ -216,8 +234,39 @@ pub fn fit_planet_map(
         },
         contact_rmse,
         rank,
+        independent_paths,
+        evidence_resolution,
+        parameter_to_physical,
         converged,
     })
+}
+
+fn field_evidence_resolution(
+    svd: &SVD<f64, Dyn, Dyn>,
+    parameter_count: usize,
+) -> Option<DMatrix<f64>> {
+    let v_t = svd.v_t.as_ref()?;
+    if v_t.ncols() != parameter_count {
+        return None;
+    }
+    let largest = svd.singular_values.get(0).copied().unwrap_or(0.0);
+    let cutoff = largest * 1e-8;
+    let components = svd
+        .singular_values
+        .len()
+        .min(v_t.nrows())
+        .min(parameter_count);
+    let values = DVector::from_fn(components, |index, _| {
+        let singular = svd.singular_values.get(index).copied().unwrap_or(0.0);
+        if singular > cutoff {
+            let information = singular * singular;
+            information / (1.0 + information)
+        } else {
+            0.0
+        }
+    });
+    let right_vectors = v_t.rows(0, components).transpose();
+    Some(&right_vectors * DMatrix::from_diagonal(&values) * right_vectors.transpose())
 }
 
 fn encode_planets(map: &PlanetMap, world: WorldParameters) -> DVector<f64> {
@@ -651,6 +700,10 @@ mod tests {
             few_paths.covariance.is_none(),
             "many correlated point rows cannot replace independent paths"
         );
+        assert_eq!(
+            few_paths.covariance_unavailable_reason,
+            Some(CovarianceUnavailableReason::InsufficientIndependentPaths)
+        );
         let fit =
             fit_planet_map(&initial, &paths, &contacts, world, &AtomicBool::new(false)).unwrap();
         for (got, expected) in fit.map.planets.iter().zip(&truth.planets) {
@@ -665,6 +718,10 @@ mod tests {
         assert!(fit.contact_rmse < 0.5);
         assert_eq!(fit.rank, 6);
         assert!(fit.covariance.is_some());
+        assert_eq!(fit.covariance_unavailable_reason, None);
+        assert!(fit.independent_paths > fit.rank);
+        assert!(fit.evidence_resolution.as_ref().unwrap().trace() > 0.0);
+        assert!(fit.parameter_to_physical.is_some());
         let repeated = paths
             .iter()
             .chain(paths.iter())
@@ -871,5 +928,9 @@ mod tests {
         .unwrap();
         assert!(fit.covariance.is_none());
         assert!(fit.rank < 3);
+        assert_eq!(
+            fit.covariance_unavailable_reason,
+            Some(CovarianceUnavailableReason::RankDeficient)
+        );
     }
 }

@@ -7,6 +7,16 @@ use crate::simulation::{ShotObservation, WorldParameters};
 use crate::strategy::MapBelief;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OnlineStageProfile {
+    pub prepare: Duration,
+    pub planet_fit: Duration,
+    pub local_residual: Duration,
+    pub field_hypothesis: Duration,
+    pub hypothesis_residual: Duration,
+}
 
 #[derive(Default)]
 pub struct OnlineEstimator {
@@ -24,6 +34,27 @@ impl OnlineEstimator {
         events: &[ServerEvent],
         cancelled: &AtomicBool,
     ) -> Option<MapBelief> {
+        self.observe_batch_inner(events, cancelled, None)
+    }
+
+    pub(crate) fn observe_profiled(
+        &mut self,
+        event: &ServerEvent,
+        cancelled: &AtomicBool,
+    ) -> (Option<MapBelief>, OnlineStageProfile) {
+        let mut stages = OnlineStageProfile::default();
+        let belief =
+            self.observe_batch_inner(std::slice::from_ref(event), cancelled, Some(&mut stages));
+        (belief, stages)
+    }
+
+    fn observe_batch_inner(
+        &mut self,
+        events: &[ServerEvent],
+        cancelled: &AtomicBool,
+        mut stages: Option<&mut OnlineStageProfile>,
+    ) -> Option<MapBelief> {
+        let prepare_started = stages.as_ref().map(|_| Instant::now());
         let mut prior_observations = self.observations.clone();
         let mut prior_map = self
             .belief
@@ -92,14 +123,24 @@ impl OnlineEstimator {
             })
             .collect::<Vec<_>>();
         let mut belief = MapBelief::new(map, None);
+        if let (Some(profile), Some(started)) = (stages.as_deref_mut(), prepare_started) {
+            profile.prepare += started.elapsed();
+        }
         if !belief.map.planets.is_empty() {
-            match fit_planet_map(
+            belief.covariance_unavailable_reason =
+                Some(crate::estimator::CovarianceUnavailableReason::FitFailed);
+            let fit_started = stages.as_ref().map(|_| Instant::now());
+            let fit_result = fit_planet_map(
                 &belief.map,
                 &self.observations,
                 &contact_constraints,
                 WorldParameters::default(),
                 cancelled,
-            ) {
+            );
+            if let (Some(profile), Some(started)) = (stages.as_deref_mut(), fit_started) {
+                profile.planet_fit += started.elapsed();
+            }
+            match fit_result {
                 Ok(fit) => {
                     self.contacts.refine_active_planets(&fit.map.planets);
                     let refined_map = PlanetMap {
@@ -113,10 +154,32 @@ impl OnlineEstimator {
                     };
                     let same_topology = refined_map == fit.map;
                     belief.map = refined_map;
-                    belief.parameter_covariance = if fit.converged && same_topology {
-                        fit.covariance
+                    belief.fit_rank = Some(fit.rank);
+                    belief.fit_parameter_count = Some(fit.map.planets.len() * 3);
+                    belief.fit_independent_path_count = Some(fit.independent_paths);
+                    belief.field_evidence = if same_topology && fit.converged {
+                        fit.evidence_resolution.zip(fit.parameter_to_physical).map(
+                            |(resolution, parameter_to_physical)| {
+                                std::sync::Arc::new(crate::strategy::FieldEvidence {
+                                    resolution,
+                                    parameter_to_physical,
+                                })
+                            },
+                        )
                     } else {
                         None
+                    };
+                    belief.parameter_covariance = if !same_topology || !fit.converged {
+                        None
+                    } else {
+                        fit.covariance
+                    };
+                    belief.covariance_unavailable_reason = if !same_topology {
+                        Some(crate::estimator::CovarianceUnavailableReason::TopologyChanged)
+                    } else if !fit.converged {
+                        Some(crate::estimator::CovarianceUnavailableReason::FitDidNotConverge)
+                    } else {
+                        fit.covariance_unavailable_reason
                     };
                     belief.fit_converged = same_topology.then_some(fit.converged);
                     belief.model_position_rmse = same_topology.then_some(fit.position_rmse);
@@ -135,6 +198,9 @@ impl OnlineEstimator {
                     eprintln!("LivePlanetFitError {error}; retaining contact-seeded partial map")
                 }
             }
+        } else {
+            belief.covariance_unavailable_reason =
+                Some(crate::estimator::CovarianceUnavailableReason::NoPlanetParameters);
         }
         if cancelled.load(Ordering::SeqCst) {
             return None;
@@ -153,17 +219,27 @@ impl OnlineEstimator {
             .filter(|h| h.association_ambiguous)
             .count();
         belief.contact_points = self.contacts.contact_points().to_vec();
+        let residual_started = stages.as_ref().map(|_| Instant::now());
         belief.local_field =
             crate::local_field::LocalField::from_observations(&belief.map, &self.observations);
-        if !self.update_field_hypotheses_prequential(
+        if let (Some(profile), Some(started)) = (stages.as_deref_mut(), residual_started) {
+            profile.local_residual += started.elapsed();
+        }
+        let hypothesis_started = stages.as_ref().map(|_| Instant::now());
+        let hypothesis_ok = self.update_field_hypotheses_prequential(
             &prior_map,
             &belief.map,
             &prior_observations,
             &new_observations,
             cancelled,
-        ) {
+        );
+        if let (Some(profile), Some(started)) = (stages.as_deref_mut(), hypothesis_started) {
+            profile.field_hypothesis += started.elapsed();
+        }
+        if !hypothesis_ok {
             return None;
         }
+        let hypothesis_residual_started = stages.as_ref().map(|_| Instant::now());
         if let Some(hypothesis) = &self.field_hypothesis {
             let mut gravity_sources = belief.map.clone();
             gravity_sources.planets.push(crate::protocol::Planet {
@@ -178,6 +254,10 @@ impl OnlineEstimator {
                     &self.observations,
                 ));
             belief.field_hypothesis = Some(hypothesis.clone());
+        }
+        if let (Some(profile), Some(started)) = (stages.as_deref_mut(), hypothesis_residual_started)
+        {
+            profile.hypothesis_residual += started.elapsed();
         }
         if cancelled.load(Ordering::SeqCst) {
             return None;
@@ -640,6 +720,10 @@ mod tests {
             )
             .unwrap();
         assert!(belief.map.planets.is_empty());
+        assert_eq!(
+            belief.covariance_unavailable_reason,
+            Some(crate::estimator::CovarianceUnavailableReason::NoPlanetParameters)
+        );
         let heldout = ShotObservation {
             player_id: 1,
             angle_degrees: 0.0,

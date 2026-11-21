@@ -14,6 +14,20 @@ const PARAMETERS_PER_PLANET: usize = 3;
 /// Position observations are f32; exact synthetic fits still need a nonzero noise floor.
 const POSITION_NOISE_FLOOR: f64 = 1e-4;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CovarianceUnavailableReason {
+    NotComputed,
+    NoPlanetParameters,
+    FitFailed,
+    TopologyChanged,
+    FitDidNotConverge,
+    ParameterTransformUnavailable,
+    RankDeficient,
+    InsufficientResidualDegreesOfFreedom,
+    InsufficientIndependentPaths,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct FitResult {
     /// Best-fit physical source configuration. Radius is held at its prior value in this fit.
@@ -22,6 +36,7 @@ pub struct FitResult {
     /// Local covariance uses a `1e-4` world-unit observation-noise floor. `None` means the fit
     /// Jacobian is rank deficient or has no residual degrees of freedom.
     pub covariance: Option<DMatrix<f64>>,
+    pub covariance_unavailable_reason: Option<CovarianceUnavailableReason>,
     pub rank: usize,
     pub singular_values: Vec<f64>,
     pub residual_rmse: f64,
@@ -486,7 +501,9 @@ pub fn fit_fixed_count(
     let rank_tolerance = largest_singular_value * 1e-8;
     let rank = svd.rank(rank_tolerance);
     let singular_values = svd.singular_values.iter().copied().collect::<Vec<_>>();
-    let covariance = if rank == parameter_count && residuals.len() > parameter_count {
+    let covariance_unavailable_reason =
+        covariance_unavailable_reason(rank, parameter_count, residuals.len());
+    let covariance = if covariance_unavailable_reason.is_none() {
         let residual_variance = (residuals.norm_squared()
             / (residuals.len() - parameter_count) as f64)
             .max(POSITION_NOISE_FLOOR.powi(2));
@@ -508,11 +525,26 @@ pub fn fit_fixed_count(
     Ok(FitResult {
         map: fitted_map,
         covariance,
+        covariance_unavailable_reason,
         rank,
         singular_values,
         residual_rmse,
         converged: report.termination.was_successful(),
     })
+}
+
+fn covariance_unavailable_reason(
+    rank: usize,
+    parameter_count: usize,
+    residual_count: usize,
+) -> Option<CovarianceUnavailableReason> {
+    if rank < parameter_count {
+        Some(CovarianceUnavailableReason::RankDeficient)
+    } else if residual_count <= parameter_count {
+        Some(CovarianceUnavailableReason::InsufficientResidualDegreesOfFreedom)
+    } else {
+        None
+    }
 }
 
 struct TrajectoryFitProblem {
@@ -710,6 +742,23 @@ mod tests {
         };
         shot.points = simulate_sampled_path(map, &shot, WorldParameters::default(), 40).unwrap();
         shot
+    }
+
+    #[test]
+    fn covariance_unavailability_explains_rank_and_residual_degree_failures() {
+        assert_eq!(
+            covariance_unavailable_reason(2, 3, 20),
+            Some(CovarianceUnavailableReason::RankDeficient)
+        );
+        assert_eq!(
+            covariance_unavailable_reason(3, 3, 3),
+            Some(CovarianceUnavailableReason::InsufficientResidualDegreesOfFreedom)
+        );
+        assert_eq!(covariance_unavailable_reason(3, 3, 4), None);
+        assert_eq!(
+            serde_json::to_value(CovarianceUnavailableReason::RankDeficient).unwrap(),
+            "rank_deficient"
+        );
     }
 
     #[test]

@@ -8,6 +8,7 @@ use crate::simulation::{
 use nalgebra::DMatrix;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub struct MapBelief {
@@ -19,6 +20,13 @@ pub struct MapBelief {
     pub hypothesis_local_field: Option<crate::local_field::LocalField>,
     /// Covariance ordered by `[center_x, center_y, mass]` for each planet.
     pub parameter_covariance: Option<DMatrix<f64>>,
+    /// Why physical parameter covariance is unavailable for this published belief.
+    pub covariance_unavailable_reason: Option<crate::estimator::CovarianceUnavailableReason>,
+    pub fit_rank: Option<usize>,
+    pub fit_parameter_count: Option<usize>,
+    pub fit_independent_path_count: Option<usize>,
+    /// Modelled-planet parameter sensitivity informed by this map epoch's observations.
+    pub field_evidence: Option<Arc<FieldEvidence>>,
     /// Observed contact points, retained even before radius is identifiable.
     pub contact_points: Vec<Point>,
     /// Raw trajectory error exposes model mismatch beyond local covariance.
@@ -28,14 +36,30 @@ pub struct MapBelief {
     pub uncertain_associations: usize,
 }
 
+#[derive(Clone, Debug)]
+pub struct FieldEvidence {
+    /// Resolution matrix in the fitter's normalized parameter coordinates.
+    pub resolution: DMatrix<f64>,
+    /// Maps normalized fitter parameters to physical `[x, y, mass]` parameters.
+    pub parameter_to_physical: DMatrix<f64>,
+}
+
 impl MapBelief {
     pub fn new(map: PlanetMap, parameter_covariance: Option<DMatrix<f64>>) -> Self {
+        let covariance_unavailable_reason = parameter_covariance
+            .is_none()
+            .then_some(crate::estimator::CovarianceUnavailableReason::NotComputed);
         Self {
             map,
             local_field: crate::local_field::LocalField::default(),
             field_hypothesis: None,
             hypothesis_local_field: None,
             parameter_covariance,
+            covariance_unavailable_reason,
+            fit_rank: None,
+            fit_parameter_count: None,
+            fit_independent_path_count: None,
+            field_evidence: None,
             contact_points: Vec::new(),
             model_position_rmse: None,
             fit_converged: None,
@@ -71,6 +95,52 @@ impl MapBelief {
                 (source.x + correction.x - base.x).hypot(source.y + correction.y - base.y);
             Some((evidence * (1.0 - evidence)).sqrt() * difference)
         })
+    }
+
+    /// Fraction of the modelled physical gravity field constrained by trajectory and
+    /// contact evidence. This is a sensitivity-availability heuristic, not a probability
+    /// or a claim about unmodelled planets.
+    pub fn evidence_availability_at(&self, position: Vec2) -> Option<f64> {
+        const FIELD_SENSITIVITY_FLOOR: f64 = 1e-12;
+        let evidence = self.field_evidence.as_ref()?;
+        let parameter_count = self.map.planets.len().checked_mul(3)?;
+        if parameter_count == 0
+            || evidence.resolution.shape() != (parameter_count, parameter_count)
+            || evidence.parameter_to_physical.shape() != (parameter_count, parameter_count)
+        {
+            return None;
+        }
+
+        let mut physical_sensitivity = DMatrix::zeros(2, parameter_count);
+        for (index, planet) in self.map.planets.iter().enumerate() {
+            let dx = planet.x - position.x;
+            let dy = planet.y - position.y;
+            let radius_squared = dx * dx + dy * dy;
+            if !radius_squared.is_finite() || radius_squared == 0.0 {
+                return None;
+            }
+            let inverse_r3 = 1.0 / (radius_squared * radius_squared.sqrt());
+            let inverse_r5 = inverse_r3 / radius_squared;
+            let offset = index * 3;
+            physical_sensitivity[(0, offset)] =
+                planet.mass * (inverse_r3 - 3.0 * dx * dx * inverse_r5);
+            physical_sensitivity[(1, offset)] = -3.0 * planet.mass * dx * dy * inverse_r5;
+            physical_sensitivity[(0, offset + 1)] = -3.0 * planet.mass * dx * dy * inverse_r5;
+            physical_sensitivity[(1, offset + 1)] =
+                planet.mass * (inverse_r3 - 3.0 * dy * dy * inverse_r5);
+            physical_sensitivity[(0, offset + 2)] = dx * inverse_r3;
+            physical_sensitivity[(1, offset + 2)] = dy * inverse_r3;
+        }
+        let parameter_sensitivity = physical_sensitivity * &evidence.parameter_to_physical;
+        let total_sensitivity =
+            (&parameter_sensitivity * parameter_sensitivity.transpose()).trace();
+        let explained_sensitivity =
+            (&parameter_sensitivity * &evidence.resolution * parameter_sensitivity.transpose())
+                .trace();
+        let availability = explained_sensitivity / (total_sensitivity + FIELD_SENSITIVITY_FLOOR);
+        availability
+            .is_finite()
+            .then_some(availability.clamp(0.0, 1.0))
     }
 
     fn field_uncertainty(&self, position: Vec2) -> Option<f64> {
@@ -949,6 +1019,57 @@ mod tests {
             .field_uncertainty(Vec2::new(2.0, 0.0))
             .expect("matching covariance");
         assert!((uncertainty - 4.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn evidence_availability_follows_modelled_parameter_sensitivity_beyond_paths() {
+        let map = PlanetMap {
+            planets: vec![crate::protocol::Planet {
+                x: 600.0,
+                y: 500.0,
+                radius: 30.0,
+                mass: 2700.0,
+            }],
+        };
+        let mut belief = MapBelief::new(map, None);
+        let far_point = Vec2::new(0.0, 500.0);
+        assert_eq!(belief.evidence_availability_at(far_point), None);
+
+        belief.field_evidence = Some(Arc::new(FieldEvidence {
+            resolution: DMatrix::identity(3, 3) * 0.5,
+            parameter_to_physical: DMatrix::identity(3, 3),
+        }));
+        let availability = belief
+            .evidence_availability_at(far_point)
+            .expect("parameterized physical map has a sensitivity model");
+        assert!((availability - 0.5).abs() < 0.01);
+
+        Arc::make_mut(belief.field_evidence.as_mut().unwrap())
+            .resolution
+            .fill(0.0);
+        assert_eq!(belief.evidence_availability_at(far_point), Some(0.0));
+
+        Arc::make_mut(belief.field_evidence.as_mut().unwrap()).resolution[(0, 0)] = 0.5;
+        assert!(
+            belief.evidence_availability_at(far_point).unwrap() > 0.3,
+            "a constrained gravity direction remains useful when other parameters are unidentified"
+        );
+
+        let evidence = Arc::make_mut(belief.field_evidence.as_mut().unwrap());
+        evidence.resolution =
+            DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![1.0, 0.0, 0.0]));
+        evidence.parameter_to_physical =
+            DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![300.0, 300.0, 1_500.0]));
+        let horizontal = belief
+            .evidence_availability_at(Vec2::new(300.0, 500.0))
+            .unwrap();
+        let vertical = belief
+            .evidence_availability_at(Vec2::new(600.0, 200.0))
+            .unwrap();
+        assert!(
+            horizontal > vertical,
+            "availability should follow the resolved parameter's field sensitivity"
+        );
     }
 
     #[test]
