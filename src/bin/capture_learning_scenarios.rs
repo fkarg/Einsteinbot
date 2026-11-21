@@ -391,8 +391,12 @@ mod tests {
             y: 20.0,
             mass: 100.0,
             support: vec![],
+            support_paths: vec![],
             baseline_continuation_rmse: 1.0,
             continuation_rmse: 0.5,
+            training_paths: 1,
+            validation_paths: 1,
+            relative_improvement: 0.5,
         };
         let mut shot = ShotObservation {
             player_id: 1,

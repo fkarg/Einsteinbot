@@ -1,9 +1,13 @@
 //! Field-only gravity proposal from an observed trajectory.
 use crate::estimator::seed_planet_from_residuals_cancellable;
+use crate::local_field::LocalField;
 use crate::map::{PlanetMap, Vec2};
 use crate::planet_fit::fit_planet_map;
 use crate::protocol::{Planet, Point};
-use crate::simulation::{ShotObservation, WorldParameters, simulate_sampled_positions};
+use crate::simulation::{
+    ShotObservation, WorldParameters, simulate_sampled_positions,
+    simulate_sampled_positions_with_hypothesis, simulate_sampled_positions_with_local_field,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -16,16 +20,40 @@ pub struct FieldHypothesis {
     pub y: f64,
     pub mass: f64,
     pub support: Vec<Point>,
+    /// Independent paths constraining this model; `support` remains for older captures.
+    #[serde(default)]
+    pub support_paths: Vec<Vec<Point>>,
+    /// Legacy field names for mean held-out position RMSE. Single-path proposals score
+    /// the held-out tail; joint proposals score whole independent trajectories.
     pub baseline_continuation_rmse: f64,
     pub continuation_rmse: f64,
+    /// Independent trajectories used to estimate and validate this source.
+    #[serde(default)]
+    pub training_paths: usize,
+    #[serde(default)]
+    pub validation_paths: usize,
+    /// Relative reduction in mean held-out position RMSE; heuristic, not a probability.
+    #[serde(default)]
+    pub relative_improvement: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FieldValidation {
+    pub baseline_rmse: f64,
+    pub candidate_rmse: f64,
+    pub paths: usize,
+    pub improved_paths: usize,
+    pub regressed: bool,
 }
 
 impl FieldHypothesis {
     /// Distance in world units to the nearest observed timed trajectory segment.
     /// This proxy is not a standard deviation; proximity alone cannot prove accuracy.
     pub fn support_distance(&self, point: Vec2) -> f64 {
-        self.support
-            .windows(2)
+        self.support_paths
+            .iter()
+            .flat_map(|path| path.windows(2))
+            .chain(self.support.windows(2))
             .map(|pair| {
                 let x = f64::from(pair[0].x) - point.x;
                 let y = f64::from(pair[0].y) - point.y;
@@ -139,8 +167,13 @@ pub fn propose_field(
         y: source.y,
         mass: source.mass,
         support: shot.points[..count].to_vec(),
+        support_paths: vec![shot.points[..count].to_vec()],
         baseline_continuation_rmse,
         continuation_rmse,
+        training_paths: 1,
+        validation_paths: 1,
+        relative_improvement: (1.0 - continuation_rmse / baseline_continuation_rmse)
+            .clamp(0.0, 1.0),
     })
 }
 
@@ -210,9 +243,201 @@ pub fn propose_residual_field(
         y: source.y,
         mass: source.mass,
         support: shot.points[..count].to_vec(),
+        support_paths: vec![shot.points[..count].to_vec()],
         baseline_continuation_rmse,
         continuation_rmse,
+        training_paths: 1,
+        validation_paths: 1,
+        relative_improvement: (1.0 - continuation_rmse / baseline_continuation_rmse)
+            .clamp(0.0, 1.0),
     })
+}
+
+/// Seed a field-only source from prior paths and require improvement on distinct whole paths.
+/// The source extends globally as a gravity field, but only the local residual is interpolated
+/// near training paths. Neither component supplies collision geometry.
+pub fn propose_joint_residual_field(
+    training: &[ShotObservation],
+    validation: &[ShotObservation],
+    baseline: &PlanetMap,
+    world: WorldParameters,
+    cancelled: &AtomicBool,
+) -> Option<FieldHypothesis> {
+    if cancelled.load(Ordering::Relaxed) {
+        return None;
+    }
+    let training = distinct_paths(training);
+    let validation = distinct_paths(validation);
+    if training.is_empty() || validation.is_empty() {
+        return None;
+    }
+    let source =
+        seed_planet_from_residuals_cancellable(baseline, &training, world, 30.0, 50.0, cancelled)
+            .ok()?;
+    if cancelled.load(Ordering::Relaxed)
+        || ![source.x, source.y, source.mass]
+            .iter()
+            .all(|value| value.is_finite())
+        || source.mass <= 0.0
+    {
+        return None;
+    }
+
+    let candidate = FieldHypothesis {
+        x: source.x,
+        y: source.y,
+        mass: source.mass,
+        support: training[0].points.clone(),
+        support_paths: training
+            .iter()
+            .chain(&validation)
+            .map(|shot| shot.points.clone())
+            .collect(),
+        baseline_continuation_rmse: 0.0,
+        continuation_rmse: 0.0,
+        training_paths: training.len(),
+        validation_paths: 0,
+        relative_improvement: 0.0,
+    };
+
+    let Ok(Some(validation)) = validate_residual_field(
+        &candidate,
+        &training,
+        &validation,
+        baseline,
+        world,
+        cancelled,
+    ) else {
+        return None;
+    };
+    if validation.regressed || validation.improved_paths == 0 || cancelled.load(Ordering::Relaxed) {
+        return None;
+    }
+    Some(FieldHypothesis {
+        baseline_continuation_rmse: validation.baseline_rmse,
+        continuation_rmse: validation.candidate_rmse,
+        validation_paths: validation.paths,
+        relative_improvement: if validation.baseline_rmse > 0.0 {
+            (1.0 - validation.candidate_rmse / validation.baseline_rmse).clamp(0.0, 1.0)
+        } else {
+            0.0
+        },
+        ..candidate
+    })
+}
+
+/// Compare source/no-source predictions on whole paths not used to build either residual field.
+/// `regressed` flags any path whose error worsens by more than 20% plus the quantization floor.
+pub fn validate_residual_field(
+    hypothesis: &FieldHypothesis,
+    training: &[ShotObservation],
+    validation: &[ShotObservation],
+    baseline: &PlanetMap,
+    world: WorldParameters,
+    cancelled: &AtomicBool,
+) -> Result<Option<FieldValidation>, String> {
+    let training = distinct_paths(training);
+    let validation = distinct_paths(validation);
+    if training.is_empty() || validation.is_empty() {
+        return Ok(None);
+    }
+    let baseline_field = LocalField::from_observations(baseline, &training);
+    let source_field = LocalField::from_observations(
+        &PlanetMap {
+            planets: baseline
+                .planets
+                .iter()
+                .cloned()
+                .chain(std::iter::once(Planet {
+                    x: hypothesis.x,
+                    y: hypothesis.y,
+                    radius: 0.0,
+                    mass: hypothesis.mass,
+                }))
+                .collect(),
+        },
+        &training,
+    );
+    let mut baseline_error = 0.0;
+    let mut candidate_error = 0.0;
+    let mut paths = 0;
+    let mut improved_paths = 0;
+    let mut regressed = false;
+    for shot in &validation {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err("cancelled".to_owned());
+        }
+        let Some(base) = path_rmse(baseline, &baseline_field, None, shot, world)? else {
+            continue;
+        };
+        let Some(candidate) = path_rmse(baseline, &source_field, Some(hypothesis), shot, world)?
+        else {
+            return Ok(None);
+        };
+        regressed |= candidate > base * 1.2 + 0.01;
+        if base > 0.01 && candidate < base * 0.8 {
+            improved_paths += 1;
+        }
+        baseline_error += base;
+        candidate_error += candidate;
+        paths += 1;
+    }
+    Ok((paths > 0).then(|| FieldValidation {
+        baseline_rmse: baseline_error / paths as f64,
+        candidate_rmse: candidate_error / paths as f64,
+        paths,
+        improved_paths,
+        regressed,
+    }))
+}
+
+fn distinct_paths(shots: &[ShotObservation]) -> Vec<ShotObservation> {
+    let mut distinct = Vec::new();
+    for shot in shots.iter().filter(|shot| shot.points.len() >= 3) {
+        if !distinct.iter().any(|known: &ShotObservation| {
+            known.angle_degrees == shot.angle_degrees
+                && known.velocity == shot.velocity
+                && known.points == shot.points
+        }) {
+            distinct.push(shot.clone());
+        }
+    }
+    distinct
+}
+
+fn path_rmse(
+    map: &PlanetMap,
+    field: &LocalField,
+    hypothesis: Option<&FieldHypothesis>,
+    shot: &ShotObservation,
+    world: WorldParameters,
+) -> Result<Option<f64>, String> {
+    let Some(sample_count) = shot.points.len().checked_sub(1) else {
+        return Ok(None);
+    };
+    if sample_count < 2 {
+        return Ok(None);
+    }
+    let predicted = if let Some(hypothesis) = hypothesis {
+        simulate_sampled_positions_with_hypothesis(
+            map,
+            field,
+            hypothesis,
+            shot,
+            world,
+            sample_count,
+        )
+    } else {
+        simulate_sampled_positions_with_local_field(map, field, shot, world, sample_count)
+    }?;
+    let mut squared = 0.0;
+    let mut coordinates = 0;
+    for (observed, predicted) in shot.points[1..sample_count].iter().zip(&predicted[1..]) {
+        squared += (f64::from(observed.x) - predicted.x).powi(2)
+            + (f64::from(observed.y) - predicted.y).powi(2);
+        coordinates += 2;
+    }
+    Ok((coordinates > 0).then(|| (squared / coordinates as f64).sqrt()))
 }
 
 #[cfg(test)]
@@ -234,6 +459,19 @@ mod tests {
         let path = simulate_shot(map, &shot, WorldParameters::default(), 2000).unwrap();
         assert_eq!(path.termination, Termination::BattlefieldMargin);
         shot.points = path.points;
+        shot
+    }
+
+    fn observed_any(map: &PlanetMap, y: f32, angle: f64) -> ShotObservation {
+        let mut shot = ShotObservation {
+            player_id: 1,
+            angle_degrees: angle,
+            velocity: 8.0,
+            points: vec![Point { x: 200.0, y }],
+        };
+        shot.points = simulate_shot(map, &shot, WorldParameters::default(), 2000)
+            .unwrap()
+            .points;
         shot
     }
     #[test]
@@ -291,8 +529,12 @@ mod tests {
             y: 10.0,
             mass: 2700.0,
             support: vec![Point { x: 0.0, y: 0.0 }, Point { x: 100.0, y: 0.0 }],
+            support_paths: vec![],
             baseline_continuation_rmse: 10.0,
             continuation_rmse: 1.0,
+            training_paths: 1,
+            validation_paths: 1,
+            relative_improvement: 0.9,
         };
         let on = hypothesis.relative_uncertainty_proxy(Vec2::new(50.0, 0.0));
         let near = hypothesis.relative_uncertainty_proxy(Vec2::new(50.0, 25.0));
@@ -405,6 +647,64 @@ mod tests {
         )
         .unwrap();
         assert_eq!(path.termination, Termination::SampleLimit);
+    }
+
+    #[test]
+    fn joint_residual_source_uses_prior_paths_and_improves_a_whole_heldout_path() {
+        let known = PlanetMap {
+            planets: vec![Planet {
+                x: 600.0,
+                y: 500.0,
+                radius: 30.0,
+                mass: 2700.0,
+            }],
+        };
+        let truth = PlanetMap {
+            planets: vec![
+                known.planets[0].clone(),
+                Planet {
+                    x: 900.0,
+                    y: 500.0,
+                    radius: 35.0,
+                    mass: 4287.5,
+                },
+            ],
+        };
+        let training = [
+            observed_any(&truth, 400.0, 0.0),
+            observed_any(&truth, 350.0, 0.0),
+        ];
+        let validation = [observed_any(&truth, 250.0, 0.0)];
+        let proposal = propose_joint_residual_field(
+            &training,
+            &validation,
+            &known,
+            WorldParameters::default(),
+            &AtomicBool::new(false),
+        )
+        .expect("joint residual source predicts a separate path");
+
+        assert_eq!(proposal.training_paths, 2);
+        assert_eq!(proposal.validation_paths, 1);
+        assert!(proposal.relative_improvement >= 0.2);
+        let on_path = proposal.support_distance(Vec2::new(200.0, 400.0));
+        let other_path = proposal.support_distance(Vec2::new(200.0, 350.0));
+        let far = proposal.support_distance(Vec2::new(200.0, 50.0));
+        assert!(on_path < 0.001 && other_path < 0.001 && far > on_path + 100.0);
+
+        let mut invalid_world = WorldParameters::default();
+        invalid_world.substeps_per_tick = 0;
+        assert!(
+            validate_residual_field(
+                &proposal,
+                &training,
+                &validation,
+                &known,
+                invalid_world,
+                &AtomicBool::new(false),
+            )
+            .is_err()
+        );
     }
 
     #[test]

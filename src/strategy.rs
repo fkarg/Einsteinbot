@@ -44,17 +44,48 @@ impl MapBelief {
         }
     }
 
+    /// Gravity disagreement between the supported source and no-source models.
+    /// This is a model-choice spread heuristic, not a probability or full epistemic
+    /// uncertainty; it is unavailable without a validated field hypothesis.
+    pub fn model_disagreement_at(&self, position: Vec2) -> Option<f64> {
+        // Treat the validated source and the no-source model as alternatives. Their
+        // gravity difference is broad in space, while the validation score controls
+        // how much model-choice uncertainty remains. This is a heuristic mixture, not
+        // a calibrated posterior; keep it separate from physical parameter covariance.
+        self.field_hypothesis.as_ref().and_then(|hypothesis| {
+            let evidence = 1.0
+                - (-hypothesis.relative_improvement.clamp(0.0, 1.0)
+                    * hypothesis.validation_paths as f64)
+                    .exp();
+            let base = self
+                .local_field
+                .residual(position)
+                .unwrap_or_else(|| Vec2::new(0.0, 0.0));
+            let source = hypothesis.acceleration(position)?;
+            let correction = self
+                .hypothesis_local_field
+                .as_ref()
+                .and_then(|field| field.residual(position))
+                .unwrap_or_else(|| Vec2::new(0.0, 0.0));
+            let difference =
+                (source.x + correction.x - base.x).hypot(source.y + correction.y - base.y);
+            Some((evidence * (1.0 - evidence)).sqrt() * difference)
+        })
+    }
+
     fn field_uncertainty(&self, position: Vec2) -> Option<f64> {
-        let Some(covariance) = &self.parameter_covariance else {
-            return None;
-        };
-        let Ok(covariance) = self.map.acceleration_covariance(position, covariance) else {
-            return None;
-        };
-        // Include parameter correlations: center/mass uncertainty can reinforce or
-        // cancel in the predicted acceleration at this point.
-        let variance = covariance.xx + covariance.yy;
-        Some(variance.max(0.0).sqrt())
+        let parameter = self.parameter_covariance.as_ref().and_then(|parameters| {
+            self.map
+                .acceleration_covariance(position, parameters)
+                .ok()
+                .map(|covariance| (covariance.xx + covariance.yy).max(0.0).sqrt())
+        });
+        let model = self.model_disagreement_at(position).map(f64::abs);
+        match (parameter, model) {
+            (Some(parameter), Some(model)) => Some(parameter.max(model)),
+            (Some(uncertainty), None) | (None, Some(uncertainty)) => Some(uncertainty),
+            (None, None) => None,
+        }
     }
 }
 
@@ -892,6 +923,35 @@ mod tests {
     }
 
     #[test]
+    fn validated_source_disagreement_contributes_broad_gravity_uncertainty() {
+        let mut belief = MapBelief::new(PlanetMap { planets: vec![] }, None);
+        belief.field_hypothesis = Some(crate::field_hypothesis::FieldHypothesis {
+            x: 600.0,
+            y: 500.0,
+            mass: 2700.0,
+            support: vec![],
+            support_paths: vec![],
+            baseline_continuation_rmse: 3.0,
+            continuation_rmse: 0.6,
+            training_paths: 3,
+            validation_paths: 1,
+            relative_improvement: 0.8,
+        });
+        belief.hypothesis_local_field = Some(crate::local_field::LocalField::default());
+        let far_from_support = Vec2::new(200.0, 500.0);
+        let early = belief
+            .field_uncertainty(far_from_support)
+            .expect("source/no-source disagreement is available without covariance");
+        belief.field_hypothesis.as_mut().unwrap().validation_paths = 8;
+        let corroborated = belief.field_uncertainty(far_from_support).unwrap();
+        assert!(early > 0.0);
+        assert!(
+            corroborated < early,
+            "independent support reduces model-choice spread"
+        );
+    }
+
+    #[test]
     fn diagnostic_snapshot_restores_targeting_history() {
         let mut state = flat_field_state();
         state.observe(&observed_shot((100.0, 100.0), 3.0, 15));
@@ -1015,8 +1075,12 @@ mod tests {
             y: 100.0,
             mass: 2700.0,
             support: vec![Point { x: 100.0, y: 100.0 }, Point { x: 110.0, y: 100.0 }],
+            support_paths: vec![],
             baseline_continuation_rmse: 10.0,
             continuation_rmse: 1.0,
+            training_paths: 1,
+            validation_paths: 1,
+            relative_improvement: 0.9,
         });
         belief.hypothesis_local_field = Some(crate::local_field::LocalField::default());
         state.set_map_belief(Some(belief));

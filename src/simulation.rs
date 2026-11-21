@@ -471,8 +471,12 @@ mod tests {
             y,
             mass,
             support: vec![],
+            support_paths: vec![],
             baseline_continuation_rmse: 1.0,
             continuation_rmse: 0.5,
+            training_paths: 1,
+            validation_paths: 1,
+            relative_improvement: 0.5,
         }
     }
 

@@ -50,7 +50,7 @@ Terms (from the user's decomposition; they stay separate diagnostics first, and 
 | `fit_converged`, `model_position_rmse` | `map_belief` | per belief | rmse may be absent mid-capture |
 | `contact_points[]` | `map_belief` | per contact | accepted endpoints only |
 | `local_field` | `map_belief` | spatial samples | residual mean, fixed 40-unit support |
-| `field_hypothesis`, `hypothesis_local_field` | `map_belief` | one source | never collision geometry |
+| `field_hypothesis`, `hypothesis_local_field` | `map_belief` | one source | never collision geometry; includes all independent support paths, training/validation counts, and held-out RMSE improvement. The legacy `continuation_rmse` names hold tail RMSE for single-path proposals and whole-path RMSE for joint proposals. |
 | `bot_state` (positions, in-flight, covered cells) | decision | per decision | |
 | `map_epoch`, `map_submitted_watermark`, `map_processed_watermark`, `map_pending_events`, `map_wait_ms`, `map_wait_fallback`, `map_updating` | decision | per decision | observation age |
 | `choice` | decision | per decision | policy output |
@@ -60,6 +60,7 @@ Terms (from the user's decomposition; they stay separate diagnostics first, and 
 
 | ID | Quantity | Granularity | Viewer use | Status |
 | --- | --- | --- | --- | --- |
+| Q-MD | `model_disagreement_at(Vec2) -> Option<f64>`: gravity spread between the no-source and validated source models, weighted by held-out improvement and independent validation count; `None` without a validated source | per location | inspect broad-area model-choice uncertainty separately from physical parameter covariance and residual uncertainty | library method implemented; viewer endpoint pending |
 | Q-EV | evidence availability `evidence_at(Vec2) -> Option<f64>` reflecting global parameter sensitivity of observed paths, not a fixed-distance tube; `None` when no evidence model exists | per location | replaces the current binary "Evidence" layer (viewer currently uses only the 40-unit residual support) | proposed |
 | Q-RU | residual uncertainty `residual_uncertainty_at(Vec2) -> Option<f64>` | per location | separate layer from residual mean | proposed |
 | Q-FU | epistemic field uncertainty `field_uncertainty_at(Vec2) -> Option<f64>` derived from the model mixture (not a sum of the above), with a `components` breakdown | per location | combined view plus per-cause attribution | proposed |
@@ -100,3 +101,4 @@ Terms (from the user's decomposition; they stay separate diagnostics first, and 
 | --- | --- | --- | --- |
 | 2026-11-21 | viewer | `/api/decisions` gains `accuracy` (disclosed-map comparison, null without a disclosed map) and `/api/snapshot` gains `planet_match`; both additive. | no |
 | 2026-11-21 | viewer | Created this contract. Viewer removes the `field`/`heat`/`scale`/`resolution` controls; `/api/snapshot` keeps accepting `field` and `step` for compatibility. | no |
+| 2026-11-21 | estimator | `field_hypothesis` adds support paths and validation/training metrics; joint hypotheses are seeded from prior trajectories and scored on new whole paths against the frozen prior physical map, then vetoed if the post-fit physical map already explains them. `MapBelief::model_disagreement_at` exposes a separate broad source/no-source gravity spread; it is heuristic, not calibrated, and does not replace residual uncertainty or full Q-FU. | no |

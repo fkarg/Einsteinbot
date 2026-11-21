@@ -303,8 +303,19 @@ fn learned_baseline_probe(truth: &PlanetMap) {
         y: source.y,
         mass: source.mass,
         support: train.points[..train.points.len() - 1].to_vec(),
+        support_paths: observations
+            .iter()
+            .map(|shot| shot.points.clone())
+            .collect(),
         baseline_continuation_rmse: base_tail,
         continuation_rmse: fit_tail,
+        training_paths: observations.len(),
+        validation_paths: 1,
+        relative_improvement: if base_tail > 0.0 {
+            (1.0 - fit_tail / base_tail).clamp(0.0, 1.0)
+        } else {
+            0.0
+        },
     });
     println!(
         "  seed_and_joint_fit_ms={seed_and_joint_fit_ms} contacts={} fake_source_radius={}",

@@ -173,23 +173,40 @@ fn try_seed_planet_from_residuals(
         ));
     }
 
-    let samples = observations
-        .iter()
-        .flat_map(|observation| reconstruct_acceleration(&observation.points))
-        .map(|(position, observed)| {
+    // Give each distinct trajectory equal weight. Its tick samples are correlated, so a long
+    // path must not overwhelm other independent directions merely by containing more points.
+    let mut unique_observations: Vec<&ShotObservation> = Vec::new();
+    for observation in observations {
+        if !unique_observations.iter().any(|known| {
+            known.angle_degrees == observation.angle_degrees
+                && known.velocity == observation.velocity
+                && known.points == observation.points
+        }) {
+            unique_observations.push(observation);
+        }
+    }
+    let mut paths = Vec::new();
+    for observation in unique_observations {
+        if cancelled() {
+            return Err(FitError("residual seed cancelled".to_owned()));
+        }
+        let mut samples = Vec::new();
+        for (position, observed) in reconstruct_acceleration(&observation.points) {
             if cancelled() {
                 return Err(FitError("residual seed cancelled".to_owned()));
             }
             let predicted = current_map
                 .acceleration(position)
                 .map_err(|error| FitError(error.to_string()))?;
-            Ok((
-                position,
-                crate::map::Vec2::new(observed.x - predicted.x, observed.y - predicted.y),
-            ))
-        })
-        .collect::<Result<Vec<_>, FitError>>()?;
-    if samples.is_empty() {
+            let residual =
+                crate::map::Vec2::new(observed.x - predicted.x, observed.y - predicted.y);
+            samples.push((position, residual));
+        }
+        if !samples.is_empty() {
+            paths.push(samples);
+        }
+    }
+    if paths.is_empty() {
         return Err(FitError(
             "shot observations contain no regular acceleration samples".to_owned(),
         ));
@@ -205,21 +222,28 @@ fn try_seed_planet_from_residuals(
             }
             let mut numerator = 0.0;
             let mut denominator = 0.0;
-            for (position, residual) in &samples {
-                if cancelled() {
-                    return Err(FitError("residual seed cancelled".to_owned()));
+            for path in &paths {
+                let mut path_numerator = 0.0;
+                let mut path_denominator = 0.0;
+                for (position, residual) in path {
+                    if cancelled() {
+                        return Err(FitError("residual seed cancelled".to_owned()));
+                    }
+                    let dx = center_x - position.x;
+                    let dy = center_y - position.y;
+                    let distance_squared = dx * dx + dy * dy;
+                    if distance_squared == 0.0 {
+                        continue;
+                    }
+                    let scale = 1.0 / (distance_squared * distance_squared.sqrt());
+                    let gx = dx * scale;
+                    let gy = dy * scale;
+                    path_numerator += residual.x * gx + residual.y * gy;
+                    path_denominator += gx * gx + gy * gy;
                 }
-                let dx = center_x - position.x;
-                let dy = center_y - position.y;
-                let distance_squared = dx * dx + dy * dy;
-                if distance_squared == 0.0 {
-                    continue;
-                }
-                let scale = 1.0 / (distance_squared * distance_squared.sqrt());
-                let gx = dx * scale;
-                let gy = dy * scale;
-                numerator += residual.x * gx + residual.y * gy;
-                denominator += gx * gx + gy * gy;
+                let sample_count = path.len() as f64;
+                numerator += path_numerator / sample_count;
+                denominator += path_denominator / sample_count;
             }
             if denominator > 0.0 && numerator > 0.0 {
                 let mass = numerator / denominator;
@@ -867,6 +891,55 @@ mod tests {
         assert!((fit.map.planets[0].x - truth.planets[0].x).abs() < 1.0);
         assert!((fit.map.planets[0].y - truth.planets[0].y).abs() < 1.0);
         assert!((fit.map.planets[0].mass - truth.planets[0].mass).abs() < 100.0);
+    }
+
+    #[test]
+    fn duplicate_trajectories_do_not_multiply_their_residual_evidence() {
+        let truth = PlanetMap {
+            planets: vec![Planet {
+                x: 500.0,
+                y: 450.0,
+                radius: 30.0,
+                mass: 40_000.0,
+            }],
+        };
+        let shot = observation(&truth, (200.0, 200.0), 25.0, 8.0);
+        let other = observation(&truth, (800.0, 250.0), 150.0, 8.0);
+        let baseline = PlanetMap { planets: vec![] };
+        let single = seed_planet_from_residuals(
+            &baseline,
+            &[shot.clone(), other.clone()],
+            WorldParameters::default(),
+            30.0,
+            80.0,
+        )
+        .unwrap();
+        let duplicate = seed_planet_from_residuals(
+            &baseline,
+            &[
+                shot.clone(),
+                ShotObservation {
+                    player_id: 2,
+                    ..shot.clone()
+                },
+                ShotObservation {
+                    player_id: 3,
+                    ..shot.clone()
+                },
+                ShotObservation {
+                    player_id: 4,
+                    ..shot
+                },
+                other,
+            ],
+            WorldParameters::default(),
+            30.0,
+            80.0,
+        )
+        .unwrap();
+        assert!((duplicate.x - single.x).abs() < 1e-9);
+        assert!((duplicate.y - single.y).abs() < 1e-9);
+        assert!((duplicate.mass - single.mass).abs() < 1e-9);
     }
 
     #[test]

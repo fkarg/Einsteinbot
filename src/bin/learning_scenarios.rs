@@ -1047,8 +1047,12 @@ mod tests {
             y: 120.0,
             mass: 2700.0,
             support: vec![],
+            support_paths: vec![],
             baseline_continuation_rmse: 2.0,
             continuation_rmse: 1.0,
+            training_paths: 1,
+            validation_paths: 1,
+            relative_improvement: 0.5,
         });
         belief.hypothesis_local_field = Some(Default::default());
         let trial = shot(Launch {
