@@ -21,7 +21,8 @@ use std::path::PathBuf;
 const PAGE: &str = include_str!("../../web/map_viewer.html");
 const DEFAULT_PORT: u16 = 8765;
 const PLAYER_RADIUS: f64 = 4.0;
-const FIELD_GRID_STEP: usize = 10;
+const FIELD_GRID_STEP: usize = 5;
+const MAX_FIELD_SAMPLES: usize = 200_000;
 
 fn main() {
     if let Err(error) = run() {
@@ -326,10 +327,38 @@ fn selected_snapshot(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Resul
         step.parse::<usize>()
             .map_err(|_| "invalid grid step".to_owned())
     })?;
-    if ![5, 10, 25].contains(&grid_step) {
-        return Err("grid step must be 5, 10, or 25 world units".to_owned());
+    if ![1, 2, 5, 10, 25].contains(&grid_step) {
+        return Err("grid step must be 1, 2, 5, 10, or 25 world units".to_owned());
     }
-    let field_grid = make_field_grid(&data, actual_planets.as_deref(), grid_step)?;
+    let world = WorldParameters::default();
+    let view = Viewport {
+        x: optional_finite(&parameters, "x", 0.0)?,
+        y: optional_finite(&parameters, "y", 0.0)?,
+        width: optional_finite(&parameters, "width", world.battlefield_width)?,
+        height: optional_finite(&parameters, "height", world.battlefield_height)?,
+    };
+    if view.x < 0.0
+        || view.y < 0.0
+        || view.width <= 0.0
+        || view.height <= 0.0
+        || view.x + view.width > world.battlefield_width
+        || view.y + view.height > world.battlefield_height
+    {
+        return Err("viewport must fit inside the battlefield".to_owned());
+    }
+    let start_x = (view.x as usize / grid_step) * grid_step;
+    let start_y = (view.y as usize / grid_step) * grid_step;
+    let end_x = (view.x + view.width).ceil() as usize;
+    let end_y = (view.y + view.height).ceil() as usize;
+    let columns = (end_x.saturating_sub(start_x) / grid_step) + 1;
+    let rows = (end_y.saturating_sub(start_y) / grid_step) + 1;
+    let sample_count = columns.saturating_mul(rows);
+    if sample_count > MAX_FIELD_SAMPLES {
+        return Err(format!(
+            "viewport at {grid_step}-unit spacing requests {sample_count} samples; zoom in or choose a coarser grid"
+        ));
+    }
+    let field_grid = make_field_grid(&data, actual_planets.as_deref(), grid_step, view)?;
     let selected_shot = selection.strip_prefix("event:").and_then(|_| {
         events
                 .iter()
@@ -360,7 +389,31 @@ fn selected_snapshot(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Resul
         "events": trajectories,
         "actual_planets": actual_planets,
         "field_grid": field_grid,
+        "view": {"x":view.x,"y":view.y,"width":view.width,"height":view.height},
     }))
+}
+
+#[derive(Clone, Copy)]
+struct Viewport {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+fn optional_finite(
+    parameters: &BTreeMap<&str, &str>,
+    key: &str,
+    default: f64,
+) -> Result<f64, String> {
+    let Some(value) = parameters.get(key) else {
+        return Ok(default);
+    };
+    let value = value.parse::<f64>().map_err(|_| format!("invalid {key}"))?;
+    value
+        .is_finite()
+        .then_some(value)
+        .ok_or_else(|| format!("nonfinite {key}"))
 }
 
 fn decode_belief(value: &Value) -> Result<Option<MapBelief>, String> {
@@ -438,6 +491,7 @@ fn make_field_grid(
     data: &Value,
     actual: Option<&[Planet]>,
     grid_step: usize,
+    view: Viewport,
 ) -> Result<Value, String> {
     let belief = decode_belief(&data["map_belief"])?;
     let covariance = belief
@@ -448,8 +502,12 @@ fn make_field_grid(
     });
     let world = WorldParameters::default();
     let mut samples = Vec::new();
-    for y in (0..=world.battlefield_height as usize).step_by(grid_step) {
-        for x in (0..=world.battlefield_width as usize).step_by(grid_step) {
+    let start_x = (view.x as usize / grid_step) * grid_step;
+    let start_y = (view.y as usize / grid_step) * grid_step;
+    let end_x = (view.x + view.width).ceil() as usize;
+    let end_y = (view.y + view.height).ceil() as usize;
+    for y in (start_y..=end_y).step_by(grid_step) {
+        for x in (start_x..=end_x).step_by(grid_step) {
             let position = Vec2::new(x as f64, y as f64);
             let Some(belief) = &belief else {
                 let oracle = actual_map
@@ -531,6 +589,10 @@ fn make_field_grid(
         "width": world.battlefield_width,
         "height": world.battlefield_height,
         "step": grid_step,
+        "origin_x": start_x,
+        "origin_y": start_y,
+        "columns": (end_x.saturating_sub(start_x) / grid_step) + 1,
+        "rows": (end_y.saturating_sub(start_y) / grid_step) + 1,
         "has_covariance": covariance.is_some(),
         "has_belief": belief.is_some(),
     }))
