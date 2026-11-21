@@ -21,7 +21,7 @@ use std::path::PathBuf;
 const PAGE: &str = include_str!("../../web/map_viewer.html");
 const DEFAULT_PORT: u16 = 8765;
 const PLAYER_RADIUS: f64 = 4.0;
-const FIELD_GRID_STEP: usize = 25;
+const FIELD_GRID_STEP: usize = 10;
 
 fn main() {
     if let Err(error) = run() {
@@ -322,7 +322,24 @@ fn selected_snapshot(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Resul
     };
     let events = read_events_before(&connection, capture_id, sequence.saturating_add(1))?;
     let actual_planets = latest_actual_planets(&events);
-    let field_grid = make_field_grid(&data, actual_planets.as_deref())?;
+    let grid_step = parameters.get("step").map_or(Ok(FIELD_GRID_STEP), |step| {
+        step.parse::<usize>()
+            .map_err(|_| "invalid grid step".to_owned())
+    })?;
+    if ![5, 10, 25].contains(&grid_step) {
+        return Err("grid step must be 5, 10, or 25 world units".to_owned());
+    }
+    let field_grid = make_field_grid(&data, actual_planets.as_deref(), grid_step)?;
+    let selected_shot = selection.strip_prefix("event:").and_then(|_| {
+        events
+                .iter()
+                .find(|(event_sequence, record)| {
+                    *event_sequence == sequence && record["event"]["type"] == "shot_fin"
+                })
+                .map(|(event_sequence, record)| {
+                    json!({"sequence":event_sequence,"event":record["event"]})
+                })
+    });
     let trajectories = events
         .iter()
         .filter(|(_, record)| record["event"]["type"] == "shot_fin")
@@ -338,6 +355,7 @@ fn selected_snapshot(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Resul
         "sequence": sequence,
         "diagnostic": data,
         "diagnostic_sequence": diagnostic_sequence,
+        "selected_shot": selected_shot,
         "selection_kind": if is_decision {"decision"} else if selection.starts_with("event:") {"timeline_event"} else {"latest_capture_state"},
         "events": trajectories,
         "actual_planets": actual_planets,
@@ -416,7 +434,11 @@ fn decode_belief(value: &Value) -> Result<Option<MapBelief>, String> {
     Ok(Some(belief))
 }
 
-fn make_field_grid(data: &Value, actual: Option<&[Planet]>) -> Result<Value, String> {
+fn make_field_grid(
+    data: &Value,
+    actual: Option<&[Planet]>,
+    grid_step: usize,
+) -> Result<Value, String> {
     let belief = decode_belief(&data["map_belief"])?;
     let covariance = belief
         .as_ref()
@@ -426,8 +448,8 @@ fn make_field_grid(data: &Value, actual: Option<&[Planet]>) -> Result<Value, Str
     });
     let world = WorldParameters::default();
     let mut samples = Vec::new();
-    for y in (0..=world.battlefield_height as usize).step_by(FIELD_GRID_STEP) {
-        for x in (0..=world.battlefield_width as usize).step_by(FIELD_GRID_STEP) {
+    for y in (0..=world.battlefield_height as usize).step_by(grid_step) {
+        for x in (0..=world.battlefield_width as usize).step_by(grid_step) {
             let position = Vec2::new(x as f64, y as f64);
             let Some(belief) = &belief else {
                 let oracle = actual_map
@@ -508,7 +530,7 @@ fn make_field_grid(data: &Value, actual: Option<&[Planet]>) -> Result<Value, Str
         "samples": samples,
         "width": world.battlefield_width,
         "height": world.battlefield_height,
-        "step": FIELD_GRID_STEP,
+        "step": grid_step,
         "has_covariance": covariance.is_some(),
         "has_belief": belief.is_some(),
     }))
