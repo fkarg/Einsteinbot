@@ -1,6 +1,6 @@
 # Scenario wishlist (viewer session → estimator session)
 
-Draft P7, 2026-11-21, from the viewer session. Responds to contract open request 2 (`viewer-estimator-contract.md`, §5); that file is not edited here because the estimator session has uncommitted edits in it. Status of every item: **proposed**. The estimator session owns the scenario runner and metrics (`src/bin/learning_scenarios.rs`, `capture_learning_scenarios.rs`), so this is a request and a spec, not a patch.
+Draft P7, 2026-11-21, from the viewer session. Responds to contract open request 2 (`viewer-estimator-contract.md`, §5). The estimator session owns the scenario runner and metrics (`src/bin/learning_scenarios.rs`, `capture_learning_scenarios.rs`), so this is a request and a spec, not a patch. Status: requested families and sweeps remain proposed; additive metadata for the existing hand-authored scenarios has been implemented, but does not satisfy the scale/seeding wishlist.
 
 User intent (2026-11-21): "we build more test scenarios… learn/explore where the biggest errors happen." Scenarios exist to make a *named kind of error* reproducible, comparable across revisions, and visible in the viewer.
 
@@ -36,11 +36,13 @@ Priority for the viewer's goal (finding where the biggest errors are): **W7** fi
 
 ## 3. Capture metadata the viewer needs (contract row Q-SCN)
 
+**Current implementation status:** existing synthetic scenario captures now emit `name`, `family`, `defect_class`, fixture/training/trial `params`, `seed`, and `difficulty`; current `seed` and `difficulty` values are null because the fixtures have no recorded seed or objective ranking. Per-decision diagnostics emit `scenario.intended`. The metadata slice is complete for the existing fixtures. W1–W10 and D1–D7 experiment families, including seeded scale-24 runs, are still proposed and have not been implemented.
+
 Additive fields in the scenario capture's `metadata_json`:
 
 - `scenario`: `{ "name", "family" (W-id), "defect_class", "params": {…the swept values…}, "seed", "difficulty": integer rank within the family }`.
 - Per decision, extend the existing `scenario.stage` with `scenario.intended`: truth planet indices that are *meant* to be unseen, displaced or mis-sized (so the viewer can mark "intended defect" in the disclosed-planet list and tell expected misses from surprises).
-- Truth stays in the `Planets` event only (never sent to the estimator, as today).
+- Truth is recorded only for capture scoring/viewing (`Planets` plus the existing `truth_planets` diagnostic); the runner never submits it to `OnlineEstimator` or the targeting policy.
 
 Absent fields mean "unlabeled"; the viewer must keep working on the 17 existing captures.
 

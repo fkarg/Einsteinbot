@@ -17,6 +17,16 @@ pub struct CaptureMetadata {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ScenarioCaptureMetadata {
+    pub name: String,
+    pub family: String,
+    pub defect_class: String,
+    pub params: serde_json::Value,
+    pub seed: Option<u64>,
+    pub difficulty: Option<u32>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct StoredEvent {
     pub sequence: i64,
     pub timestamp_unix_ms: i64,
@@ -33,6 +43,23 @@ pub struct EventLog {
 impl EventLog {
     /// Create one capture for one recording TCP connection in the SQLite database.
     pub fn create(path: impl AsRef<Path>, metadata: &CaptureMetadata) -> StoreResult<Self> {
+        Self::create_inner(path, metadata, None)
+    }
+
+    /// Create a synthetic scenario capture with additive scenario labels in capture metadata.
+    pub fn create_with_scenario_metadata(
+        path: impl AsRef<Path>,
+        metadata: &CaptureMetadata,
+        scenario: &ScenarioCaptureMetadata,
+    ) -> StoreResult<Self> {
+        Self::create_inner(path, metadata, Some(scenario))
+    }
+
+    fn create_inner(
+        path: impl AsRef<Path>,
+        metadata: &CaptureMetadata,
+        scenario: Option<&ScenarioCaptureMetadata>,
+    ) -> StoreResult<Self> {
         let connection = Connection::open(path)?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.execute_batch(
@@ -79,6 +106,9 @@ impl EventLog {
             "git_revision": option_env!("EINSTEINBOT_GIT_REVISION"),
             "source_changes": option_env!("EINSTEINBOT_GIT_DIRTY").and_then(|value| value.parse::<bool>().ok()),
         });
+        if let Some(scenario) = scenario {
+            metadata_json["scenario"] = serde_json::to_value(scenario)?;
+        }
         let metadata_json = serde_json::to_string(&metadata_json)?;
         connection.execute(
             "INSERT INTO captures (started_at_unix_ms, metadata_json) VALUES (?1, ?2)",
@@ -256,6 +286,46 @@ mod tests {
                 || metadata["build"]["git_revision"].is_null()
         );
         assert!(metadata["build"].get("source_changes").is_some());
+    }
+
+    #[test]
+    fn scenario_capture_metadata_is_additive_and_keeps_unknown_seed_fields_null() {
+        let metadata = CaptureMetadata {
+            started_at_unix_ms: 1,
+            process_id: 42,
+            host: "synthetic-scenario".into(),
+            port: 0,
+            client_name: "two_planets_one_known".into(),
+            protocol_version: 8,
+        };
+        let scenario = ScenarioCaptureMetadata {
+            name: "two_planets_one_known".into(),
+            family: "partial_map".into(),
+            defect_class: "unseen_planet".into(),
+            params: serde_json::json!({"truth_planet_count": 2}),
+            seed: None,
+            difficulty: None,
+        };
+        let log =
+            EventLog::create_with_scenario_metadata(":memory:", &metadata, &scenario).unwrap();
+        let text: String = log
+            .connection
+            .query_row(
+                "SELECT metadata_json FROM captures WHERE id=?1",
+                [log.capture_id()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let stored: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(stored["scenario"]["name"], "two_planets_one_known");
+        assert_eq!(stored["scenario"]["family"], "partial_map");
+        assert_eq!(stored["scenario"]["defect_class"], "unseen_planet");
+        assert_eq!(stored["scenario"]["params"]["truth_planet_count"], 2);
+        assert!(stored["scenario"]["seed"].is_null());
+        assert!(stored["scenario"]["difficulty"].is_null());
+        assert!(stored["build"].is_object());
+        assert_eq!(stored["host"], "synthetic-scenario");
     }
 
     #[test]

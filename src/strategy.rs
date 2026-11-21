@@ -110,6 +110,10 @@ struct InFlightShot {
 pub struct BotState {
     own_id: Option<u32>,
     player_positions: BTreeMap<u32, Point>,
+    /// Distinct spawn-like positions reported in this map epoch. These are observed
+    /// possibilities, not a complete catalogue; a later spawn may be somewhere new.
+    #[serde(default)]
+    observed_spawn_locations: Vec<Point>,
     #[serde(skip)]
     map_belief: Option<MapBelief>,
     known_shots: Vec<KnownShot>,
@@ -132,11 +136,23 @@ impl BotState {
                 self.covered_cells.clear();
                 self.map_belief = None;
                 self.in_flight.clear();
+                // NewtonWars may report freshly initialized player positions just before
+                // sending Planets. Treat current positions as the new epoch's observed
+                // candidates while discarding the prior map's history.
+                self.observed_spawn_locations.clear();
+                for position in self.player_positions.values() {
+                    if !self.observed_spawn_locations.contains(position) {
+                        self.observed_spawn_locations.push(position.clone());
+                    }
+                }
             }
             ServerEvent::OwnId { player_id } => self.own_id = Some(*player_id),
             ServerEvent::PlayerPosition { player_id, x, y } => {
-                self.player_positions
-                    .insert(*player_id, Point { x: *x, y: *y });
+                let position = Point { x: *x, y: *y };
+                if !self.observed_spawn_locations.contains(&position) {
+                    self.observed_spawn_locations.push(position.clone());
+                }
+                self.set_player_position(*player_id, position);
             }
             ServerEvent::PlayerLeave { player_id } => {
                 self.player_positions.remove(player_id);
@@ -208,6 +224,9 @@ impl BotState {
         serde_json::json!({
             "own_id": self.own_id,
             "player_positions": self.player_positions,
+            "observed_spawn_locations": self.observed_spawn_locations,
+            "spawn_locations_complete": false,
+            "new_spawn_locations_possible": true,
             "known_shots": self.known_shots,
             "in_flight": self.in_flight,
             "covered_cells": self.covered_cells,
@@ -216,6 +235,16 @@ impl BotState {
 
     pub fn player_positions(&self) -> &BTreeMap<u32, Point> {
         &self.player_positions
+    }
+
+    /// Update a position from a simulated/test state that is not evidence of a spawn.
+    pub fn set_player_position(&mut self, player_id: u32, position: Point) {
+        self.player_positions.insert(player_id, position);
+    }
+
+    /// Distinct positions reported during the current map epoch. More locations may exist.
+    pub fn observed_spawn_locations(&self) -> &[Point] {
+        &self.observed_spawn_locations
     }
 
     pub fn own_id(&self) -> Option<u32> {
@@ -968,6 +997,101 @@ mod tests {
         assert_eq!(restored.known_shots, state.known_shots);
         assert_eq!(restored.covered_cells, state.covered_cells);
         assert_eq!(restored.in_flight, state.in_flight);
+        assert_eq!(
+            restored.observed_spawn_locations(),
+            state.observed_spawn_locations()
+        );
+    }
+
+    #[test]
+    fn spawn_positions_accumulate_as_a_deduplicated_incomplete_map_set() {
+        let mut state = BotState::default();
+        for (player_id, x, y) in [
+            (1, 100.0, 200.0),
+            (2, 100.0, 200.0),
+            (1, 350.0, 420.0),
+            (3, 620.0, 140.0),
+        ] {
+            state.observe(&ServerEvent::PlayerPosition { player_id, x, y });
+        }
+
+        assert_eq!(
+            state.observed_spawn_locations(),
+            vec![
+                Point { x: 100.0, y: 200.0 },
+                Point { x: 350.0, y: 420.0 },
+                Point { x: 620.0, y: 140.0 },
+            ],
+            "reused sites deduplicate while newly reported sites extend the map-scoped set"
+        );
+        let diagnostic = state.diagnostic_snapshot();
+        assert_eq!(diagnostic["spawn_locations_complete"], false);
+        assert_eq!(diagnostic["new_spawn_locations_possible"], true);
+        assert_eq!(
+            diagnostic["observed_spawn_locations"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn synthetic_player_positions_do_not_become_spawn_evidence() {
+        let mut state = BotState::default();
+        state.set_player_position(2, Point { x: 500.0, y: 300.0 });
+
+        assert_eq!(
+            state.player_positions().get(&2),
+            Some(&Point { x: 500.0, y: 300.0 })
+        );
+        assert!(state.observed_spawn_locations().is_empty());
+    }
+
+    #[test]
+    fn map_epoch_keeps_positions_announced_before_planets_as_new_spawn_candidates() {
+        let mut state = BotState::default();
+        state.observe(&ServerEvent::PlayerPosition {
+            player_id: 1,
+            x: 100.0,
+            y: 100.0,
+        });
+        state.observe(&ServerEvent::PlayerPosition {
+            player_id: 1,
+            x: 300.0,
+            y: 300.0,
+        });
+        state.observe(&ServerEvent::PlayerPosition {
+            player_id: 2,
+            x: 500.0,
+            y: 500.0,
+        });
+
+        state.observe(&ServerEvent::Planets { planets: vec![] });
+
+        assert_eq!(
+            state.observed_spawn_locations(),
+            vec![Point { x: 300.0, y: 300.0 }, Point { x: 500.0, y: 500.0 },],
+            "Planets can follow the new map's respawn positions, so retain current positions but drop older anchors"
+        );
+    }
+
+    #[test]
+    fn legacy_diagnostic_snapshot_has_no_spawn_locations_but_allows_new_ones() {
+        let snapshot = serde_json::json!({
+            "own_id": 1,
+            "player_positions": {},
+            "known_shots": [],
+            "covered_cells": [],
+            "in_flight": []
+        });
+        let restored = BotState::from_diagnostic_snapshot(&snapshot).unwrap();
+
+        assert!(restored.observed_spawn_locations().is_empty());
+        assert_eq!(
+            restored.diagnostic_snapshot()["spawn_locations_complete"],
+            false
+        );
     }
 
     #[test]

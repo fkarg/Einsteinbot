@@ -1,6 +1,6 @@
 //! Deterministic offline learning experiments. Ground truth generates observations and scores
 //! choices; it is never sent to OnlineEstimator or the learned-map targeting policy.
-use einsteinbot::event_store::{CaptureMetadata, EventLog};
+use einsteinbot::event_store::{CaptureMetadata, EventLog, ScenarioCaptureMetadata};
 use einsteinbot::map::{PlanetMap, Vec2};
 use einsteinbot::online_map::OnlineEstimator;
 use einsteinbot::protocol::{Planet, Point, RecordedEvent, ServerEvent};
@@ -23,6 +23,10 @@ struct Launch {
 #[derive(Clone)]
 struct Scenario {
     name: &'static str,
+    family: &'static str,
+    defect_class: &'static str,
+    /// Truth-map planet indices this decision is designed to clarify or evaluate.
+    truth_intended_planet_indices: &'static [usize],
     truth: PlanetMap,
     observations: Vec<(Launch, Termination)>,
     trial: Launch,
@@ -96,7 +100,7 @@ impl ScenarioCapture {
                     "map_source": "online",
                     "map_belief": belief_json,
                     "bot_state": state.diagnostic_snapshot(),
-                    "scenario": {"name": scenario.name, "stage": stage, "truth_planets": scenario.truth.planets},
+                    "scenario": scenario.diagnostic_metadata(stage),
                     "choice": choice_json,
                 }),
             )
@@ -108,6 +112,63 @@ impl ScenarioCapture {
         self.log
             .finish(self.timestamp_ms)
             .expect("finish scenario capture");
+    }
+}
+
+impl Scenario {
+    fn capture_metadata(&self) -> ScenarioCaptureMetadata {
+        let contacted_planets = self
+            .observations
+            .iter()
+            .filter_map(|(_, termination)| match termination {
+                Termination::PlanetCollision(index) => Some(*index),
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        ScenarioCaptureMetadata {
+            name: self.name.into(),
+            family: self.family.into(),
+            defect_class: self.defect_class.into(),
+            params: serde_json::json!({
+                "truth_planet_count": self.truth.planets.len(),
+                "training_path_count": self.observations.len(),
+                "contacted_planet_indices": contacted_planets,
+                "training_paths": self.observations.iter().map(|(launch, termination)| {
+                    serde_json::json!({
+                        "launch_x": launch.x,
+                        "launch_y": launch.y,
+                        "angle_degrees": launch.angle,
+                        "speed": launch.speed,
+                        "expected_termination": match termination {
+                            Termination::PlanetCollision(index) => serde_json::json!({"planet_collision": index}),
+                            Termination::PlayerCollision(player_id) => serde_json::json!({"player_collision": player_id}),
+                            Termination::BattlefieldMargin => serde_json::json!("battlefield_margin"),
+                            Termination::SampleLimit => serde_json::json!("sample_limit"),
+                        },
+                    })
+                }).collect::<Vec<_>>(),
+                "trial": {
+                    "launch_x": self.trial.x,
+                    "launch_y": self.trial.y,
+                    "angle_degrees": self.trial.angle,
+                    "speed": self.trial.speed,
+                    "target_tick": self.target_tick,
+                },
+            }),
+            // These fixtures are hand-authored and deterministic; the original source
+            // did not record an objective difficulty ranking.
+            seed: None,
+            difficulty: None,
+        }
+    }
+
+    fn diagnostic_metadata(&self, stage: &str) -> serde_json::Value {
+        serde_json::json!({
+            "name": self.name,
+            "stage": stage,
+            "intended": self.truth_intended_planet_indices,
+            "truth_planets": self.truth.planets,
+        })
     }
 }
 
@@ -160,7 +221,13 @@ fn observe_launch(
         );
     }
     estimator.observe(&source, &AtomicBool::new(false));
-    state.observe(&source);
+    state.set_player_position(
+        1,
+        Point {
+            x: launch.x,
+            y: launch.y,
+        },
+    );
     // The observed source is the only player in the field during these training shots.
     // Every ShotFin below is a real planet or margin termination, never a truncated path.
     let path = simulate_targeting_shot(
@@ -400,8 +467,8 @@ fn run(scenario: Scenario, mut capture: Option<ScenarioCapture>) {
         y: scenario.trial.y,
     };
     let target = trial_path.points[scenario.target_tick].clone();
-    state.observe(&position(1, start.x, start.y));
-    state.observe(&position(2, target.x, target.y));
+    state.set_player_position(1, start.clone());
+    state.set_player_position(2, target.clone());
     if let Some(capture) = &mut capture {
         capture.event(&position(1, start.x, start.y), None);
         capture.event(&position(2, target.x, target.y), None);
@@ -620,6 +687,9 @@ fn scenarios() -> Vec<Scenario> {
     vec![
         Scenario {
             name: "flat_direct",
+            family: "flat_baseline",
+            defect_class: "none",
+            truth_intended_planet_indices: &[],
             truth: PlanetMap { planets: vec![] },
             observations: vec![(launch(200.0, 400.0, 0, 8), Termination::BattlefieldMargin)],
             trial: launch(200.0, 250.0, 0, 8),
@@ -627,6 +697,9 @@ fn scenarios() -> Vec<Scenario> {
         },
         Scenario {
             name: "one_planet_noncontact_flyby",
+            family: "single_planet_flyby",
+            defect_class: "unseen_planet",
+            truth_intended_planet_indices: &[0],
             truth: one(),
             observations: vec![(launch(200.0, 400.0, 0, 8), Termination::BattlefieldMargin)],
             trial: launch(200.0, 350.0, 0, 8),
@@ -634,6 +707,9 @@ fn scenarios() -> Vec<Scenario> {
         },
         Scenario {
             name: "flat_diagonal",
+            family: "flat_baseline",
+            defect_class: "none",
+            truth_intended_planet_indices: &[],
             truth: PlanetMap { planets: vec![] },
             observations: vec![(launch(200.0, 400.0, 0, 8), Termination::BattlefieldMargin)],
             trial: launch(250.0, 700.0, 35, 8),
@@ -641,6 +717,9 @@ fn scenarios() -> Vec<Scenario> {
         },
         Scenario {
             name: "one_planet_distant_flyby",
+            family: "single_planet_flyby",
+            defect_class: "unseen_planet",
+            truth_intended_planet_indices: &[0],
             truth: one(),
             observations: vec![(launch(200.0, 200.0, 0, 8), Termination::BattlefieldMargin)],
             trial: launch(200.0, 350.0, 0, 8),
@@ -648,6 +727,9 @@ fn scenarios() -> Vec<Scenario> {
         },
         Scenario {
             name: "one_planet_closer_flyby",
+            family: "single_planet_flyby",
+            defect_class: "unseen_planet",
+            truth_intended_planet_indices: &[0],
             truth: one(),
             observations: vec![(launch(200.0, 380.0, 0, 8), Termination::BattlefieldMargin)],
             trial: launch(200.0, 350.0, 0, 8),
@@ -655,6 +737,9 @@ fn scenarios() -> Vec<Scenario> {
         },
         Scenario {
             name: "one_planet_reverse_flyby",
+            family: "single_planet_flyby",
+            defect_class: "unseen_planet",
+            truth_intended_planet_indices: &[0],
             truth: one(),
             observations: vec![(
                 launch(1400.0, 600.0, 180, 8),
@@ -665,6 +750,9 @@ fn scenarios() -> Vec<Scenario> {
         },
         Scenario {
             name: "small_planet_single_contact",
+            family: "single_contact",
+            defect_class: "underconstrained_planet_geometry",
+            truth_intended_planet_indices: &[0],
             truth: PlanetMap {
                 planets: vec![planet(600.0, 500.0, 20.0)],
             },
@@ -674,6 +762,9 @@ fn scenarios() -> Vec<Scenario> {
         },
         Scenario {
             name: "large_planet_single_contact",
+            family: "single_contact",
+            defect_class: "underconstrained_planet_geometry",
+            truth_intended_planet_indices: &[0],
             truth: PlanetMap {
                 planets: vec![planet(600.0, 500.0, 40.0)],
             },
@@ -683,6 +774,9 @@ fn scenarios() -> Vec<Scenario> {
         },
         Scenario {
             name: "one_planet_single_contact",
+            family: "single_contact",
+            defect_class: "underconstrained_planet_geometry",
+            truth_intended_planet_indices: &[0],
             truth: one(),
             observations: vec![(launch(200.0, 500.0, 0, 8), Termination::PlanetCollision(0))],
             trial: launch(200.0, 350.0, 0, 8),
@@ -690,6 +784,9 @@ fn scenarios() -> Vec<Scenario> {
         },
         Scenario {
             name: "one_planet_established",
+            family: "established_map",
+            defect_class: "map_recovery_baseline",
+            truth_intended_planet_indices: &[],
             truth: one(),
             observations: vec![
                 (launch(200.0, 500.0, 0, 8), Termination::PlanetCollision(0)),
@@ -707,6 +804,9 @@ fn scenarios() -> Vec<Scenario> {
         },
         Scenario {
             name: "two_planets_one_known",
+            family: "partial_map",
+            defect_class: "unseen_planet",
+            truth_intended_planet_indices: &[1],
             truth: two(),
             observations: vec![
                 (launch(200.0, 500.0, 0, 8), Termination::PlanetCollision(0)),
@@ -721,6 +821,9 @@ fn scenarios() -> Vec<Scenario> {
         },
         Scenario {
             name: "two_planets_flybys_only",
+            family: "multi_planet_flyby",
+            defect_class: "unseen_planet",
+            truth_intended_planet_indices: &[0, 1],
             truth: two(),
             observations: vec![
                 (launch(200.0, 100.0, 0, 8), Termination::BattlefieldMargin),
@@ -734,6 +837,9 @@ fn scenarios() -> Vec<Scenario> {
         },
         Scenario {
             name: "two_planets_established_reverse",
+            family: "established_map",
+            defect_class: "map_recovery_baseline",
+            truth_intended_planet_indices: &[],
             truth: two(),
             observations: vec![
                 (launch(200.0, 500.0, 0, 8), Termination::PlanetCollision(0)),
@@ -755,6 +861,9 @@ fn scenarios() -> Vec<Scenario> {
         },
         Scenario {
             name: "three_planets_established_swerve",
+            family: "established_map",
+            defect_class: "multi_planet_swerve",
+            truth_intended_planet_indices: &[],
             truth: PlanetMap {
                 planets: vec![
                     planet(600.0, 500.0, 30.0),
@@ -786,6 +895,9 @@ fn scenarios() -> Vec<Scenario> {
         },
         Scenario {
             name: "three_planets_partial_swerve",
+            family: "partial_map",
+            defect_class: "unseen_planet",
+            truth_intended_planet_indices: &[2],
             truth: PlanetMap {
                 planets: vec![
                     planet(600.0, 500.0, 30.0),
@@ -813,6 +925,9 @@ fn scenarios() -> Vec<Scenario> {
         },
         Scenario {
             name: "four_planets_four_contact_map",
+            family: "established_map",
+            defect_class: "multi_planet_map_recovery",
+            truth_intended_planet_indices: &[],
             truth: PlanetMap {
                 planets: vec![
                     planet(500.0, 400.0, 25.0),
@@ -841,6 +956,9 @@ fn scenarios() -> Vec<Scenario> {
         },
         Scenario {
             name: "two_planets_established",
+            family: "established_map",
+            defect_class: "multi_planet_map_recovery",
+            truth_intended_planet_indices: &[],
             truth: two(),
             observations: vec![
                 (launch(200.0, 500.0, 0, 8), Termination::PlanetCollision(0)),
@@ -969,7 +1087,7 @@ fn discard_incomplete_scenario_captures(
     transaction.commit().map_err(|error| error.to_string())
 }
 
-fn create_scenario_capture(path: &Path, scenario: &str) -> Result<ScenarioCapture, String> {
+fn create_scenario_capture(path: &Path, scenario: &Scenario) -> Result<ScenarioCapture, String> {
     let started_at_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| error.to_string())?
@@ -979,10 +1097,12 @@ fn create_scenario_capture(path: &Path, scenario: &str) -> Result<ScenarioCaptur
         process_id: std::process::id(),
         host: "synthetic-scenario".into(),
         port: 0,
-        client_name: scenario.into(),
+        client_name: scenario.name.into(),
         protocol_version: 8,
     };
-    let log = EventLog::create(path, &metadata).map_err(|error| error.to_string())?;
+    let scenario_metadata = scenario.capture_metadata();
+    let log = EventLog::create_with_scenario_metadata(path, &metadata, &scenario_metadata)
+        .map_err(|error| error.to_string())?;
     Ok(ScenarioCapture {
         log,
         timestamp_ms: started_at_unix_ms,
@@ -1025,7 +1145,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 None
             } else {
-                Some(create_scenario_capture(&db_path, scenario.name)?)
+                Some(create_scenario_capture(&db_path, &scenario)?)
             }
         } else {
             None
@@ -1121,6 +1241,75 @@ mod tests {
     }
 
     #[test]
+    fn scenario_metadata_labels_only_explicit_expected_defects() {
+        let scenarios = scenarios();
+        for scenario in &scenarios {
+            let metadata = scenario.capture_metadata();
+            assert_eq!(metadata.name, scenario.name);
+            assert!(!metadata.family.is_empty());
+            assert!(!metadata.defect_class.is_empty());
+            assert!(
+                metadata.seed.is_none(),
+                "all current fixtures are hand-authored"
+            );
+            assert!(
+                metadata.difficulty.is_none(),
+                "no objective difficulty ranking was recorded"
+            );
+            assert!(
+                scenario
+                    .truth_intended_planet_indices
+                    .iter()
+                    .all(|index| *index < scenario.truth.planets.len())
+            );
+
+            let decision = scenario.diagnostic_metadata("partial");
+            assert_eq!(decision["name"], metadata.name);
+            assert!(decision.get("family").is_none());
+            assert!(decision.get("params").is_none());
+            assert!(decision.get("seed").is_none());
+            assert!(decision.get("difficulty").is_none());
+            assert_eq!(decision["stage"], "partial");
+            assert_eq!(
+                decision["intended"],
+                serde_json::json!(scenario.truth_intended_planet_indices)
+            );
+            assert_eq!(
+                metadata.params["truth_planet_count"],
+                scenario.truth.planets.len()
+            );
+        }
+
+        let find = |name| {
+            scenarios
+                .iter()
+                .find(|scenario| scenario.name == name)
+                .unwrap()
+        };
+        assert_eq!(
+            find("one_planet_noncontact_flyby").truth_intended_planet_indices,
+            &[0]
+        );
+        assert_eq!(
+            find("two_planets_one_known").truth_intended_planet_indices,
+            &[1]
+        );
+        assert_eq!(
+            find("two_planets_flybys_only").truth_intended_planet_indices,
+            &[0, 1]
+        );
+        assert_eq!(
+            find("three_planets_partial_swerve").truth_intended_planet_indices,
+            &[2]
+        );
+        assert!(
+            find("three_planets_established_swerve")
+                .truth_intended_planet_indices
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn scenario_captures_are_deduplicated_by_name_and_revision() {
         let path = std::env::temp_dir().join(format!(
             "einsteinbot-scenario-index-{}.sqlite",
@@ -1202,8 +1391,8 @@ mod tests {
             simulate_shot(&scenario.truth, &trial, WorldParameters::default(), 2000).unwrap();
         let target = witness.points[scenario.target_tick].clone();
         let start = &trial.points[0];
-        state.observe(&position(1, start.x, start.y));
-        state.observe(&position(2, target.x, target.y));
+        state.set_player_position(1, start.clone());
+        state.set_player_position(2, target.clone());
         let players = [
             (1, Vec2::new(f64::from(start.x), f64::from(start.y))),
             (2, Vec2::new(f64::from(target.x), f64::from(target.y))),
@@ -1255,8 +1444,14 @@ mod tests {
         }
         assert!(estimator.belief().unwrap().map.planets.is_empty());
         let start = scenario.trial;
-        state.observe(&position(1, start.x, start.y));
-        state.observe(&position(2, 600.0, 250.0));
+        state.set_player_position(
+            1,
+            Point {
+                x: start.x,
+                y: start.y,
+            },
+        );
+        state.set_player_position(2, Point { x: 600.0, y: 250.0 });
         let choice = TargetingPolicy::default().choose(&state, 20.0).unwrap();
         let players = [(1, Vec2::new(200.0, 250.0)), (2, Vec2::new(600.0, 250.0))];
         let selected = shot(Launch {
