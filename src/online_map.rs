@@ -34,7 +34,7 @@ pub struct OnlineStageProfile {
     pub fit_candidate_accepted: Option<bool>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct OnlineEstimator {
     contacts: ContactMap,
     players: BTreeMap<u32, Point>,
@@ -53,7 +53,9 @@ impl OnlineEstimator {
         self.observe_batch_inner(events, cancelled, None, None)
     }
 
-    pub(crate) fn observe_profiled(
+    /// Ingest one event with a caller-selected fit effort and return stage timings.
+    /// This is intended for offline profiling and controlled fit-budget experiments.
+    pub fn observe_profiled(
         &mut self,
         event: &ServerEvent,
         cancelled: &AtomicBool,
@@ -143,6 +145,16 @@ impl OnlineEstimator {
                     point: point.clone(),
                 })
             })
+            .chain(unassigned_surface_constraints(
+                &map.planets,
+                &self
+                    .contacts
+                    .hypotheses()
+                    .iter()
+                    .flat_map(|hypothesis| hypothesis.contacts.iter().cloned())
+                    .collect::<Vec<_>>(),
+                self.contacts.contact_points(),
+            ))
             .collect::<Vec<_>>();
         let mut belief = MapBelief::new(map, None);
         if let (Some(profile), Some(started)) = (stages.as_deref_mut(), prepare_started) {
@@ -499,6 +511,44 @@ impl OnlineEstimator {
     }
 }
 
+/// Reuse terminal points that were classified as likely planet contacts even when
+/// their short terminal acceleration trace could not seed a separate contact fit.
+/// A point only constrains a planet when it lies within 8 units of exactly one
+/// estimated surface; this prevents a bare endpoint from inventing geometry or
+/// binding to either member of a crowded pair. The tolerance is a heuristic.
+fn unassigned_surface_constraints<'a>(
+    active: &'a [crate::protocol::Planet],
+    owned_points: &'a [Point],
+    contact_points: &'a [Point],
+) -> impl Iterator<Item = ContactConstraint> + 'a {
+    const MAX_SURFACE_ERROR: f64 = 8.0;
+    contact_points.iter().filter_map(move |point| {
+        if owned_points.contains(point) {
+            return None;
+        }
+        let mut nearest: Option<(usize, f64)> = None;
+        let mut second_error = f64::INFINITY;
+        for (planet_index, planet) in active.iter().enumerate() {
+            let error = ((f64::from(point.x) - planet.x).hypot(f64::from(point.y) - planet.y)
+                - planet.radius)
+                .abs();
+            if error < nearest.map_or(f64::INFINITY, |(_, best)| best) {
+                second_error = nearest.map_or(f64::INFINITY, |(_, best)| best);
+                nearest = Some((planet_index, error));
+            } else {
+                second_error = second_error.min(error);
+            }
+        }
+        let (planet_index, error) = nearest?;
+        (error <= MAX_SURFACE_ERROR && second_error > MAX_SURFACE_ERROR).then(|| {
+            ContactConstraint {
+                planet_index,
+                point: point.clone(),
+            }
+        })
+    })
+}
+
 fn relative_improvement(baseline: f64, candidate: f64) -> f64 {
     if baseline > 0.0 {
         (1.0 - candidate / baseline).clamp(0.0, 1.0)
@@ -539,6 +589,57 @@ mod tests {
             velocity: 3.0,
             points: path.points,
         }
+    }
+
+    #[test]
+    fn bare_terminal_point_constrains_one_nearby_estimated_surface() {
+        let planets = vec![
+            Planet {
+                x: 500.0,
+                y: 500.0,
+                radius: 30.0,
+                mass: 2700.0,
+            },
+            Planet {
+                x: 700.0,
+                y: 500.0,
+                radius: 30.0,
+                mass: 2700.0,
+            },
+        ];
+        let point = Point { x: 670.0, y: 500.0 };
+        let constraints =
+            unassigned_surface_constraints(&planets, &[], std::slice::from_ref(&point))
+                .collect::<Vec<_>>();
+        assert_eq!(constraints.len(), 1);
+        assert_eq!(constraints[0].planet_index, 1);
+        assert_eq!(constraints[0].point, point);
+    }
+
+    #[test]
+    fn terminal_point_is_not_reassigned_when_owned_ambiguous_or_far_from_surface() {
+        let planets = vec![
+            Planet {
+                x: 500.0,
+                y: 500.0,
+                radius: 30.0,
+                mass: 2700.0,
+            },
+            Planet {
+                x: 545.0,
+                y: 500.0,
+                radius: 30.0,
+                mass: 2700.0,
+            },
+        ];
+        let ambiguous = Point { x: 522.5, y: 500.0 };
+        let distant = Point { x: 500.0, y: 461.0 };
+        let owned = Point { x: 500.0, y: 470.0 };
+        let candidates = [ambiguous.clone(), distant.clone(), owned.clone()];
+        let constraints =
+            unassigned_surface_constraints(&planets, std::slice::from_ref(&owned), &candidates)
+                .collect::<Vec<_>>();
+        assert!(constraints.is_empty());
     }
 
     #[test]
