@@ -23,6 +23,10 @@ pub struct PlanetFit {
     /// or inactive inequality rows. This remains a conservative local approximation,
     /// not a calibrated posterior over unknown planet configurations.
     pub covariance: Option<DMatrix<f64>>,
+    /// Partial local covariance for diagnostics when the fit is rank-deficient or
+    /// has too few independent paths. Null directions are omitted, so consumers
+    /// must treat this as approximate rather than complete uncertainty.
+    pub approximate_covariance: Option<DMatrix<f64>>,
     pub covariance_unavailable_reason: Option<CovarianceUnavailableReason>,
     pub position_rmse: f64,
     pub contact_rmse: f64,
@@ -261,23 +265,33 @@ fn fit_planet_map_inner(
     } else {
         None
     };
-    let covariance = if let (None, Some(parameter_to_physical)) = (
-        covariance_unavailable_reason,
-        parameter_to_physical.as_ref(),
-    ) {
-        let inverse = svd
-            .pseudo_inverse(tolerance)
-            .map_err(|error| error.to_string())?;
-        let variance = (residuals.norm_squared() / (independent_paths - rank) as f64).max(1e-8);
-        let parameter_covariance = &inverse * inverse.transpose() * variance;
-        // Centers depend on both their bounded coordinate and radius. Propagate
-        // the full nonlinear decoding Jacobian, including those cross terms.
-        let covariance =
-            parameter_to_physical * parameter_covariance * parameter_to_physical.transpose();
-        Some(covariance)
-    } else {
-        None
-    };
+    let (covariance, approximate_covariance) =
+        if let Some(parameter_to_physical) = parameter_to_physical.as_ref() {
+            let inverse = svd
+                .pseudo_inverse(tolerance)
+                .map_err(|error| error.to_string())?;
+            // The complete-fit covariance uses independent paths for its scale.
+            // Partial fits instead use residual-vector degrees of freedom because
+            // independent_paths <= rank is exactly why their covariance is partial.
+            let degrees_of_freedom = if covariance_unavailable_reason.is_none() {
+                independent_paths - rank
+            } else {
+                residuals.len().saturating_sub(rank).max(1)
+            };
+            let variance = (residuals.norm_squared() / degrees_of_freedom as f64).max(1e-8);
+            let parameter_covariance = &inverse * inverse.transpose() * variance;
+            // Centers depend on both their bounded coordinate and radius. Propagate
+            // the full nonlinear decoding Jacobian, including those cross terms.
+            let covariance =
+                parameter_to_physical * parameter_covariance * parameter_to_physical.transpose();
+            if covariance_unavailable_reason.is_none() {
+                (Some(covariance), None)
+            } else {
+                (None, Some(covariance))
+            }
+        } else {
+            (None, None)
+        };
     if let (Some(profile), Some(started)) = (profile.as_deref_mut(), linear_algebra_started) {
         profile.final_jacobian_and_covariance += started.elapsed();
     }
@@ -321,6 +335,7 @@ fn fit_planet_map_inner(
     Ok(PlanetFit {
         map,
         covariance,
+        approximate_covariance,
         covariance_unavailable_reason,
         position_rmse: if coordinates == 0 {
             0.0
@@ -795,10 +810,12 @@ mod tests {
             few_paths.covariance.is_none(),
             "many correlated point rows cannot replace independent paths"
         );
+        assert!(few_paths.approximate_covariance.is_some());
         assert_eq!(
             few_paths.covariance_unavailable_reason,
             Some(CovarianceUnavailableReason::InsufficientIndependentPaths)
         );
+        assert!(few_paths.evidence_resolution.is_some());
         let fit =
             fit_planet_map(&initial, &paths, &contacts, world, &AtomicBool::new(false)).unwrap();
         for (got, expected) in fit.map.planets.iter().zip(&truth.planets) {
@@ -1022,7 +1039,10 @@ mod tests {
         )
         .unwrap();
         assert!(fit.covariance.is_none());
+        assert!(fit.approximate_covariance.is_some());
         assert!(fit.rank < 3);
+        assert!(!fit.converged);
+        assert!(fit.evidence_resolution.is_some());
         assert_eq!(
             fit.covariance_unavailable_reason,
             Some(CovarianceUnavailableReason::RankDeficient)

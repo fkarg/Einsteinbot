@@ -20,6 +20,9 @@ pub struct MapBelief {
     pub hypothesis_local_field: Option<crate::local_field::LocalField>,
     /// Covariance ordered by `[center_x, center_y, mass]` for each planet.
     pub parameter_covariance: Option<DMatrix<f64>>,
+    /// A diagnostic Gauss-Newton covariance, possibly partial or evaluated before
+    /// convergence. It is recorded for inspection but never used by targeting.
+    pub approximate_parameter_covariance: Option<DMatrix<f64>>,
     /// Why physical parameter covariance is unavailable for this published belief.
     pub covariance_unavailable_reason: Option<crate::estimator::CovarianceUnavailableReason>,
     pub fit_rank: Option<usize>,
@@ -32,6 +35,10 @@ pub struct MapBelief {
     /// Raw trajectory error exposes model mismatch beyond local covariance.
     pub model_position_rmse: Option<f64>,
     pub fit_converged: Option<bool>,
+    /// Explicit marker for maps whose fit is non-converged, rank-deficient, or otherwise incomplete.
+    pub fit_approximate: Option<bool>,
+    /// Raw optimizer termination, separate from the stricter `fit_converged` quality flag.
+    pub optimizer_converged: Option<bool>,
     pub planet_contact_counts: Vec<usize>,
     pub uncertain_associations: usize,
 }
@@ -55,6 +62,7 @@ impl MapBelief {
             field_hypothesis: None,
             hypothesis_local_field: None,
             parameter_covariance,
+            approximate_parameter_covariance: None,
             covariance_unavailable_reason,
             fit_rank: None,
             fit_parameter_count: None,
@@ -63,6 +71,8 @@ impl MapBelief {
             contact_points: Vec::new(),
             model_position_rmse: None,
             fit_converged: None,
+            fit_approximate: None,
+            optimizer_converged: None,
             planet_contact_counts: Vec::new(),
             uncertain_associations: 0,
         }
@@ -97,9 +107,10 @@ impl MapBelief {
         })
     }
 
-    /// Fraction of the modelled physical gravity field constrained by trajectory and
-    /// contact evidence. This is a sensitivity-availability heuristic, not a probability
-    /// or a claim about unmodelled planets.
+    /// Fraction of this fitted model's local parameter sensitivity lying in directions
+    /// identified by its fit. This measures model-parameter identifiability, not spatial
+    /// observation coverage or total field certainty: a full-rank fit can be near 1
+    /// throughout the battlefield while still omitting real sources.
     pub fn evidence_availability_at(&self, position: Vec2) -> Option<f64> {
         const FIELD_SENSITIVITY_FLOOR: f64 = 1e-12;
         let evidence = self.field_evidence.as_ref()?;
@@ -1019,6 +1030,21 @@ mod tests {
             .field_uncertainty(Vec2::new(2.0, 0.0))
             .expect("matching covariance");
         assert!((uncertainty - 4.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn diagnostic_approximate_covariance_is_not_used_for_targeting() {
+        let map = PlanetMap {
+            planets: vec![crate::protocol::Planet {
+                x: 0.0,
+                y: 0.0,
+                radius: 1.0,
+                mass: 8.0,
+            }],
+        };
+        let mut belief = MapBelief::new(map, None);
+        belief.approximate_parameter_covariance = Some(DMatrix::identity(3, 3) * 1e6);
+        assert_eq!(belief.field_uncertainty(Vec2::new(2.0, 0.0)), None);
     }
 
     #[test]

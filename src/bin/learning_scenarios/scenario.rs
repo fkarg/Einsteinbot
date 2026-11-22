@@ -59,6 +59,9 @@ impl ScenarioCapture {
             "covariance": belief.parameter_covariance.as_ref().map(|matrix| {
                 (0..matrix.nrows()).map(|row| (0..matrix.ncols()).map(|col| matrix[(row, col)]).collect::<Vec<_>>()).collect::<Vec<_>>()
             }),
+            "approximate_covariance": belief.approximate_parameter_covariance.as_ref().map(|matrix| {
+                (0..matrix.nrows()).map(|row| (0..matrix.ncols()).map(|col| matrix[(row, col)]).collect::<Vec<_>>()).collect::<Vec<_>>()
+            }),
             "covariance_unavailable_reason": belief.covariance_unavailable_reason,
             "fit_rank": belief.fit_rank,
             "fit_parameter_count": belief.fit_parameter_count,
@@ -69,6 +72,8 @@ impl ScenarioCapture {
             })),
             "model_position_rmse": belief.model_position_rmse,
             "fit_converged": belief.fit_converged,
+            "fit_approximate": belief.fit_approximate,
+            "optimizer_converged": belief.optimizer_converged,
             "planet_contact_counts": belief.planet_contact_counts,
             "uncertain_associations": belief.uncertain_associations,
         }));

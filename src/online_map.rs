@@ -203,12 +203,14 @@ impl OnlineEstimator {
                             .map(|h| h.planet.clone())
                             .collect(),
                     };
-                    let same_topology = refined_map == fit.map;
+                    // Refinement is expected to change floating-point geometry.
+                    // Only promoted/removed hypotheses change the fitted topology.
+                    let same_topology = refined_map.planets.len() == fit.map.planets.len();
                     belief.map = refined_map;
                     belief.fit_rank = Some(fit.rank);
                     belief.fit_parameter_count = Some(fit.map.planets.len() * 3);
                     belief.fit_independent_path_count = Some(fit.independent_paths);
-                    belief.field_evidence = if same_topology && fit.converged {
+                    belief.field_evidence = if same_topology {
                         fit.evidence_resolution.zip(fit.parameter_to_physical).map(
                             |(resolution, parameter_to_physical)| {
                                 std::sync::Arc::new(crate::strategy::FieldEvidence {
@@ -220,11 +222,21 @@ impl OnlineEstimator {
                     } else {
                         None
                     };
-                    belief.parameter_covariance = if !same_topology || !fit.converged {
-                        None
+                    let fit_converged = same_topology
+                        && fit.converged
+                        && fit.rank == fit.map.planets.len() * 3
+                        && fit.independent_paths > fit.rank
+                        && fit.covariance_unavailable_reason.is_none()
+                        && fit.covariance.is_some();
+                    let (covariance, approximate_covariance) = if fit_converged {
+                        (fit.covariance, None)
+                    } else if same_topology {
+                        (None, fit.approximate_covariance.or(fit.covariance))
                     } else {
-                        fit.covariance
+                        (None, None)
                     };
+                    belief.parameter_covariance = covariance;
+                    belief.approximate_parameter_covariance = approximate_covariance;
                     belief.covariance_unavailable_reason = if !same_topology {
                         Some(crate::estimator::CovarianceUnavailableReason::TopologyChanged)
                     } else if !fit.converged {
@@ -232,26 +244,39 @@ impl OnlineEstimator {
                     } else {
                         fit.covariance_unavailable_reason
                     };
-                    belief.fit_converged = same_topology.then_some(fit.converged);
+                    belief.fit_converged = Some(fit_converged);
+                    belief.fit_approximate = Some(!fit_converged);
+                    belief.optimizer_converged = Some(fit.converged);
                     belief.model_position_rmse = same_topology.then_some(fit.position_rmse);
                     eprintln!(
-                        "LivePlanetFit planets={} observations={} position_rmse={:.4} contact_rmse={:.4} rank={} covariance={} converged={}",
+                        "LivePlanetFit planets={} observations={} position_rmse={:.4} contact_rmse={:.4} rank={} covariance={} approximate_covariance={} fit_converged={} optimizer_converged={}",
                         belief.map.planets.len(),
                         self.observations.len(),
                         fit.position_rmse,
                         fit.contact_rmse,
                         fit.rank,
                         belief.parameter_covariance.is_some(),
+                        belief.approximate_parameter_covariance.is_some(),
+                        fit_converged,
                         fit.converged
                     );
                 }
                 Err(error) => {
+                    belief.fit_converged = Some(false);
+                    belief.fit_approximate = Some(true);
+                    // A failed fit may stop before or after the optimizer; no raw
+                    // optimizer termination was returned by the fitting API.
+                    belief.optimizer_converged = None;
                     eprintln!("LivePlanetFitError {error}; retaining contact-seeded partial map")
                 }
             }
         } else {
             belief.covariance_unavailable_reason =
                 Some(crate::estimator::CovarianceUnavailableReason::NoPlanetParameters);
+            // No fitted model exists to call converged or approximate.
+            belief.fit_converged = None;
+            belief.fit_approximate = None;
+            belief.optimizer_converged = None;
         }
         if cancelled.load(Ordering::SeqCst) {
             return None;
@@ -826,6 +851,12 @@ mod tests {
             .observe(&event, &cancelled)
             .expect("contact seeded physical map");
         assert_eq!(belief.map.planets.len(), 1);
+        assert_eq!(belief.fit_approximate, Some(true));
+        assert_eq!(belief.fit_converged, Some(false));
+        assert!(belief.optimizer_converged.is_some());
+        assert!(belief.field_evidence.is_some());
+        assert!(belief.approximate_parameter_covariance.is_some());
+        assert!(belief.parameter_covariance.is_none());
         let planet = &belief.map.planets[0];
         assert_eq!(planet.mass, planet.radius.powi(3) / 10.0);
         let shot = ShotObservation::try_from(&event).unwrap();
