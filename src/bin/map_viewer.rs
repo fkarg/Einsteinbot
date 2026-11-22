@@ -344,6 +344,8 @@ fn list_decisions(path: &PathBuf, capture_id: i64) -> Result<Value, String> {
                 "fit_rmse": belief["model_position_rmse"],
                 "fit_converged": belief["fit_converged"],
                 "covariance": belief["covariance"].is_array(),
+                "approximate_covariance": belief["approximate_covariance"].is_array(),
+                "fit_approximate": belief["fit_approximate"],
                 "covariance_reason": belief["covariance_unavailable_reason"],
                 "field_evidence": belief["field_evidence"].is_object(),
                 "map_epoch": epoch_starts
@@ -875,6 +877,7 @@ fn decode_belief(value: &Value) -> Result<Option<MapBelief>, String> {
         );
     }
     belief.parameter_covariance = matrix_from_json(&value["covariance"]);
+    belief.approximate_parameter_covariance = matrix_from_json(&value["approximate_covariance"]);
     if let (Some(resolution), Some(parameter_to_physical)) = (
         matrix_from_json(&value["field_evidence"]["resolution"]),
         matrix_from_json(&value["field_evidence"]["parameter_to_physical"]),
@@ -918,6 +921,9 @@ fn make_field_grid(
     let actual_map = actual.map(|planets| PlanetMap {
         planets: planets.to_vec(),
     });
+    let approximate_covariance = belief
+        .as_ref()
+        .and_then(|belief| belief.approximate_parameter_covariance.as_ref());
     let world = WorldParameters::default();
     let mut samples = Vec::new();
     let start_x = (view.x as usize / grid_step) * grid_step;
@@ -947,6 +953,7 @@ fn make_field_grid(
                     oracle.map(|v| v.y),
                     Option::<f64>::None,
                     false,
+                    Option::<f64>::None,
                     Option::<f64>::None,
                     Option::<f64>::None
                 ]));
@@ -1001,6 +1008,9 @@ fn make_field_grid(
             let sigma = covariance
                 .and_then(|matrix| belief.map.acceleration_covariance(position, matrix).ok())
                 .map(|covariance| (covariance.xx + covariance.yy).max(0.0).sqrt());
+            let approximate_sigma = approximate_covariance
+                .and_then(|matrix| belief.map.acceleration_covariance(position, matrix).ok())
+                .map(|covariance| (covariance.xx + covariance.yy).max(0.0).sqrt());
             let selected = match display_field {
                 "delta" => delta,
                 "total" => gravity,
@@ -1029,7 +1039,8 @@ fn make_field_grid(
                 sigma,
                 has_residual,
                 belief.model_disagreement_at(position),
-                belief.evidence_availability_at(position)
+                belief.evidence_availability_at(position),
+                approximate_sigma
             ]));
         }
     }
@@ -1043,6 +1054,7 @@ fn make_field_grid(
         "columns": (end_x.saturating_sub(start_x) / grid_step) + 1,
         "rows": (end_y.saturating_sub(start_y) / grid_step) + 1,
         "has_covariance": covariance.is_some(),
+        "has_approximate_covariance": approximate_covariance.is_some(),
         "has_belief": belief.is_some(),
     }))
 }
@@ -1627,7 +1639,7 @@ mod tests {
         )
         .unwrap();
         let sample = &grid["samples"][0];
-        assert_eq!(sample.as_array().unwrap().len(), 16);
+        assert_eq!(sample.as_array().unwrap().len(), 17);
         assert_eq!(sample[2], 0.0);
         assert_eq!(sample[3], 0.0);
         assert_eq!(sample[13], false);
@@ -1635,6 +1647,29 @@ mod tests {
         assert!(sample[14].is_null());
         // No recorded field evidence (older captures): availability is unavailable, not zero.
         assert!(sample[15].is_null());
+        assert!(sample[16].is_null());
+    }
+
+    #[test]
+    fn field_grid_keeps_approximate_uncertainty_apart_from_the_fit_covariance() {
+        let identity = json!([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
+        let data = json!({
+            "map_belief": {
+                "planets": [{"x": 10.0, "y": 0.0, "radius": 2.0, "mass": 50.0}],
+                "local_field": {"samples": []},
+                "approximate_covariance": identity
+            }
+        });
+        let view = Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+        };
+        let grid = make_field_grid(&data, None, 1, view, "total").unwrap();
+        assert!(grid["samples"][0][12].is_null(), "no complete covariance");
+        assert!(grid["samples"][0][16].as_f64().unwrap() > 0.0);
+        assert_eq!(grid["has_approximate_covariance"], true);
     }
 
     #[test]

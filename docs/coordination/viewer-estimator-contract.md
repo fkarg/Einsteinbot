@@ -43,6 +43,7 @@ Terms (from the user's decomposition; they stay separate diagnostics first, and 
 
 | Field | Where | Granularity | Notes |
 | --- | --- | --- | --- |
+| 2026-11-22 | viewer | Viewer decodes `approximate_covariance`; field rows gain element 16 = approximate field σ; `/api/decisions` gains `approximate_covariance` and `fit_approximate`. Fit uncertainty draws the complete covariance when present, else the approximate one under an "Approximate" banner. Verified on live captures 48 and 49. | no |
 | `planets[]` (`x,y,radius,mass`) | `map_belief` | per planet | collision disks |
 | `planet_contact_counts[]` | `map_belief` | per planet | surface contacts supporting it |
 | `uncertain_associations` | `map_belief` | per belief | ambiguous contact associations |
