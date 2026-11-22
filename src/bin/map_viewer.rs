@@ -7,7 +7,9 @@ use einsteinbot::simulation::{
     ShotObservation, Termination, WorldParameters, simulate_shot, simulate_targeting_shot,
     simulate_targeting_shot_with_hypothesis, simulate_targeting_shot_with_local_field,
 };
-use einsteinbot::strategy::{BotState, MapBelief, ShotChoice, TargetingPolicy, TargetingSettings};
+use einsteinbot::strategy::{
+    BotState, FieldEvidence, MapBelief, ShotChoice, TargetingPolicy, TargetingSettings,
+};
 use nalgebra::DMatrix;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::{Value, json};
@@ -17,6 +19,7 @@ use std::error::Error;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[path = "map_viewer/degrade.rs"]
 mod degrade;
@@ -807,6 +810,23 @@ fn optional_finite(
         .ok_or_else(|| format!("nonfinite {key}"))
 }
 
+/// A square, finite matrix from nested JSON arrays; anything else is unavailable.
+fn matrix_from_json(value: &Value) -> Option<DMatrix<f64>> {
+    let rows = value.as_array()?;
+    let columns = rows.first()?.as_array()?.len();
+    if columns == 0 || rows.len() != columns {
+        return None;
+    }
+    let mut matrix = DMatrix::zeros(rows.len(), columns);
+    for (row, cells) in rows.iter().enumerate() {
+        let cells = cells.as_array().filter(|cells| cells.len() == columns)?;
+        for (column, cell) in cells.iter().enumerate() {
+            matrix[(row, column)] = cell.as_f64().filter(|value| value.is_finite())?;
+        }
+    }
+    Some(matrix)
+}
+
 fn decode_belief(value: &Value) -> Result<Option<MapBelief>, String> {
     if value.is_null() {
         return Ok(None);
@@ -837,26 +857,15 @@ fn decode_belief(value: &Value) -> Result<Option<MapBelief>, String> {
                 .map_err(|error| format!("invalid hypothesis local field: {error}"))?,
         );
     }
-    if let Some(covariance) = value.get("covariance").and_then(Value::as_array) {
-        let rows = covariance.len();
-        let columns = covariance
-            .first()
-            .and_then(Value::as_array)
-            .map_or(0, Vec::len);
-        if rows > 0
-            && columns > 0
-            && rows == columns
-            && covariance
-                .iter()
-                .all(|row| row.as_array().is_some_and(|row| row.len() == columns))
-        {
-            let matrix = DMatrix::from_fn(rows, columns, |row, column| {
-                covariance[row][column].as_f64().unwrap_or(f64::NAN)
-            });
-            if matrix.iter().all(|value| value.is_finite()) {
-                belief.parameter_covariance = Some(matrix);
-            }
-        }
+    belief.parameter_covariance = matrix_from_json(&value["covariance"]);
+    if let (Some(resolution), Some(parameter_to_physical)) = (
+        matrix_from_json(&value["field_evidence"]["resolution"]),
+        matrix_from_json(&value["field_evidence"]["parameter_to_physical"]),
+    ) {
+        belief.field_evidence = Some(Arc::new(FieldEvidence {
+            resolution,
+            parameter_to_physical,
+        }));
     }
     belief.model_position_rmse = value["model_position_rmse"].as_f64();
     belief.fit_converged = value["fit_converged"].as_bool();
@@ -921,6 +930,7 @@ fn make_field_grid(
                     oracle.map(|v| v.y),
                     Option::<f64>::None,
                     false,
+                    Option::<f64>::None,
                     Option::<f64>::None
                 ]));
                 continue;
@@ -1001,7 +1011,8 @@ fn make_field_grid(
                 actual_vector.map(|v| v.y),
                 sigma,
                 has_residual,
-                belief.model_disagreement_at(position)
+                belief.model_disagreement_at(position),
+                belief.evidence_availability_at(position)
             ]));
         }
     }
@@ -1599,12 +1610,41 @@ mod tests {
         )
         .unwrap();
         let sample = &grid["samples"][0];
-        assert_eq!(sample.as_array().unwrap().len(), 15);
+        assert_eq!(sample.as_array().unwrap().len(), 16);
         assert_eq!(sample[2], 0.0);
         assert_eq!(sample[3], 0.0);
         assert_eq!(sample[13], false);
         // No validated field-only source: model disagreement is unavailable, not zero.
         assert!(sample[14].is_null());
+        // No recorded field evidence (older captures): availability is unavailable, not zero.
+        assert!(sample[15].is_null());
+    }
+
+    #[test]
+    fn field_grid_reports_recorded_evidence_availability() {
+        let planet = json!({"x": 10.0, "y": 0.0, "radius": 2.0, "mass": 50.0});
+        let identity = json!([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
+        let data = json!({
+            "map_belief": {
+                "planets": [planet],
+                "local_field": {"samples": []},
+                "field_evidence": {"resolution": identity, "parameter_to_physical": identity}
+            }
+        });
+        let view = Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+        };
+        let grid = make_field_grid(&data, None, 1, view, "total").unwrap();
+        let availability = grid["samples"][0][15].as_f64().unwrap();
+        assert!(availability > 0.0 && availability <= 1.0);
+        // A malformed matrix is dropped rather than guessed.
+        let mut broken = data.clone();
+        broken["map_belief"]["field_evidence"]["resolution"] = json!([[1.0, 0.0], [0.0]]);
+        let grid = make_field_grid(&broken, None, 1, view, "total").unwrap();
+        assert!(grid["samples"][0][15].is_null());
     }
 
     #[test]
