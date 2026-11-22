@@ -312,6 +312,17 @@ fn list_decisions(path: &PathBuf, capture_id: i64) -> Result<Value, String> {
         .prepare("SELECT sequence, timestamp_unix_ms, bot_name, data_json FROM diagnostics WHERE capture_id=?1 AND kind='target_decision' ORDER BY sequence")
         .map_err(|error| error.to_string())?;
     let disclosed = disclosed_maps(&connection, capture_id)?;
+    // Each `Planets` message starts a new map epoch; carried-forward estimates must not cross one.
+    let mut epoch_starts = Vec::new();
+    let mut epoch_statement = connection
+        .prepare("SELECT sequence FROM events WHERE capture_id=?1 AND event_type='planets' ORDER BY sequence")
+        .map_err(|error| error.to_string())?;
+    for sequence in epoch_statement
+        .query_map([capture_id], |row| row.get::<_, i64>(0))
+        .map_err(|error| error.to_string())?
+    {
+        epoch_starts.push(sequence.map_err(|error| error.to_string())?);
+    }
     let rows = statement
         .query_map([capture_id], |row| {
             let data: String = row.get(3)?;
@@ -333,6 +344,12 @@ fn list_decisions(path: &PathBuf, capture_id: i64) -> Result<Value, String> {
                 "fit_rmse": belief["model_position_rmse"],
                 "fit_converged": belief["fit_converged"],
                 "covariance": belief["covariance"].is_array(),
+                "covariance_reason": belief["covariance_unavailable_reason"],
+                "field_evidence": belief["field_evidence"].is_object(),
+                "map_epoch": epoch_starts
+                    .partition_point(|start| *start <= sequence)
+                    .checked_sub(1)
+                    .map_or(0, |index| epoch_starts[index]),
             }))
         })
         .map_err(|error| error.to_string())?;
