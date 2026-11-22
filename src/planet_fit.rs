@@ -262,9 +262,12 @@ fn fit_planet_map_inner(
         Some(CovarianceUnavailableReason::InsufficientIndependentPaths)
     } else if parameter_to_physical.is_none() {
         Some(CovarianceUnavailableReason::ParameterTransformUnavailable)
+    } else if !converged {
+        Some(CovarianceUnavailableReason::FitDidNotConverge)
     } else {
         None
     };
+    let covariance_complete = covariance_unavailable_reason.is_none() && converged;
     let (covariance, approximate_covariance) =
         if let Some(parameter_to_physical) = parameter_to_physical.as_ref() {
             let inverse = svd
@@ -273,7 +276,7 @@ fn fit_planet_map_inner(
             // The complete-fit covariance uses independent paths for its scale.
             // Partial fits instead use residual-vector degrees of freedom because
             // independent_paths <= rank is exactly why their covariance is partial.
-            let degrees_of_freedom = if covariance_unavailable_reason.is_none() {
+            let degrees_of_freedom = if covariance_complete {
                 independent_paths - rank
             } else {
                 residuals.len().saturating_sub(rank).max(1)
@@ -284,7 +287,7 @@ fn fit_planet_map_inner(
             // the full nonlinear decoding Jacobian, including those cross terms.
             let covariance =
                 parameter_to_physical * parameter_covariance * parameter_to_physical.transpose();
-            if covariance_unavailable_reason.is_none() {
+            if covariance_complete {
                 (Some(covariance), None)
             } else {
                 (None, Some(covariance))
@@ -829,8 +832,13 @@ mod tests {
         assert!(fit.position_rmse < 0.01, "{}", fit.position_rmse);
         assert!(fit.contact_rmse < 0.5);
         assert_eq!(fit.rank, 6);
-        assert!(fit.covariance.is_some());
-        assert_eq!(fit.covariance_unavailable_reason, None);
+        assert!(!fit.converged);
+        assert!(fit.covariance.is_none());
+        assert!(fit.approximate_covariance.is_some());
+        assert_eq!(
+            fit.covariance_unavailable_reason,
+            Some(CovarianceUnavailableReason::FitDidNotConverge)
+        );
         assert!(fit.independent_paths > fit.rank);
         assert!(fit.evidence_resolution.as_ref().unwrap().trace() > 0.0);
         assert!(fit.parameter_to_physical.is_some());
@@ -847,8 +855,8 @@ mod tests {
             &AtomicBool::new(false),
         )
         .unwrap();
-        let covariance = fit.covariance.as_ref().unwrap();
-        let repeated_covariance = repeated_fit.covariance.as_ref().unwrap();
+        let covariance = fit.approximate_covariance.as_ref().unwrap();
+        let repeated_covariance = repeated_fit.approximate_covariance.as_ref().unwrap();
         assert!(
             (covariance - repeated_covariance).norm() <= covariance.norm() * 1e-6,
             "replayed deterministic paths must not manufacture confidence"
