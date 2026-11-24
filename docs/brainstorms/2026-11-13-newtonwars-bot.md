@@ -1,5 +1,13 @@
 # NewtonWars bot — grill-me capture
 
+## Current estimator follow-up: ambiguity is not yet integrated
+
+The live estimator and targeting do **not** yet retain a set of plausible gravity maps, incorporate their disagreement into the uncertainty layer, or propagate those alternatives through shot prediction. The viewer does not yet display those alternatives or their trajectory spread. The existing single-source/no-source disagreement heuristic is not the proposed multi-map ambiguity model.
+
+The offline experiment in Round 41 screens and compares alternative fields and simulates their fixed-horizon trajectories. It is diagnostic only: its fit thresholds and model spread are not calibrated, its sampled candidates can miss the truth, and its hypothetical gravity sources are not collision geometry. Do not interpret agreement among the candidates as certainty.
+
+Remaining work: validate qualification against multiple independent observed paths; retain, update and prune distinct plausible maps across observations while keeping unexplained uncertainty visible; coordinate additive viewer serialization and diagnostics; and test collision-aware trajectory and outcome predictions across alternatives against the current live baseline before enabling them for targeting. See Round 41 for evidence, limitations and reproducible commands.
+
 ## Goal and scope
 Build an information-gathering NewtonWars bot in Rust. The supplied Notes.md prioritizes discovering planet locations/gravity efficiently, tracking uncertainty, incrementally updating a map, and improving shot targeting; full RL is explicitly later. User suggests first determining local build/run, then a basic telnet client and communication map, keeping modules clean. Test coverage can remain small, with a few core tests.
 
