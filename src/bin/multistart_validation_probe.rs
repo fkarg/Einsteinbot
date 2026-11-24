@@ -232,6 +232,35 @@ fn main() {
                 }
             }
             let proposal_ms = started.elapsed().as_millis();
+            // Future-path scores are reported only after all candidate fitting and
+            // selection. They must not influence retention or refinement.
+            for (label, candidate, validation_rmse) in &candidates {
+                let future = position_rmse(candidate, heldout, world).ok();
+                let belief = MapBelief::new(candidate.clone(), None);
+                let field = einsteinbot::field_score::score_field(
+                    &truth,
+                    &belief,
+                    &paths[..3],
+                    world,
+                    einsteinbot::field_score::FieldModel::Physical,
+                );
+                let explored = field
+                    .as_ref()
+                    .and_then(|s| s.explored.as_ref())
+                    .and_then(|s| s.vector_rmse);
+                let unexplored = field
+                    .as_ref()
+                    .and_then(|s| s.unexplored.as_ref())
+                    .and_then(|s| s.vector_rmse);
+                let whole = field
+                    .as_ref()
+                    .and_then(|s| s.whole.as_ref())
+                    .and_then(|s| s.vector_rmse);
+                println!(
+                    "  candidate case={seed} seed={strategy:?} label={label} count={} validation={validation_rmse:.6} future={future:?} explored={explored:?} unexplored={unexplored:?} whole={whole:?}",
+                    candidate.planets.len()
+                );
+            }
             let mut online = OnlineEstimator::with_seed_strategy(strategy);
             let cancel = AtomicBool::new(false);
             let live_started = Instant::now();
