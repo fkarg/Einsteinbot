@@ -1,5 +1,7 @@
 //! Offline comparison of source starts and independent-path model selection.
 //! The synthetic oracle generates and scores trajectories; it never reaches a fitter.
+#[path = "multistart_validation_probe/ambiguity.rs"]
+mod ambiguity;
 #[path = "multistart_validation_probe/retention.rs"]
 mod retention;
 use einsteinbot::estimator::{
@@ -210,6 +212,82 @@ fn main() {
             ];
             for (name, members) in &policies {
                 println!("  retained case={seed} rule={name} indices={members:?}");
+            }
+            // Freeze the membership before accessing truth or the outer path.
+            // The tolerance is a sensitivity experiment, not a probability.
+            let ambiguity_sets: Vec<_> = [0.10, 0.25, 0.50]
+                .into_iter()
+                .map(|relative| {
+                    let (qualified, selected) =
+                        ambiguity::select(&candidates, &paths[..3], relative, 0.01, 3);
+                    (relative, qualified, selected)
+                })
+                .collect();
+            for (relative, qualified, selected) in &ambiguity_sets {
+                let maps: Vec<_> = selected.iter().map(|&i| &candidates[i].1).collect();
+                let mut spreads = Vec::new();
+                let mut invalid = 0usize;
+                if maps.len() >= 2 {
+                    for shot in &paths[..3] {
+                        for point in shot
+                            .points
+                            .iter()
+                            .take(shot.points.len().saturating_sub(1))
+                            .step_by(10)
+                        {
+                            let p = einsteinbot::map::Vec2::new(point.x.into(), point.y.into());
+                            match ambiguity::field_spread(&maps, p) {
+                                Some(value) => spreads.push(value),
+                                None => invalid += 1,
+                            }
+                        }
+                    }
+                }
+                let mean_spread = (!spreads.is_empty() && invalid == 0)
+                    .then(|| spreads.iter().sum::<f64>() / spreads.len() as f64);
+                let max_spread = (invalid == 0 && !spreads.is_empty())
+                    .then(|| spreads.iter().copied().fold(0.0_f64, f64::max));
+                let invalid_distances = qualified
+                    .iter()
+                    .filter(|i| !selected.contains(i))
+                    .filter(|&&i| {
+                        selected.iter().any(|&j| {
+                            retention::distance(&candidates[i].1, &candidates[j].1, &paths[..3])
+                                .is_none()
+                        })
+                    })
+                    .count();
+                let prediction_status = if maps.is_empty() {
+                    "no_qualified_candidates"
+                } else if heldout[0].points.len() < 3 {
+                    "insufficient_timed_points"
+                } else {
+                    "computed"
+                };
+                // These unbounded gravity-only forecasts deliberately have no collision geometry.
+                let prediction_started = Instant::now();
+                let prediction = ambiguity::predict(&maps, &heldout[0], world);
+                let prediction_us = prediction_started.elapsed().as_micros();
+                let mean_field = ambiguity::mean_field_scores(&maps, &truth, &paths[..3], world);
+                println!(
+                    "  ambiguity {}",
+                    serde_json::json!({
+                        "case": seed, "seed": format!("{strategy:?}"), "relative": relative,
+                        "floor": 0.01, "cap": 3, "qualified": qualified, "selected": selected,
+                        "evaluation_stage": "pre_refinement", "distance_invalid_candidates": invalid_distances,
+                        "field_spread_observed_mean": mean_spread, "field_spread_observed_max": max_spread, "field_spread_samples": spreads.len(),
+                        "field_spread_invalid": invalid, "members": prediction.members,
+                        "prediction_status": prediction_status, "prediction_failures": prediction.failures, "prediction_us": prediction_us,
+                        "best_validation_path_rmse": prediction.nominal_rmse,
+                        "member_path_rmse": prediction.member_rmse,
+                        "mean_member_path_rmse": prediction.mean_member_rmse,
+                        "mean_path_rmse": prediction.mean_rmse, "max_path_spread": prediction.max_spread,
+                        "flat_path_rmse": flat_test,
+                    "mean_field_explored_rmse": mean_field[0],
+                    "mean_field_unexplored_rmse": mean_field[1],
+                    "mean_field_whole_rmse": mean_field[2]
+                    })
+                );
             }
             // Fit the full pool once, so each arm is scored on identical refined
             // maps. Record per-map effort; this is not a matched-compute study.

@@ -67,7 +67,7 @@ pub fn retain(
     keep
 }
 
-fn distance(a: &PlanetMap, b: &PlanetMap, paths: &[ShotObservation]) -> Option<f64> {
+pub(super) fn distance(a: &PlanetMap, b: &PlanetMap, paths: &[ShotObservation]) -> Option<f64> {
     let mut sum = 0.0;
     let mut n = 0;
     for shot in paths {
