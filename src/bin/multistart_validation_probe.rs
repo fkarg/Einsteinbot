@@ -1,5 +1,7 @@
 //! Offline comparison of source starts and independent-path model selection.
 //! The synthetic oracle generates and scores trajectories; it never reaches a fitter.
+#[path = "multistart_validation_probe/retention.rs"]
+mod retention;
 use einsteinbot::estimator::{
     SeedStrategy, fit_fixed_count, fit_greedy_source_counts_with_strategy, position_rmse,
     seed_planet_from_residuals_with_strategy,
@@ -189,6 +191,81 @@ fn main() {
                     }
                 }
             }
+            let retention_started = Instant::now();
+            // The three policies consume exactly the same pool and observed prefix.
+            // The held-out path and truth are unavailable to retention.
+            let policies = [
+                (
+                    "ranked",
+                    retention::retain(&candidates, &paths[..3], 2, retention::Rule::Ranked),
+                ),
+                (
+                    "count",
+                    retention::retain(&candidates, &paths[..3], 2, retention::Rule::Count),
+                ),
+                (
+                    "field",
+                    retention::retain(&candidates, &paths[..3], 2, retention::Rule::Field),
+                ),
+            ];
+            for (name, members) in &policies {
+                println!("  retained case={seed} rule={name} indices={members:?}");
+            }
+            // Fit the full pool once, so each arm is scored on identical refined
+            // maps. Record per-map effort; this is not a matched-compute study.
+            let updated: Vec<_> = candidates
+                .iter()
+                .map(|(_, map, _)| {
+                    let begin = Instant::now();
+                    let result = if map.planets.is_empty() {
+                        Ok(map.clone())
+                    } else {
+                        fit_fixed_count(map, &paths[..3], world).map(|fit| fit.map)
+                    };
+                    (result, begin.elapsed().as_micros())
+                })
+                .collect();
+            for (index, (result, micros)) in updated.iter().enumerate() {
+                // A failed update keeps its previous map and is explicitly flagged.
+                let (map, status, failure) = match result {
+                    Ok(map) => (map, "updated", None),
+                    Err(error) => (
+                        &candidates[index].1,
+                        "refit_failed_fallback",
+                        Some(error.to_string()),
+                    ),
+                };
+                let belief = MapBelief::new(map.clone(), None);
+                let field = einsteinbot::field_score::score_field(
+                    &truth,
+                    &belief,
+                    &paths[..3],
+                    world,
+                    einsteinbot::field_score::FieldModel::Physical,
+                );
+                let explored = field
+                    .as_ref()
+                    .and_then(|s| s.explored.as_ref())
+                    .and_then(|s| s.vector_rmse);
+                let unexplored = field
+                    .as_ref()
+                    .and_then(|s| s.unexplored.as_ref())
+                    .and_then(|s| s.vector_rmse);
+                let whole = field
+                    .as_ref()
+                    .and_then(|s| s.whole.as_ref())
+                    .and_then(|s| s.vector_rmse);
+                let future = position_rmse(map, heldout, world).ok();
+                if let Some(error) = failure {
+                    println!("  update_error case={seed} index={index} error={error:?}");
+                }
+                println!(
+                    "  updated case={seed} index={index} label={} count={} status={status} fit_us={micros} explored={explored:?} unexplored={unexplored:?} whole={whole:?} future={future:?}",
+                    candidates[index].0,
+                    map.planets.len()
+                );
+            }
+            let retention_elapsed = retention_started.elapsed();
             // Apply the existing field-validation heuristic to each complexity step:
             // require >0.01 absolute and >20% relative improvement on path 3.
             let mut selected = &candidates[0];
@@ -231,7 +308,10 @@ fn main() {
                     );
                 }
             }
-            let proposal_ms = started.elapsed().as_millis();
+            let proposal_ms = started
+                .elapsed()
+                .saturating_sub(retention_elapsed)
+                .as_millis();
             // Future-path scores are reported only after all candidate fitting and
             // selection. They must not influence retention or refinement.
             for (label, candidate, validation_rmse) in &candidates {
