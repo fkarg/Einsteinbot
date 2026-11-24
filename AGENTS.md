@@ -6,6 +6,8 @@ This repository is **Einsteinbot**, a Rust project to build an information-gathe
 
 The project target is to infer planet locations and gravity effects efficiently, maintain an incrementally updated map with uncertainty, and use that model to improve shot selection. Reinforcement learning is explicitly a later possibility, not an initial requirement.
 
+For estimator evaluation, prioritize gravity-field accuracy in explored areas; also assess whole-field and unexplored-area accuracy, planet collision geometry, uncertainty, and trajectory prediction separately. Targeting and strategy ultimately optimize shot outcomes and game strength, not the estimator's field score alone. Use oracle truth only for evaluation, never as fit input. See [`docs/estimator-evaluation.md`](docs/estimator-evaluation.md) for the proposed scorecard and measurement semantics.
+
 ## Development direction
 
 - First understand how to build and run the local NewtonWars game.
@@ -20,6 +22,7 @@ The project target is to infer planet locations and gravity effects efficiently,
 
 - One bot session owns one TCP connection. `--clients N` starts several concurrent sessions only against loopback hosts; same-IP remote fan-out is rejected by NewtonWars. A manager run has one SQLite capture: the first session records shared world events once, and each session tags its own identity/energy events and outbound commands with its bot name.
 - The client uses the NewtonWars protocol version 8. Keep transport, typed protocol events, and bot policy in separate modules.
+- The live estimator uses the grid residual-source initializer by default. The bearing initializer remains available per estimator instance for offline paired scoring; do not enable it in the live client without comparative evidence.
 - SQLite recording defaults on and stores parsed semantic inbound events and outbound commands in global sequence order per invocation. A multi-client manager records shared world events once and tags bot-specific events and commands; it does not store raw TCP bytes. `--no-record` disables it; `--dummy` opts into the simple energy-gated firing policy.
 - A SQLite capture remains one connection's complete replay log. The estimator treats each observed `Planets` update as a separate map-fit episode; oracle maps are used automatically when present for boundaries and scoring, never as fit input. A shot's first recorded point is its launch position, so fit paths across player position changes together when the map is unchanged.
 - The client rate limiter is per TCP connection: 16 outbound wire bytes per second with a 512-byte burst. Upstream refills one byte every three loop steps and exempts localhost, so its actual wall-clock rate depends on loop pace. Keep the client cap unless upstream source or limits change.

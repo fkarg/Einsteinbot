@@ -36,6 +36,8 @@ pub struct OnlineStageProfile {
 
 #[derive(Clone, Default)]
 pub struct OnlineEstimator {
+    seed_strategy: crate::estimator::SeedStrategy,
+    provisional_enabled: bool,
     contacts: ContactMap,
     players: BTreeMap<u32, Point>,
     observations: Vec<ShotObservation>,
@@ -44,6 +46,24 @@ pub struct OnlineEstimator {
 }
 
 impl OnlineEstimator {
+    /// Choose the source initializer for this independent estimator instance.
+    pub fn with_seed_strategy(seed_strategy: crate::estimator::SeedStrategy) -> Self {
+        Self {
+            seed_strategy,
+            ..Self::default()
+        }
+    }
+
+    /// Enable the experimental, inspection-only first-flyby proposal.
+    pub fn with_provisional_field(mut self) -> Self {
+        self.provisional_enabled = true;
+        self
+    }
+
+    pub fn seed_strategy(&self) -> crate::estimator::SeedStrategy {
+        self.seed_strategy
+    }
+
     /// Ingest an ordered group of events, then fit once if it contains new trajectories.
     pub fn observe_batch(
         &mut self,
@@ -327,6 +347,37 @@ impl OnlineEstimator {
         if !hypothesis_ok {
             return None;
         }
+        // A first flyby can constrain a field even when no independent path exists
+        // to validate it. Keep this separate from the targeting hypothesis.
+        if self.provisional_enabled
+            && prior_observations.iter().all(|shot| shot.points.len() < 3)
+            && belief.map.planets.is_empty()
+            && self.field_hypothesis.is_none()
+        {
+            let mut scorable = new_observations
+                .iter()
+                .filter(|shot| shot.points.len() >= 3);
+            if let (Some(shot), None) = (scorable.next(), scorable.next()) {
+                belief.provisional_field_hypothesis =
+                    crate::field_hypothesis::propose_provisional_field_with_strategy(
+                        shot,
+                        WorldParameters::default(),
+                        cancelled,
+                        self.seed_strategy,
+                    );
+            }
+        } else if self.provisional_enabled
+            && belief.map.planets.is_empty()
+            && self.field_hypothesis.is_none()
+            && new_observations.iter().all(|shot| shot.points.len() < 3)
+        {
+            // A path with fewer than two timed points cannot validate or refute
+            // the previous source. Preserve it until informative evidence arrives.
+            belief.provisional_field_hypothesis = self
+                .belief
+                .as_ref()
+                .and_then(|previous| previous.provisional_field_hypothesis.clone());
+        }
         let hypothesis_residual_started = stages.as_ref().map(|_| Instant::now());
         if let Some(hypothesis) = &self.field_hypothesis {
             let mut gravity_sources = belief.map.clone();
@@ -365,7 +416,9 @@ impl OnlineEstimator {
         validation: &[ShotObservation],
         cancelled: &AtomicBool,
     ) -> bool {
-        use crate::field_hypothesis::{propose_joint_residual_field, validate_residual_field};
+        use crate::field_hypothesis::{
+            propose_joint_residual_field_with_strategy, validate_residual_field,
+        };
         if validation.is_empty() || training.is_empty() {
             return !cancelled.load(Ordering::Relaxed);
         }
@@ -456,12 +509,13 @@ impl OnlineEstimator {
             self.field_hypothesis = None;
         }
 
-        let Some(candidate) = propose_joint_residual_field(
+        let Some(candidate) = propose_joint_residual_field_with_strategy(
             training,
             validation,
             baseline,
             WorldParameters::default(),
             cancelled,
+            self.seed_strategy,
         ) else {
             return !cancelled.load(Ordering::Relaxed);
         };
@@ -506,8 +560,12 @@ impl OnlineEstimator {
     }
     pub fn reset(&mut self) {
         let players = std::mem::take(&mut self.players);
+        let seed_strategy = self.seed_strategy;
+        let provisional_enabled = self.provisional_enabled;
         *self = Self::default();
         self.players = players;
+        self.seed_strategy = seed_strategy;
+        self.provisional_enabled = provisional_enabled;
     }
 }
 
@@ -640,6 +698,258 @@ mod tests {
             unassigned_surface_constraints(&planets, std::slice::from_ref(&owned), &candidates)
                 .collect::<Vec<_>>();
         assert!(constraints.is_empty());
+    }
+
+    #[test]
+    fn first_flyby_publishes_a_tentative_field_without_collision_geometry() {
+        let truth = PlanetMap {
+            planets: vec![Planet {
+                x: 600.0,
+                y: 500.0,
+                radius: 30.0,
+                mass: 2700.0,
+            }],
+        };
+        let launch = ShotObservation {
+            player_id: 1,
+            angle_degrees: 0.0,
+            velocity: 8.0,
+            points: vec![Point { x: 200.0, y: 400.0 }],
+        };
+        let path = simulate_shot(&truth, &launch, WorldParameters::default(), 2000).unwrap();
+        assert_eq!(
+            path.termination,
+            crate::simulation::Termination::BattlefieldMargin
+        );
+        let event = ServerEvent::ShotFin {
+            player_id: 1,
+            angle: 0.0,
+            velocity: 8.0,
+            points: path.points.clone(),
+        };
+        let default_belief = OnlineEstimator::default()
+            .observe(&event, &AtomicBool::new(false))
+            .unwrap();
+        assert!(default_belief.provisional_field_hypothesis.is_none());
+        let mut estimator = OnlineEstimator::default().with_provisional_field();
+        estimator.reset();
+        let belief = estimator
+            .observe(
+                &ServerEvent::ShotFin {
+                    player_id: 1,
+                    angle: 0.0,
+                    velocity: 8.0,
+                    points: path.points,
+                },
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert!(belief.map.planets.is_empty());
+        assert!(
+            belief.field_hypothesis.is_none(),
+            "one path is not independent validation"
+        );
+        let candidate = belief
+            .provisional_field_hypothesis
+            .expect("one flyby supplies a tentative source");
+        assert_eq!(candidate.source.validation_paths, 0);
+        assert!((candidate.source.x - 600.0).hypot(candidate.source.y - 500.0) < 5.0);
+        let json = serde_json::to_value(&candidate).unwrap();
+        assert_eq!(json["source"]["validation_paths"], 0);
+        assert_eq!(json["approximate_covariance"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            json["covariance_unavailable_reason"],
+            "insufficient_independent_paths"
+        );
+        let second = ShotObservation {
+            player_id: 1,
+            angle_degrees: 0.0,
+            velocity: 8.0,
+            points: vec![Point { x: 200.0, y: 350.0 }],
+        };
+        let path = simulate_shot(&truth, &second, WorldParameters::default(), 2000).unwrap();
+        let updated = estimator
+            .observe(
+                &ServerEvent::ShotFin {
+                    player_id: 1,
+                    angle: 0.0,
+                    velocity: 8.0,
+                    points: path.points,
+                },
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert!(updated.provisional_field_hypothesis.is_none());
+        assert!(
+            updated.field_hypothesis.is_some(),
+            "an independent flyby can validate the source"
+        );
+    }
+
+    #[test]
+    fn unscorable_short_path_does_not_discard_first_flyby_hypothesis() {
+        let truth = PlanetMap {
+            planets: vec![Planet {
+                x: 600.0,
+                y: 500.0,
+                radius: 30.0,
+                mass: 2700.0,
+            }],
+        };
+        let launch = ShotObservation {
+            player_id: 1,
+            angle_degrees: 0.0,
+            velocity: 8.0,
+            points: vec![Point { x: 200.0, y: 400.0 }],
+        };
+        let path = simulate_shot(&truth, &launch, WorldParameters::default(), 2000).unwrap();
+        let mut estimator = OnlineEstimator::default().with_provisional_field();
+        let cancel = AtomicBool::new(false);
+        let first = estimator
+            .observe(
+                &ServerEvent::ShotFin {
+                    player_id: 1,
+                    angle: 0.0,
+                    velocity: 8.0,
+                    points: path.points,
+                },
+                &cancel,
+            )
+            .unwrap();
+        let source = first.provisional_field_hypothesis.unwrap().source;
+        let short = ServerEvent::ShotFin {
+            player_id: 1,
+            angle: 90.0,
+            velocity: 2.0,
+            points: vec![Point { x: 200.0, y: 400.0 }, Point { x: 200.0, y: 399.0 }],
+        };
+        let later = estimator.observe(&short, &cancel).unwrap();
+        let retained = later
+            .provisional_field_hypothesis
+            .expect("unscorable path is not contrary evidence")
+            .source;
+        assert_eq!(
+            (retained.x, retained.y, retained.mass),
+            (source.x, source.y, source.mass)
+        );
+        assert!(later.field_hypothesis.is_none());
+        estimator.observe(&ServerEvent::Planets { planets: vec![] }, &cancel);
+        assert!(
+            estimator.belief().is_none(),
+            "map reset must clear the tentative source"
+        );
+    }
+
+    #[test]
+    fn short_first_shot_does_not_prevent_the_first_qualifying_flyby() {
+        let truth = PlanetMap {
+            planets: vec![Planet {
+                x: 600.0,
+                y: 500.0,
+                radius: 30.0,
+                mass: 2700.0,
+            }],
+        };
+        let launch = ShotObservation {
+            player_id: 1,
+            angle_degrees: 0.0,
+            velocity: 8.0,
+            points: vec![Point { x: 200.0, y: 400.0 }],
+        };
+        let path = simulate_shot(&truth, &launch, WorldParameters::default(), 2000).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut estimator = OnlineEstimator::default().with_provisional_field();
+        estimator
+            .observe(
+                &ServerEvent::ShotFin {
+                    player_id: 1,
+                    angle: 90.0,
+                    velocity: 2.0,
+                    points: vec![Point { x: 200.0, y: 400.0 }, Point { x: 200.0, y: 399.0 }],
+                },
+                &cancel,
+            )
+            .unwrap();
+        let belief = estimator
+            .observe(
+                &ServerEvent::ShotFin {
+                    player_id: 1,
+                    angle: 0.0,
+                    velocity: 8.0,
+                    points: path.points,
+                },
+                &cancel,
+            )
+            .unwrap();
+        assert!(
+            belief.provisional_field_hypothesis.is_some(),
+            "unscorable history must not block the first informative flyby"
+        );
+        assert!(
+            belief.field_hypothesis.is_none(),
+            "a short earlier path is not independent validation"
+        );
+    }
+
+    #[test]
+    fn initial_batch_with_multiple_informative_paths_does_not_publish_one_as_the_only_evidence() {
+        let truth = PlanetMap {
+            planets: vec![Planet {
+                x: 600.0,
+                y: 500.0,
+                radius: 30.0,
+                mass: 2700.0,
+            }],
+        };
+        let events = [400.0, 350.0].map(|y| {
+            let shot = ShotObservation {
+                player_id: 1,
+                angle_degrees: 0.0,
+                velocity: 8.0,
+                points: vec![Point { x: 200.0, y }],
+            };
+            let points = simulate_shot(&truth, &shot, WorldParameters::default(), 2000)
+                .unwrap()
+                .points;
+            ServerEvent::ShotFin {
+                player_id: 1,
+                angle: 0.0,
+                velocity: 8.0,
+                points,
+            }
+        });
+        let belief = OnlineEstimator::default()
+            .with_provisional_field()
+            .observe_batch(&events, &AtomicBool::new(false))
+            .unwrap();
+        assert!(belief.provisional_field_hypothesis.is_none());
+    }
+
+    #[test]
+    fn first_flat_flyby_does_not_publish_a_tentative_source() {
+        let flat = PlanetMap { planets: vec![] };
+        let launch = ShotObservation {
+            player_id: 1,
+            angle_degrees: -7.0,
+            velocity: 8.0,
+            points: vec![Point { x: 200.0, y: 400.0 }],
+        };
+        let path = simulate_shot(&flat, &launch, WorldParameters::default(), 2000).unwrap();
+        let mut estimator = OnlineEstimator::default();
+        let belief = estimator
+            .observe(
+                &ServerEvent::ShotFin {
+                    player_id: 1,
+                    angle: -7.0,
+                    velocity: 8.0,
+                    points: path.points,
+                },
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert!(belief.provisional_field_hypothesis.is_none());
+        assert!(belief.field_hypothesis.is_none());
+        assert!(belief.map.planets.is_empty());
     }
 
     #[test]

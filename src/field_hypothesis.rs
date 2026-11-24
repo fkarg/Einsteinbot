@@ -1,5 +1,7 @@
 //! Field-only gravity proposal from an observed trajectory.
-use crate::estimator::seed_planet_from_residuals_cancellable;
+use crate::estimator::{
+    SeedStrategy, seed_planet_from_residuals_cancellable, seed_planet_from_residuals_with_strategy,
+};
 use crate::local_field::LocalField;
 use crate::map::{PlanetMap, Vec2};
 use crate::planet_fit::fit_planet_map;
@@ -37,6 +39,16 @@ pub struct FieldHypothesis {
     pub relative_improvement: f64,
 }
 
+/// Conditional first-path fit, before validation by an independent trajectory.
+/// The covariance is an approximate local diagnostic conditional on the single-source
+/// model; it excludes missing sources and may omit unidentified directions.
+#[derive(Clone, Debug, Serialize)]
+pub struct ProvisionalFieldHypothesis {
+    pub source: FieldHypothesis,
+    pub approximate_covariance: Option<[[f64; 3]; 3]>,
+    pub covariance_unavailable_reason: Option<crate::estimator::CovarianceUnavailableReason>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FieldValidation {
     pub baseline_rmse: f64,
@@ -46,7 +58,52 @@ pub struct FieldValidation {
     pub regressed: bool,
 }
 
+/// Descriptive fit on one observed path, not independent statistical evidence.
+#[derive(Clone, Debug)]
+pub struct ObservedPathImpact {
+    /// Indices into the shot's regular position samples.
+    pub sample_indices: Vec<usize>,
+    pub baseline_vector_rmse: f64,
+    pub candidate_vector_rmse: f64,
+}
+
 impl FieldHypothesis {
+    /// Select observed samples where this source's acceleration exceeds an
+    /// absolute threshold, and compare residual vectors before and after it.
+    /// Adjacent samples overlap; they must not be counted as independent paths.
+    pub fn observed_path_impact(
+        &self,
+        baseline: &PlanetMap,
+        shot: &ShotObservation,
+        threshold: f64,
+    ) -> Option<ObservedPathImpact> {
+        if !threshold.is_finite() || threshold < 0.0 {
+            return None;
+        }
+        let residuals = crate::estimator::acceleration_residuals(baseline, shot).ok()?;
+        let mut indices = Vec::new();
+        let (mut before, mut after) = (0.0, 0.0);
+        for (index, sample) in residuals.iter().enumerate() {
+            let source = self.acceleration(sample.position)?;
+            if source.norm_squared().sqrt() < threshold {
+                continue;
+            }
+            let dx = sample.observed.x - sample.predicted.x;
+            let dy = sample.observed.y - sample.predicted.y;
+            before += dx * dx + dy * dy;
+            after += (dx - source.x).powi(2) + (dy - source.y).powi(2);
+            indices.push(index + 1);
+        }
+        if indices.is_empty() {
+            return None;
+        }
+        let count = indices.len() as f64;
+        Some(ObservedPathImpact {
+            sample_indices: indices,
+            baseline_vector_rmse: (before / count).sqrt(),
+            candidate_vector_rmse: (after / count).sqrt(),
+        })
+    }
     /// Distance in world units to the nearest observed timed trajectory segment.
     /// This proxy is not a standard deviation; proximity alone cannot prove accuracy.
     pub fn support_distance(&self, point: Vec2) -> f64 {
@@ -103,6 +160,30 @@ pub fn propose_field(
     world: WorldParameters,
     cancelled: &AtomicBool,
 ) -> Option<FieldHypothesis> {
+    propose_provisional_field(shot, world, cancelled).map(|proposal| {
+        let mut source = proposal.source;
+        // Preserve the legacy API's count of its held-out tail. Provisional
+        // diagnostics use zero because this tail is not an independent path.
+        source.validation_paths = 1;
+        source
+    })
+}
+
+pub fn propose_provisional_field(
+    shot: &ShotObservation,
+    world: WorldParameters,
+    cancelled: &AtomicBool,
+) -> Option<ProvisionalFieldHypothesis> {
+    propose_provisional_field_with_strategy(shot, world, cancelled, SeedStrategy::Grid)
+}
+
+/// Offline or per-session variant of the first-flyby proposal.
+pub fn propose_provisional_field_with_strategy(
+    shot: &ShotObservation,
+    world: WorldParameters,
+    cancelled: &AtomicBool,
+    strategy: SeedStrategy,
+) -> Option<ProvisionalFieldHypothesis> {
     if cancelled.load(Ordering::Relaxed) {
         return None;
     }
@@ -116,12 +197,13 @@ pub fn propose_field(
     // point leaves [0, split) for training and [split, count) exclusively for validation.
     early.points.truncate(split + 1);
     let flat = PlanetMap { planets: vec![] };
-    let seed = seed_planet_from_residuals_cancellable(
+    let seed = seed_planet_from_residuals_with_strategy(
         &flat,
         std::slice::from_ref(&early),
         world,
         30.0,
         50.0,
+        strategy,
         cancelled,
     )
     .ok()?;
@@ -162,18 +244,27 @@ pub fn propose_field(
         return None;
     }
     let source = &fit.map.planets[0];
-    Some(FieldHypothesis {
-        x: source.x,
-        y: source.y,
-        mass: source.mass,
-        support: shot.points[..count].to_vec(),
-        support_paths: vec![shot.points[..count].to_vec()],
-        baseline_continuation_rmse,
-        continuation_rmse,
-        training_paths: 1,
-        validation_paths: 1,
-        relative_improvement: (1.0 - continuation_rmse / baseline_continuation_rmse)
-            .clamp(0.0, 1.0),
+    let covariance = fit
+        .approximate_covariance
+        .as_ref()
+        .or(fit.covariance.as_ref())
+        .map(|matrix| std::array::from_fn(|row| std::array::from_fn(|col| matrix[(row, col)])));
+    Some(ProvisionalFieldHypothesis {
+        approximate_covariance: covariance,
+        covariance_unavailable_reason: fit.covariance_unavailable_reason,
+        source: FieldHypothesis {
+            x: source.x,
+            y: source.y,
+            mass: source.mass,
+            support: shot.points[..count].to_vec(),
+            support_paths: vec![shot.points[..count].to_vec()],
+            baseline_continuation_rmse,
+            continuation_rmse,
+            training_paths: 1,
+            validation_paths: 0,
+            relative_improvement: (1.0 - continuation_rmse / baseline_continuation_rmse)
+                .clamp(0.0, 1.0),
+        },
     })
 }
 
@@ -263,6 +354,24 @@ pub fn propose_joint_residual_field(
     world: WorldParameters,
     cancelled: &AtomicBool,
 ) -> Option<FieldHypothesis> {
+    propose_joint_residual_field_with_strategy(
+        training,
+        validation,
+        baseline,
+        world,
+        cancelled,
+        SeedStrategy::Grid,
+    )
+}
+
+pub(crate) fn propose_joint_residual_field_with_strategy(
+    training: &[ShotObservation],
+    validation: &[ShotObservation],
+    baseline: &PlanetMap,
+    world: WorldParameters,
+    cancelled: &AtomicBool,
+    strategy: SeedStrategy,
+) -> Option<FieldHypothesis> {
     if cancelled.load(Ordering::Relaxed) {
         return None;
     }
@@ -271,9 +380,10 @@ pub fn propose_joint_residual_field(
     if training.is_empty() || validation.is_empty() {
         return None;
     }
-    let source =
-        seed_planet_from_residuals_cancellable(baseline, &training, world, 30.0, 50.0, cancelled)
-            .ok()?;
+    let source = seed_planet_from_residuals_with_strategy(
+        baseline, &training, world, 30.0, 50.0, strategy, cancelled,
+    )
+    .ok()?;
     if cancelled.load(Ordering::Relaxed)
         || ![source.x, source.y, source.mass]
             .iter()
@@ -520,6 +630,30 @@ mod tests {
         assert!(
             on_path < 0.001 && far > on_path + 100.0,
             "on_path={on_path} far={far}"
+        );
+    }
+    #[test]
+    fn impact_query_reports_field_strength_and_residual_reduction_on_observed_samples() {
+        let truth = PlanetMap {
+            planets: vec![Planet {
+                x: 600.0,
+                y: 500.0,
+                radius: 30.0,
+                mass: 2700.0,
+            }],
+        };
+        let shot = observed(&truth, 400.0, 0.0);
+        let hypothesis =
+            propose_field(&shot, WorldParameters::default(), &AtomicBool::new(false)).unwrap();
+        let impact = hypothesis
+            .observed_path_impact(&PlanetMap { planets: vec![] }, &shot, 0.01)
+            .unwrap();
+        assert!(!impact.sample_indices.is_empty());
+        assert!(impact.candidate_vector_rmse < impact.baseline_vector_rmse * 0.05);
+        assert!(
+            hypothesis
+                .observed_path_impact(&PlanetMap { planets: vec![] }, &shot, 1000.0)
+                .is_none()
         );
     }
     #[test]

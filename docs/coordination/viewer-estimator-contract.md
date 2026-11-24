@@ -51,6 +51,7 @@ Terms (from the user's decomposition; they stay separate diagnostics first, and 
 | `fit_converged`, `fit_approximate`, `optimizer_converged`, rank/count fields, `model_position_rmse` | `map_belief` | per belief | `fit_converged` is false for approximate fits; `optimizer_converged` preserves raw optimizer termination; RMSE may be absent when fitting fails |
 | `contact_points[]` | `map_belief` | per contact | accepted endpoints only |
 | `local_field` | `map_belief` | spatial samples | residual mean, fixed 40-unit support |
+| `provisional_field_hypothesis` | `map_belief` | one source | Experimental opt-in only; emitted after the first qualifying flyby; retained across paths with fewer than two timed points, otherwise replaced or cleared when another observation is processed. Inspection only, never collision geometry or targeting input. `source` holds a position, mass and same-path tail scores with `validation_paths = 0`. `approximate_covariance` is a nullable 3×3 conditional diagnostic in x, y, mass order; omitted null directions and unmodelled sources make it incomplete. `covariance_unavailable_reason` explains why full covariance is unavailable. Old captures lack the field. |
 | `field_hypothesis`, `hypothesis_local_field` | `map_belief` | one source | never collision geometry; includes all independent support paths, training/validation counts, and held-out RMSE improvement. The legacy `continuation_rmse` names hold tail RMSE for single-path proposals and whole-path RMSE for joint proposals. |
 | `bot_state` (current positions, in-flight shots, completed shot inputs, covered cells, `observed_spawn_locations`) | decision | per decision | Map-scoped, deduplicated `PlayerPosition` samples; explicitly incomplete (`spawn_locations_complete: false`, `new_spawn_locations_possible: true`). |
 | `map_epoch`, `map_submitted_watermark`, `map_processed_watermark`, `map_pending_events`, `map_wait_ms`, `map_wait_fallback`, `map_updating` | decision | per decision | observation age |
@@ -106,7 +107,6 @@ Terms (from the user's decomposition; they stay separate diagnostics first, and 
 
 | File | Session | Why | Since |
 | --- | --- | --- | --- |
-| *(none)* | | | |
 
 ## 5. Open requests
 

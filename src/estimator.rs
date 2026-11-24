@@ -14,6 +14,17 @@ const PARAMETERS_PER_PLANET: usize = 3;
 /// Position observations are f32; exact synthetic fits still need a nonzero noise floor.
 const POSITION_NOISE_FLOOR: f64 = 1e-4;
 
+/// Residual-source initializer. The established grid search remains the live default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeedStrategy {
+    /// Search only the established grid.
+    #[default]
+    Grid,
+    /// Consider the bearing candidate alongside the same grid candidates.
+    Bearing,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CovarianceUnavailableReason {
@@ -133,6 +144,7 @@ pub fn seed_planet_from_residuals(
         world,
         radius_prior,
         grid_spacing,
+        SeedStrategy::Grid,
         &mut || false,
     )?
     .ok_or_else(|| FitError("no positive point-source residual fit found".to_owned()))
@@ -147,12 +159,34 @@ pub fn seed_planet_from_residuals_cancellable(
     grid_spacing: f64,
     cancelled: &AtomicBool,
 ) -> Result<Planet, FitError> {
+    seed_planet_from_residuals_with_strategy(
+        current_map,
+        observations,
+        world,
+        radius_prior,
+        grid_spacing,
+        SeedStrategy::Grid,
+        cancelled,
+    )
+}
+
+/// Select an initializer per estimator instance; no process-global state is used.
+pub fn seed_planet_from_residuals_with_strategy(
+    current_map: &PlanetMap,
+    observations: &[ShotObservation],
+    world: WorldParameters,
+    radius_prior: f64,
+    grid_spacing: f64,
+    strategy: SeedStrategy,
+    cancelled: &AtomicBool,
+) -> Result<Planet, FitError> {
     try_seed_planet_from_residuals(
         current_map,
         observations,
         world,
         radius_prior,
         grid_spacing,
+        strategy,
         &mut || cancelled.load(Ordering::Relaxed),
     )?
     .ok_or_else(|| FitError("no positive point-source residual fit found".to_owned()))
@@ -164,6 +198,7 @@ fn try_seed_planet_from_residuals(
     world: WorldParameters,
     radius_prior: f64,
     grid_spacing: f64,
+    strategy: SeedStrategy,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<Option<Planet>, FitError> {
     if cancelled() {
@@ -227,62 +262,99 @@ fn try_seed_planet_from_residuals(
         ));
     }
 
-    let mut best: Option<(f64, Planet)> = None;
-    let mut center_x = radius_prior;
-    while center_x <= world.battlefield_width - radius_prior {
-        let mut center_y = radius_prior;
-        while center_y <= world.battlefield_height - radius_prior {
+    // Each residual points approximately toward an unexplained source. Intersect
+    // all bearing lines by least squares, giving separate paths equal weight.
+    // Second differences amplify position quantization; using the acceleration
+    // components as line normals naturally downweights very weak bearings.
+    let (mut xx, mut xy, mut yy, mut bx, mut by) = (0.0, 0.0, 0.0, 0.0, 0.0);
+    for path in paths.iter().filter(|_| strategy == SeedStrategy::Bearing) {
+        let weight = 1.0 / path.len() as f64;
+        for (position, residual) in path.iter().step_by(3) {
             if cancelled() {
                 return Err(FitError("residual seed cancelled".to_owned()));
             }
-            let mut numerator = 0.0;
-            let mut denominator = 0.0;
-            for path in &paths {
-                let mut path_numerator = 0.0;
-                let mut path_denominator = 0.0;
-                for (position, residual) in path {
-                    if cancelled() {
-                        return Err(FitError("residual seed cancelled".to_owned()));
-                    }
-                    let dx = center_x - position.x;
-                    let dy = center_y - position.y;
-                    let distance_squared = dx * dx + dy * dy;
-                    if distance_squared == 0.0 {
-                        continue;
-                    }
-                    let scale = 1.0 / (distance_squared * distance_squared.sqrt());
-                    let gx = dx * scale;
-                    let gy = dy * scale;
-                    path_numerator += residual.x * gx + residual.y * gy;
-                    path_denominator += gx * gx + gy * gy;
-                }
-                let sample_count = path.len() as f64;
-                numerator += path_numerator / sample_count;
-                denominator += path_denominator / sample_count;
-            }
-            if denominator > 0.0 && numerator > 0.0 {
-                let mass = numerator / denominator;
-                let score = numerator * numerator / denominator;
-                if mass.is_finite()
-                    && score.is_finite()
-                    && best
-                        .as_ref()
-                        .is_none_or(|(best_score, _)| score > *best_score)
-                {
-                    best = Some((
-                        score,
-                        Planet {
-                            x: center_x,
-                            y: center_y,
-                            radius: radius_prior,
-                            mass,
-                        },
-                    ));
-                }
-            }
-            center_y += grid_spacing;
+            let nx = -residual.y;
+            let ny = residual.x;
+            let projection = nx * position.x + ny * position.y;
+            xx += weight * nx * nx;
+            xy += weight * nx * ny;
+            yy += weight * ny * ny;
+            bx += weight * nx * projection;
+            by += weight * ny * projection;
         }
-        center_x += grid_spacing;
+    }
+    let determinant = xx * yy - xy * xy;
+    let mut centers = Vec::new();
+    if determinant > 1e-6 * (xx + yy).powi(2) {
+        let x = (bx * yy - by * xy) / determinant;
+        let y = (by * xx - bx * xy) / determinant;
+        if x.is_finite()
+            && y.is_finite()
+            && x >= radius_prior
+            && y >= radius_prior
+            && x <= world.battlefield_width - radius_prior
+            && y <= world.battlefield_height - radius_prior
+        {
+            centers.push((x, y));
+        }
+    }
+    let grid = std::iter::successors(Some(radius_prior), |x| Some(x + grid_spacing))
+        .take_while(|x| *x <= world.battlefield_width - radius_prior)
+        .flat_map(|x| {
+            std::iter::successors(Some(radius_prior), move |y| Some(y + grid_spacing))
+                .take_while(move |y| *y <= world.battlefield_height - radius_prior)
+                .map(move |y| (x, y))
+        });
+    let mut best: Option<(f64, Planet)> = None;
+    for (center_x, center_y) in centers.into_iter().chain(grid) {
+        if cancelled() {
+            return Err(FitError("residual seed cancelled".to_owned()));
+        }
+        let mut numerator = 0.0;
+        let mut denominator = 0.0;
+        for path in &paths {
+            let mut path_numerator = 0.0;
+            let mut path_denominator = 0.0;
+            for (position, residual) in path {
+                if cancelled() {
+                    return Err(FitError("residual seed cancelled".to_owned()));
+                }
+                let dx = center_x - position.x;
+                let dy = center_y - position.y;
+                let distance_squared = dx * dx + dy * dy;
+                if distance_squared == 0.0 {
+                    continue;
+                }
+                let scale = 1.0 / (distance_squared * distance_squared.sqrt());
+                let gx = dx * scale;
+                let gy = dy * scale;
+                path_numerator += residual.x * gx + residual.y * gy;
+                path_denominator += gx * gx + gy * gy;
+            }
+            let sample_count = path.len() as f64;
+            numerator += path_numerator / sample_count;
+            denominator += path_denominator / sample_count;
+        }
+        if denominator > 0.0 && numerator > 0.0 {
+            let mass = numerator / denominator;
+            let score = numerator * numerator / denominator;
+            if mass.is_finite()
+                && score.is_finite()
+                && best
+                    .as_ref()
+                    .is_none_or(|(best_score, _)| score > *best_score)
+            {
+                best = Some((
+                    score,
+                    Planet {
+                        x: center_x,
+                        y: center_y,
+                        radius: radius_prior,
+                        mass,
+                    },
+                ));
+            }
+        }
     }
 
     Ok(best.map(|(_, planet)| planet))
@@ -300,6 +372,27 @@ pub fn fit_greedy_source_counts(
     max_sources: usize,
     radius_prior: f64,
     grid_spacing: f64,
+) -> Result<SourceCountSearch, FitError> {
+    fit_greedy_source_counts_with_strategy(
+        training,
+        validation,
+        world,
+        max_sources,
+        radius_prior,
+        grid_spacing,
+        SeedStrategy::Grid,
+    )
+}
+
+/// Offline source-count exploration using one explicit initializer throughout.
+pub fn fit_greedy_source_counts_with_strategy(
+    training: &[ShotObservation],
+    validation: &[ShotObservation],
+    world: WorldParameters,
+    max_sources: usize,
+    radius_prior: f64,
+    grid_spacing: f64,
+    strategy: SeedStrategy,
 ) -> Result<SourceCountSearch, FitError> {
     if training.is_empty() {
         return Err(FitError(
@@ -329,6 +422,7 @@ pub fn fit_greedy_source_counts(
             world,
             radius_prior,
             grid_spacing,
+            strategy,
             &mut || false,
         )?
         else {
@@ -790,6 +884,7 @@ mod tests {
             WorldParameters::default(),
             30.0,
             50.0,
+            SeedStrategy::Grid,
             &mut || {
                 checks += 1;
                 checks > extraction_checks + 10
@@ -900,6 +995,43 @@ mod tests {
         assert_eq!(shots[0].angle_degrees, 30.0);
         assert_eq!(shots[0].velocity, 8.0);
         assert_eq!(shots[0].points[0].x, 1.0);
+    }
+
+    #[test]
+    fn residual_seed_recovers_a_single_flyby_source_between_grid_points() {
+        let truth = PlanetMap {
+            planets: vec![Planet {
+                x: 600.0,
+                y: 500.0,
+                radius: 30.0,
+                mass: 2700.0,
+            }],
+        };
+        let mut shot = ShotObservation {
+            player_id: 1,
+            angle_degrees: 0.0,
+            velocity: 8.0,
+            points: vec![crate::protocol::Point { x: 200.0, y: 400.0 }],
+        };
+        shot.points =
+            crate::simulation::simulate_shot(&truth, &shot, WorldParameters::default(), 2000)
+                .unwrap()
+                .points;
+        let seed = seed_planet_from_residuals_with_strategy(
+            &PlanetMap { planets: vec![] },
+            &[shot],
+            WorldParameters::default(),
+            30.0,
+            50.0,
+            SeedStrategy::Bearing,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(
+            (seed.x - 600.0).hypot(seed.y - 500.0) < 5.0,
+            "seed={seed:?}"
+        );
+        assert!((seed.mass - 2700.0).abs() < 150.0, "seed={seed:?}");
     }
 
     #[test]

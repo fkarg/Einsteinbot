@@ -407,7 +407,8 @@ fn to_point(point: Vec2) -> Point {
     }
 }
 
-fn field_acceleration(
+/// Evaluate the same physical, source and residual field used by the simulator.
+pub fn field_acceleration(
     map: &PlanetMap,
     field: Option<&LocalField>,
     hypothesis: Option<&FieldHypothesis>,

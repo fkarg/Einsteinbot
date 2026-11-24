@@ -126,6 +126,64 @@ fn observe_launch(
         belief.model_position_rmse,
         belief.parameter_covariance.is_some()
     );
+    if let Some(provisional) = &belief.provisional_field_hypothesis {
+        let source = &provisional.source;
+        let nearest = truth
+            .planets
+            .iter()
+            .map(|planet| {
+                (
+                    (planet.x - source.x).hypot(planet.y - source.y),
+                    (planet.mass - source.mass).abs(),
+                )
+            })
+            .min_by(|a, b| a.0.total_cmp(&b.0));
+        let field = PlanetMap {
+            planets: vec![Planet {
+                x: source.x,
+                y: source.y,
+                mass: source.mass,
+                radius: 0.0,
+            }],
+        };
+        let count = scenario.target_tick + 1;
+        let witness = einsteinbot::simulation::simulate_sampled_positions(
+            truth,
+            &shot(scenario.trial),
+            WorldParameters::default(),
+            count,
+        )
+        .unwrap();
+        let predicted = einsteinbot::simulation::simulate_sampled_positions(
+            &field,
+            &shot(scenario.trial),
+            WorldParameters::default(),
+            count,
+        )
+        .unwrap();
+        let flat = einsteinbot::simulation::simulate_sampled_positions(
+            &PlanetMap { planets: vec![] },
+            &shot(scenario.trial),
+            WorldParameters::default(),
+            count,
+        )
+        .unwrap();
+        let rmse = |prediction: &[Vec2]| {
+            (witness
+                .iter()
+                .zip(prediction)
+                .map(|(a, b)| (a.x - b.x).powi(2) + (a.y - b.y).powi(2))
+                .sum::<f64>()
+                / (2 * count) as f64)
+                .sqrt()
+        };
+        let witness_rmse = rmse(&predicted);
+        let flat_witness_rmse = rmse(&flat);
+        println!(
+            "    provisional_source nearest_center_mass_error={nearest:?} tail_rmse={:.6} baseline_tail_rmse={:.6} witness_rmse={witness_rmse:.6} flat_witness_rmse={flat_witness_rmse:.6}",
+            source.continuation_rmse, source.baseline_continuation_rmse
+        );
+    }
 }
 fn distance_to_path(path: &[Point], target: &Point) -> f64 {
     path.iter()
@@ -270,7 +328,7 @@ fn evaluate(
 
 fn run(scenario: Scenario, mut capture: Option<ScenarioCapture>) {
     println!("scenario={}", scenario.name);
-    let mut estimator = OnlineEstimator::default();
+    let mut estimator = OnlineEstimator::default().with_provisional_field();
     let mut state = BotState::default();
     if let Some(capture) = &mut capture {
         capture.event(
@@ -426,6 +484,46 @@ fn run(scenario: Scenario, mut capture: Option<ScenarioCapture>) {
         );
     }
     if let Some(belief) = &learned {
+        if let Some(provisional) = &belief.provisional_field_hypothesis {
+            let source = &provisional.source;
+            let nearest = scenario
+                .truth
+                .planets
+                .iter()
+                .map(|p| {
+                    (
+                        (p.x - source.x).hypot(p.y - source.y),
+                        (p.mass - source.mass).abs(),
+                    )
+                })
+                .min_by(|a, b| a.0.total_cmp(&b.0));
+            let field = PlanetMap {
+                planets: vec![Planet {
+                    x: source.x,
+                    y: source.y,
+                    mass: source.mass,
+                    radius: 0.0,
+                }],
+            };
+            let predicted = einsteinbot::simulation::simulate_sampled_path(
+                &field,
+                &shot(scenario.trial),
+                WorldParameters::default(),
+                count,
+            )
+            .unwrap();
+            let error = einsteinbot::simulation::compare_trajectories(
+                &witness.points[1..count],
+                &predicted[1..],
+            );
+            println!(
+                "  provisional_source nearest_center_mass_error={nearest:?} heldout_witness_coordinate_rmse={:.6} tail_rmse={:.6} baseline_tail_rmse={:.6} approximate_covariance={}",
+                error.rmse,
+                source.continuation_rmse,
+                source.baseline_continuation_rmse,
+                provisional.approximate_covariance.is_some()
+            );
+        }
         let use_hypothesis =
             belief.field_hypothesis.is_some() && belief.hypothesis_local_field.is_some();
         let predicted = predict_belief(belief, &shot(scenario.trial), count, use_hypothesis);
@@ -1241,7 +1339,7 @@ mod tests {
             .into_iter()
             .find(|case| case.name == "one_planet_noncontact_flyby")
             .unwrap();
-        let mut estimator = OnlineEstimator::default();
+        let mut estimator = OnlineEstimator::default().with_provisional_field();
         let mut state = BotState::default();
         state.observe(&ServerEvent::OwnId { player_id: 1 });
         for (stage, (launch, expected)) in scenario.observations.iter().copied().enumerate() {

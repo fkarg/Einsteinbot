@@ -16,6 +16,8 @@ pub struct MapBelief {
     pub local_field: crate::local_field::LocalField,
     /// An uncertain field-only explanation, never a collision obstacle.
     pub field_hypothesis: Option<crate::field_hypothesis::FieldHypothesis>,
+    /// First-flyby explanation for inspection only, not a targeting model.
+    pub provisional_field_hypothesis: Option<crate::field_hypothesis::ProvisionalFieldHypothesis>,
     /// Local residuals recomputed against the physical field plus that hypothesis.
     pub hypothesis_local_field: Option<crate::local_field::LocalField>,
     /// Covariance ordered by `[center_x, center_y, mass]` for each planet.
@@ -60,6 +62,7 @@ impl MapBelief {
             map,
             local_field: crate::local_field::LocalField::default(),
             field_hypothesis: None,
+            provisional_field_hypothesis: None,
             hypothesis_local_field: None,
             parameter_covariance,
             approximate_parameter_covariance: None,

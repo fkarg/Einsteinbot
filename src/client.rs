@@ -440,6 +440,7 @@ fn target_commands(
             "planets": belief.map.planets,
             "local_field": belief.local_field,
             "field_hypothesis": belief.field_hypothesis,
+            "provisional_field_hypothesis": belief.provisional_field_hypothesis,
             "hypothesis_local_field": belief.hypothesis_local_field,
             "contact_points": belief.contact_points,
             "covariance": belief.parameter_covariance.as_ref().map(|matrix| {
