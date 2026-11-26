@@ -20,7 +20,9 @@ pub struct WeightedMap {
 pub struct MapBelief {
     pub map: PlanetMap,
     /// Approximate-evidence weight of `map` among the retained modes (not a calibrated
-    /// probability). `None` when no evidence weighting was computed.
+    /// probability). `None` when no evidence weighting was computed or when the search was cut short
+    /// (`search_limit` set): the weights are normalized over the modes found, so they would read
+    /// as certainty.
     pub map_weight: Option<f64>,
     /// Other retained modes in descending weight, at most a few. Not consulted by targeting yet.
     pub alternatives: Vec<WeightedMap>,

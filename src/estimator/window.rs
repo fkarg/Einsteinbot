@@ -80,6 +80,7 @@ impl PathData {
     ) -> Option<Self> {
         // The engine records a debris shot's first dot without stepping it when the shot was
         // created after its slot was simulated that tick: the launch dot is then duplicated.
+        assert!(!extra_sd.is_empty(), "at least one noise level is needed");
         let points = match points {
             [first, second, ..] if first == second => &points[1..],
             _ => points,
@@ -246,11 +247,13 @@ fn interpolation_error(ticks: &[V2]) -> Vec<f64> {
         .map(|s| {
             let position_error = INTERPOLATION_SCALE * (fourth(s) + fourth(s + 1)) / 2.0;
             // Rate of change of the observed acceleration across this interval.
-            let (lo, hi) = (s.max(1), (s + 1).min(t - 2));
-            let (a0, a1) = (second(lo), second(hi));
+            // The end intervals borrow the neighbouring pair of ticks (second differences exist
+            // only at ticks 1..=t-2), so no interval gets a zero rate.
+            let lo = s.clamp(1, t - 3);
+            let (a0, a1) = (second(lo), second(lo + 1));
             let da = (a1[0] - a0[0]).hypot(a1[1] - a0[1]);
             let step = (ticks[s + 1][0] - ticks[s][0]).hypot(ticks[s + 1][1] - ticks[s][1]);
-            position_error * da / (hi - lo).max(1) as f64 / step.max(1e-9)
+            position_error * da / step.max(1e-9)
         })
         .collect()
 }
@@ -296,6 +299,18 @@ fn interpolate(ticks: &[V2], v0: V2, n: usize) -> Vec<V2> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every tick interval, the first and the last included, gets a nonzero error estimate on a
+    /// path whose acceleration changes.
+    #[test]
+    fn end_intervals_get_interpolation_variance() {
+        let ticks: Vec<V2> = (0..12)
+            .map(|i| [10.0 * i as f64, 0.05 * (i as f64).powi(4)])
+            .collect();
+        let error = interpolation_error(&ticks);
+        assert_eq!(error.len(), ticks.len() - 1);
+        assert!(error.iter().all(|e| *e > 0.0), "{error:?}");
+    }
 
     /// The pentadiagonal factor reproduces the rounding-noise covariance of the rows computed
     /// independently (the interpolation variance is negligible on this smooth path).

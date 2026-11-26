@@ -15,6 +15,7 @@ use crate::protocol::{Planet, Point};
 use crate::simulation::WorldParameters;
 use levenberg_marquardt::{LeastSquaresProblem, LevenbergMarquardt};
 use nalgebra::{DMatrix, DVector, Dyn, SymmetricEigen, U1, VecStorage};
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
@@ -98,7 +99,7 @@ fn add_planet_field(field: &mut [Vec<f64>; 2], nodes: &[[f64; 2]], x: f64, y: f6
 pub(super) struct Unexplained {
     pub position: [f64; 2],
     pub acceleration: [f64; 2],
-    /// Whitened residual magnitude (about 1.4 for a correct model and noise).
+    /// Whitened residual magnitude (about 1.25 on average, 1.4 rms, for a correct model and noise).
     pub significance: f64,
 }
 
@@ -358,7 +359,9 @@ impl<'a> Fit<'a> {
         )
     }
 
-    /// Local minimum from `start`, or the best point reached when the deadline passes. The fit
+    /// Local minimum from `start`, or the best point reached when the deadline passes (never worse
+    /// than `start`: `Lm` remembers the lowest-norm point it evaluated, because the optimizer
+    /// leaves its last, possibly worse, trial step as the parameters when it is interrupted). The fit
     /// runs coarse to fine over the noise levels: the likelihood at exact noise is so sharp that a
     /// start more than a few units off a planet is outside its basin, while the coarse levels
     /// are wide enough to find it. `None` if cancelled or the model cannot be evaluated at the
@@ -371,10 +374,13 @@ impl<'a> Fit<'a> {
                 .with_patience(LM_PATIENCE)
                 .minimize(Lm {
                     fit: self,
-                    u,
+                    u: u.clone(),
                     level,
+                    best: RefCell::new(None),
                 });
-            u = lm.u;
+            if let Some((_, best)) = lm.best.into_inner() {
+                u = best;
+            }
         }
         let theta = self.decode(&u);
         let chi2 = self.chi2(&theta)?;
@@ -461,6 +467,8 @@ struct Lm<'a> {
     fit: &'a Fit<'a>,
     u: DVector<f64>,
     level: usize,
+    /// Lowest residual norm evaluated so far and its parameters.
+    best: RefCell<Option<(f64, DVector<f64>)>>,
 }
 
 impl LeastSquaresProblem<f64, Dyn, Dyn> for Lm<'_> {
@@ -477,9 +485,15 @@ impl LeastSquaresProblem<f64, Dyn, Dyn> for Lm<'_> {
         if self.fit.deadline.is_some_and(|d| Instant::now() >= d) {
             return None;
         }
-        self.fit
-            .evaluate(&self.fit.decode(&self.u), false, self.level)
-            .map(|(residuals, _)| residuals)
+        let (residuals, _) = self
+            .fit
+            .evaluate(&self.fit.decode(&self.u), false, self.level)?;
+        let norm = residuals.norm();
+        let mut best = self.best.borrow_mut();
+        if best.as_ref().is_none_or(|(lowest, _)| norm < *lowest) {
+            *best = Some((norm, self.u.clone()));
+        }
+        Some(residuals)
     }
     fn jacobian(&self) -> Option<DMatrix<f64>> {
         if self.fit.deadline.is_some_and(|d| Instant::now() >= d) {

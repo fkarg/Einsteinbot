@@ -697,3 +697,135 @@ fn recovery_rate_of_one_planet_worlds() {
         );
     }
 }
+
+// The optimizer leaves its last trial step as the parameters when the deadline interrupts it; the
+// refit returns the best point it evaluated instead. This sweep is a smoke test: the interrupted
+// trial is rarely worse than the *start*, so it does not by itself fail without the fix.
+#[test]
+fn a_deadline_never_leaves_a_refit_worse_than_its_start() {
+    let cancelled = AtomicBool::new(false);
+    let truth = world_of(vec![
+        planet(500.0, 500.0, 30.0),
+        planet(1200.0, 700.0, 30.0),
+    ]);
+    let shots: Vec<Shot> = [
+        ((350.0, 500.0), 0.0),
+        ((1050.0, 700.0), 0.0),
+        ((900.0, 600.0), 150.0),
+        ((300.0, 900.0), 20.0),
+    ]
+    .iter()
+    .map(|(start, angle)| shot_with_contact(&shot_in(&truth, *start, *angle, 6.0), &[]))
+    .collect();
+    let start = [[520.0, 480.0, 35.0], [1180.0, 720.0, 26.0]];
+    for micros in (0..12_000).step_by(100) {
+        let fit = Fit::new(
+            &shots,
+            WorldParameters::default(),
+            &cancelled,
+            false,
+            Vec::new(),
+        )
+        .with_deadline(Instant::now() + Duration::from_micros(micros));
+        let (theta, chi2) = fit.refine(&start).unwrap();
+        let before = fit.chi2(&start).unwrap();
+        assert!(
+            chi2 <= before * (1.0 + 0.0),
+            "{micros} us: {chi2} after, {before} before ({theta:?})"
+        );
+    }
+}
+
+// With no time at all the published belief is still at least as good (on the new data) as the
+// warm-start map it started from.
+#[test]
+fn an_exhausted_budget_never_publishes_worse_than_the_warm_start() {
+    let truth = world_of(vec![planet(900.0, 500.0, 30.0)]);
+    let warm = vec![planet(910.0, 490.0, 32.0)];
+    let (mut estimator, cancelled) = estimator();
+    estimator.time_budget = Duration::ZERO;
+    estimator.warm_starts = vec![warm.clone()];
+    let belief = estimator
+        .observe(&shot_in(&truth, (500.0, 380.0), 0.0, 10.0), &cancelled)
+        .unwrap();
+    assert_eq!(belief.search_limit, Some(SearchLimit::TimeBudget));
+    let fit = Fit::new(
+        &estimator.shots,
+        WorldParameters::default(),
+        &cancelled,
+        true,
+        Vec::new(),
+    );
+    let evidence = |planets: &[Planet]| {
+        let theta: Vec<_> = planets.iter().map(fit::theta_of).collect();
+        fit.evidence(&theta).unwrap().log_evidence
+    };
+    assert!(evidence(&belief.map.planets) >= evidence(&warm));
+}
+
+// Cancellation arriving in the middle of the search returns no belief and leaves the retry state
+// and the warm starts as they were.
+#[test]
+fn cancellation_during_the_search_publishes_nothing_and_changes_no_state() {
+    let truth = world_of(vec![
+        planet(500.0, 500.0, 30.0),
+        planet(1200.0, 700.0, 30.0),
+        planet(900.0, 200.0, 25.0),
+    ]);
+    let events: Vec<ServerEvent> = [
+        ((350.0, 500.0), 0.0),
+        ((1050.0, 700.0), 0.0),
+        ((900.0, 400.0), 90.0),
+        ((300.0, 900.0), 20.0),
+        ((1500.0, 300.0), 170.0),
+    ]
+    .iter()
+    .map(|(start, angle)| shot_in(&truth, *start, *angle, 6.0))
+    .collect();
+    let (mut estimator, _) = estimator();
+    let warm = vec![planet(505.0, 495.0, 30.0)];
+    estimator.warm_starts = vec![warm.clone()];
+    let cancelled = AtomicBool::new(false);
+    let belief = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            std::thread::sleep(Duration::from_millis(15));
+            cancelled.store(true, Ordering::SeqCst);
+        });
+        estimator.observe_batch(&events, &cancelled)
+    });
+    assert!(belief.is_none());
+    assert!(estimator.stale);
+    assert!(estimator.belief().is_none());
+    assert_eq!(estimator.warm_starts, vec![warm]);
+}
+
+// The budget bounds the search, not the work after it (evidence of each mode, the diagnostic
+// `model_position_rmse` over every shot, and the unrefit warm-start evaluations are not
+// budgeted); on this small problem that remainder is far below the slack.
+#[test]
+fn the_time_budget_bounds_the_update_time() {
+    let truth = world_of(vec![
+        planet(500.0, 500.0, 30.0),
+        planet(1200.0, 700.0, 30.0),
+        planet(900.0, 200.0, 25.0),
+    ]);
+    let (mut estimator, cancelled) = estimator();
+    let budget = Duration::from_millis(50);
+    estimator.time_budget = budget;
+    let events: Vec<ServerEvent> = [
+        ((350.0, 500.0), 0.0),
+        ((1050.0, 700.0), 0.0),
+        ((900.0, 400.0), 90.0),
+        ((300.0, 900.0), 20.0),
+        ((1500.0, 300.0), 170.0),
+    ]
+    .iter()
+    .map(|(start, angle)| shot_in(&truth, *start, *angle, 6.0))
+    .collect();
+    let started = Instant::now();
+    let belief = estimator.observe_batch(&events, &cancelled).unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(belief.search_limit, Some(SearchLimit::TimeBudget));
+    assert!(belief.map_weight.is_none());
+    assert!(elapsed < budget + Duration::from_secs(2), "{elapsed:?}");
+}

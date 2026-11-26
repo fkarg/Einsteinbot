@@ -7,7 +7,8 @@
 //! to every path, and `search` grows and shrinks K on the approximate evidence (Laplace/Occam
 //! with a prior of 20:1 against each extra planet, so K=0 is favoured). Distinct supported modes
 //! are kept (at most `MAX_MODES`) with normalized evidence weights. **These weights are heuristic
-//! rankings, not calibrated probabilities.** The published `map` is the maximum-weight mode.
+//! rankings, not calibrated probabilities**, and the published `map_weight` is absent when the search
+//! stopped early (`search_limit`). The published `map` is the maximum-weight mode.
 //!
 //! Surface contacts (`contacts`) are extra evidence only: a gated surface constraint on the
 //! joint fit that never creates a planet. Contact terms enter only planet-bearing models; the
@@ -63,7 +64,8 @@ pub enum CovarianceUnavailableReason {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchLimit {
-    /// The best map already has the maximum number of planets.
+    /// The best map has the maximum number of planets, so growing it was not attempted (a
+    /// supported extra planet may or may not exist).
     PlanetCap,
     /// The per-update time budget ran out.
     TimeBudget,
@@ -109,6 +111,10 @@ pub struct Estimator {
     pub max_planets: usize,
     /// Wall-clock budget per update for growing and shrinking K; the best belief found so far is
     /// published when it runs out.
+    /// The budget bounds the search (checked between iterations and inside each fit evaluation).
+    /// Not budgeted, so an update can overrun: the unrefit warm-start and flat evidence at the
+    /// start of the search, the evidence (Jacobian) of each mode, and `model_position_rmse`, which
+    /// simulates every shot of the epoch and is only a diagnostic.
     pub time_budget: Duration,
 }
 
@@ -237,7 +243,9 @@ impl Estimator {
 
         let top = &kept[0];
         let mut belief = MapBelief::new(map_of(top), None);
-        belief.map_weight = Some(weight(top));
+        // The weights are normalized over the modes that were kept; a truncated search has not
+        // seen the modes it would be compared with, so no weight is reported then.
+        belief.map_weight = limit.is_none().then(|| weight(top));
         belief.alternatives = kept[1..]
             .iter()
             .map(|mode| WeightedMap {

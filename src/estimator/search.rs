@@ -86,10 +86,14 @@ fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> 
                 })
             })
             .collect::<Vec<_>>();
-        // A panicking worker loses only its own results; the panic message is still printed.
+        // A panicking worker is a bug, not "nothing found": propagate it.
         handles
             .into_iter()
-            .flat_map(|handle| handle.join().unwrap_or_default())
+            .flat_map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
             .collect()
     });
     results.sort_by_key(|(index, _)| *index);
@@ -237,6 +241,9 @@ pub(super) fn search(
         .filter(|planets| !planets.is_empty())
         .map(|planets| planets.iter().map(theta_of).collect())
         .collect();
+    // The warm modes enter unrefit first, so a refit that is cut short (deadline) or fails can
+    // never lose them or leave the belief worse than the previous update's maps on the new data.
+    modes.extend(starts.iter().filter_map(|start| mode_at(&joint, start)));
     modes.extend(
         par_map(&starts, |start| refit(&joint, start))
             .into_iter()
