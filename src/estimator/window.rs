@@ -65,6 +65,11 @@ pub(super) struct PathData {
     y: [Vec<f64>; 2],
     /// Per noise level (see `new`) and axis.
     whiteners: Vec<[Whitener; 2]>,
+    /// First node of each row of a thinned path (`thinned`): kept rows that are neighbours on
+    /// the path share nodes. `None` for a full path (row `r` starts at node `r * n + 1`).
+    row_node: Option<Vec<usize>>,
+    /// Row centres of a thinned path (a full path's are its ticks).
+    centers: Option<Vec<V2>>,
 }
 
 impl PathData {
@@ -77,6 +82,20 @@ impl PathData {
         velocity: f64,
         world: WorldParameters,
         extra_sd: &[f64],
+    ) -> Option<Self> {
+        Self::new_relative(points, angle_degrees, velocity, world, extra_sd, 0.0)
+    }
+
+    /// As `new`, with `relative` times the observed acceleration magnitude of each row added to
+    /// that row's noise standard deviation (in quadrature, both axes). Experimental, for the
+    /// search stage only (`diagnose/thinning.rs`); 0 is the exact noise model.
+    pub fn new_relative(
+        points: &[Point],
+        angle_degrees: f64,
+        velocity: f64,
+        world: WorldParameters,
+        extra_sd: &[f64],
+        relative: f64,
     ) -> Option<Self> {
         // The engine records a debris shot's first dot without stepping it when the shot was
         // created after its slot was simulated that tick: the launch dot is then duplicated.
@@ -129,7 +148,12 @@ impl PathData {
                         second: Vec::with_capacity(rows),
                     };
                     for i in 0..rows {
-                        let c0 = var(i) + 4.0 * var(i + 1) + var(i + 2) + interpolation_variance[i];
+                        let relative_sd = relative * y[0][i].hypot(y[1][i]);
+                        let c0 = var(i)
+                            + 4.0 * var(i + 1)
+                            + var(i + 2)
+                            + interpolation_variance[i]
+                            + relative_sd * relative_sd;
                         let c1 = if i >= 1 {
                             -2.0 * (var(i) + var(i + 1))
                         } else {
@@ -162,16 +186,94 @@ impl PathData {
             substeps: n,
             y,
             whiteners,
+            row_node: None,
+            centers: None,
         })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    /// Observed acceleration magnitude (second difference) of row `r`.
+    pub fn strength(&self, r: usize) -> f64 {
+        self.y[0][r].hypot(self.y[1][r])
+    }
+
+    /// A path of only the rows `keep` (ascending), each with its own `2n - 1` nodes. The row
+    /// noise is the original's marginal variance (correlation between neighbouring rows is
+    /// dropped), so this is an approximate objective for the search stage only.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn thinned(&self, keep: &[usize]) -> Option<Self> {
+        if keep.is_empty() || self.row_node.is_some() {
+            return None;
+        }
+        let n = self.substeps;
+        let mut nodes: Vec<V2> = Vec::new();
+        let mut row_node = Vec::with_capacity(keep.len());
+        let mut previous: Option<usize> = None;
+        for &r in keep {
+            match previous {
+                // Neighbouring row: its nodes continue the previous row's.
+                Some(p) if r == p + 1 => {
+                    let start = row_node[row_node.len() - 1] + n;
+                    nodes.extend_from_slice(&self.nodes[r * n + n..r * n + 2 * n]);
+                    row_node.push(start);
+                }
+                _ => {
+                    row_node.push(nodes.len());
+                    nodes.extend_from_slice(&self.nodes[r * n + 1..r * n + 2 * n]);
+                }
+            }
+            previous = Some(r);
+        }
+        let whiteners = self
+            .whiteners
+            .iter()
+            .map(|level| {
+                [0, 1].map(|axis| {
+                    let w = &level[axis];
+                    Whitener {
+                        diagonal: keep
+                            .iter()
+                            .map(|&r| {
+                                (w.diagonal[r].powi(2) + w.first[r].powi(2) + w.second[r].powi(2))
+                                    .sqrt()
+                            })
+                            .collect(),
+                        first: vec![0.0; keep.len()],
+                        second: vec![0.0; keep.len()],
+                    }
+                })
+            })
+            .collect();
+        Some(Self {
+            nodes,
+            ticks: self.ticks.clone(),
+            kernel: self.kernel.clone(),
+            substeps: n,
+            y: [0, 1].map(|axis| keep.iter().map(|&r| self.y[axis][r]).collect()),
+            whiteners,
+            row_node: Some(row_node),
+            centers: Some(keep.iter().map(|&r| self.ticks[r + 1]).collect()),
+        })
+    }
+
+    /// Nodes read by the rows `rows`.
+    pub fn node_range(&self, rows: std::ops::Range<usize>) -> std::ops::Range<usize> {
+        let n = self.substeps;
+        match &self.row_node {
+            None => rows.start * n + 1..(rows.end - 1) * n + 2 * n,
+            Some(v) => v[rows.start]..v[rows.end - 1] + 2 * n - 1,
+        }
+    }
+
+    fn first_node(&self, r: usize) -> usize {
+        self.row_node
+            .as_ref()
+            .map_or(r * self.substeps + 1, |v| v[r])
     }
 
     /// Number of noise levels.
     pub fn levels(&self) -> usize {
         self.whiteners.len()
-    }
-
-    pub fn substeps(&self) -> usize {
-        self.substeps
     }
 
     pub fn row_count(&self) -> usize {
@@ -180,14 +282,14 @@ impl PathData {
 
     /// Position on the path at the centre of row `r`.
     pub fn center(&self, r: usize) -> V2 {
-        self.ticks[r + 1]
+        self.centers.as_ref().map_or(self.ticks[r + 1], |c| c[r])
     }
 
     /// `out[r] = sum_i kernel_i * field[node r * n + 1 + i]` for the rows `rows` (others are left
     /// alone) of one axis of the field at the nodes.
     pub fn apply(&self, field: &[f64], out: &mut [f64], rows: std::ops::Range<usize>) {
         for r in rows {
-            let first = r * self.substeps + 1;
+            let first = self.first_node(r);
             out[r] = self
                 .kernel
                 .iter()
@@ -315,6 +417,45 @@ mod tests {
         let error = interpolation_error(&ticks);
         assert_eq!(error.len(), ticks.len() - 1);
         assert!(error.iter().all(|e| *e > 0.0), "{error:?}");
+    }
+
+    /// A thinned path (neighbouring kept rows share nodes) reads the same field values as the full
+    /// path: its raw residuals are the full path's at the kept rows.
+    #[test]
+    fn thinned_path_matches_full_rows() {
+        let points: Vec<Point> = (0..40)
+            .map(|i| Point {
+                x: 500.0 + 4.0 * i as f32 + 0.01 * (i * i) as f32,
+                y: 300.0 - 3.0 * i as f32 + 0.02 * (i * i * i) as f32 * 0.01,
+            })
+            .collect();
+        let world = WorldParameters::default();
+        let full = PathData::new(&points, 0.0, 3.0, world, &[0.0]).unwrap();
+        let keep = [0, 1, 2, 7, 12, 13, 30];
+        let thin = full.thinned(&keep).unwrap();
+        assert_eq!(thin.row_count(), keep.len());
+        let field: [Vec<f64>; 2] = [0, 1].map(|axis| {
+            full.nodes
+                .iter()
+                .map(|p| 0.001 * p[axis] + 0.0003 * p[1 - axis])
+                .collect()
+        });
+        let thin_field: [Vec<f64>; 2] = [0, 1].map(|axis| {
+            thin.nodes
+                .iter()
+                .map(|p| 0.001 * p[axis] + 0.0003 * p[1 - axis])
+                .collect()
+        });
+        for axis in 0..2 {
+            let mut a = vec![0.0; full.row_count()];
+            let mut b = vec![0.0; thin.row_count()];
+            full.raw_residual(axis, &field[axis], &mut a);
+            thin.raw_residual(axis, &thin_field[axis], &mut b);
+            for (i, &r) in keep.iter().enumerate() {
+                assert!((a[r] - b[i]).abs() < 1e-12, "row {r}: {} vs {}", a[r], b[i]);
+            }
+        }
+        assert!(thin.nodes.len() < keep.len() * (2 * world.substeps_per_tick - 1));
     }
 
     /// The pentadiagonal factor reproduces the rounding-noise covariance of the rows computed

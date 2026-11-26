@@ -1017,3 +1017,5 @@ fn diagnose_normal_equations_optimizer() {
         }
     }
 }
+
+mod thinning;

@@ -303,7 +303,6 @@ impl<'a> Fit<'a> {
         for &(index, row) in starts {
             let path = self.shots[index].path.as_ref().expect("a path");
             let r = path.row_count();
-            let n = path.substeps();
             let mut derivative = vec![vec![0.0; path.nodes.len()]; 6];
             let mut scratch = vec![0.0; r];
             for j in planets.clone() {
@@ -327,7 +326,7 @@ impl<'a> Fit<'a> {
                 let mass = MASS_PER_RADIUS_CUBED * th[2].powi(3);
                 let dmass = 3.0 * MASS_PER_RADIUS_CUBED * th[2].powi(2);
                 // Nodes read by the rows: row `i` uses nodes `i * n + 1 ..= i * n + 2n - 1`.
-                for i in rows.start * n + 1..(rows.end - 1) * n + 2 * n {
+                for i in path.node_range(rows.clone()) {
                     let p = path.nodes[i];
                     let (dx, dy) = (th[0] - p[0], th[1] - p[1]);
                     let d2 = (dx * dx + dy * dy).max(1e-18);
