@@ -82,8 +82,8 @@
       <canvas id="scrub" aria-label="Capture timeline"></canvas>
       <div class="toolbar">
         <div class="layergroups" role="group" aria-label="Map layer">
-          <div class="lg"><small>What the bot believed</small><div class="layers"><button type="button" class="layer" data-layer="gravity" title="The bot's unified gravity belief: fitted planets plus the observed local correction (the field its simulator uses)">Gravity belief</button></div></div>
-          <div class="lg"><small>How sure it was</small><div class="layers"><button type="button" class="layer" data-layer="uncertainty" title="Field uncertainty propagated from the fit covariance">Fit uncertainty</button><button type="button" class="layer" data-layer="evidence" title="Fraction of the modelled planet field that the fit's recorded paths resolve (teal; heuristic, blind to planets the map lacks). Older captures show only where paths support a local correction">Observation coverage</button><button type="button" class="layer" data-layer="disagreement" title="Where the no-source and the validated field-only source model would pull differently, weighted by how undecided the evidence is">Rival-model disagreement</button></div></div>
+          <div class="lg"><small>What the bot believed</small><div class="layers"><button type="button" class="layer" data-layer="gravity" title="The gravity of the bot's fitted planets (the field its simulator uses)">Gravity belief</button></div></div>
+          <div class="lg"><small>How sure it was</small><div class="layers"><button type="button" class="layer" data-layer="uncertainty" title="Field uncertainty propagated from the fit covariance">Fit uncertainty</button><button type="button" class="layer" data-layer="evidence" title="Fraction of the modelled planet field that the fit's recorded paths resolve (teal; heuristic, blind to planets the map lacks).">Observation coverage</button></div></div>
           <div class="lg"><small>Versus truth</small><div class="layers"><button type="button" class="layer" data-layer="error" id="errorLayer">Belief error</button></div></div>
         </div>
         <label><input type="checkbox" id="beliefPlanets" checked> Estimated planets</label>
@@ -93,7 +93,6 @@
         <label title="Places players were seen to appear in this map epoch (recorded by the bot; older captures lack them). Samples only: the set is incomplete and new spawns elsewhere are possible."><input type="checkbox" id="spawns"> Spawn samples</label>
         <label title="Dots at recorded path samples: observed path curvature minus the gravity of the fitted planets. A diagnostic that can include numerical noise; large clusters hint at a missing or misplaced planet."><input type="checkbox" id="pathResiduals"> Path residuals</label>
         <label id="arrowsLabel" title="Arrows show the direction of the layer's vector: for Gravity belief the pull, for Belief error the belief's extra pull compared with truth (belief − truth). Colour still shows magnitude."><input type="checkbox" id="arrows" checked> Direction arrows</label>
-        <label id="correctionsLabel" title="On: fitted planets plus the observed local residual correction (what the bot uses). Off: fitted planets only, which shows where corrections mask missing planets."><input type="checkbox" id="corrections" checked> Local corrections</label>
         <button id="zoomIn" type="button">Zoom in</button><button id="zoomOut" type="button">Zoom out</button><button id="resetView" type="button">Full map</button>
       </div>
       <div id="tip"></div>
@@ -105,13 +104,12 @@
       </div>
       <details class="explain"><summary>Help</summary>
         <ul>
-          <li><b>Gravity belief</b> is the field the bot simulates with: fitted planets plus the observed local correction (<b>Local corrections</b> off shows the planets alone). <b>Observation coverage</b> shows how much of the modelled planet field the fit's paths resolve (0–1, a heuristic that cannot see planets missing from the map; older captures fall back to where paths support a local correction). <b>Fit uncertainty</b> comes from the fit covariance; when it is missing the reason and fit size are shown. <b>Belief error</b> is belief minus truth and exists only when the capture has a truth map.</li>
+          <li><b>Gravity belief</b> is the field the bot simulates with: the gravity of the fitted planets. <b>Observation coverage</b> shows how much of the modelled planet field the fit's paths resolve (0–1, a heuristic that cannot see planets missing from the map). <b>Fit uncertainty</b> comes from the fit covariance; when it is missing the reason and fit size are shown. <b>Belief error</b> is belief minus truth and exists only when the capture has a truth map.</li>
           <li><b>Truth</b> is the planet list the server discloses when it runs with <code>sendplanets 1</code>. It is diagnosis only and never an estimator input. <b>Direction arrows</b> point along the layer's vector (angles: 0° right, 90° down); for Belief error they point to where the belief pulls extra. Belief error colours are on a log scale. Hover shows a compact probe; click pins the full one. Dimmed layers say why they are unavailable.</li>
-          <li><b>Model disagreement</b> is how far the gravity of the no-source model and the validated field-only source model differ, weighted by held-out improvement; it exists only while a validated source does, and is a heuristic, not a probability. It says nothing about space where neither model has evidence.</li>
           <li>Dark cells have no value for the layer (not zero gravity). Uncertainty comes from the fit covariance and ignores omitted planets and model error.</li>
           <li>Truth planets are the game's own map, for diagnosis only. A truth planet is a <b>close match</b> when an estimate lies within 10 units and 5 units of radius; <b>center off</b> / <b>size off</b> exceed one threshold; <b>missing</b> has no estimate within 80 units. Pairs are one-to-one, closest first.</li>
           <li>Spawn samples (blue squares) are positions where players were observed to appear in the current map epoch, as recorded by the bot. They are samples, not a complete set.</li>
-          <li>Contacts are path endpoints the estimator accepted as surface hits, not every collision. The pink diamond is a field-only source: a gravity explanation, never collision geometry.</li>
+          <li>Contacts are path endpoints the estimator accepted as surface hits, not every collision.</li>
           <li><b>Shot review</b> re-simulates the decision's chosen shot under the recorded belief and compares it with the shot that actually followed. Outcomes are read off the observed endpoint and are inferences, not server reports. The green timeline line is each decision's belief scored against the next 5 observed shots (median path error), which needs no truth map. Repairs change one planet of the belief to the truth one and re-simulate: a sensitivity, not proof of cause.</li>
           <li>Faded dots are where a player stood before it moved. Scenario shots are labelled from what the scenario generator recorded: <b>training</b> shots build the baseline information, the <b>trial</b> shot is the policy's shot (muted versus bold lines).</li>
           <li>“Map events pending” in the decision panel means the snapshot may lag the latest observations.</li>
@@ -141,7 +139,7 @@
         </div>
         <details class="explain"><summary>Free simulation and audits</summary>
           <div class="controls">
-            <label>Gravity model<select id="model"><option value="belief">Recorded physical map + local residual</option><option value="hypothesis">Recorded map + field hypothesis</option><option value="actual">Truth map (actual)</option></select></label>
+            <label>Gravity model<select id="model"><option value="belief">Recorded physical map</option><option value="actual">Truth map (actual)</option></select></label>
             <label>Velocity<input id="velocity" type="number" min="2" max="50" step="1" value="8"></label>
             <label>Angle (degrees)<input id="angle" type="number" min="-180" max="180" step="1" value="0"></label>
             <button id="simulate">Simulate this shot</button>

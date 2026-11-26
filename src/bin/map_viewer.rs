@@ -911,12 +911,8 @@ fn make_field_grid(
                     Option::<f64>::None,
                     Option::<f64>::None,
                     Option::<f64>::None,
-                    Option::<f64>::None,
-                    Option::<f64>::None,
                     oracle.map(|v| v.x),
                     oracle.map(|v| v.y),
-                    Option::<f64>::None,
-                    false,
                     Option::<f64>::None,
                     Option::<f64>::None,
                     Option::<f64>::None
@@ -953,13 +949,9 @@ fn make_field_grid(
                 gravity.map(|v| v.1),
                 physical.map(|v| v.x),
                 physical.map(|v| v.y),
-                Option::<f64>::None,
-                Option::<f64>::None,
                 actual_vector.map(|v| v.x),
                 actual_vector.map(|v| v.y),
                 sigma,
-                false,
-                Option::<f64>::None,
                 belief.evidence_availability_at(position),
                 approximate_sigma
             ]));
@@ -1523,15 +1515,12 @@ mod tests {
         )
         .unwrap();
         let sample = &grid["samples"][0];
-        assert_eq!(sample.as_array().unwrap().len(), 17);
+        assert_eq!(sample.as_array().unwrap().len(), 13);
         assert_eq!(sample[2], 0.0);
         assert_eq!(sample[3], 0.0);
-        assert_eq!(sample[13], false);
-        // Residual/model-disagreement slots are retained for the web client and always unavailable.
-        assert!(sample[14].is_null());
         // No recorded field evidence (older captures): availability is unavailable, not zero.
-        assert!(sample[15].is_null());
-        assert!(sample[16].is_null());
+        assert!(sample[11].is_null());
+        assert!(sample[12].is_null());
     }
 
     #[test]
@@ -1550,8 +1539,8 @@ mod tests {
             height: 1.0,
         };
         let grid = make_field_grid(&data, None, 1, view, "total").unwrap();
-        assert!(grid["samples"][0][12].is_null(), "no complete covariance");
-        assert!(grid["samples"][0][16].as_f64().unwrap() > 0.0);
+        assert!(grid["samples"][0][10].is_null(), "no complete covariance");
+        assert!(grid["samples"][0][12].as_f64().unwrap() > 0.0);
         assert_eq!(grid["has_approximate_covariance"], true);
     }
 
@@ -1572,13 +1561,13 @@ mod tests {
             height: 1.0,
         };
         let grid = make_field_grid(&data, None, 1, view, "total").unwrap();
-        let availability = grid["samples"][0][15].as_f64().unwrap();
+        let availability = grid["samples"][0][11].as_f64().unwrap();
         assert!(availability > 0.0 && availability <= 1.0);
         // A malformed matrix is dropped rather than guessed.
         let mut broken = data.clone();
         broken["map_belief"]["field_evidence"]["resolution"] = json!([[1.0, 0.0], [0.0]]);
         let grid = make_field_grid(&broken, None, 1, view, "total").unwrap();
-        assert!(grid["samples"][0][15].is_null());
+        assert!(grid["samples"][0][11].is_null());
     }
 
     #[test]
