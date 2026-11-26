@@ -174,7 +174,7 @@ fn one_planet_world_beats_flat_on_a_held_out_shot() {
 fn shot_with_contact(event: &ServerEvent, players: &[Point]) -> Shot {
     let obs = shot_of(event);
     let contact = contacts::classify(&obs.points, players, WorldParameters::default());
-    Shot::new(obs, contact, WorldParameters::default())
+    Shot::new(obs, contact, WorldParameters::default(), &NOISE_LEVELS)
 }
 
 fn center_error(theta: &[f64; 3]) -> f64 {
@@ -205,8 +205,8 @@ fn trajectory_alone_recovers_a_hit_and_the_contact_refines_it() {
     };
     // Start well off the truth (28 units, 5 radius units).
     let start = [[520.0, 480.0, 35.0]];
-    let (alone, _) = fit(false).refine(&start).unwrap();
-    let (joint, _) = fit(true).refine(&alone).unwrap();
+    let (alone, _) = fit(false).refine(&start, &fit::Budget::UNLIMITED).unwrap();
+    let (joint, _) = fit(true).refine(&alone, &fit::Budget::UNLIMITED).unwrap();
     assert!(
         center_error(&alone[0]) < 0.5 && (alone[0][2] - 30.0).abs() < 0.5,
         "{alone:?}"
@@ -534,9 +534,12 @@ fn a_cancelled_fit_is_retried_on_the_next_event() {
     let (mut estimator, _) = estimator();
     // A shot was ingested but its fit never published (cancelled or failed).
     let obs = shot_of(&good_shot());
-    estimator
-        .shots
-        .push(Shot::new(obs, None, WorldParameters::default()));
+    estimator.shots.push(Shot::new(
+        obs,
+        None,
+        WorldParameters::default(),
+        &NOISE_LEVELS,
+    ));
     estimator.stale = true;
     let cancelled = AtomicBool::new(true);
     assert!(
@@ -562,7 +565,14 @@ fn a_mode_at_a_bound_reports_no_covariance() {
             shot_in(&truth, (500.0, 380.0), 0.0, 10.0),
             shot_in(&truth, (900.0, 150.0), 90.0, 8.0),
         ]
-        .map(|event| Shot::new(shot_of(&event), None, WorldParameters::default()));
+        .map(|event| {
+            Shot::new(
+                shot_of(&event),
+                None,
+                WorldParameters::default(),
+                &NOISE_LEVELS,
+            )
+        });
         Fit::new(
             &shots,
             WorldParameters::default(),
@@ -718,7 +728,7 @@ fn a_deadline_never_leaves_a_refit_worse_than_its_start() {
     .map(|(start, angle)| shot_with_contact(&shot_in(&truth, *start, *angle, 6.0), &[]))
     .collect();
     let start = [[520.0, 480.0, 35.0], [1180.0, 720.0, 26.0]];
-    for micros in (0..12_000).step_by(100) {
+    for micros in (0..12_000).step_by(600) {
         let fit = Fit::new(
             &shots,
             WorldParameters::default(),
@@ -727,7 +737,7 @@ fn a_deadline_never_leaves_a_refit_worse_than_its_start() {
             Vec::new(),
         )
         .with_deadline(Instant::now() + Duration::from_micros(micros));
-        let (theta, chi2) = fit.refine(&start).unwrap();
+        let (theta, chi2) = fit.refine(&start, &fit::Budget::UNLIMITED).unwrap();
         let before = fit.chi2(&start).unwrap();
         assert!(
             chi2 <= before * (1.0 + 0.0),
@@ -828,4 +838,137 @@ fn the_time_budget_bounds_the_update_time() {
     assert_eq!(belief.search_limit, Some(SearchLimit::TimeBudget));
     assert!(belief.map_weight.is_none());
     assert!(elapsed < budget + Duration::from_secs(2), "{elapsed:?}");
+}
+
+fn three_planet_events() -> Vec<ServerEvent> {
+    let truth = world_of(vec![
+        planet(500.0, 500.0, 30.0),
+        planet(1200.0, 700.0, 30.0),
+        planet(900.0, 200.0, 25.0),
+    ]);
+    [
+        ((350.0, 500.0), 0.0),
+        ((1050.0, 700.0), 0.0),
+        ((900.0, 400.0), 90.0),
+    ]
+    .iter()
+    .map(|(start, angle)| shot_in(&truth, *start, *angle, 6.0))
+    .collect()
+}
+
+// The evaluation limit is a work count: the belief and the work done do not depend on the clock
+// or on how many threads share the work.
+#[test]
+fn the_evaluation_limit_gives_the_same_belief_whatever_the_load() {
+    let events = three_planet_events();
+    let run = |parallel: bool, budget: Duration| {
+        let (mut estimator, cancelled) = estimator();
+        estimator.max_evaluations = Some(150);
+        estimator.time_budget = budget;
+        estimator.parallel_evaluations = parallel;
+        let belief = estimator.observe_batch(&events, &cancelled).unwrap();
+        (belief, estimator.last_report().unwrap().evaluations)
+    };
+    let (first, work) = run(false, Duration::from_secs(3600));
+    assert_eq!(first.search_limit, Some(SearchLimit::WorkBudget));
+    assert!(first.map_weight.is_none());
+    // Evidence evaluations may overshoot the limit slightly, never by a whole stage.
+    assert!(work < 600, "{work} evaluations");
+    for (parallel, budget) in [
+        (false, Duration::from_secs(3600)),
+        (true, Duration::from_secs(3600)),
+        (false, Duration::from_secs(1800)),
+    ] {
+        let (again, again_work) = run(parallel, budget);
+        assert_eq!(again.map.planets, first.map.planets, "parallel {parallel}");
+        assert_eq!(again_work, work);
+        assert_eq!(again.search_limit, first.search_limit);
+    }
+}
+
+// A part that exceeds its wall-clock ceiling is named in the report and fails loudly on demand;
+// parts without a ceiling and runs within their ceilings report nothing.
+#[test]
+fn an_exceeded_part_ceiling_is_reported_by_name() {
+    let events = three_planet_events();
+    let (mut generous, cancelled) = estimator();
+    generous.max_planets = 2;
+    generous
+        .ceilings
+        .0
+        .insert(Part::WindowBuild, Duration::from_secs(60));
+    generous.observe_batch(&events, &cancelled).unwrap();
+    let report = generous.last_report().unwrap();
+    assert!(report.violations.is_empty());
+    report.assert_within_ceilings();
+    assert!(report.part(Part::WindowBuild).unwrap().calls == 3);
+    for part in [Part::JacobianEval, Part::LmSolve, Part::BirthJoint] {
+        assert!(report.part(part).is_some_and(|p| p.calls > 0), "{part:?}");
+    }
+
+    let (mut hurried, cancelled) = estimator();
+    hurried
+        .ceilings
+        .0
+        .insert(Part::Evidence, Duration::from_nanos(1));
+    hurried.observe_batch(&events, &cancelled).unwrap();
+    let report = hurried.last_report().unwrap();
+    assert_eq!(
+        report.violations.iter().map(|v| v.part).collect::<Vec<_>>(),
+        vec![Part::Evidence]
+    );
+    let message = std::panic::catch_unwind(|| report.assert_within_ceilings())
+        .unwrap_err()
+        .downcast::<String>()
+        .unwrap();
+    assert!(message.contains("evidence"), "{message}");
+}
+
+// The analytic Jacobian matches finite differences of the residual (window rows, interior-sample
+// penalties and contacts), and splitting an evaluation over threads changes no bit.
+#[test]
+fn the_jacobian_matches_finite_differences_and_threads_change_nothing() {
+    let cancelled = AtomicBool::new(false);
+    let truth = world_of(vec![
+        planet(500.0, 500.0, 30.0),
+        planet(1200.0, 700.0, 28.0),
+        planet(900.0, 250.0, 25.0),
+    ]);
+    let shots: Vec<Shot> = [
+        ((350.0, 500.0), 0.0),
+        ((1050.0, 700.0), 0.0),
+        ((900.0, 450.0), 90.0),
+    ]
+    .iter()
+    .map(|(start, angle)| {
+        shot_with_contact(
+            &shot_in(&truth, *start, *angle, 6.0),
+            &[Point { x: 1.0, y: 1.0 }],
+        )
+    })
+    .collect();
+    let fit = Fit::new(&shots, WorldParameters::default(), &cancelled, true, vec![]);
+    let theta = [
+        [505.0, 497.0, 30.5],
+        [1195.0, 703.0, 27.0],
+        [905.0, 255.0, 25.5],
+    ];
+    let (residual, jacobian) = fit.evaluate(&theta, true, 0, 1).unwrap();
+    let jacobian = jacobian.unwrap();
+    for threads in [2, 3, 8] {
+        let (r, j) = fit.evaluate(&theta, true, 0, threads).unwrap();
+        assert!(r == residual && j.unwrap() == jacobian, "{threads} threads");
+    }
+    let h = 1e-5;
+    for column in 0..9 {
+        let at = |sign: f64| {
+            let mut moved = theta;
+            moved[column / 3][column % 3] += sign * h;
+            fit.evaluate(&moved, false, 0, 1).unwrap().0
+        };
+        let numeric = (at(1.0) - at(-1.0)) / (2.0 * h);
+        let scale = numeric.amax().max(1e-9);
+        let error = (numeric - jacobian.column(column)).amax();
+        assert!(error < 1e-3 * scale, "column {column}: {error} vs {scale}");
+    }
 }

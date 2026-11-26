@@ -1,5 +1,5 @@
 //! Field evaluation of the physical-planet map from an ordered capture; truth is used only for scoring.
-use einsteinbot::estimator::Estimator;
+use einsteinbot::estimator::{Estimator, Part};
 use einsteinbot::event_store::EventLog;
 use einsteinbot::field_score::score_field;
 use einsteinbot::map::PlanetMap;
@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 
 struct Replay {
     estimator: Estimator,
+    /// Number of updates in which a wall-clock part ceiling was exceeded.
+    ceiling_violations: usize,
     fit_micros: u128,
     /// Duration of the most recent path update.
     update_micros: u128,
@@ -28,6 +30,7 @@ impl Replay {
         estimator.max_planets = max_planets.unwrap_or(estimator.max_planets);
         estimator.time_budget = time_budget.unwrap_or(estimator.time_budget);
         Self {
+            ceiling_violations: 0,
             estimator,
             fit_micros: 0,
             update_micros: 0,
@@ -74,6 +77,25 @@ impl Replay {
                 self.estimator.observe(event, &AtomicBool::new(false));
                 self.update_micros = start.elapsed().as_micros();
                 self.fit_micros += self.update_micros;
+                if let Some(report) = self.estimator.last_report() {
+                    if !report.violations.is_empty() {
+                        self.ceiling_violations += 1;
+                        eprintln!(
+                            "PART CEILING EXCEEDED at sequence {sequence}: {}",
+                            report
+                                .violations
+                                .iter()
+                                .map(|v| format!(
+                                    "{} {:.1} ms > {:.1} ms",
+                                    v.part.name(),
+                                    v.observed_ms,
+                                    v.ceiling_ms
+                                ))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                    }
+                }
                 self.observations.push(shot);
                 self.completed_total += 1;
                 let mut row = self.snapshot(sequence, "after_completion");
@@ -99,6 +121,7 @@ impl Replay {
             "fit_ms": self.fit_micros as f64 / 1000.0,
             "update_ms": self.update_micros as f64 / 1000.0,
             "search_limit": belief.search_limit,
+            "update_report": self.estimator.last_report(),
             "belief_published": self.estimator.belief().is_some(),
             "physical_planets": belief.map.planets.len(),
             "physical": null, "flat": null, "oracle": null });
@@ -124,6 +147,10 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut max_completed = None;
     let mut max_planets = None;
     let mut time_budget = None;
+    let mut max_evaluations = None;
+    let mut noise_sd = None;
+    let mut parallel_evaluations = true;
+    let mut ceilings = einsteinbot::estimator::PartCeilings::default();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--db-path" => db = args.next().ok_or("--db-path requires a value")?,
@@ -156,9 +183,37 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         .parse()?,
                 ))
             }
+            "--max-evaluations" => {
+                max_evaluations = Some(
+                    args.next()
+                        .ok_or("--max-evaluations requires a value")?
+                        .parse::<u64>()?,
+                )
+            }
+            "--serial-evaluations" => parallel_evaluations = false,
+            "--noise-sd" => {
+                noise_sd = Some(
+                    args.next()
+                        .ok_or("--noise-sd requires a value")?
+                        .parse::<f64>()?,
+                )
+            }
+            "--ceiling-ms" => {
+                let value = args.next().ok_or("--ceiling-ms requires PART=MS")?;
+                let (name, ms) = value.split_once('=').ok_or("--ceiling-ms needs PART=MS")?;
+                let part = Part::from_name(name).ok_or_else(|| {
+                    format!(
+                        "unknown part {name}; parts: {}",
+                        Part::ALL.map(Part::name).join(", ")
+                    )
+                })?;
+                ceilings
+                    .0
+                    .insert(part, Duration::from_secs_f64(ms.parse::<f64>()? / 1e3));
+            }
             "--help" | "-h" => {
                 println!(
-                    "Usage: field_scorecard --capture-id ID [--db-path PATH] [--empty-is-flat] [--max-completed N] [--max-planets N] [--time-budget-ms MS]\nJSON lines report causal pre-launch and post-completion physical-map field scores. Empty planet messages are unknown unless --empty-is-flat is explicitly set."
+                    "Usage: field_scorecard --capture-id ID [--db-path PATH] [--empty-is-flat] [--max-completed N] [--max-planets N] [--time-budget-ms MS] [--max-evaluations N] [--noise-sd SD] [--serial-evaluations] [--ceiling-ms PART=MS]...\n--max-evaluations is a deterministic work limit (residual plus Jacobian evaluations per update; results do not depend on load) and, unless --time-budget-ms is given, removes the wall-clock budget. --ceiling-ms fails the run (exit 2, naming the part) when a part of an update exceeds the wall-clock ceiling.\nJSON lines report causal pre-launch and post-completion physical-map field scores. Empty planet messages are unknown unless --empty-is-flat is explicitly set."
                 );
                 return Ok(());
             }
@@ -176,7 +231,18 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if events.is_empty() {
         return Err(format!("capture {capture} is missing or has no recorded events").into());
     }
+    // The deterministic mode must not be cut by the wall clock unless that is requested.
+    let time_budget = match (time_budget, max_evaluations) {
+        (None, Some(_)) => Some(Duration::from_secs(24 * 3600)),
+        (budget, _) => budget,
+    };
     let mut replay = Replay::new(empty_is_flat, max_planets, time_budget);
+    replay.estimator.max_evaluations = max_evaluations;
+    replay.estimator.parallel_evaluations = parallel_evaluations;
+    if let Some(noise_sd) = noise_sd {
+        replay.estimator.noise_levels = vec![noise_sd];
+    }
+    replay.estimator.ceilings = ceilings;
     println!(
         "{}",
         json!({"type":"field_scorecard", "capture_id":capture, "db_path":db,
@@ -192,6 +258,13 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             }
         }
+    }
+    if replay.ceiling_violations > 0 {
+        eprintln!(
+            "{} update(s) exceeded a part ceiling",
+            replay.ceiling_violations
+        );
+        std::process::exit(2);
     }
     Ok(())
 }

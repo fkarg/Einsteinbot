@@ -11,11 +11,12 @@
 //! rankings, not calibrated probabilities.
 use super::Shot;
 use super::window::PathData;
+use super::work::{Part, Stats, par_map};
 use crate::protocol::{Planet, Point};
 use crate::simulation::WorldParameters;
 use levenberg_marquardt::{LeastSquaresProblem, LevenbergMarquardt};
 use nalgebra::{DMatrix, DVector, Dyn, SymmetricEigen, U1, VecStorage};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
@@ -42,6 +43,10 @@ const BOUND_MARGIN: f64 = 0.5;
 /// the parameters are treated as under-identified.
 const MIN_CORRELATION_EIGENVALUE: f64 = 1e-4;
 const LM_PATIENCE: usize = 40;
+/// An evaluation with fewer planet-times-node terms than this is not split over threads.
+const PARALLEL_MIN_PLANET_NODES: usize = 40_000;
+/// More threads than this per evaluation do not help (measured: 8 and 16 threads are alike).
+const MAX_EVALUATION_THREADS: usize = 8;
 /// Prior odds against each additional planet.
 const PLANET_PRIOR_ODDS: f64 = 20.0;
 
@@ -110,6 +115,25 @@ pub(super) struct Evidence {
     pub covariance: Option<DMatrix<f64>>,
 }
 
+/// Limits of one `refine`: a deterministic evaluation count and an optional wall-clock instant
+/// (in addition to the `Fit`'s own deadline).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Budget {
+    pub evaluations: u64,
+    pub deadline: Option<Instant>,
+    /// Threads one evaluation may use (1: none are spawned).
+    pub threads: usize,
+}
+
+impl Budget {
+    #[cfg(test)]
+    pub const UNLIMITED: Budget = Budget {
+        evaluations: u64::MAX,
+        deadline: None,
+        threads: 1,
+    };
+}
+
 pub(super) struct Fit<'a> {
     shots: &'a [Shot],
     world: WorldParameters,
@@ -123,6 +147,20 @@ pub(super) struct Fit<'a> {
     fixed: Vec<Planet>,
     /// Field of the fixed planets at each shot's nodes (empty arrays without a path or planets).
     base: Vec<[Vec<f64>; 2]>,
+    stats: Option<&'a Stats>,
+    /// Measured and rejected variants (see `diagnose.rs`); they exist only in test builds.
+    #[cfg(test)]
+    experiments: Experiments,
+}
+
+/// Jacobian entries of a planet only for rows within `jacobian_radius` of it; the optimizer's
+/// relative stopping tolerance; the normal-equations optimizer instead of the QR-based one.
+#[cfg(test)]
+#[derive(Default)]
+struct Experiments {
+    jacobian_radius: Option<f64>,
+    tolerance: Option<f64>,
+    normal_equations: bool,
 }
 
 impl<'a> Fit<'a> {
@@ -158,7 +196,33 @@ impl<'a> Fit<'a> {
             use_contacts,
             fixed,
             base,
+            stats: None,
+            #[cfg(test)]
+            experiments: Experiments::default(),
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_normal_equations(mut self) -> Self {
+        self.experiments.normal_equations = true;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_tolerance(mut self, tolerance: f64) -> Self {
+        self.experiments.tolerance = Some(tolerance);
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_jacobian_radius(mut self, radius: f64) -> Self {
+        self.experiments.jacobian_radius = Some(radius);
+        self
+    }
+
+    pub fn with_stats(mut self, stats: &'a Stats) -> Self {
+        self.stats = Some(stats);
+        self
     }
 
     pub fn with_deadline(mut self, deadline: Instant) -> Self {
@@ -188,17 +252,136 @@ impl<'a> Fit<'a> {
     }
 
     /// Residual vector (and its Jacobian with respect to `theta`) of the free planets.
-    fn evaluate(
+    pub(super) fn evaluate(
         &self,
         theta: &[[f64; 3]],
         want_jacobian: bool,
         level: usize,
+        threads: usize,
+    ) -> Option<(DVector<f64>, Option<DMatrix<f64>>)> {
+        let started = Instant::now();
+        let out = self.compute(theta, want_jacobian, level, threads);
+        if let Some(stats) = self.stats {
+            let part = if want_jacobian {
+                Part::JacobianEval
+            } else {
+                Part::ResidualEval
+            };
+            stats.add(part, started.elapsed());
+        }
+        out
+    }
+
+    /// The whitened window residuals of one path, axis by axis.
+    fn path_residual(&self, index: usize, theta: &[[f64; 3]], level: usize) -> Vec<f64> {
+        let path = self.shots[index].path.as_ref().expect("a path");
+        let r = path.row_count();
+        let field = self.field(index, path, theta);
+        let mut res = vec![0.0; 2 * r];
+        for axis in 0..2 {
+            path.residual(
+                axis,
+                level,
+                &field[axis],
+                &mut res[axis * r..(axis + 1) * r],
+            );
+        }
+        res
+    }
+
+    /// Jacobian columns `3 * planets.start ..` of the window rows of every path, column-major with
+    /// `total` rows (the rows of paths come in `self.shots` order, `starts` locates each path).
+    fn data_jacobian(
+        &self,
+        theta: &[[f64; 3]],
+        planets: std::ops::Range<usize>,
+        level: usize,
+        total: usize,
+        starts: &[(usize, usize)],
+    ) -> Vec<f64> {
+        let mut block = vec![0.0; total * 3 * planets.len()];
+        for &(index, row) in starts {
+            let path = self.shots[index].path.as_ref().expect("a path");
+            let r = path.row_count();
+            let n = path.substeps();
+            let mut derivative = vec![vec![0.0; path.nodes.len()]; 6];
+            let mut scratch = vec![0.0; r];
+            for j in planets.clone() {
+                let th = &theta[j];
+                #[cfg(test)]
+                let rows = match self.experiments.jacobian_radius {
+                    None => 0..r,
+                    Some(radius) => {
+                        let near = |i: &usize| {
+                            let c = path.center(*i);
+                            (th[0] - c[0]).hypot(th[1] - c[1]) <= radius
+                        };
+                        match ((0..r).find(near), (0..r).rev().find(near)) {
+                            (Some(first), Some(last)) => first..last + 1,
+                            _ => continue,
+                        }
+                    }
+                };
+                #[cfg(not(test))]
+                let rows = 0..r;
+                let mass = MASS_PER_RADIUS_CUBED * th[2].powi(3);
+                let dmass = 3.0 * MASS_PER_RADIUS_CUBED * th[2].powi(2);
+                // Nodes read by the rows: row `i` uses nodes `i * n + 1 ..= i * n + 2n - 1`.
+                for i in rows.start * n + 1..(rows.end - 1) * n + 2 * n {
+                    let p = path.nodes[i];
+                    let (dx, dy) = (th[0] - p[0], th[1] - p[1]);
+                    let d2 = (dx * dx + dy * dy).max(1e-18);
+                    let inverse_r3 = 1.0 / (d2 * d2.sqrt());
+                    let inverse_r5 = inverse_r3 / d2;
+                    let cross = -3.0 * mass * dx * dy * inverse_r5;
+                    // Index: parameter * 2 + axis.
+                    derivative[0][i] = mass * (inverse_r3 - 3.0 * dx * dx * inverse_r5);
+                    derivative[1][i] = cross;
+                    derivative[2][i] = cross;
+                    derivative[3][i] = mass * (inverse_r3 - 3.0 * dy * dy * inverse_r5);
+                    derivative[4][i] = dmass * dx * inverse_r3;
+                    derivative[5][i] = dmass * dy * inverse_r3;
+                }
+                for param in 0..3 {
+                    let column = (3 * (j - planets.start) + param) * total;
+                    for axis in 0..2 {
+                        scratch.fill(0.0);
+                        path.apply(&derivative[param * 2 + axis], &mut scratch, rows.clone());
+                        path.whiten(axis, level, &mut scratch, rows.start);
+                        for (i, v) in scratch.iter().enumerate().skip(rows.start) {
+                            block[column + row + axis * r + i] = -v;
+                        }
+                    }
+                }
+            }
+        }
+        block
+    }
+
+    fn compute(
+        &self,
+        theta: &[[f64; 3]],
+        want_jacobian: bool,
+        level: usize,
+        threads: usize,
     ) -> Option<(DVector<f64>, Option<DMatrix<f64>>)> {
         if self.cancelled.load(Ordering::Relaxed) {
             return None;
         }
         let k = theta.len();
         let paths = self.shots.iter().filter(|shot| shot.path.is_some()).count();
+        // Threads only pay off when there is enough work to share (measured in `diagnose.rs`).
+        let planet_nodes: usize = k * self
+            .shots
+            .iter()
+            .filter_map(|shot| shot.path.as_ref())
+            .map(|path| path.nodes.len())
+            .sum::<usize>();
+        let threads = if planet_nodes >= PARALLEL_MIN_PLANET_NODES {
+            threads.min(MAX_EVALUATION_THREADS)
+        } else {
+            1
+        };
         let contacts = if self.use_contacts && k > 0 {
             self.shots
                 .iter()
@@ -207,56 +390,42 @@ impl<'a> Fit<'a> {
         } else {
             0
         };
-        let total = self.data_rows() + paths * k + contacts;
-        let mut res = vec![0.0; total];
-        let mut jacobian = want_jacobian.then(|| DMatrix::zeros(total, 3 * k));
+        let data_rows = self.data_rows();
+        let total = data_rows + paths * k + contacts;
+        // (shot index, first data row) of every path.
+        let mut starts = Vec::with_capacity(paths);
         let mut row = 0;
         for (index, shot) in self.shots.iter().enumerate() {
-            let Some(path) = &shot.path else { continue };
-            let r = path.row_count();
-            let field = self.field(index, path, theta);
-            for axis in 0..2 {
-                path.residual(
-                    axis,
-                    level,
-                    &field[axis],
-                    &mut res[row + axis * r..row + (axis + 1) * r],
-                );
+            if let Some(path) = &shot.path {
+                starts.push((index, row));
+                row += 2 * path.row_count();
             }
-            if let Some(jacobian) = jacobian.as_mut() {
-                let nodes = path.nodes.len();
-                let mut derivative = vec![vec![0.0; nodes]; 6];
-                let mut scratch = vec![0.0; r];
-                for (j, th) in theta.iter().enumerate() {
-                    let mass = MASS_PER_RADIUS_CUBED * th[2].powi(3);
-                    let dmass = 3.0 * MASS_PER_RADIUS_CUBED * th[2].powi(2);
-                    for (i, p) in path.nodes.iter().enumerate() {
-                        let (dx, dy) = (th[0] - p[0], th[1] - p[1]);
-                        let d2 = (dx * dx + dy * dy).max(1e-18);
-                        let inverse_r3 = 1.0 / (d2 * d2.sqrt());
-                        let inverse_r5 = inverse_r3 / d2;
-                        let cross = -3.0 * mass * dx * dy * inverse_r5;
-                        // Index: parameter * 2 + axis.
-                        derivative[0][i] = mass * (inverse_r3 - 3.0 * dx * dx * inverse_r5);
-                        derivative[1][i] = cross;
-                        derivative[2][i] = cross;
-                        derivative[3][i] = mass * (inverse_r3 - 3.0 * dy * dy * inverse_r5);
-                        derivative[4][i] = dmass * dx * inverse_r3;
-                        derivative[5][i] = dmass * dy * inverse_r3;
-                    }
-                    for param in 0..3 {
-                        for axis in 0..2 {
-                            path.apply(&derivative[param * 2 + axis], &mut scratch);
-                            path.whiten(axis, level, &mut scratch);
-                            for (i, v) in scratch.iter().enumerate() {
-                                jacobian[(row + axis * r + i, 3 * j + param)] = -v;
-                            }
-                        }
-                    }
-                }
-            }
-            row += 2 * r;
         }
+        let mut res = Vec::with_capacity(total);
+        for part in par_map(&starts, threads.min(paths).min(k.max(1)), |&(index, _)| {
+            self.path_residual(index, theta, level)
+        }) {
+            res.extend(part);
+        }
+        res.resize(total, 0.0);
+        let mut jacobian = want_jacobian.then(|| {
+            let mut jacobian = DMatrix::zeros(total, 3 * k);
+            // Planets are split into one chunk per thread; each chunk is a contiguous block of columns.
+            let chunk = k.div_ceil(threads.clamp(1, k.max(1)));
+            let chunks: Vec<std::ops::Range<usize>> = (0..k)
+                .step_by(chunk.max(1))
+                .map(|first| first..(first + chunk).min(k))
+                .collect();
+            let blocks = par_map(&chunks, threads, |planets| {
+                self.data_jacobian(theta, planets.clone(), level, total, &starts)
+            });
+            for (planets, block) in chunks.iter().zip(blocks) {
+                jacobian.as_mut_slice()[3 * planets.start * total..][..block.len()]
+                    .copy_from_slice(&block);
+            }
+            jacobian
+        });
+        let mut row = data_rows;
         for shot in self.shots.iter().filter(|shot| shot.path.is_some()) {
             let path = shot.path.as_ref().expect("filtered");
             for (j, th) in theta.iter().enumerate() {
@@ -309,7 +478,7 @@ impl<'a> Fit<'a> {
 
     /// Chi-square at the finest noise level.
     pub fn chi2(&self, theta: &[[f64; 3]]) -> Option<f64> {
-        self.evaluate(theta, false, FINEST)
+        self.evaluate(theta, false, FINEST, 1)
             .map(|(residuals, _)| residuals.norm_squared())
     }
 
@@ -367,31 +536,70 @@ impl<'a> Fit<'a> {
     /// are wide enough to find it. `None` if cancelled or the model cannot be evaluated at the
     /// result. Running out of patience is not a failure: the iterate is still a valid point and
     /// is scored by its evidence like any other.
-    pub fn refine(&self, start: &[[f64; 3]]) -> Option<(Vec<[f64; 3]>, f64)> {
+    pub fn refine(&self, start: &[[f64; 3]], budget: &Budget) -> Option<(Vec<[f64; 3]>, f64)> {
+        let started = Instant::now();
+        let used = Cell::new(0);
         let mut u = self.encode(start);
         for level in 0..self.levels {
-            let (lm, _) = LevenbergMarquardt::new()
-                .with_patience(LM_PATIENCE)
-                .minimize(Lm {
+            #[cfg(test)]
+            if self.experiments.normal_equations {
+                let mut lm = Lm {
                     fit: self,
                     u: u.clone(),
                     level,
                     best: RefCell::new(None),
-                });
+                    budget,
+                    used: &used,
+                };
+                normal_equations_lm(&mut lm);
+                if let Some((_, best)) = lm.best.into_inner() {
+                    u = best;
+                }
+                continue;
+            }
+            #[cfg_attr(not(test), allow(unused_mut))]
+            let mut optimizer = LevenbergMarquardt::new().with_patience(LM_PATIENCE);
+            #[cfg(test)]
+            if let Some(tolerance) = self.experiments.tolerance {
+                optimizer = optimizer
+                    .with_ftol(tolerance)
+                    .with_xtol(tolerance)
+                    .with_gtol(tolerance);
+            }
+            let (lm, _) = optimizer.minimize(Lm {
+                fit: self,
+                u: u.clone(),
+                level,
+                best: RefCell::new(None),
+                budget,
+                used: &used,
+            });
             if let Some((_, best)) = lm.best.into_inner() {
                 u = best;
             }
         }
         let theta = self.decode(&u);
         let chi2 = self.chi2(&theta)?;
+        if let Some(stats) = self.stats {
+            stats.add(Part::LmSolve, started.elapsed());
+        }
         Some((theta, chi2))
     }
 
     /// Laplace evidence and covariance at `theta` (all planets free, none fixed).
     pub fn evidence(&self, theta: &[[f64; 3]]) -> Option<Evidence> {
+        let started = Instant::now();
+        let out = self.laplace(theta);
+        if let Some(stats) = self.stats {
+            stats.add(Part::Evidence, started.elapsed());
+        }
+        out
+    }
+
+    fn laplace(&self, theta: &[[f64; 3]]) -> Option<Evidence> {
         debug_assert!(self.fixed.is_empty());
         let k = theta.len();
-        let (residuals, jacobian) = self.evaluate(theta, true, FINEST)?;
+        let (residuals, jacobian) = self.evaluate(theta, true, FINEST, 1)?;
         let chi2 = residuals.norm_squared();
         if k == 0 {
             return Some(Evidence {
@@ -400,6 +608,7 @@ impl<'a> Fit<'a> {
             });
         }
         let jacobian = jacobian.expect("requested");
+        let covariance_started = Instant::now();
         let information = jacobian.tr_mul(&jacobian);
         // Gaussian prior as wide as a uniform one over the allowed ranges.
         let prior_sd = |i: usize| {
@@ -431,6 +640,9 @@ impl<'a> Fit<'a> {
                 let dof = (self.data_rows() as f64 - 3.0 * k as f64).max(1.0);
                 inverse * (chi2 / dof).max(1.0)
             });
+        if let Some(stats) = self.stats {
+            stats.add(Part::Covariance, covariance_started.elapsed());
+        }
         log_evidence.is_finite().then_some(Evidence {
             log_evidence,
             covariance,
@@ -448,7 +660,7 @@ impl<'a> Fit<'a> {
             for axis in 0..2 {
                 path.raw_residual(axis, &field[axis], &mut raw[axis]);
                 white[axis].copy_from_slice(&raw[axis]);
-                path.whiten(axis, FINEST, &mut white[axis]);
+                path.whiten(axis, FINEST, &mut white[axis], 0);
             }
             for i in 0..r {
                 out.push(Unexplained {
@@ -463,12 +675,110 @@ impl<'a> Fit<'a> {
     }
 }
 
+#[cfg(test)]
+/// Levenberg-Marquardt on the normal equations `(J'J + mu diag(J'J)) step = -J'r` (Marquardt
+/// scaling, Nielsen's damping update): the `n x n` system costs a fraction of the QR
+/// factorization of the `m x n` Jacobian that the `levenberg_marquardt` crate computes per iteration.
+fn normal_equations_lm(lm: &mut Lm) {
+    let n = lm.u.len();
+    let max_evaluations = (LM_PATIENCE * (n + 1)) as u64;
+    let start_used = lm.used.get();
+    let Some(mut residuals) = lm.residuals() else {
+        return;
+    };
+    let mut cost = 0.5 * residuals.norm_squared();
+    let mut mu = 1e-3;
+    let mut nu = 2.0;
+    'outer: loop {
+        if lm.used.get() - start_used > max_evaluations {
+            return;
+        }
+        let Some(jacobian) = lm.jacobian() else {
+            return;
+        };
+        let information = jacobian.tr_mul(&jacobian);
+        let gradient = jacobian.tr_mul(&residuals);
+        if gradient.amax() == 0.0 {
+            return;
+        }
+        let scale = information.diagonal().map(|d| d.max(1e-12));
+        loop {
+            let mut damped = information.clone();
+            for i in 0..n {
+                damped[(i, i)] += mu * scale[i];
+            }
+            let step = damped.cholesky().map(|c| c.solve(&(-&gradient)));
+            let Some(step) = step.filter(|s| s.iter().all(|v| v.is_finite())) else {
+                mu *= nu;
+                nu *= 2.0;
+                if mu > 1e16 {
+                    return;
+                }
+                continue;
+            };
+            let current = lm.u.clone();
+            if step.norm() <= 1e-10 * (current.norm() + 1e-10) {
+                return;
+            }
+            lm.set_params(&(&current + &step));
+            let Some(trial) = lm.residuals() else {
+                return;
+            };
+            let trial_cost = 0.5 * trial.norm_squared();
+            let predicted = 0.5
+                * step
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| s * (mu * scale[i] * s - gradient[i]))
+                    .sum::<f64>();
+            let rho = (cost - trial_cost) / predicted;
+            if rho > 0.0 && trial_cost.is_finite() {
+                let relative = (cost - trial_cost) / cost.max(1e-300);
+                residuals = trial;
+                cost = trial_cost;
+                mu *= (1.0 - (2.0 * rho - 1.0).powi(3)).max(1.0 / 3.0);
+                nu = 2.0;
+                if relative < 1e-10 {
+                    return;
+                }
+                continue 'outer;
+            }
+            lm.set_params(&current);
+            mu *= nu;
+            nu *= 2.0;
+            if mu > 1e16 {
+                return;
+            }
+        }
+    }
+}
+
 struct Lm<'a> {
     fit: &'a Fit<'a>,
     u: DVector<f64>,
     level: usize,
     /// Lowest residual norm evaluated so far and its parameters.
     best: RefCell<Option<(f64, DVector<f64>)>>,
+    budget: &'a Budget,
+    /// Evaluations of this refinement so far (shared across its noise levels).
+    used: &'a Cell<u64>,
+}
+
+impl Lm<'_> {
+    /// Whether another evaluation is allowed; counts it when it is.
+    fn spend(&self) -> bool {
+        let out_of_time = self
+            .fit
+            .deadline
+            .into_iter()
+            .chain(self.budget.deadline)
+            .any(|d| Instant::now() >= d);
+        if out_of_time || self.used.get() >= self.budget.evaluations {
+            return false;
+        }
+        self.used.set(self.used.get() + 1);
+        true
+    }
 }
 
 impl LeastSquaresProblem<f64, Dyn, Dyn> for Lm<'_> {
@@ -482,12 +792,15 @@ impl LeastSquaresProblem<f64, Dyn, Dyn> for Lm<'_> {
         self.u.clone()
     }
     fn residuals(&self) -> Option<DVector<f64>> {
-        if self.fit.deadline.is_some_and(|d| Instant::now() >= d) {
+        if !self.spend() {
             return None;
         }
-        let (residuals, _) = self
-            .fit
-            .evaluate(&self.fit.decode(&self.u), false, self.level)?;
+        let (residuals, _) = self.fit.evaluate(
+            &self.fit.decode(&self.u),
+            false,
+            self.level,
+            self.budget.threads,
+        )?;
         let norm = residuals.norm();
         let mut best = self.best.borrow_mut();
         if best.as_ref().is_none_or(|(lowest, _)| norm < *lowest) {
@@ -496,11 +809,13 @@ impl LeastSquaresProblem<f64, Dyn, Dyn> for Lm<'_> {
         Some(residuals)
     }
     fn jacobian(&self) -> Option<DMatrix<f64>> {
-        if self.fit.deadline.is_some_and(|d| Instant::now() >= d) {
+        if !self.spend() {
             return None;
         }
         let theta = self.fit.decode(&self.u);
-        let (_, jacobian) = self.fit.evaluate(&theta, true, self.level)?;
+        let (_, jacobian) = self
+            .fit
+            .evaluate(&theta, true, self.level, self.budget.threads)?;
         let mut jacobian = jacobian?;
         // Chain to the logistic coordinates: x and y depend on their own coordinate and, through
         // the bounds, on the radius coordinate.

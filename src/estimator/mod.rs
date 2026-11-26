@@ -19,8 +19,10 @@ mod eval;
 mod fit;
 mod search;
 mod window;
+mod work;
 
 pub use eval::{position_rmse, shot_observations, shot_position_rmse};
+pub use work::{CeilingViolation, Part, PartCeilings, PartReport, UpdateReport};
 
 use crate::map::PlanetMap;
 use crate::protocol::{Point, ServerEvent};
@@ -32,6 +34,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use window::PathData;
+use work::Stats;
 
 /// At most this many modes (including the flat one) are retained.
 const MAX_MODES: usize = 4;
@@ -69,6 +72,8 @@ pub enum SearchLimit {
     PlanetCap,
     /// The per-update time budget ran out.
     TimeBudget,
+    /// The deterministic evaluation limit (`Estimator::max_evaluations`) was reached.
+    WorkBudget,
 }
 
 /// A completed trajectory, its prepared windowed comparison (`None` when it is too short for a
@@ -85,13 +90,14 @@ impl Shot {
         obs: ShotObservation,
         contact: Option<contacts::Contact>,
         world: WorldParameters,
+        noise_levels: &[f64],
     ) -> Self {
         let path = PathData::new(
             &obs.points,
             obs.angle_degrees,
             obs.velocity,
             world,
-            &NOISE_LEVELS,
+            noise_levels,
         );
         Self { obs, contact, path }
     }
@@ -116,6 +122,21 @@ pub struct Estimator {
     /// start of the search, the evidence (Jacobian) of each mode, and `model_position_rmse`, which
     /// simulates every shot of the epoch and is only a diagnostic.
     pub time_budget: Duration,
+    /// Deterministic bound on residual plus Jacobian evaluations per update (`None`: unbounded).
+    /// Independent of `time_budget`; see `work.rs`.
+    pub max_evaluations: Option<u64>,
+    /// Whether a refit's own evaluations use the cores that the other refits of its stage leave
+    /// idle (results are identical either way; see `diagnose.rs` for the measurement).
+    pub parallel_evaluations: bool,
+    /// Position-noise levels of the likelihood, coarse to fine (default `NOISE_LEVELS`). Set
+    /// before the first shot: paths are prepared with it when they arrive.
+    pub noise_levels: Vec<f64>,
+    /// Wall-clock ceilings per part of the update; exceeded ones are listed in `last_report`.
+    pub ceilings: PartCeilings,
+    /// Work and timing of the most recent update that ran the search.
+    last_report: Option<UpdateReport>,
+    /// Window-build and contact-classification times of shots ingested since the last update.
+    pending_timings: Vec<(Part, Duration)>,
 }
 
 impl Default for Estimator {
@@ -128,6 +149,12 @@ impl Default for Estimator {
             stale: false,
             max_planets: DEFAULT_MAX_PLANETS,
             time_budget: DEFAULT_TIME_BUDGET,
+            max_evaluations: None,
+            parallel_evaluations: true,
+            noise_levels: NOISE_LEVELS.to_vec(),
+            ceilings: PartCeilings::default(),
+            last_report: None,
+            pending_timings: Vec::new(),
         }
     }
 }
@@ -170,8 +197,15 @@ impl Estimator {
                         continue;
                     }
                     let players = self.players.values().cloned().collect::<Vec<_>>();
+                    let started = Instant::now();
                     let contact = contacts::classify(&obs.points, &players, world);
-                    self.shots.push(Shot::new(obs, contact, world));
+                    self.pending_timings
+                        .push((Part::Contacts, started.elapsed()));
+                    let started = Instant::now();
+                    self.shots
+                        .push(Shot::new(obs, contact, world, &self.noise_levels));
+                    self.pending_timings
+                        .push((Part::WindowBuild, started.elapsed()));
                     self.stale = true;
                 }
                 _ => {}
@@ -200,6 +234,11 @@ impl Estimator {
         self.belief.as_ref()
     }
 
+    /// Work counts and per-part timings of the most recent update that ran the search.
+    pub fn last_report(&self) -> Option<&UpdateReport> {
+        self.last_report.as_ref()
+    }
+
     /// Forget the map epoch's evidence. Player positions survive: the server announces a
     /// player's new position just before that player's `Planets` event.
     pub fn reset(&mut self) {
@@ -207,6 +246,10 @@ impl Estimator {
             players: std::mem::take(&mut self.players),
             max_planets: self.max_planets,
             time_budget: self.time_budget,
+            max_evaluations: self.max_evaluations,
+            parallel_evaluations: self.parallel_evaluations,
+            noise_levels: std::mem::take(&mut self.noise_levels),
+            ceilings: std::mem::take(&mut self.ceilings),
             ..Self::default()
         };
     }
@@ -217,9 +260,23 @@ impl Estimator {
         let limits = Limits {
             max_planets: self.max_planets,
             deadline: Instant::now() + self.time_budget,
+            max_evaluations: self.max_evaluations,
+            parallel_evaluations: self.parallel_evaluations,
+            ceilings: &self.ceilings,
         };
-        let (mut modes, limit) =
-            search::search(&self.shots, world, cancelled, &self.warm_starts, &limits)?;
+        let stats = Stats::default();
+        for (part, elapsed) in self.pending_timings.drain(..) {
+            stats.add(part, elapsed);
+        }
+        let (mut modes, limit) = search::search(
+            &self.shots,
+            world,
+            cancelled,
+            &self.warm_starts,
+            &limits,
+            &stats,
+        )?;
+        let diagnostics_started = Instant::now();
         // One ranking pass: best first, coinciding modes merged, weak ones dropped.
         modes.sort_by(|a, b| b.log_evidence.total_cmp(&a.log_evidence));
         let best = modes[0].log_evidence;
@@ -289,6 +346,8 @@ impl Estimator {
             })
             .count();
         self.warm_starts = kept.into_iter().map(|mode| mode.planets).collect();
+        stats.add(Part::Diagnostics, diagnostics_started.elapsed());
+        self.last_report = Some(stats.report(&self.ceilings));
         Some(belief)
     }
 }
@@ -298,3 +357,6 @@ mod tests;
 
 #[cfg(test)]
 mod measurements;
+
+#[cfg(test)]
+mod diagnose;

@@ -170,6 +170,10 @@ impl PathData {
         self.whiteners.len()
     }
 
+    pub fn substeps(&self) -> usize {
+        self.substeps
+    }
+
     pub fn row_count(&self) -> usize {
         self.y[0].len()
     }
@@ -179,11 +183,12 @@ impl PathData {
         self.ticks[r + 1]
     }
 
-    /// `out[r] = sum_i kernel_i * field[node r * n + 1 + i]` for one axis of the field at the nodes.
-    pub fn apply(&self, field: &[f64], out: &mut [f64]) {
-        for (r, out) in out.iter_mut().enumerate() {
+    /// `out[r] = sum_i kernel_i * field[node r * n + 1 + i]` for the rows `rows` (others are left
+    /// alone) of one axis of the field at the nodes.
+    pub fn apply(&self, field: &[f64], out: &mut [f64], rows: std::ops::Range<usize>) {
+        for r in rows {
             let first = r * self.substeps + 1;
-            *out = self
+            out[r] = self
                 .kernel
                 .iter()
                 .zip(&field[first..])
@@ -195,21 +200,21 @@ impl PathData {
     /// Whitened residual `L^-1 (y - W field)` of one axis at a noise level.
     pub fn residual(&self, axis: usize, level: usize, field: &[f64], out: &mut [f64]) {
         self.raw_residual(axis, field, out);
-        self.whiten(axis, level, out);
+        self.whiten(axis, level, out, 0);
     }
 
     /// Unwhitened `y - W field` of one axis.
     pub fn raw_residual(&self, axis: usize, field: &[f64], out: &mut [f64]) {
-        self.apply(field, out);
+        self.apply(field, out, 0..out.len());
         for (o, y) in out.iter_mut().zip(&self.y[axis]) {
             *o = y - *o;
         }
     }
 
-    /// Replace `v` by `L^-1 v` at a noise level.
-    pub fn whiten(&self, axis: usize, level: usize, v: &mut [f64]) {
+    /// Replace `v` by `L^-1 v` at a noise level, where `v` is zero before row `start`.
+    pub fn whiten(&self, axis: usize, level: usize, v: &mut [f64], start: usize) {
         let w = &self.whiteners[level.min(self.whiteners.len() - 1)][axis];
-        for i in 0..v.len() {
+        for i in start..v.len() {
             let mut s = v[i];
             if i >= 1 {
                 s -= w.first[i] * v[i - 1];
