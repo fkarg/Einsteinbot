@@ -36,6 +36,9 @@ pub struct MapBelief {
     pub unmatched_contacts: usize,
     /// Coordinate RMSE of `map` against the regular samples of every path fitted.
     pub model_position_rmse: Option<f64>,
+    /// Set when the planet-count search stopped at its cap or time budget rather than by running
+    /// out of proposals.
+    pub search_limit: Option<crate::estimator::SearchLimit>,
 }
 
 impl MapBelief {
@@ -52,6 +55,7 @@ impl MapBelief {
             contact_points: Vec::new(),
             unmatched_contacts: 0,
             model_position_rmse: None,
+            search_limit: None,
         }
     }
 
@@ -74,6 +78,7 @@ impl MapBelief {
             })).collect::<Vec<_>>(),
             "unmatched_contacts": self.unmatched_contacts,
             "model_position_rmse": self.model_position_rmse,
+            "search_limit": self.search_limit,
         })
     }
 

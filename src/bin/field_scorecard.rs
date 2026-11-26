@@ -8,11 +8,13 @@ use einsteinbot::simulation::{ShotObservation, WorldParameters};
 use einsteinbot::strategy::MapBelief;
 use serde_json::{Value, json};
 use std::sync::atomic::AtomicBool;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 struct Replay {
     estimator: Estimator,
     fit_micros: u128,
+    /// Duration of the most recent path update.
+    update_micros: u128,
     observations: Vec<ShotObservation>,
     truth: Option<PlanetMap>,
     epoch: usize,
@@ -21,10 +23,14 @@ struct Replay {
 }
 
 impl Replay {
-    fn new(empty_is_flat: bool) -> Self {
+    fn new(empty_is_flat: bool, max_planets: Option<usize>, time_budget: Option<Duration>) -> Self {
+        let mut estimator = Estimator::default();
+        estimator.max_planets = max_planets.unwrap_or(estimator.max_planets);
+        estimator.time_budget = time_budget.unwrap_or(estimator.time_budget);
         Self {
-            estimator: Estimator::default(),
+            estimator,
             fit_micros: 0,
+            update_micros: 0,
             observations: Vec::new(),
             truth: None,
             epoch: 0,
@@ -66,7 +72,8 @@ impl Replay {
                 }
                 let start = Instant::now();
                 self.estimator.observe(event, &AtomicBool::new(false));
-                self.fit_micros += start.elapsed().as_micros();
+                self.update_micros = start.elapsed().as_micros();
+                self.fit_micros += self.update_micros;
                 self.observations.push(shot);
                 self.completed_total += 1;
                 let mut row = self.snapshot(sequence, "after_completion");
@@ -90,6 +97,8 @@ impl Replay {
             "completed_total": self.completed_total,
             "truth_status": if self.truth.is_some() { "disclosed" } else { "unavailable" },
             "fit_ms": self.fit_micros as f64 / 1000.0,
+            "update_ms": self.update_micros as f64 / 1000.0,
+            "search_limit": belief.search_limit,
             "belief_published": self.estimator.belief().is_some(),
             "physical_planets": belief.map.planets.len(),
             "physical": null, "flat": null, "oracle": null });
@@ -113,6 +122,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut capture: Option<i64> = None;
     let mut empty_is_flat = false;
     let mut max_completed = None;
+    let mut max_planets = None;
+    let mut time_budget = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--db-path" => db = args.next().ok_or("--db-path requires a value")?,
@@ -131,9 +142,23 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         .parse::<usize>()?,
                 )
             }
+            "--max-planets" => {
+                max_planets = Some(
+                    args.next()
+                        .ok_or("--max-planets requires a value")?
+                        .parse::<usize>()?,
+                )
+            }
+            "--time-budget-ms" => {
+                time_budget = Some(Duration::from_millis(
+                    args.next()
+                        .ok_or("--time-budget-ms requires a value")?
+                        .parse()?,
+                ))
+            }
             "--help" | "-h" => {
                 println!(
-                    "Usage: field_scorecard --capture-id ID [--db-path PATH] [--empty-is-flat] [--max-completed N]\nJSON lines report causal pre-launch and post-completion physical-map field scores. Empty planet messages are unknown unless --empty-is-flat is explicitly set."
+                    "Usage: field_scorecard --capture-id ID [--db-path PATH] [--empty-is-flat] [--max-completed N] [--max-planets N] [--time-budget-ms MS]\nJSON lines report causal pre-launch and post-completion physical-map field scores. Empty planet messages are unknown unless --empty-is-flat is explicitly set."
                 );
                 return Ok(());
             }
@@ -151,7 +176,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if events.is_empty() {
         return Err(format!("capture {capture} is missing or has no recorded events").into());
     }
-    let mut replay = Replay::new(empty_is_flat);
+    let mut replay = Replay::new(empty_is_flat, max_planets, time_budget);
     println!(
         "{}",
         json!({"type":"field_scorecard", "capture_id":capture, "db_path":db,
@@ -199,7 +224,7 @@ mod tests {
 
     #[test]
     fn launch_snapshot_excludes_shots_that_finish_after_launch_and_resets_per_epoch() {
-        let mut replay = Replay::new(true);
+        let mut replay = Replay::new(true, None, None);
         replay.ingest(1, &ServerEvent::Planets { planets: vec![] });
         let initial = replay.ingest(2, &begin(0.0)).unwrap();
         assert_eq!(initial["completed_paths"], 0);
@@ -221,7 +246,7 @@ mod tests {
 
     #[test]
     fn empty_planets_are_not_implicitly_a_disclosed_flat_world() {
-        let mut replay = Replay::new(false);
+        let mut replay = Replay::new(false, None, None);
         replay.ingest(1, &ServerEvent::Planets { planets: vec![] });
         let row = replay.ingest(2, &begin(0.0)).unwrap();
         assert_eq!(row["truth_status"], "unavailable");

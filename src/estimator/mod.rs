@@ -1,23 +1,23 @@
 //! Planet-map estimator (v2). The default belief is a flat world (no planets); a planet is
 //! admitted only when trajectory evidence supports it.
 //!
-//! Slice P1 considers K in {0, 1} planets. Each K is fitted separately: K=0 is the flat model,
-//! K=1 is one planet fitted by multi-start least squares (`fit`). The two are compared with an
-//! approximate evidence (Laplace/Occam factor on noise-floor-normalized trajectory residuals)
-//! and a prior that favours K=0 by 20:1. Distinct supported modes are kept (at most
-//! `MAX_MODES`) with normalized evidence weights. **These weights are heuristic rankings, not
-//! calibrated probabilities.** The published `map` is the maximum-weight mode.
+//! Estimation compares the model's gravity field with the field implied by the observed paths
+//! (`window`: windowed velocity-change comparison with the engine's exact discrete kernel and the
+//! f32 rounding covariance); no dynamics are simulated in the fit. `fit` jointly fits K planets
+//! to every path, and `search` grows and shrinks K on the approximate evidence (Laplace/Occam
+//! with a prior of 20:1 against each extra planet, so K=0 is favoured). Distinct supported modes
+//! are kept (at most `MAX_MODES`) with normalized evidence weights. **These weights are heuristic
+//! rankings, not calibrated probabilities.** The published `map` is the maximum-weight mode.
 //!
-//! Surface contacts (`contacts`) are extra evidence: they start some fits and add a surface
-//! constraint to the K=1 fit, but never create a planet. Oracle planets are never an input.
-//!
-//! Contact terms (and the interior-sample terms that forbid a regular sample inside the disk)
-//! enter only the planet's chi-square; the flat model has no such terms. A hit can therefore
-//! lower a planet's evidence relative to flat but never raise it: a contact never helps admit a
-//! planet, only trajectory curvature does.
+//! Surface contacts (`contacts`) are extra evidence only: a gated surface constraint on the
+//! joint fit that never creates a planet. Contact terms enter only planet-bearing models; the
+//! flat model has none. A hit can therefore lower a planet's evidence relative to flat but never
+//! raise it. Oracle planets are never an input.
 mod contacts;
 mod eval;
 mod fit;
+mod search;
+mod window;
 
 pub use eval::{position_rmse, shot_observations, shot_position_rmse};
 
@@ -25,15 +25,28 @@ use crate::map::PlanetMap;
 use crate::protocol::{Point, ServerEvent};
 use crate::simulation::{ShotObservation, WorldParameters};
 use crate::strategy::{MapBelief, WeightedMap};
-use fit::{CONTACT_FULL, Mode, Problem};
+use fit::CONTACT_FULL;
+use search::{Limits, Mode, same_map};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+use window::PathData;
 
 /// At most this many modes (including the flat one) are retained.
 const MAX_MODES: usize = 4;
 /// Modes whose log evidence trails the best by more than this are dropped (relative weight
 /// below about 1e-3).
 const RETAIN_NATS: f64 = 7.0;
+/// Position-noise levels (world units, on top of f32 rounding) the fit goes through, coarse to
+/// fine; the last is the scored likelihood. PROVISIONAL, NOT MEASURED: the measured residual
+/// scale against the disclosed truth (`measure_residual_scale_on_live_captures`) is f32 rounding
+/// only, i.e. 0, but with 0 (or an annealed 0.3 -> 0.03 -> 0) the multi-planet scorecard cases are
+/// far worse than with a single 0.1 level (docs/estimator-evaluation.md). Needs a decision.
+const NOISE_LEVELS: [f64; 1] = [0.1];
+/// Default cap on the number of planets in a map.
+pub const DEFAULT_MAX_PLANETS: usize = 24;
+/// Default wall-clock budget per update for growing and shrinking K.
+pub const DEFAULT_TIME_BUDGET: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -42,28 +55,75 @@ pub enum CovarianceUnavailableReason {
     NotComputed,
     /// The published map has no planets: uncertainty about planets not yet found is not modelled.
     NoPlanets,
-    /// The data leave the planet's parameters (nearly) undetermined, or the mode sits at a bound.
+    /// The data leave the planets' parameters (nearly) undetermined, or a planet sits at a bound.
     UnderIdentified,
 }
 
-/// A completed trajectory plus its possible terminal contact, classified with the players known
-/// when it finished.
+/// Why the search for more (or fewer) planets stopped before it ran out of proposals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchLimit {
+    /// The best map already has the maximum number of planets.
+    PlanetCap,
+    /// The per-update time budget ran out.
+    TimeBudget,
+}
+
+/// A completed trajectory, its prepared windowed comparison (`None` when it is too short for a
+/// window) and its possible terminal contact, classified with the players known when it finished.
 #[derive(Clone, Debug)]
 struct Shot {
     obs: ShotObservation,
     contact: Option<contacts::Contact>,
+    path: Option<PathData>,
 }
 
-#[derive(Clone, Default)]
+impl Shot {
+    fn new(
+        obs: ShotObservation,
+        contact: Option<contacts::Contact>,
+        world: WorldParameters,
+    ) -> Self {
+        let path = PathData::new(
+            &obs.points,
+            obs.angle_degrees,
+            obs.velocity,
+            world,
+            &NOISE_LEVELS,
+        );
+        Self { obs, contact, path }
+    }
+}
+
+#[derive(Clone)]
 pub struct Estimator {
     players: BTreeMap<u32, Point>,
     shots: Vec<Shot>,
-    /// `[x, y, radius]` of the previous fit's planet modes; warm starts for the next fit.
-    warm_starts: Vec<[f64; 3]>,
+    /// Planets of the previous update's retained modes; warm starts for the next update.
+    warm_starts: Vec<Vec<crate::protocol::Planet>>,
     belief: Option<MapBelief>,
     /// Shots were added since the last published belief: the next event retries the fit even if it
     /// brings nothing new (a cancelled or failed fit must not stall the estimator).
     stale: bool,
+    /// Maximum number of planets in a map.
+    pub max_planets: usize,
+    /// Wall-clock budget per update for growing and shrinking K; the best belief found so far is
+    /// published when it runs out.
+    pub time_budget: Duration,
+}
+
+impl Default for Estimator {
+    fn default() -> Self {
+        Self {
+            players: BTreeMap::new(),
+            shots: Vec::new(),
+            warm_starts: Vec::new(),
+            belief: None,
+            stale: false,
+            max_planets: DEFAULT_MAX_PLANETS,
+            time_budget: DEFAULT_TIME_BUDGET,
+        }
+    }
 }
 
 impl Estimator {
@@ -105,7 +165,7 @@ impl Estimator {
                     }
                     let players = self.players.values().cloned().collect::<Vec<_>>();
                     let contact = contacts::classify(&obs.points, &players, world);
-                    self.shots.push(Shot { obs, contact });
+                    self.shots.push(Shot::new(obs, contact, world));
                     self.stale = true;
                 }
                 _ => {}
@@ -116,9 +176,7 @@ impl Estimator {
         }
         let Some(belief) = self.infer(world, cancelled) else {
             if !cancelled.load(Ordering::SeqCst) {
-                eprintln!(
-                    "estimator: simulation failed; the fit will be retried on the next event"
-                );
+                eprintln!("estimator: the fit failed; it will be retried on the next event");
             }
             return None;
         };
@@ -139,26 +197,23 @@ impl Estimator {
     /// Forget the map epoch's evidence. Player positions survive: the server announces a
     /// player's new position just before that player's `Planets` event.
     pub fn reset(&mut self) {
-        let players = std::mem::take(&mut self.players);
-        *self = Self::default();
-        self.players = players;
+        *self = Self {
+            players: std::mem::take(&mut self.players),
+            max_planets: self.max_planets,
+            time_budget: self.time_budget,
+            ..Self::default()
+        };
     }
 
-    /// Fit K=0 and K=1, rank the modes and build the belief. `None` when cancelled or when a
-    /// path cannot be simulated.
+    /// Search K, rank the modes and build the belief. `None` when cancelled or when the flat model
+    /// cannot be evaluated.
     fn infer(&mut self, world: WorldParameters, cancelled: &AtomicBool) -> Option<MapBelief> {
-        let problem = Problem {
-            shots: &self.shots,
-            world,
-            cancelled,
-            use_contacts: true,
+        let limits = Limits {
+            max_planets: self.max_planets,
+            deadline: Instant::now() + self.time_budget,
         };
-        let mut modes = vec![Mode {
-            planet: None,
-            log_evidence: -0.5 * problem.flat_chi2()?,
-            covariance: None,
-        }];
-        modes.extend(fit::planet_modes(&problem, &self.warm_starts)?);
+        let (mut modes, limit) =
+            search::search(&self.shots, world, cancelled, &self.warm_starts, &limits)?;
         // One ranking pass: best first, coinciding modes merged, weak ones dropped.
         modes.sort_by(|a, b| b.log_evidence.total_cmp(&a.log_evidence));
         let best = modes[0].log_evidence;
@@ -166,10 +221,7 @@ impl Estimator {
         for mode in modes {
             let duplicate = kept
                 .iter()
-                .any(|other| match (&other.planet, &mode.planet) {
-                    (Some(a), Some(b)) => fit::same_mode(fit::theta_of(a), fit::theta_of(b)),
-                    _ => false,
-                });
+                .any(|other| same_map(&other.planets, &mode.planets));
             if !duplicate && mode.log_evidence >= best - RETAIN_NATS && kept.len() < MAX_MODES {
                 kept.push(mode);
             }
@@ -180,7 +232,7 @@ impl Estimator {
             .sum();
         let weight = |mode: &Mode| (mode.log_evidence - best).exp() / total;
         let map_of = |mode: &Mode| PlanetMap {
-            planets: mode.planet.clone().into_iter().collect(),
+            planets: mode.planets.clone(),
         };
 
         let top = &kept[0];
@@ -193,14 +245,15 @@ impl Estimator {
                 weight: weight(mode),
             })
             .collect();
-        belief.covariance_unavailable_reason = match (&top.planet, &top.covariance) {
-            (None, _) => Some(CovarianceUnavailableReason::NoPlanets),
-            (Some(_), None) => Some(CovarianceUnavailableReason::UnderIdentified),
-            (Some(planet), Some(covariance)) => {
-                belief.parameter_covariance = Some(fit::covariance_xym(covariance, planet.radius));
+        belief.covariance_unavailable_reason = match (top.planets.is_empty(), &top.covariance) {
+            (true, _) => Some(CovarianceUnavailableReason::NoPlanets),
+            (false, None) => Some(CovarianceUnavailableReason::UnderIdentified),
+            (false, Some(covariance)) => {
+                belief.parameter_covariance = Some(fit::covariance_xym(covariance, &top.planets));
                 None
             }
         };
+        belief.search_limit = limit;
 
         let observations = self
             .shots
@@ -227,13 +280,13 @@ impl Estimator {
                 })
             })
             .count();
-        self.warm_starts = kept
-            .iter()
-            .filter_map(|mode| mode.planet.as_ref().map(fit::theta_of))
-            .collect();
+        self.warm_starts = kept.into_iter().map(|mode| mode.planets).collect();
         Some(belief)
     }
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod measurements;
