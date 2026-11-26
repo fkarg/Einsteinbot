@@ -9,14 +9,22 @@
 //! 20000), `STAGE1` (share of it for the search stage, default 0.5), `NOISE`, plus the
 //! `SEEDS`/`LIVE`/`KS`/`PATHS` of `cases`.
 use super::*;
+use crate::estimator::fit::Budget;
+use crate::estimator::search::seeds;
 use crate::estimator::search::{Mode, deaths, refit};
-use crate::estimator::work::cores;
+use crate::estimator::work::{cores, par_map};
 
 #[derive(Clone, Copy, Debug)]
 struct Variant {
     /// Thinning: cell size, rows per cell, row cap, prefer strongly accelerated rows.
     thin: Option<(f64, usize, usize, bool)>,
     relative: f64,
+    /// Re-thin after every growth round by the residual of the current map (strength = whitened
+    /// residual magnitude under the exact noise) instead of the observed acceleration.
+    resid: bool,
+    /// After the search-stage growth stalls, keep adding planets with the found ones frozen as
+    /// fixed field, re-thinning by the raw residual of the frozen map each round.
+    frozen: bool,
 }
 
 fn parse(spec: &str) -> Variant {
@@ -29,29 +37,45 @@ fn parse(spec: &str) -> Variant {
             p[3] == "strong",
         )
     };
+    let resid = p.contains(&"resid");
+    let frozen = p.contains(&"frozen");
     match p[0] {
         "exact" => Variant {
             thin: None,
             relative: 0.0,
+            resid,
+            frozen,
         },
         "rel" => Variant {
             thin: None,
             relative: p[1].parse().unwrap(),
+            resid,
+            frozen,
         },
         "thin" => Variant {
             thin: Some(thin(&p[1..])),
             relative: 0.0,
+            resid,
+            frozen,
         },
         "thinrel" => Variant {
             thin: Some(thin(&p[1..5])),
             relative: p[5].parse().unwrap(),
+            resid,
+            frozen,
         },
         other => panic!("unknown variant {other}"),
     }
 }
 
 /// The shots of the search stage: relative noise term and/or thinned rows.
-fn search_shots(case: &Case, variant: Variant, noise: f64) -> Vec<Shot> {
+/// `strengths[s][r]` replaces the observed acceleration as the row preference when given.
+fn search_shots(
+    case: &Case,
+    variant: Variant,
+    noise: f64,
+    strengths: Option<&[Vec<f64>]>,
+) -> Vec<Shot> {
     let world = WorldParameters::default();
     let mut shots: Vec<Shot> = case
         .shots
@@ -79,7 +103,7 @@ fn search_shots(case: &Case, variant: Variant, noise: f64) -> Vec<Shot> {
                 candidates.push((
                     s,
                     r,
-                    path.strength(r),
+                    strengths.map_or_else(|| path.strength(r), |v| v[s][r]),
                     ((c[0] / cell).floor() as i64, (c[1] / cell).floor() as i64),
                 ));
             }
@@ -139,6 +163,119 @@ fn grow(joint: &Fit, shots: &[Shot], modes: &mut Vec<Mode>, run: &Run, world: Wo
             break;
         }
     }
+}
+
+/// Growth with the search rows re-thinned every round by the residual of the current best map
+/// (whitened residual magnitude under the exact noise, residual-only evaluations not counted).
+/// The row set changes per round, so evidence is only compared within a round.
+fn grow_resid(
+    case: &Case,
+    variant: Variant,
+    noise: f64,
+    exact: &Fit,
+    modes: &mut Vec<Mode>,
+    run: &Run,
+    world: WorldParameters,
+) {
+    let never = AtomicBool::new(false);
+    for _ in 0..60 {
+        let parent = best(modes).clone();
+        if parent.planets.len() >= run.limits.max_planets || work_done(run) {
+            break;
+        }
+        let theta = theta_of_planets(&parent.planets);
+        let (res, _) = exact.evaluate(&theta, false, 0, 1).unwrap();
+        let mut offset = 0;
+        let strengths: Vec<Vec<f64>> = case
+            .shots
+            .iter()
+            .map(|shot| {
+                let r = shot.path.as_ref().map_or(0, |p| p.row_count());
+                let v = (0..r)
+                    .map(|i| res[offset + i].hypot(res[offset + r + i]))
+                    .collect();
+                offset += 2 * r;
+                v
+            })
+            .collect();
+        let search = search_shots(case, variant, noise, Some(&strengths));
+        let joint = Fit::new(&search, world, &never, false, vec![]).with_stats(run.stats);
+        let here = mode_at(&joint, &theta).unwrap();
+        let children = births(&search, &joint, &here, world, &never, run);
+        let improved = children
+            .first()
+            .is_some_and(|c| c.log_evidence > here.log_evidence);
+        *modes = children;
+        modes.push(here);
+        if !improved {
+            break;
+        }
+    }
+}
+
+/// Freeze-and-continue growth: the planets found so far are fixed field (never refitted); each
+/// round thins the full rows by the raw residual under them, seeds from the unexplained windows
+/// of the thinned rows, fits one new planet on them and freezes it if the (thinned) evidence
+/// improves. Returns the frozen map.
+fn grow_frozen(
+    case: &Case,
+    variant: Variant,
+    noise: f64,
+    mut frozen: Vec<Planet>,
+    run: &Run,
+    world: WorldParameters,
+) -> Vec<Planet> {
+    let never = AtomicBool::new(false);
+    for _ in 0..40 {
+        if frozen.len() >= run.limits.max_planets || work_done(run) {
+            break;
+        }
+        let full = Fit::new(&case.shots, world, &never, false, frozen.clone());
+        let strengths: Vec<Vec<f64>> = case
+            .shots
+            .iter()
+            .enumerate()
+            .map(|(index, shot)| {
+                let Some(path) = &shot.path else {
+                    return Vec::new();
+                };
+                let field = full.field(index, path, &[]);
+                let r = path.row_count();
+                let mut raw = [vec![0.0; r], vec![0.0; r]];
+                for axis in 0..2 {
+                    path.raw_residual(axis, &field[axis], &mut raw[axis]);
+                }
+                (0..r).map(|i| raw[0][i].hypot(raw[1][i])).collect()
+            })
+            .collect();
+        let search = search_shots(case, variant, noise, Some(&strengths));
+        let joint = Fit::new(&search, world, &never, false, frozen.clone()).with_stats(run.stats);
+        let seeds = seeds(&joint, &[], world);
+        if seeds.is_empty() {
+            break;
+        }
+        let left = run
+            .limits
+            .max_evaluations
+            .map_or(u64::MAX, |m| m.saturating_sub(run.stats.evaluations()));
+        let budget = Budget {
+            evaluations: left.div_ceil(seeds.len() as u64).min(1500),
+            deadline: None,
+            threads: (cores() / seeds.len()).max(1),
+        };
+        let flat = mode_at(&joint, &[]).unwrap();
+        let mut modes: Vec<Mode> =
+            par_map(&seeds, cores(), |seed| refit(&joint, &[*seed], &budget))
+                .into_iter()
+                .flatten()
+                .collect();
+        modes.sort_by(|a, b| b.log_evidence.total_cmp(&a.log_evidence));
+        match modes.first() {
+            Some(m) if m.log_evidence > flat.log_evidence => frozen.push(m.planets[0].clone()),
+            _ => break,
+        }
+    }
+    frozen
 }
 
 fn prune(joint: &Fit, modes: &mut Vec<Mode>, run: &Run) {
@@ -229,7 +366,7 @@ fn diagnose_thinning_search() {
                 ceilings: &ceilings,
             };
             let started = Instant::now();
-            let search = search_shots(&case, variant, noise);
+            let search = search_shots(&case, variant, noise, None);
             let search_rows: usize = search
                 .iter()
                 .filter_map(|s| s.path.as_ref())
@@ -264,8 +401,36 @@ fn diagnose_thinning_search() {
                 };
                 let sjoint = Fit::new(&search, world, &never, false, vec![]).with_stats(&stats);
                 let mut smodes = vec![mode_at(&sjoint, &[]).unwrap()];
-                grow(&sjoint, &search, &mut smodes, &run1, world);
+                if variant.resid {
+                    grow_resid(&case, variant, noise, &exact_fit, &mut smodes, &run1, world);
+                } else {
+                    grow(&sjoint, &search, &mut smodes, &run1, world);
+                }
                 let found = theta_of_planets(&best(&smodes).planets);
+                let found = if variant.frozen {
+                    let s = score(&found, &truth, &exact_fit, rows);
+                    println!(
+                        "   stage1: K {} rec2 {} rec15 {} spur {} ratio {:.3e} evals {}",
+                        s.k,
+                        s.recall2,
+                        s.recall15,
+                        s.spurious,
+                        s.ratio,
+                        stats.evaluations()
+                    );
+                    let planets = best(&smodes).planets.clone();
+                    let l = limits(budget);
+                    let run = Run {
+                        limits: &l,
+                        stats: &stats,
+                    };
+                    theta_of_planets(&grow_frozen(&case, variant, noise, planets, &run, world))
+                } else {
+                    found
+                };
+                if variant.frozen {
+                    smodes = vec![mode_at(&exact, &found).unwrap()];
+                }
                 stage1_score = Some(score(&found, &truth, &exact_fit, rows));
                 evals1 = stats.evaluations();
                 wall1 = started.elapsed().as_secs_f64();
@@ -294,8 +459,11 @@ fn diagnose_thinning_search() {
                             Variant {
                                 thin: None,
                                 relative: *level,
+                                resid: false,
+                                frozen: false,
                             },
                             noise,
+                            None,
                         );
                         let fit = Fit::new(&shots, world, &never, false, vec![]).with_stats(&stats);
                         if let Some((theta, _)) = fit.refine(&found, &b) {
@@ -308,7 +476,26 @@ fn diagnose_thinning_search() {
                         );
                     }
                     modes.extend(refit(&exact, &found, &b));
+                    let show = |label: &str, modes: &[Mode]| {
+                        let s = score(
+                            &theta_of_planets(&best(modes).planets),
+                            &truth,
+                            &exact_fit,
+                            rows,
+                        );
+                        println!(
+                            "   {label}: K {} rec2 {} rec15 {} spur {} ratio {:.3e} evals {}",
+                            s.k,
+                            s.recall2,
+                            s.recall15,
+                            s.spurious,
+                            s.ratio,
+                            stats.evaluations()
+                        );
+                    };
+                    show("after exact refit", &modes);
                     grow(&exact, &case.shots, &mut modes, &run2, world);
+                    show("after exact growth", &modes);
                     prune(&exact, &mut modes, &run2);
                     modes
                 }

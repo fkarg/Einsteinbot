@@ -230,7 +230,7 @@ impl<'a> Fit<'a> {
         self
     }
 
-    fn field(&self, index: usize, path: &PathData, theta: &[[f64; 3]]) -> [Vec<f64>; 2] {
+    pub(super) fn field(&self, index: usize, path: &PathData, theta: &[[f64; 3]]) -> [Vec<f64>; 2] {
         let mut field = if self.base[index][0].is_empty() {
             [vec![0.0; path.nodes.len()], vec![0.0; path.nodes.len()]]
         } else {
