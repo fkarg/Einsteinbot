@@ -355,7 +355,9 @@ fn diagnose_thinning_search() {
             chi2_per_row(&exact_fit, &truth, rows)
         );
         for spec in &variants {
-            let variant = parse(spec);
+            // `a+b`: search stages in turn; each continues growing from the previous stage's map.
+            let stages: Vec<Variant> = spec.split('+').map(parse).collect();
+            let variant = stages[0];
             let staged = variant.thin.is_some() || variant.relative > 0.0;
             let stats = Stats::default();
             let limits = |max: u64| Limits {
@@ -405,6 +407,20 @@ fn diagnose_thinning_search() {
                     grow_resid(&case, variant, noise, &exact_fit, &mut smodes, &run1, world);
                 } else {
                     grow(&sjoint, &search, &mut smodes, &run1, world);
+                }
+                for later in &stages[1..] {
+                    let theta = theta_of_planets(&best(&smodes).planets);
+                    let shots = search_shots(&case, *later, noise, None);
+                    let joint = Fit::new(&shots, world, &never, false, vec![]).with_stats(&stats);
+                    let b = Budget {
+                        evaluations: u64::MAX,
+                        deadline: None,
+                        threads: cores(),
+                    };
+                    // Refit the map on this stage's rows, then grow on them.
+                    smodes = vec![mode_at(&joint, &theta).unwrap()];
+                    smodes.extend(refit(&joint, &theta, &b));
+                    grow(&joint, &shots, &mut smodes, &run1, world);
                 }
                 let found = theta_of_planets(&best(&smodes).planets);
                 let found = if variant.frozen {
