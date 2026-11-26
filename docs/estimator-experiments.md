@@ -103,6 +103,16 @@ relative-error term in the noise during the search only (the earlier annealed no
 homotopy failed, this form differs: it down-weights strong rows where unmodeled planets
 dominate); the final fit and evidence stay exact. Status: todo.
 
+E9c (added after the user's clarification, 2026-11-26): the user meant the relative
+error bounds as in newton-bot (sigma growing with |a|, a tolerance for what the model does
+not capture) when asking for "uncertainty bounds" on the fit; the session had read it as
+parameter covariance. So also test a relative-error term as part of the permanent
+likelihood (not only in the search), with an allowance that shrinks as the map becomes
+complete (more planets explain more of the field), and compare final planet position
+error, chi2 ratio, explored/unexplored RMSE and evidence behaviour against the exact
+likelihood. This also bears on Q8 (the provisional noise level 0.1 is a crude form of the
+same allowance). Status: todo (queued after W5 reports; W5's brief covers search-only use).
+
 ### Later (not in the current round)
 - Targeting from newton-bot: p_hit averaged over covariance-sampled models; a separate
   targeting thread (Q1).
