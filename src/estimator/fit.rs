@@ -1,6 +1,6 @@
 //! One-planet (K=1) trajectory fit and its approximate evidence.
 //!
-//! Model: a single planet `(x, y, radius)` with mass tied to radius (`mass = radius^3 / 10`, as
+//! Model: a single planet `(x, y, radius)` with mass tied to radius (`MASS_PER_RADIUS_CUBED`, as
 //! the local NewtonWars generator does), fitted by multi-start Levenberg-Marquardt to the regular
 //! samples of the completed trajectories. The fit is continuous; no grid is searched.
 //!
@@ -11,34 +11,42 @@ use super::{MAX_MODES, Shot};
 use crate::map::PlanetMap;
 use crate::protocol::{Planet, Point};
 use crate::simulation::{WorldParameters, reconstruct_acceleration, simulate_sampled_positions};
-use levenberg_marquardt::{LeastSquaresProblem, LevenbergMarquardt};
+use levenberg_marquardt::{LeastSquaresProblem, LevenbergMarquardt, TerminationReason};
 use nalgebra::{DMatrix, DVector, Dyn, Matrix3, SymmetricEigen, U1, VecStorage, Vector3};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-/// Position noise floor in world units (also absorbs small simulator/engine mismatch).
-/// Heuristic: sub-unit deflections are not trusted as evidence for a planet.
+/// Position noise floor in world units (also absorbs small simulator/engine mismatch). It is also
+/// the scale of the interior-sample residuals (a regular sample inside the disk), so one number
+/// sets how much any positional mismatch counts. Heuristic: sub-unit deflections are not trusted
+/// as evidence for a planet.
 const NOISE_SIGMA: f64 = 0.5;
 /// A path's residual is smooth and strongly correlated along time, so it carries few independent
 /// coordinates; each path is weighted as if it had this many (mean squared residual times this).
 /// Heuristic. It also stops long or chaotic paths dominating by sample count.
 const COORDS_PER_PATH: f64 = 8.0;
-/// Scale of interior-sample residuals (a regular sample inside the disk), in world units.
-const SURFACE_SIGMA: f64 = 0.5;
 const MIN_CONTACT_SIGMA: f64 = 0.25;
-/// A contact constrains the planet only within this distance of its surface (full weight inside
-/// `CONTACT_FULL`, smoothly tapering to nothing at `CONTACT_GATE`). Farther contacts are left
-/// unexplained, and are reported as a mismatch, so a contact cannot drag the fit. Heuristic,
-/// chosen to exceed the trajectory-only position uncertainty of a hit (about 8 units along the approach in the test fixture), because a narrower gate let a fit slide to where the contact no longer constrains it. The earlier estimator's 8-unit snap was too tight for this.
-pub(super) const CONTACT_GATE: f64 = 40.0;
-const CONTACT_FULL: f64 = 15.0;
+/// A contact constrains the planet only near its surface: full weight within `CONTACT_FULL`,
+/// tapering smoothly to nothing at `CONTACT_GATE`. Farther contacts stay unexplained, so a
+/// contact cannot drag the fit. Heuristic: the gate exceeds the trajectory-only position
+/// uncertainty of a hit (about 8 units along the approach in the test fixture), because a
+/// narrower gate let a fit slide to where the contact no longer constrains it; the v1 estimator's
+/// 8-unit snap was too tight for this.
+const CONTACT_GATE: f64 = 40.0;
+/// A contact within this distance of a surface is fully constrained by it.
+pub(super) const CONTACT_FULL: f64 = 15.0;
 /// Radius range of the local generator (an assumption about the server, not protocol fact).
 const RADIUS_RANGE: (f64, f64) = (20.0, 40.0);
 /// Minimum reconstructed acceleration (units/tick^2) worth proposing a planet for; below it the
 /// second differences of f32 positions are mostly rounding.
 const ACCELERATION_FLOOR: f64 = 3e-3;
-/// A planet must beat the flat world by this many nats of approximate evidence on top of the
-/// Occam factor: a prior log-odds of 1:20 against a planet.
-pub(super) const PLANET_PRIOR_LOG_ODDS: f64 = -2.995_732_273_553_991; // ln(1/20)
+/// Mass is tied to the radius cubed, as the local generator does: `mass = 0.1 * radius^3`.
+const MASS_PER_RADIUS_CUBED: f64 = 0.1;
+/// Modes closer than this to a bound (in the units of the bound) are saturated: their covariance
+/// is not reported.
+const BOUND_MARGIN: f64 = 0.5;
+/// The correlation matrix of the sensitivities must have its smallest eigenvalue above this, or
+/// the parameters are treated as under-identified.
+const MIN_CORRELATION_EIGENVALUE: f64 = 1e-4;
 const MAX_STARTS: usize = 18;
 const LM_PATIENCE: usize = 40;
 /// Modes closer than this in centre and radius are the same mode.
@@ -53,12 +61,14 @@ pub(super) struct Problem<'a> {
     pub use_contacts: bool,
 }
 
+/// One hypothesis about the world: the flat model (`planet` is `None`) or one planet.
 #[derive(Clone, Debug)]
 pub(super) struct Mode {
-    pub planet: Planet,
-    /// Laplace evidence including the planet prior; comparable with `-0.5 * flat chi2`.
+    pub planet: Option<Planet>,
+    /// Approximate log evidence including the planet prior; the flat model's is `-0.5 * chi2`.
     pub log_evidence: f64,
-    /// `[x, y, radius]` covariance, `None` when the data leave the parameters under-identified.
+    /// `[x, y, radius]` covariance of the planet, `None` when the data leave the parameters
+    /// under-identified or the mode is saturated at a bound.
     pub covariance: Option<Matrix3<f64>>,
 }
 
@@ -67,8 +77,19 @@ pub(super) fn planet_at(theta: [f64; 3]) -> Planet {
         x: theta[0],
         y: theta[1],
         radius: theta[2],
-        mass: theta[2].powi(3) / 10.0,
+        mass: MASS_PER_RADIUS_CUBED * theta[2].powi(3),
     }
+}
+
+pub(super) fn theta_of(planet: &Planet) -> [f64; 3] {
+    [planet.x, planet.y, planet.radius]
+}
+
+/// Covariance of `[x, y, radius]` expressed for `[x, y, mass]` (first-order, from the mass tie).
+pub(super) fn covariance_xym(covariance: &Matrix3<f64>, radius: f64) -> DMatrix<f64> {
+    let mut transform = DMatrix::identity(3, 3);
+    transform[(2, 2)] = 3.0 * MASS_PER_RADIUS_CUBED * radius * radius;
+    &transform * DMatrix::from_fn(3, 3, |i, j| covariance[(i, j)]) * transform.transpose()
 }
 
 fn surface_error(planet: &Planet, point: &Point) -> f64 {
@@ -123,7 +144,8 @@ impl Problem<'_> {
     pub fn flat_chi2(&self) -> Option<f64> {
         let mut residuals = Vec::new();
         self.trajectory(&PlanetMap { planets: vec![] }, &mut residuals)?;
-        Some(residuals.iter().map(|r| r * r).sum())
+        let chi2 = residuals.iter().map(|r| r * r).sum::<f64>();
+        chi2.is_finite().then_some(chi2)
     }
 
     /// Residuals of the one-planet model `theta = [x, y, radius]`.
@@ -141,7 +163,7 @@ impl Problem<'_> {
             // A regular sample inside the disk is impossible. One entry per sample keeps the
             // residual length independent of the parameters.
             for sample in &shot.obs.points[1..regular] {
-                residuals.push((-surface_error(&planet, sample)).max(0.0) / SURFACE_SIGMA);
+                residuals.push((-surface_error(&planet, sample)).max(0.0) / NOISE_SIGMA);
             }
             if let (true, Some(contact)) = (self.use_contacts, &shot.contact) {
                 residuals.push(contact_residual(
@@ -160,13 +182,14 @@ impl Problem<'_> {
         self.planet_residuals(theta).map(|r| r.norm_squared())
     }
 
-    fn in_bounds(&self, theta: [f64; 3]) -> bool {
+    /// Whether `theta` lies inside the radius range and the battlefield, shrunk by `margin`.
+    fn in_bounds(&self, theta: [f64; 3], margin: f64) -> bool {
         let r = theta[2];
-        (RADIUS_RANGE.0..=RADIUS_RANGE.1).contains(&r)
-            && theta[0] >= r
-            && theta[0] <= self.world.battlefield_width - r
-            && theta[1] >= r
-            && theta[1] <= self.world.battlefield_height - r
+        (RADIUS_RANGE.0 + margin..=RADIUS_RANGE.1 - margin).contains(&r)
+            && theta[0] >= r + margin
+            && theta[0] <= self.world.battlefield_width - r - margin
+            && theta[1] >= r + margin
+            && theta[1] <= self.world.battlefield_height - r - margin
     }
 
     /// Logistic coordinates keep the centre in the battlefield and the radius in range.
@@ -193,14 +216,21 @@ impl Problem<'_> {
         ])
     }
 
-    /// Local minimum from `start`; `None` if cancelled or the model cannot be evaluated.
+    /// Local minimum from `start`; `None` if cancelled, the model cannot be evaluated, or the
+    /// solver reports a failure. Running out of patience is not a failure: the iterate is still a
+    /// valid point and is scored by its evidence like any other.
     pub fn refine(&self, start: [f64; 3]) -> Option<([f64; 3], f64)> {
-        let (lm, _) = LevenbergMarquardt::new()
+        let (lm, report) = LevenbergMarquardt::new()
             .with_patience(LM_PATIENCE)
             .minimize(Lm {
                 problem: *self,
                 u: self.encode(start),
             });
+        if !report.termination.was_successful()
+            && !matches!(report.termination, TerminationReason::LostPatience)
+        {
+            return None;
+        }
         let theta = self.decode(&lm.u);
         Some((theta, self.chi2(theta)?))
     }
@@ -232,10 +262,16 @@ impl Problem<'_> {
         let scaled =
             Matrix3::from_diagonal(&prior_sd) * information * Matrix3::from_diagonal(&prior_sd);
         let occam = 0.5 * (Matrix3::identity() + scaled).determinant().ln();
-        let log_evidence = -0.5 * chi2 - occam + PLANET_PRIOR_LOG_ODDS;
-        let eigenvalues = SymmetricEigen::new(information).eigenvalues;
-        let (smallest, largest) = (eigenvalues.min(), eigenvalues.max());
-        let covariance = (smallest > 1e-6 * largest)
+        // A planet must beat the flat world by this much on top of the Occam factor: a prior
+        // log-odds of 1:20 against a planet.
+        let log_evidence = -0.5 * chi2 - occam - (20f64).ln();
+        // Report no covariance for a mode saturated at a bound (the Gaussian approximation does
+        // not hold there) or with a badly conditioned (diagonal-normalized) information matrix.
+        let scale = Matrix3::from_diagonal(&information.diagonal().map(|d| d.sqrt().recip()));
+        let correlation = scale * information * scale;
+        let well_conditioned = correlation.iter().all(|v| v.is_finite())
+            && SymmetricEigen::new(correlation).eigenvalues.min() > MIN_CORRELATION_EIGENVALUE;
+        let covariance = (well_conditioned && self.in_bounds(theta, BOUND_MARGIN))
             .then(|| information.try_inverse())
             .flatten()
             .map(|inverse| {
@@ -332,7 +368,7 @@ fn starts(problem: &Problem, warm: &[[f64; 3]]) -> Vec<[f64; 3]> {
     peaks.sort_by(|a, b| b.0.total_cmp(&a.0));
     for (magnitude, position, acceleration) in peaks {
         for radius in RADII {
-            let distance = (radius.powi(3) / 10.0 / magnitude).sqrt();
+            let distance = (MASS_PER_RADIUS_CUBED * radius.powi(3) / magnitude).sqrt();
             proposals.push([
                 position.x + acceleration.x / magnitude * distance,
                 position.y + acceleration.y / magnitude * distance,
@@ -342,7 +378,7 @@ fn starts(problem: &Problem, warm: &[[f64; 3]]) -> Vec<[f64; 3]> {
     }
     let mut kept: Vec<[f64; 3]> = Vec::new();
     for proposal in proposals {
-        if problem.in_bounds(proposal)
+        if problem.in_bounds(proposal, 0.0)
             && kept.len() < MAX_STARTS
             && !kept.iter().any(|other| same_mode(*other, proposal))
         {
@@ -352,13 +388,16 @@ fn starts(problem: &Problem, warm: &[[f64; 3]]) -> Vec<[f64; 3]> {
     kept
 }
 
-fn same_mode(a: [f64; 3], b: [f64; 3]) -> bool {
+pub(super) fn same_mode(a: [f64; 3], b: [f64; 3]) -> bool {
     (a[0] - b[0]).hypot(a[1] - b[1]) < SAME_MODE.0 && (a[2] - b[2]).abs() < SAME_MODE.1
 }
 
-/// Distinct one-planet modes, best evidence first, at most `MAX_MODES`. `None` when cancelled.
-/// Every start is first fitted to the trajectories alone; the retained modes are then refined
-/// with the surface-contact terms, so a contact can sharpen or check a fit but not define it.
+/// One-planet modes, at most `MAX_MODES`; `None` when cancelled. They may coincide after
+/// refinement; the caller does the final ranking and de-duplication.
+/// Every start is first fitted to the trajectories alone, and only the best `MAX_MODES` distinct
+/// results are kept (this bounds the costlier work below). When contacts exist the retained
+/// modes are refined again with the surface-contact terms, so a contact can sharpen or check a
+/// fit but not define it.
 pub(super) fn planet_modes(problem: &Problem, warm: &[[f64; 3]]) -> Option<Vec<Mode>> {
     let trajectory_only = Problem {
         use_contacts: false,
@@ -386,9 +425,10 @@ pub(super) fn planet_modes(problem: &Problem, warm: &[[f64; 3]]) -> Option<Vec<M
                 })
             })
             .collect::<Vec<_>>();
+        // A panicking worker loses only its own fits; the panic message is still printed.
         handles
             .into_iter()
-            .flat_map(|handle| handle.join().expect("fit worker panicked"))
+            .flat_map(|handle| handle.join().unwrap_or_default())
             .collect()
     });
     if problem.cancelled.load(Ordering::Relaxed) {
@@ -401,35 +441,31 @@ pub(super) fn planet_modes(problem: &Problem, warm: &[[f64; 3]]) -> Option<Vec<M
             distinct.push(fit);
         }
     }
+    let has_contacts =
+        problem.use_contacts && problem.shots.iter().any(|shot| shot.contact.is_some());
     let mut modes = Vec::new();
     for (theta, chi2) in distinct {
-        let (theta, chi2) =
-            if problem.use_contacts && problem.shots.iter().any(|shot| shot.contact.is_some()) {
-                problem.refine(theta).unwrap_or((theta, chi2))
-            } else {
-                (theta, chi2)
-            };
+        let refined = if has_contacts {
+            // A failed contact refinement keeps the trajectory-only point, rescored with contacts.
+            problem
+                .refine(theta)
+                .or_else(|| problem.chi2(theta).map(|chi2| (theta, chi2)))
+        } else {
+            Some((theta, chi2))
+        };
         if problem.cancelled.load(Ordering::Relaxed) {
             return None;
         }
+        let Some((theta, chi2)) = refined else {
+            continue;
+        };
         if let Some((log_evidence, covariance)) = problem.laplace(theta, chi2) {
             modes.push(Mode {
-                planet: planet_at(theta),
+                planet: Some(planet_at(theta)),
                 log_evidence,
                 covariance,
             });
         }
     }
-    modes.sort_by(|a, b| b.log_evidence.total_cmp(&a.log_evidence));
-    let mut distinct: Vec<Mode> = Vec::new();
-    for mode in modes {
-        let theta = [mode.planet.x, mode.planet.y, mode.planet.radius];
-        if !distinct
-            .iter()
-            .any(|kept| same_mode([kept.planet.x, kept.planet.y, kept.planet.radius], theta))
-        {
-            distinct.push(mode);
-        }
-    }
-    Some(distinct)
+    Some(modes)
 }

@@ -10,6 +10,11 @@
 //!
 //! Surface contacts (`contacts`) are extra evidence: they start some fits and add a surface
 //! constraint to the K=1 fit, but never create a planet. Oracle planets are never an input.
+//!
+//! Contact terms (and the interior-sample terms that forbid a regular sample inside the disk)
+//! enter only the planet's chi-square; the flat model has no such terms. A hit can therefore
+//! lower a planet's evidence relative to flat but never raise it: a contact never helps admit a
+//! planet, only trajectory curvature does.
 mod contacts;
 mod eval;
 mod fit;
@@ -20,8 +25,7 @@ use crate::map::PlanetMap;
 use crate::protocol::{Point, ServerEvent};
 use crate::simulation::{ShotObservation, WorldParameters};
 use crate::strategy::{MapBelief, WeightedMap};
-use fit::{CONTACT_GATE, Problem};
-use nalgebra::DMatrix;
+use fit::{CONTACT_FULL, Mode, Problem};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -34,10 +38,11 @@ const RETAIN_NATS: f64 = 7.0;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CovarianceUnavailableReason {
+    /// No covariance was computed (the belief did not come from the estimator).
     NotComputed,
     /// The published map has no planets: uncertainty about planets not yet found is not modelled.
     NoPlanets,
-    /// The data leave the planet's parameters (nearly) undetermined.
+    /// The data leave the planet's parameters (nearly) undetermined, or the mode sits at a bound.
     UnderIdentified,
 }
 
@@ -56,35 +61,27 @@ pub struct Estimator {
     /// `[x, y, radius]` of the previous fit's planet modes; warm starts for the next fit.
     warm_starts: Vec<[f64; 3]>,
     belief: Option<MapBelief>,
-}
-
-struct Component {
-    map: PlanetMap,
-    log_evidence: f64,
-    covariance: Option<nalgebra::Matrix3<f64>>,
-    /// `[x, y, radius]`; `None` for the flat model.
-    theta: Option<[f64; 3]>,
+    /// Shots were added since the last published belief: the next event retries the fit even if it
+    /// brings nothing new (a cancelled or failed fit must not stall the estimator).
+    stale: bool,
 }
 
 impl Estimator {
-    /// Ingest an ordered group of events, then fit once if it contains new trajectories.
-    /// Returns `None` when nothing changed or the fit was cancelled.
+    /// Ingest an ordered group of events, then fit once if there are unpublished trajectories.
+    /// Returns `None` when nothing changed or the fit was cancelled or failed; the fit is then
+    /// retried on the next event.
     pub fn observe_batch(
         &mut self,
         events: &[ServerEvent],
         cancelled: &AtomicBool,
     ) -> Option<MapBelief> {
         let world = WorldParameters::default();
-        let mut changed = false;
         for event in events {
             if cancelled.load(Ordering::SeqCst) {
                 return None;
             }
             match event {
-                ServerEvent::Planets { .. } => {
-                    self.reset();
-                    changed = false;
-                }
+                ServerEvent::Planets { .. } => self.reset(),
                 ServerEvent::PlayerPosition { player_id, x, y } => {
                     self.players.insert(*player_id, Point { x: *x, y: *y });
                 }
@@ -95,21 +92,37 @@ impl Estimator {
                     let Ok(obs) = ShotObservation::try_from(event) else {
                         continue;
                     };
-                    if self.shots.iter().any(|shot| shot.obs == obs) {
+                    // Non-finite values would make every residual (and the evidence) NaN.
+                    if !obs.angle_degrees.is_finite()
+                        || !obs.velocity.is_finite()
+                        || !obs
+                            .points
+                            .iter()
+                            .all(|point| point.x.is_finite() && point.y.is_finite())
+                        || self.shots.iter().any(|shot| shot.obs == obs)
+                    {
                         continue;
                     }
                     let players = self.players.values().cloned().collect::<Vec<_>>();
                     let contact = contacts::classify(&obs.points, &players, world);
                     self.shots.push(Shot { obs, contact });
-                    changed = true;
+                    self.stale = true;
                 }
                 _ => {}
             }
         }
-        if !changed {
+        if !self.stale {
             return None;
         }
-        let belief = self.infer(world, cancelled)?;
+        let Some(belief) = self.infer(world, cancelled) else {
+            if !cancelled.load(Ordering::SeqCst) {
+                eprintln!(
+                    "estimator: simulation failed; the fit will be retried on the next event"
+                );
+            }
+            return None;
+        };
+        self.stale = false;
         self.belief = Some(belief.clone());
         Some(belief)
     }
@@ -131,6 +144,8 @@ impl Estimator {
         self.players = players;
     }
 
+    /// Fit K=0 and K=1, rank the modes and build the belief. `None` when cancelled or when a
+    /// path cannot be simulated.
     fn infer(&mut self, world: WorldParameters, cancelled: &AtomicBool) -> Option<MapBelief> {
         let problem = Problem {
             shots: &self.shots,
@@ -138,57 +153,55 @@ impl Estimator {
             cancelled,
             use_contacts: true,
         };
-        let flat = Component {
-            map: PlanetMap { planets: vec![] },
+        let mut modes = vec![Mode {
+            planet: None,
             log_evidence: -0.5 * problem.flat_chi2()?,
             covariance: None,
-            theta: None,
-        };
-        let mut components = vec![flat];
-        components.extend(
-            fit::planet_modes(&problem, &self.warm_starts)?
-                .into_iter()
-                .map(|mode| Component {
-                    theta: Some([mode.planet.x, mode.planet.y, mode.planet.radius]),
-                    map: PlanetMap {
-                        planets: vec![mode.planet],
-                    },
-                    log_evidence: mode.log_evidence,
-                    covariance: mode.covariance,
-                }),
-        );
-        components.sort_by(|a, b| b.log_evidence.total_cmp(&a.log_evidence));
-        let best = components[0].log_evidence;
-        components.retain(|component| component.log_evidence >= best - RETAIN_NATS);
-        components.truncate(MAX_MODES);
-        let total: f64 = components
+        }];
+        modes.extend(fit::planet_modes(&problem, &self.warm_starts)?);
+        // One ranking pass: best first, coinciding modes merged, weak ones dropped.
+        modes.sort_by(|a, b| b.log_evidence.total_cmp(&a.log_evidence));
+        let best = modes[0].log_evidence;
+        let mut kept: Vec<Mode> = Vec::new();
+        for mode in modes {
+            let duplicate = kept
+                .iter()
+                .any(|other| match (&other.planet, &mode.planet) {
+                    (Some(a), Some(b)) => fit::same_mode(fit::theta_of(a), fit::theta_of(b)),
+                    _ => false,
+                });
+            if !duplicate && mode.log_evidence >= best - RETAIN_NATS && kept.len() < MAX_MODES {
+                kept.push(mode);
+            }
+        }
+        let total: f64 = kept
             .iter()
-            .map(|component| (component.log_evidence - best).exp())
+            .map(|mode| (mode.log_evidence - best).exp())
             .sum();
-        let weight = |component: &Component| (component.log_evidence - best).exp() / total;
+        let weight = |mode: &Mode| (mode.log_evidence - best).exp() / total;
+        let map_of = |mode: &Mode| PlanetMap {
+            planets: mode.planet.clone().into_iter().collect(),
+        };
 
-        let top = &components[0];
-        let mut belief = MapBelief::new(top.map.clone(), None);
+        let top = &kept[0];
+        let mut belief = MapBelief::new(map_of(top), None);
         belief.map_weight = Some(weight(top));
-        belief.alternatives = components[1..]
+        belief.alternatives = kept[1..]
             .iter()
-            .map(|component| WeightedMap {
-                map: component.map.clone(),
-                weight: weight(component),
+            .map(|mode| WeightedMap {
+                map: map_of(mode),
+                weight: weight(mode),
             })
             .collect();
-        belief.covariance_unavailable_reason = match (&top.theta, &top.covariance) {
+        belief.covariance_unavailable_reason = match (&top.planet, &top.covariance) {
             (None, _) => Some(CovarianceUnavailableReason::NoPlanets),
             (Some(_), None) => Some(CovarianceUnavailableReason::UnderIdentified),
-            (Some(theta), Some(covariance)) => {
-                // [x, y, radius] -> [x, y, mass], mass = radius^3 / 10.
-                let mut transform = DMatrix::identity(3, 3);
-                transform[(2, 2)] = 0.3 * theta[2] * theta[2];
-                let covariance = DMatrix::from_fn(3, 3, |i, j| covariance[(i, j)]);
-                belief.parameter_covariance = Some(&transform * covariance * transform.transpose());
+            (Some(planet), Some(covariance)) => {
+                belief.parameter_covariance = Some(fit::covariance_xym(covariance, planet.radius));
                 None
             }
         };
+
         let observations = self
             .shots
             .iter()
@@ -200,6 +213,8 @@ impl Estimator {
                 belief.contact_points.push(contact.point.clone());
             }
         }
+        // Contacts beyond the full-strength range of every planet surface are not fully
+        // explained by the map (a model mismatch, or planets this slice does not model).
         belief.unmatched_contacts = belief
             .contact_points
             .iter()
@@ -208,11 +223,14 @@ impl Estimator {
                     ((f64::from(point.x) - planet.x).hypot(f64::from(point.y) - planet.y)
                         - planet.radius)
                         .abs()
-                        <= CONTACT_GATE
+                        <= CONTACT_FULL
                 })
             })
             .count();
-        self.warm_starts = components.iter().filter_map(|c| c.theta).collect();
+        self.warm_starts = kept
+            .iter()
+            .filter_map(|mode| mode.planet.as_ref().map(fit::theta_of))
+            .collect();
         Some(belief)
     }
 }

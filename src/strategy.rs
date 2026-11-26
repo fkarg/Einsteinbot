@@ -30,8 +30,9 @@ pub struct MapBelief {
     pub covariance_unavailable_reason: Option<crate::estimator::CovarianceUnavailableReason>,
     /// Terminal points classified as possible planet surface contacts.
     pub contact_points: Vec<Point>,
-    /// Possible contacts that do not lie on the surface of any planet in `map` (a model
-    /// mismatch, or planets this slice does not model). With an empty map this is all of them.
+    /// Possible contacts farther than the full-strength contact range (15 units) from the surface
+    /// of every planet in `map` (a model mismatch, or planets this slice does not model). With an
+    /// empty map this is all of them.
     pub unmatched_contacts: usize,
     /// Coordinate RMSE of `map` against the regular samples of every path fitted.
     pub model_position_rmse: Option<f64>,

@@ -17,6 +17,10 @@ pub fn shot_observations(events: &[StoredEvent]) -> Vec<ShotObservation> {
         .collect()
 }
 
+fn rmse(squared_error: f64, coordinate_count: usize) -> f64 {
+    (squared_error / coordinate_count as f64).sqrt()
+}
+
 /// Coordinate RMSE over all regular samples of several trajectories.
 pub fn position_rmse(
     map: &PlanetMap,
@@ -26,31 +30,28 @@ pub fn position_rmse(
     let mut squared_error = 0.0;
     let mut coordinate_count = 0;
     for shot in observations {
-        let Some((shot_squared_error, shot_coordinate_count)) =
+        if let Some((shot_squared_error, shot_coordinate_count)) =
             shot_position_squared_error(map, shot, world)?
-        else {
-            continue;
-        };
-        squared_error += shot_squared_error;
-        coordinate_count += shot_coordinate_count;
+        {
+            squared_error += shot_squared_error;
+            coordinate_count += shot_coordinate_count;
+        }
     }
     if coordinate_count == 0 {
         return Err("validation shots contain no regular positions".to_owned());
     }
-    Ok((squared_error / coordinate_count as f64).sqrt())
+    Ok(rmse(squared_error, coordinate_count))
 }
 
-/// Position RMSE for one completed trajectory, excluding its untimed terminal sample.
+/// Position RMSE for one completed trajectory, excluding its untimed terminal sample. `None`
+/// when the trajectory has no regular samples to compare.
 pub fn shot_position_rmse(
     map: &PlanetMap,
     observation: &ShotObservation,
     world: WorldParameters,
 ) -> Result<Option<f64>, String> {
-    shot_position_squared_error(map, observation, world).map(|result| {
-        result.map(|(squared_error, coordinate_count)| {
-            (squared_error / coordinate_count as f64).sqrt()
-        })
-    })
+    Ok(shot_position_squared_error(map, observation, world)?
+        .map(|(squared_error, count)| rmse(squared_error, count)))
 }
 
 fn shot_position_squared_error(

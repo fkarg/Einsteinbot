@@ -537,3 +537,152 @@ fn ambiguous_early_shots_keep_both_modes_until_a_later_shot_shifts_weight() {
     assert!(true_mode(&after.map));
     assert!(weight_of_truth(&after) > 0.99 && weight_of_truth(&after) > before_truth);
 }
+
+fn good_shot() -> ServerEvent {
+    shot_in(&world_of(vec![]), (300.0, 300.0), 20.0, 10.0)
+}
+
+#[test]
+fn non_finite_shots_are_ignored_without_panicking() {
+    let (mut estimator, cancelled) = estimator();
+    let ServerEvent::ShotFin {
+        player_id,
+        angle,
+        velocity,
+        mut points,
+    } = good_shot()
+    else {
+        unreachable!()
+    };
+    points[3].x = f32::NAN;
+    let bad = ServerEvent::ShotFin {
+        player_id,
+        angle,
+        velocity,
+        points,
+    };
+    assert!(estimator.observe(&bad, &cancelled).is_none());
+    assert!(estimator.shots.is_empty());
+    let belief = estimator.observe(&good_shot(), &cancelled).unwrap();
+    assert!(belief.map.planets.is_empty());
+    assert!(belief.model_position_rmse.is_some_and(f64::is_finite));
+}
+
+#[test]
+fn a_cancelled_fit_is_retried_on_the_next_event() {
+    let (mut estimator, _) = estimator();
+    // A shot was ingested but its fit never published (cancelled or failed).
+    let obs = shot_of(&good_shot());
+    estimator.shots.push(Shot { obs, contact: None });
+    estimator.stale = true;
+    let cancelled = AtomicBool::new(true);
+    assert!(
+        estimator
+            .observe(&position(9, 1.0, 1.0), &cancelled)
+            .is_none()
+    );
+    assert!(estimator.stale);
+    cancelled.store(false, Ordering::SeqCst);
+    let belief = estimator.observe(&position(9, 2.0, 2.0), &cancelled);
+    assert!(belief.is_some());
+    assert!(!estimator.stale);
+}
+
+// A mode at the radius bound has no trustworthy Gaussian approximation: no covariance, never a
+// tight-looking one. The same shots at an interior radius do identify the planet.
+#[test]
+fn a_mode_at_a_bound_reports_no_covariance() {
+    let cancelled = AtomicBool::new(false);
+    let shots_for = |truth: &PlanetMap| {
+        [
+            shot_in(truth, (500.0, 380.0), 0.0, 10.0),
+            shot_in(truth, (900.0, 150.0), 90.0, 8.0),
+        ]
+        .map(|event| Shot {
+            obs: shot_of(&event),
+            contact: None,
+        })
+    };
+    let covariance_at = |radius: f64| {
+        let truth = world_of(vec![planet(900.0, 500.0, radius)]);
+        let shots = shots_for(&truth);
+        let problem = problem(&shots, &cancelled, false);
+        problem.laplace([900.0, 500.0, radius], 0.0).unwrap().1
+    };
+    assert!(covariance_at(30.0).is_some());
+    assert!(covariance_at(40.0).is_none());
+    assert!(covariance_at(20.0).is_none());
+}
+
+/// Deterministic uniform values in `[0, 1)`.
+fn uniform(state: &mut u64) -> f64 {
+    *state = state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    (*state >> 11) as f64 / (1u64 << 53) as f64
+}
+
+// Measurement, not a gate: how often K=1 recovers a real planet (centre within 5 units, radius
+// within 2) from contact-free paths. Run with
+// `cargo test recovery_rate -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn recovery_rate_of_one_planet_worlds() {
+    let mut state = 12345u64;
+    for (label, aimed, shot_count) in [
+        ("aimed past the planet, 4 shots", true, 4),
+        ("blind, 4 shots", false, 4),
+        ("aimed past the planet, 1 shot", true, 1),
+        ("blind, 1 shot", false, 1),
+    ] {
+        let (mut recovered, mut chosen, worlds) = (0, 0, 30);
+        for _ in 0..worlds {
+            let radius = 20.0 + 20.0 * uniform(&mut state);
+            let center = (
+                300.0 + 1400.0 * uniform(&mut state),
+                200.0 + 600.0 * uniform(&mut state),
+            );
+            let truth = world_of(vec![planet(center.0, center.1, radius)]);
+            let mut estimator = Estimator::default();
+            let cancelled = AtomicBool::new(false);
+            let mut belief = None;
+            for _ in 0..shot_count {
+                let start = (
+                    100.0 + 1700.0 * uniform(&mut state),
+                    100.0 + 800.0 * uniform(&mut state),
+                );
+                let target = if aimed {
+                    // Pass 50-200 units beside the planet.
+                    let side = 50.0 + 150.0 * uniform(&mut state);
+                    let around = std::f64::consts::TAU * uniform(&mut state);
+                    (
+                        center.0 + side * around.cos(),
+                        center.1 + side * around.sin(),
+                    )
+                } else {
+                    (
+                        100.0 + 1700.0 * uniform(&mut state),
+                        100.0 + 800.0 * uniform(&mut state),
+                    )
+                };
+                let angle = (-(target.1 - f64::from(start.1)))
+                    .atan2(target.0 - f64::from(start.0))
+                    .to_degrees();
+                let velocity = 8.0 + 4.0 * uniform(&mut state);
+                let event = shot_in(&truth, (start.0 as f32, start.1 as f32), angle, velocity);
+                belief = estimator.observe(&event, &cancelled).or(belief);
+            }
+            if let Some(found) = belief.and_then(|b| b.map.planets.first().cloned()) {
+                chosen += 1;
+                if (found.x - center.0).hypot(found.y - center.1) < 5.0
+                    && (found.radius - radius).abs() < 2.0
+                {
+                    recovered += 1;
+                }
+            }
+        }
+        println!(
+            "recovery [{label}]: planet chosen {chosen}/{worlds}, recovered {recovered}/{worlds}"
+        );
+    }
+}
