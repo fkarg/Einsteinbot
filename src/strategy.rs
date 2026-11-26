@@ -5,42 +5,36 @@ use crate::simulation::{ShotObservation, Termination, WorldParameters, simulate_
 use nalgebra::DMatrix;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 
+/// One retained alternative map with its approximate-evidence weight.
+#[derive(Clone, Debug)]
+pub struct WeightedMap {
+    pub map: PlanetMap,
+    /// Normalized approximate-evidence weight among the retained modes. This is a heuristic
+    /// ranking, not a calibrated probability.
+    pub weight: f64,
+}
+
+/// What the estimator publishes. `map` is the maximum-weight mode; targeting simulates only it.
 #[derive(Clone, Debug)]
 pub struct MapBelief {
     pub map: PlanetMap,
-    /// Covariance ordered by `[center_x, center_y, mass]` for each planet.
+    /// Approximate-evidence weight of `map` among the retained modes (not a calibrated
+    /// probability). `None` when no evidence weighting was computed.
+    pub map_weight: Option<f64>,
+    /// Other retained modes in descending weight, at most a few. Not consulted by targeting yet.
+    pub alternatives: Vec<WeightedMap>,
+    /// Covariance of `map` ordered by `[center_x, center_y, mass]` for each planet.
     pub parameter_covariance: Option<DMatrix<f64>>,
-    /// A diagnostic Gauss-Newton covariance, possibly partial or evaluated before
-    /// convergence. It is recorded for inspection but never used by targeting.
-    pub approximate_parameter_covariance: Option<DMatrix<f64>>,
-    /// Why physical parameter covariance is unavailable for this published belief.
+    /// Why `parameter_covariance` is unavailable. Unavailable is never zero uncertainty.
     pub covariance_unavailable_reason: Option<crate::estimator::CovarianceUnavailableReason>,
-    pub fit_rank: Option<usize>,
-    pub fit_parameter_count: Option<usize>,
-    pub fit_independent_path_count: Option<usize>,
-    /// Modelled-planet parameter sensitivity informed by this map epoch's observations.
-    pub field_evidence: Option<Arc<FieldEvidence>>,
-    /// Observed contact points, retained even before radius is identifiable.
+    /// Terminal points classified as possible planet surface contacts.
     pub contact_points: Vec<Point>,
-    /// Raw trajectory error exposes model mismatch beyond local covariance.
+    /// Possible contacts that do not lie on the surface of any planet in `map` (a model
+    /// mismatch, or planets this slice does not model). With an empty map this is all of them.
+    pub unmatched_contacts: usize,
+    /// Coordinate RMSE of `map` against the regular samples of every path fitted.
     pub model_position_rmse: Option<f64>,
-    pub fit_converged: Option<bool>,
-    /// Explicit marker for maps whose fit is non-converged, rank-deficient, or otherwise incomplete.
-    pub fit_approximate: Option<bool>,
-    /// Raw optimizer termination, separate from the stricter `fit_converged` quality flag.
-    pub optimizer_converged: Option<bool>,
-    pub planet_contact_counts: Vec<usize>,
-    pub uncertain_associations: usize,
-}
-
-#[derive(Clone, Debug)]
-pub struct FieldEvidence {
-    /// Resolution matrix in the fitter's normalized parameter coordinates.
-    pub resolution: DMatrix<f64>,
-    /// Maps normalized fitter parameters to physical `[x, y, mass]` parameters.
-    pub parameter_to_physical: DMatrix<f64>,
 }
 
 impl MapBelief {
@@ -50,68 +44,36 @@ impl MapBelief {
             .then_some(crate::estimator::CovarianceUnavailableReason::NotComputed);
         Self {
             map,
+            map_weight: None,
+            alternatives: Vec::new(),
             parameter_covariance,
-            approximate_parameter_covariance: None,
             covariance_unavailable_reason,
-            fit_rank: None,
-            fit_parameter_count: None,
-            fit_independent_path_count: None,
-            field_evidence: None,
             contact_points: Vec::new(),
+            unmatched_contacts: 0,
             model_position_rmse: None,
-            fit_converged: None,
-            fit_approximate: None,
-            optimizer_converged: None,
-            planet_contact_counts: Vec::new(),
-            uncertain_associations: 0,
         }
     }
 
-    /// Fraction of this fitted model's local parameter sensitivity lying in directions
-    /// identified by its fit. This measures model-parameter identifiability, not spatial
-    /// observation coverage or total field certainty: a full-rank fit can be near 1
-    /// throughout the battlefield while still omitting real sources.
-    pub fn evidence_availability_at(&self, position: Vec2) -> Option<f64> {
-        const FIELD_SENSITIVITY_FLOOR: f64 = 1e-12;
-        let evidence = self.field_evidence.as_ref()?;
-        let parameter_count = self.map.planets.len().checked_mul(3)?;
-        if parameter_count == 0
-            || evidence.resolution.shape() != (parameter_count, parameter_count)
-            || evidence.parameter_to_physical.shape() != (parameter_count, parameter_count)
-        {
-            return None;
-        }
-
-        let mut physical_sensitivity = DMatrix::zeros(2, parameter_count);
-        for (index, planet) in self.map.planets.iter().enumerate() {
-            let dx = planet.x - position.x;
-            let dy = planet.y - position.y;
-            let radius_squared = dx * dx + dy * dy;
-            if !radius_squared.is_finite() || radius_squared == 0.0 {
-                return None;
-            }
-            let inverse_r3 = 1.0 / (radius_squared * radius_squared.sqrt());
-            let inverse_r5 = inverse_r3 / radius_squared;
-            let offset = index * 3;
-            physical_sensitivity[(0, offset)] =
-                planet.mass * (inverse_r3 - 3.0 * dx * dx * inverse_r5);
-            physical_sensitivity[(1, offset)] = -3.0 * planet.mass * dx * dy * inverse_r5;
-            physical_sensitivity[(0, offset + 1)] = -3.0 * planet.mass * dx * dy * inverse_r5;
-            physical_sensitivity[(1, offset + 1)] =
-                planet.mass * (inverse_r3 - 3.0 * dy * dy * inverse_r5);
-            physical_sensitivity[(0, offset + 2)] = dx * inverse_r3;
-            physical_sensitivity[(1, offset + 2)] = dy * inverse_r3;
-        }
-        let parameter_sensitivity = physical_sensitivity * &evidence.parameter_to_physical;
-        let total_sensitivity =
-            (&parameter_sensitivity * parameter_sensitivity.transpose()).trace();
-        let explained_sensitivity =
-            (&parameter_sensitivity * &evidence.resolution * parameter_sensitivity.transpose())
-                .trace();
-        let availability = explained_sensitivity / (total_sensitivity + FIELD_SENSITIVITY_FLOOR);
-        availability
-            .is_finite()
-            .then_some(availability.clamp(0.0, 1.0))
+    /// The belief as recorded in capture diagnostics (`map_belief`). Dropped fields are simply
+    /// absent; consumers must treat absent as unavailable, never zero.
+    pub fn diagnostic_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "planets": self.map.planets,
+            "contact_points": self.contact_points,
+            "covariance": self.parameter_covariance.as_ref().map(|matrix| {
+                (0..matrix.nrows())
+                    .map(|row| (0..matrix.ncols()).map(|col| matrix[(row, col)]).collect::<Vec<_>>())
+                    .collect::<Vec<_>>()
+            }),
+            "covariance_unavailable_reason": self.covariance_unavailable_reason,
+            "map_weight": self.map_weight,
+            "alternatives": self.alternatives.iter().map(|alternative| serde_json::json!({
+                "planets": alternative.map.planets,
+                "weight": alternative.weight,
+            })).collect::<Vec<_>>(),
+            "unmatched_contacts": self.unmatched_contacts,
+            "model_position_rmse": self.model_position_rmse,
+        })
     }
 
     fn field_uncertainty(&self, position: Vec2) -> Option<f64> {
@@ -782,72 +744,6 @@ mod tests {
             .field_uncertainty(Vec2::new(2.0, 0.0))
             .expect("matching covariance");
         assert!((uncertainty - 4.0).abs() < 1e-12);
-    }
-
-    #[test]
-    fn diagnostic_approximate_covariance_is_not_used_for_targeting() {
-        let map = PlanetMap {
-            planets: vec![crate::protocol::Planet {
-                x: 0.0,
-                y: 0.0,
-                radius: 1.0,
-                mass: 8.0,
-            }],
-        };
-        let mut belief = MapBelief::new(map, None);
-        belief.approximate_parameter_covariance = Some(DMatrix::identity(3, 3) * 1e6);
-        assert_eq!(belief.field_uncertainty(Vec2::new(2.0, 0.0)), None);
-    }
-
-    #[test]
-    fn evidence_availability_follows_modelled_parameter_sensitivity_beyond_paths() {
-        let map = PlanetMap {
-            planets: vec![crate::protocol::Planet {
-                x: 600.0,
-                y: 500.0,
-                radius: 30.0,
-                mass: 2700.0,
-            }],
-        };
-        let mut belief = MapBelief::new(map, None);
-        let far_point = Vec2::new(0.0, 500.0);
-        assert_eq!(belief.evidence_availability_at(far_point), None);
-
-        belief.field_evidence = Some(Arc::new(FieldEvidence {
-            resolution: DMatrix::identity(3, 3) * 0.5,
-            parameter_to_physical: DMatrix::identity(3, 3),
-        }));
-        let availability = belief
-            .evidence_availability_at(far_point)
-            .expect("parameterized physical map has a sensitivity model");
-        assert!((availability - 0.5).abs() < 0.01);
-
-        Arc::make_mut(belief.field_evidence.as_mut().unwrap())
-            .resolution
-            .fill(0.0);
-        assert_eq!(belief.evidence_availability_at(far_point), Some(0.0));
-
-        Arc::make_mut(belief.field_evidence.as_mut().unwrap()).resolution[(0, 0)] = 0.5;
-        assert!(
-            belief.evidence_availability_at(far_point).unwrap() > 0.3,
-            "a constrained gravity direction remains useful when other parameters are unidentified"
-        );
-
-        let evidence = Arc::make_mut(belief.field_evidence.as_mut().unwrap());
-        evidence.resolution =
-            DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![1.0, 0.0, 0.0]));
-        evidence.parameter_to_physical =
-            DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![300.0, 300.0, 1_500.0]));
-        let horizontal = belief
-            .evidence_availability_at(Vec2::new(300.0, 500.0))
-            .unwrap();
-        let vertical = belief
-            .evidence_availability_at(Vec2::new(600.0, 200.0))
-            .unwrap();
-        assert!(
-            horizontal > vertical,
-            "availability should follow the resolved parameter's field sensitivity"
-        );
     }
 
     #[test]

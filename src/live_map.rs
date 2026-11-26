@@ -1,34 +1,15 @@
 //! Background map fitting; socket workers only enqueue observations and read beliefs.
-use crate::online_map::{OnlineEstimator, OnlineStageProfile};
+use crate::estimator::Estimator;
 use crate::protocol::ServerEvent;
 use crate::strategy::MapBelief;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
-
-pub(crate) struct WorkProfile {
-    pub epoch: u64,
-    pub watermark: u64,
-    pub queue_wait: Duration,
-    pub service_time: Duration,
-    pub submitted: u64,
-    pub processed: u64,
-    pub pending: usize,
-    pub stale: bool,
-    pub stages: OnlineStageProfile,
-}
-
-struct FitOutcome {
-    belief: Option<MapBelief>,
-    stages: OnlineStageProfile,
-}
 
 pub(crate) struct WorkItem {
     epoch: u64,
     watermark: u64,
     event: ServerEvent,
-    enqueued_at: Instant,
 }
 
 #[derive(Default)]
@@ -73,69 +54,26 @@ impl LiveMap {
     }
 
     pub(crate) fn spawn_with(
-        mut fit: impl FnMut(&mut OnlineEstimator, &ServerEvent, &AtomicBool) -> Option<MapBelief>
+        mut fit: impl FnMut(&mut Estimator, &ServerEvent, &AtomicBool) -> Option<MapBelief>
         + Send
         + 'static,
-    ) -> (Self, JoinHandle<()>) {
-        Self::spawn_inner(
-            move |estimator, event, cancelled| FitOutcome {
-                belief: fit(estimator, event, cancelled),
-                stages: OnlineStageProfile::default(),
-            },
-            None,
-        )
-    }
-
-    pub(crate) fn spawn_profiled(
-        fit_patience: usize,
-    ) -> (Self, JoinHandle<()>, mpsc::Receiver<WorkProfile>) {
-        let (profile_tx, profile_rx) = mpsc::channel();
-        let (feed, worker) = Self::spawn_inner(
-            move |estimator, event, cancelled| {
-                let (belief, stages) = estimator.observe_profiled(event, cancelled, fit_patience);
-                FitOutcome { belief, stages }
-            },
-            Some(profile_tx),
-        );
-        (feed, worker, profile_rx)
-    }
-
-    fn spawn_inner(
-        mut fit: impl FnMut(&mut OnlineEstimator, &ServerEvent, &AtomicBool) -> FitOutcome
-        + Send
-        + 'static,
-        profiles: Option<mpsc::Sender<WorkProfile>>,
     ) -> (Self, JoinHandle<()>) {
         let published = Arc::new(Mutex::new(Published::default()));
         let (sender, receiver) = mpsc::channel::<WorkItem>();
         let worker_state = Arc::clone(&published);
         let worker = thread::spawn(move || {
-            let mut estimator = OnlineEstimator::default();
+            let mut estimator = Estimator::default();
             let mut estimator_epoch = 0;
-            while let Ok(item) = receiver.recv() {
-                let WorkItem {
-                    epoch,
-                    watermark,
-                    event,
-                    enqueued_at,
-                } = item;
-                let started_at = Instant::now();
+            while let Ok(WorkItem {
+                epoch,
+                watermark,
+                event,
+                ..
+            }) = receiver.recv()
+            {
                 let cancelled = {
                     let state = worker_state.lock().unwrap();
                     if state.epoch != epoch {
-                        if let Some(profiles) = &profiles {
-                            let _ = profiles.send(WorkProfile {
-                                epoch,
-                                watermark,
-                                queue_wait: started_at.duration_since(enqueued_at),
-                                service_time: Duration::ZERO,
-                                submitted: state.submitted,
-                                processed: state.processed,
-                                pending: state.pending,
-                                stale: true,
-                                stages: OnlineStageProfile::default(),
-                            });
-                        }
                         continue;
                     }
                     Arc::clone(&state.fit_cancel)
@@ -143,36 +81,17 @@ impl LiveMap {
                 if estimator_epoch != epoch {
                     // The canonical connection sends a complete player snapshot
                     // after reset; old queued leave events may have been discarded.
-                    estimator = OnlineEstimator::default();
+                    estimator = Estimator::default();
                     estimator_epoch = epoch;
                 }
-                let FitOutcome { belief, stages } = fit(&mut estimator, &event, &cancelled);
-                let service_time = started_at.elapsed();
-                let queue_wait = started_at.duration_since(enqueued_at);
+                let belief = fit(&mut estimator, &event, &cancelled);
                 let mut state = worker_state.lock().unwrap();
-                let stale = state.epoch != epoch;
-                if !stale {
+                if state.epoch == epoch {
                     state.pending -= 1;
                     state.processed = watermark;
                     if let Some(belief) = belief {
                         state.belief = Some(belief);
                     }
-                }
-                let (submitted, processed, pending) =
-                    (state.submitted, state.processed, state.pending);
-                drop(state);
-                if let Some(profiles) = &profiles {
-                    let _ = profiles.send(WorkProfile {
-                        epoch,
-                        watermark,
-                        queue_wait,
-                        service_time,
-                        submitted,
-                        processed,
-                        pending,
-                        stale,
-                        stages,
-                    });
                 }
             }
         });
@@ -201,7 +120,6 @@ impl LiveMap {
             epoch,
             watermark,
             event: event.clone(),
-            enqueued_at: Instant::now(),
         }) {
             Ok(()) => Ok(watermark),
             Err(error) => {
@@ -483,39 +401,5 @@ mod tests {
         drop(feed);
         worker.join().unwrap();
         assert!(published.lock().unwrap().belief.is_some());
-    }
-
-    #[test]
-    fn profile_records_cancelled_and_queued_stale_observations() {
-        let (started_tx, started_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let (profile_tx, profile_rx) = mpsc::channel();
-        let (feed, worker) = LiveMap::spawn_inner(
-            move |_, _, _| {
-                started_tx.send(()).unwrap();
-                release_rx.recv().unwrap();
-                FitOutcome {
-                    belief: None,
-                    stages: OnlineStageProfile::default(),
-                }
-            },
-            Some(profile_tx),
-        );
-        let event = ServerEvent::PlayerLeave { player_id: 1 };
-        feed.observe(&event).unwrap();
-        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        feed.observe(&event).unwrap();
-        feed.reset();
-        drop(feed);
-        release_tx.send(()).unwrap();
-        worker.join().unwrap();
-
-        let profiles = profile_rx.into_iter().collect::<Vec<_>>();
-        assert_eq!(profiles.len(), 2);
-        assert!(profiles.iter().all(|profile| profile.stale));
-        assert_eq!(profiles[0].watermark, 1);
-        assert_eq!(profiles[1].watermark, 2);
-        assert!(profiles[0].service_time > Duration::ZERO);
-        assert_eq!(profiles[1].service_time, Duration::ZERO);
     }
 }

@@ -1,10 +1,8 @@
-use einsteinbot::estimator::{SeedStrategy, seed_planet_from_residuals_with_strategy};
 use einsteinbot::field_score::score_field;
 use einsteinbot::map::PlanetMap;
 use einsteinbot::protocol::{Planet, Point};
 use einsteinbot::simulation::{ShotObservation, WorldParameters};
 use einsteinbot::strategy::MapBelief;
-use std::sync::atomic::AtomicBool;
 
 fn world() -> WorldParameters {
     WorldParameters {
@@ -120,49 +118,4 @@ fn empty_exploration_is_not_a_zero_score() {
     assert!(report.explored.is_none());
     assert_eq!((report.explored_cells, report.unexplored_cells), (0, 4));
     assert_eq!(report.whole.unwrap().vector_rmse, Some(0.0));
-}
-
-#[test]
-fn seeding_variants_are_independent() {
-    let truth = PlanetMap {
-        planets: vec![Planet {
-            x: 600.0,
-            y: 500.0,
-            radius: 30.0,
-            mass: 2700.0,
-        }],
-    };
-    let mut shot = ShotObservation {
-        player_id: 1,
-        angle_degrees: 0.0,
-        velocity: 8.0,
-        points: vec![Point { x: 200.0, y: 400.0 }],
-    };
-    shot.points =
-        einsteinbot::simulation::simulate_shot(&truth, &shot, WorldParameters::default(), 2000)
-            .unwrap()
-            .points;
-    let flat = PlanetMap { planets: vec![] };
-    let grid = seed_planet_from_residuals_with_strategy(
-        &flat,
-        &[shot.clone()],
-        WorldParameters::default(),
-        30.0,
-        50.0,
-        SeedStrategy::Grid,
-        &AtomicBool::new(false),
-    )
-    .unwrap();
-    let bearing = seed_planet_from_residuals_with_strategy(
-        &flat,
-        &[shot],
-        WorldParameters::default(),
-        30.0,
-        50.0,
-        SeedStrategy::Bearing,
-        &AtomicBool::new(false),
-    )
-    .unwrap();
-    assert!((grid.x - 600.0).hypot(grid.y - 500.0) > 5.0);
-    assert!((bearing.x - 600.0).hypot(bearing.y - 500.0) < 5.0);
 }

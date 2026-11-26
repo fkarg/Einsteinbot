@@ -16,7 +16,7 @@ Compare estimators on the same recorded paths, map epoch, evaluation positions a
 
 When valid disclosed truth is unavailable, oracle field and physical-geometry scores are unavailable, not zero. An empty or absent disclosure is not proof of a flat world unless the run configuration establishes that fact. Oracle-based scorer settings must not change estimator input, beliefs or candidate choice.
 
-The scored field is the belief's physical planets only. There is no residual or field-only-source variant. An unavailable belief scores as the flat field and is labelled as such, never as measured zero uncertainty.
+The scored field is the published belief's maximum-weight map only (v2, 2026-11-26: flat by default, at most one planet in the first slice); retained alternative modes are not scored yet. There is no residual or field-only-source variant. An unavailable belief scores as the flat field and is labelled as such, never as measured zero uncertainty.
 
 ## Gravity-field accuracy
 
@@ -67,3 +67,19 @@ KL divergence requires two specified probability distributions and consistent su
 - A prediction that is accurate only after seeing the held-out launch or completion must fail the pre-launch snapshot check. An early collision or unmatched terminal path must not improve the path RMSE by truncation.
 - Unknown/approximate/rank-deficient uncertainty must remain unavailable or explicitly partial; a model that always reports broad uncertainty should be distinguishable from one that is both calibrated and sharp.
 - Include near-surface paths, short/late contacts, closely spaced sources, two-versus-three-source mismatch, no-source worlds, known-planet perturbations, measurement noise and withheld live captures. Freeze evaluation positions, worlds and thresholds before comparing variants; use independent worlds or captures, not ticks, for uncertainty around aggregate results.
+
+## v2 estimator first-slice results (2026-11-26)
+
+Observed with `field_scorecard` in a release build on the baseline databases (hashes unchanged from `estimator-baseline.md`), last completed-path checkpoint, vector RMSE; flat is the same scorer on an empty map. The v2 estimator models at most one planet, so multi-planet worlds are fitted by one compromise planet or none.
+
+| Case | v2 explored / unexplored / whole | flat explored / unexplored / whole | v2 planets | cumulative fit ms (v1 baseline) |
+| --- | --- | --- | ---: | --- |
+| Synthetic 1, flat | 0 / 0 / 0 | 0 / 0 / 0 | 0 | 0.49 (0.60) |
+| Synthetic 12, two flybys | 0.190 / 1.727 / 1.683 | 0.203 / 0.217 / 0.216 | 1 | 282 (77) |
+| Synthetic 18, W7 | 0.630 / 4.198 / 4.032 | 0.612 / 0.622 / 0.621 | 1 | 3961 (60104) |
+| Live 44, 8-path prefix | 0.853 / 0.564 / 0.572 | 0.854 / 0.566 / 0.574 | 1 | 670 (322) |
+| Live 49, 8-path prefix | 5.678 / 0.652 / 1.539 | 0.595 / 0.613 / 0.612 | 1 | 1295 (2105) |
+
+Reading: on the one-planet and flat fixtures v2 recovers the planet (centre error below 1 unit, radius below 0.1 on captures 2, 6, 10; no planet on capture 1). On the multi-planet cases it is worse than flat in unexplored area (12, 18) and in explored area on live 49, where the single inferred planet matched none of the 24 disclosed planets within 50 units. This is the one-planet model's misspecification, not yet fixed; it is the main open issue of this slice. Per-update wall time (10 cores) peaked at about 0.9 s on W7 (9 paths), 0.18 s on live 44, 0.41 s on live 49. These are single runs on an unisolated machine.
+
+Held-out prediction (`targeting_report --fit-planets`, full-path coordinate RMSE of the next shot, using only earlier shots, v2 / flat): capture 2 0.000025 / 110.2; capture 6 0.000017 / 39.0; capture 10 0.051 / 9.93 (later shots 0.094/9.93, 0.278/32.3). These synthetic paths share the bot's simulator, so near-zero error says inference works under the assumed simulator, not that it works on the live engine.

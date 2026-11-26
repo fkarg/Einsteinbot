@@ -209,9 +209,9 @@ fn planet_contact() -> ServerEvent {
 }
 
 fn learn_contact(state: &mut BotState) {
-    use einsteinbot::online_map::OnlineEstimator;
+    use einsteinbot::estimator::Estimator;
     use std::sync::atomic::AtomicBool;
-    let mut estimator = OnlineEstimator::default();
+    let mut estimator = Estimator::default();
     let cancelled = AtomicBool::new(false);
     for (player_id, point) in state.player_positions() {
         estimator.observe(

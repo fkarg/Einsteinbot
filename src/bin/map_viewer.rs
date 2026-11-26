@@ -4,9 +4,7 @@ use einsteinbot::protocol::{Planet, Point, RecordedEvent, ServerEvent};
 use einsteinbot::simulation::{
     ShotObservation, Termination, WorldParameters, simulate_shot, simulate_targeting_shot,
 };
-use einsteinbot::strategy::{
-    BotState, FieldEvidence, MapBelief, ShotChoice, TargetingPolicy, TargetingSettings,
-};
+use einsteinbot::strategy::{BotState, MapBelief, ShotChoice, TargetingPolicy, TargetingSettings};
 use nalgebra::DMatrix;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::{Value, json};
@@ -16,7 +14,6 @@ use std::error::Error;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::Arc;
 
 #[path = "map_viewer/degrade.rs"]
 mod degrade;
@@ -841,18 +838,7 @@ fn decode_belief(value: &Value) -> Result<Option<MapBelief>, String> {
     let mut belief = MapBelief::new(map, None);
     // Captures from before the residual removal may carry local_field / field_hypothesis keys; ignored.
     belief.parameter_covariance = matrix_from_json(&value["covariance"]);
-    belief.approximate_parameter_covariance = matrix_from_json(&value["approximate_covariance"]);
-    if let (Some(resolution), Some(parameter_to_physical)) = (
-        matrix_from_json(&value["field_evidence"]["resolution"]),
-        matrix_from_json(&value["field_evidence"]["parameter_to_physical"]),
-    ) {
-        belief.field_evidence = Some(Arc::new(FieldEvidence {
-            resolution,
-            parameter_to_physical,
-        }));
-    }
     belief.model_position_rmse = value["model_position_rmse"].as_f64();
-    belief.fit_converged = value["fit_converged"].as_bool();
     belief.contact_points = serde_json::from_value(
         value
             .get("contact_points")
@@ -860,14 +846,8 @@ fn decode_belief(value: &Value) -> Result<Option<MapBelief>, String> {
             .unwrap_or_else(|| json!([])),
     )
     .map_err(|error| error.to_string())?;
-    belief.planet_contact_counts = serde_json::from_value(
-        value
-            .get("planet_contact_counts")
-            .cloned()
-            .unwrap_or_else(|| json!([])),
-    )
-    .map_err(|error| error.to_string())?;
-    belief.uncertain_associations = value["uncertain_associations"].as_u64().unwrap_or(0) as usize;
+    // Fit diagnostics, approximate covariance and field evidence are no longer recorded or
+    // decoded; the viewer layers that used them return null (unavailable) for every capture.
     Ok(Some(belief))
 }
 
@@ -885,9 +865,6 @@ fn make_field_grid(
     let actual_map = actual.map(|planets| PlanetMap {
         planets: planets.to_vec(),
     });
-    let approximate_covariance = belief
-        .as_ref()
-        .and_then(|belief| belief.approximate_parameter_covariance.as_ref());
     let world = WorldParameters::default();
     let mut samples = Vec::new();
     let start_x = (view.x as usize / grid_step) * grid_step;
@@ -930,9 +907,6 @@ fn make_field_grid(
             let sigma = covariance
                 .and_then(|matrix| belief.map.acceleration_covariance(position, matrix).ok())
                 .map(|covariance| (covariance.xx + covariance.yy).max(0.0).sqrt());
-            let approximate_sigma = approximate_covariance
-                .and_then(|matrix| belief.map.acceleration_covariance(position, matrix).ok())
-                .map(|covariance| (covariance.xx + covariance.yy).max(0.0).sqrt());
             let selected = match display_field {
                 "delta" => delta,
                 "total" => gravity,
@@ -952,8 +926,10 @@ fn make_field_grid(
                 actual_vector.map(|v| v.x),
                 actual_vector.map(|v| v.y),
                 sigma,
-                belief.evidence_availability_at(position),
-                approximate_sigma
+                // Slots 11-12 (evidence availability, approximate sigma) are unavailable: the
+                // v2 estimator records neither.
+                Option::<f64>::None,
+                Option::<f64>::None
             ]));
         }
     }
@@ -967,7 +943,7 @@ fn make_field_grid(
         "columns": (end_x.saturating_sub(start_x) / grid_step) + 1,
         "rows": (end_y.saturating_sub(start_y) / grid_step) + 1,
         "has_covariance": covariance.is_some(),
-        "has_approximate_covariance": approximate_covariance.is_some(),
+        "has_approximate_covariance": false,
         "has_belief": belief.is_some(),
     }))
 }
@@ -1521,53 +1497,6 @@ mod tests {
         // No recorded field evidence (older captures): availability is unavailable, not zero.
         assert!(sample[11].is_null());
         assert!(sample[12].is_null());
-    }
-
-    #[test]
-    fn field_grid_keeps_approximate_uncertainty_apart_from_the_fit_covariance() {
-        let identity = json!([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
-        let data = json!({
-            "map_belief": {
-                "planets": [{"x": 10.0, "y": 0.0, "radius": 2.0, "mass": 50.0}],
-                "approximate_covariance": identity
-            }
-        });
-        let view = Viewport {
-            x: 0.0,
-            y: 0.0,
-            width: 1.0,
-            height: 1.0,
-        };
-        let grid = make_field_grid(&data, None, 1, view, "total").unwrap();
-        assert!(grid["samples"][0][10].is_null(), "no complete covariance");
-        assert!(grid["samples"][0][12].as_f64().unwrap() > 0.0);
-        assert_eq!(grid["has_approximate_covariance"], true);
-    }
-
-    #[test]
-    fn field_grid_reports_recorded_evidence_availability() {
-        let planet = json!({"x": 10.0, "y": 0.0, "radius": 2.0, "mass": 50.0});
-        let identity = json!([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
-        let data = json!({
-            "map_belief": {
-                "planets": [planet],
-                "field_evidence": {"resolution": identity, "parameter_to_physical": identity}
-            }
-        });
-        let view = Viewport {
-            x: 0.0,
-            y: 0.0,
-            width: 1.0,
-            height: 1.0,
-        };
-        let grid = make_field_grid(&data, None, 1, view, "total").unwrap();
-        let availability = grid["samples"][0][11].as_f64().unwrap();
-        assert!(availability > 0.0 && availability <= 1.0);
-        // A malformed matrix is dropped rather than guessed.
-        let mut broken = data.clone();
-        broken["map_belief"]["field_evidence"]["resolution"] = json!([[1.0, 0.0], [0.0]]);
-        let grid = make_field_grid(&broken, None, 1, view, "total").unwrap();
-        assert!(grid["samples"][0][11].is_null());
     }
 
     #[test]

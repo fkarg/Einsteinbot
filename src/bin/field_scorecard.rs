@@ -1,8 +1,8 @@
 //! Field evaluation of the physical-planet map from an ordered capture; truth is used only for scoring.
+use einsteinbot::estimator::Estimator;
 use einsteinbot::event_store::EventLog;
 use einsteinbot::field_score::score_field;
 use einsteinbot::map::PlanetMap;
-use einsteinbot::online_map::OnlineEstimator;
 use einsteinbot::protocol::{RecordedEvent, ServerEvent};
 use einsteinbot::simulation::{ShotObservation, WorldParameters};
 use einsteinbot::strategy::MapBelief;
@@ -11,7 +11,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 struct Replay {
-    estimator: OnlineEstimator,
+    estimator: Estimator,
     fit_micros: u128,
     observations: Vec<ShotObservation>,
     truth: Option<PlanetMap>,
@@ -23,7 +23,7 @@ struct Replay {
 impl Replay {
     fn new(empty_is_flat: bool) -> Self {
         Self {
-            estimator: OnlineEstimator::default(),
+            estimator: Estimator::default(),
             fit_micros: 0,
             observations: Vec::new(),
             truth: None,

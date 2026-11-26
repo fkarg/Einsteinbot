@@ -1,7 +1,7 @@
 //! Deterministic offline learning experiments. Ground truth generates observations and scores
-//! choices; it is never sent to OnlineEstimator or the learned-map targeting policy.
+//! choices; it is never sent to Estimator or the learned-map targeting policy.
+use einsteinbot::estimator::Estimator;
 use einsteinbot::map::{PlanetMap, Vec2};
-use einsteinbot::online_map::OnlineEstimator;
 use einsteinbot::protocol::{Planet, Point, ServerEvent};
 use einsteinbot::simulation::{
     ShotObservation, Termination, WorldParameters, simulate_shot, simulate_targeting_shot,
@@ -44,7 +44,7 @@ fn position(id: u32, x: f32, y: f32) -> ServerEvent {
     }
 }
 fn observe_launch(
-    estimator: &mut OnlineEstimator,
+    estimator: &mut Estimator,
     state: &mut BotState,
     truth: &PlanetMap,
     launch: Launch,
@@ -112,7 +112,7 @@ fn observe_launch(
         );
     }
     println!(
-        "  training angle={} speed={} termination={:?} samples={} fit_ms={} inferred_planets={} converged={:?} rmse={:?} covariance={}",
+        "  training angle={} speed={} termination={:?} samples={} fit_ms={} inferred_planets={} map_weight={:?} rmse={:?} covariance={}",
         launch.angle,
         launch.speed,
         path.termination,
@@ -122,7 +122,7 @@ fn observe_launch(
         },
         started.elapsed().as_millis(),
         belief.map.planets.len(),
-        belief.fit_converged,
+        belief.map_weight,
         belief.model_position_rmse,
         belief.parameter_covariance.is_some()
     );
@@ -205,7 +205,7 @@ fn evaluate(
 
 fn run(scenario: Scenario, mut capture: Option<ScenarioCapture>) {
     println!("scenario={}", scenario.name);
-    let mut estimator = OnlineEstimator::default();
+    let mut estimator = Estimator::default();
     let mut state = BotState::default();
     if let Some(capture) = &mut capture {
         capture.event(
@@ -1124,7 +1124,7 @@ mod tests {
     #[test]
     fn flat_training_and_target_are_handled_without_inventing_a_planet() {
         let scenario = scenarios().remove(0);
-        let mut estimator = OnlineEstimator::default();
+        let mut estimator = Estimator::default();
         let mut state = BotState::default();
         state.observe(&ServerEvent::OwnId { player_id: 1 });
         for (stage, (launch, expected)) in scenario.observations.iter().copied().enumerate() {

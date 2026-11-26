@@ -50,30 +50,7 @@ impl ScenarioCapture {
         observations_seen: usize,
         fit_ms: Option<u128>,
     ) {
-        let belief_json = belief.map(|belief| serde_json::json!({
-            "planets": belief.map.planets,
-            "contact_points": belief.contact_points,
-            "covariance": belief.parameter_covariance.as_ref().map(|matrix| {
-                (0..matrix.nrows()).map(|row| (0..matrix.ncols()).map(|col| matrix[(row, col)]).collect::<Vec<_>>()).collect::<Vec<_>>()
-            }),
-            "approximate_covariance": belief.approximate_parameter_covariance.as_ref().map(|matrix| {
-                (0..matrix.nrows()).map(|row| (0..matrix.ncols()).map(|col| matrix[(row, col)]).collect::<Vec<_>>()).collect::<Vec<_>>()
-            }),
-            "covariance_unavailable_reason": belief.covariance_unavailable_reason,
-            "fit_rank": belief.fit_rank,
-            "fit_parameter_count": belief.fit_parameter_count,
-            "fit_independent_path_count": belief.fit_independent_path_count,
-            "field_evidence": belief.field_evidence.as_ref().map(|evidence| serde_json::json!({
-                "resolution": (0..evidence.resolution.nrows()).map(|row| (0..evidence.resolution.ncols()).map(|column| evidence.resolution[(row, column)]).collect::<Vec<_>>()).collect::<Vec<_>>(),
-                "parameter_to_physical": (0..evidence.parameter_to_physical.nrows()).map(|row| (0..evidence.parameter_to_physical.ncols()).map(|column| evidence.parameter_to_physical[(row, column)]).collect::<Vec<_>>()).collect::<Vec<_>>(),
-            })),
-            "model_position_rmse": belief.model_position_rmse,
-            "fit_converged": belief.fit_converged,
-            "fit_approximate": belief.fit_approximate,
-            "optimizer_converged": belief.optimizer_converged,
-            "planet_contact_counts": belief.planet_contact_counts,
-            "uncertain_associations": belief.uncertain_associations,
-        }));
+        let belief_json = belief.map(MapBelief::diagnostic_json);
         let choice_json = choice.map(|choice| {
             serde_json::json!({
                 "reason": format!("{:?}", choice.reason),

@@ -231,7 +231,7 @@ fn compare_policy(events: &[(Option<String>, RecordedEvent)]) -> Comparison {
 
 #[derive(Default)]
 struct PlanetReplay {
-    estimator: einsteinbot::online_map::OnlineEstimator,
+    estimator: einsteinbot::estimator::Estimator,
     epoch: usize,
     oracle: Option<einsteinbot::map::PlanetMap>,
     fits: usize,
@@ -341,12 +341,16 @@ impl PlanetReplay {
     }
     fn print_fit(&self, belief: &einsteinbot::strategy::MapBelief) {
         println!(
-            "planet_fit epoch={} fit={} prefix_shots={} inferred={} ambiguous={} position_rmse={} covariance={} batch_shots={}",
+            "planet_fit epoch={} fit={} prefix_shots={} inferred={} alternatives={} map_weight={} position_rmse={} covariance={} batch_shots={}",
             self.epoch,
             self.fits,
             self.shots,
             belief.map.planets.len(),
-            belief.uncertain_associations,
+            belief.alternatives.len(),
+            belief
+                .map_weight
+                .map(|x| format!("{x:.3}"))
+                .unwrap_or_else(|| "unavailable".to_owned()),
             belief
                 .model_position_rmse
                 .map(|x| format!("{x:.6}"))

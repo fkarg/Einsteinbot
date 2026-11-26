@@ -1,8 +1,8 @@
 //! Prefix-only replay of real captured paths; held-out shots are selected at launch,
 //! not completion, so their learning snapshot cannot include evidence from their flight.
+use einsteinbot::estimator::Estimator;
 use einsteinbot::estimator::shot_position_rmse;
 use einsteinbot::map::{PlanetMap, Vec2};
-use einsteinbot::online_map::OnlineEstimator;
 use einsteinbot::protocol::{RecordedEvent, ServerEvent};
 use einsteinbot::simulation::{ShotObservation, WorldParameters, simulate_targeting_shot};
 use einsteinbot::strategy::{BotState, MapBelief, TargetingPolicy};
@@ -36,7 +36,7 @@ fn replay(
     holdout: usize,
     benchmark: bool,
 ) -> Vec<Evaluation> {
-    let mut estimator = OnlineEstimator::default();
+    let mut estimator = Estimator::default();
     let mut state = BotState::default();
     let cancelled = AtomicBool::new(false);
     let flat = PlanetMap { planets: vec![] };
