@@ -197,6 +197,13 @@ fn diagnose_thinning_search() {
         .split(',')
         .map(String::from)
         .collect();
+    // Score the growth stage alone: no exact refit, no deaths (for exact: no deaths).
+    let growth_only = std::env::var("GROWTH_ONLY").is_ok();
+    let anneal: Vec<f64> = std::env::var("ANNEAL")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|v| v.parse().ok())
+        .collect();
     let ceilings = PartCeilings::default();
     for case in cases(noise) {
         let rows = rows(&case);
@@ -245,7 +252,9 @@ fn diagnose_thinning_search() {
                 };
                 let mut modes = vec![mode_at(&exact, &[]).unwrap()];
                 grow(&exact, &case.shots, &mut modes, &run, world);
-                prune(&exact, &mut modes, &run);
+                if !growth_only {
+                    prune(&exact, &mut modes, &run);
+                }
                 modes
             } else {
                 let l1 = limits((budget as f64 * stage1) as u64);
@@ -260,22 +269,49 @@ fn diagnose_thinning_search() {
                 stage1_score = Some(score(&found, &truth, &exact_fit, rows));
                 evals1 = stats.evaluations();
                 wall1 = started.elapsed().as_secs_f64();
-                // Stage 2: exact refit, exact births with the rest, exact deaths.
-                let l2 = limits(budget);
-                let run2 = Run {
-                    limits: &l2,
-                    stats: &stats,
-                };
-                let mut modes = vec![mode_at(&exact, &[]).unwrap()];
-                let b = Budget {
-                    evaluations: budget.saturating_sub(stats.evaluations()).max(500),
-                    deadline: None,
-                    threads: cores(),
-                };
-                modes.extend(refit(&exact, &found, &b));
-                grow(&exact, &case.shots, &mut modes, &run2, world);
-                prune(&exact, &mut modes, &run2);
-                modes
+                if growth_only {
+                    // Score the search stage's own best map; no exact refit.
+                    smodes
+                } else {
+                    // Stage 2: exact refit, exact births with the rest, exact deaths.
+                    let l2 = limits(budget);
+                    let run2 = Run {
+                        limits: &l2,
+                        stats: &stats,
+                    };
+                    let mut modes = vec![mode_at(&exact, &[]).unwrap()];
+                    let b = Budget {
+                        evaluations: budget.saturating_sub(stats.evaluations()).max(500),
+                        deadline: None,
+                        threads: cores(),
+                    };
+                    // Optional continuation: refit the whole map on full rows with decreasing
+                    // relative noise before the exact refit (`ANNEAL=0.1,0.03,0.01`).
+                    let mut found = found;
+                    for level in anneal.iter() {
+                        let shots = search_shots(
+                            &case,
+                            Variant {
+                                thin: None,
+                                relative: *level,
+                            },
+                            noise,
+                        );
+                        let fit = Fit::new(&shots, world, &never, false, vec![]).with_stats(&stats);
+                        if let Some((theta, _)) = fit.refine(&found, &b) {
+                            found = theta;
+                        }
+                        println!(
+                            "   anneal {level}: ratio {:.3e} rec2 {}",
+                            score(&found, &truth, &exact_fit, rows).ratio,
+                            score(&found, &truth, &exact_fit, rows).recall2
+                        );
+                    }
+                    modes.extend(refit(&exact, &found, &b));
+                    grow(&exact, &case.shots, &mut modes, &run2, world);
+                    prune(&exact, &mut modes, &run2);
+                    modes
+                }
             };
             let wall = started.elapsed().as_secs_f64();
             let theta = theta_of_planets(&best(&modes).planets);
