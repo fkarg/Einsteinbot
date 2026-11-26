@@ -167,11 +167,7 @@ fn run_online_profile(
                 .saturating_sub(sample.processed)
                 .to_string()
         };
-        let stage_sum = stages.prepare
-            + stages.planet_fit
-            + stages.local_residual
-            + stages.field_hypothesis
-            + stages.hypothesis_residual;
+        let stage_sum = stages.prepare + stages.planet_fit;
         let fit_substage_sum = stages.fit_contact_seeding
             + stages.fit_optimizer
             + stages.fit_final_residual
@@ -189,7 +185,7 @@ fn run_online_profile(
             .map_or_else(|| "n/a".to_owned(), |value| value.to_string());
         let other = sample.service_time.saturating_sub(stage_sum);
         println!(
-            "  event seq={} recorded_unix_ms={} epoch={} watermark={} kind={} queue_ms={:.3} service_ms={:.3} prepare_ms={:.3} planet_fit_ms={:.3} fit_planets={} fit_paths={} fit_points={} fit_contacts={} fit_parameters={} fit_patience={} fit_lm_evaluations={} fit_converged={} fit_candidate_accepted={} fit_seed_ms={:.3} fit_optimizer_ms={:.3} fit_final_residual_ms={:.3} fit_final_jacobian_covariance_ms={:.3} fit_path_validation_ms={:.3} fit_other_ms={:.3} local_residual_ms={:.3} field_hypothesis_ms={:.3} hypothesis_residual_ms={:.3} other_ms={:.3} backlog={} stale={}",
+            "  event seq={} recorded_unix_ms={} epoch={} watermark={} kind={} queue_ms={:.3} service_ms={:.3} prepare_ms={:.3} planet_fit_ms={:.3} fit_planets={} fit_paths={} fit_points={} fit_contacts={} fit_parameters={} fit_patience={} fit_lm_evaluations={} fit_converged={} fit_candidate_accepted={} fit_seed_ms={:.3} fit_optimizer_ms={:.3} fit_final_residual_ms={:.3} fit_final_jacobian_covariance_ms={:.3} fit_path_validation_ms={:.3} fit_other_ms={:.3} other_ms={:.3} backlog={} stale={}",
             sample.sequence,
             sample.recorded_at_unix_ms,
             sample.epoch,
@@ -214,9 +210,6 @@ fn run_online_profile(
             stages.fit_final_jacobian_and_covariance.as_secs_f64() * 1000.0,
             stages.fit_path_validation.as_secs_f64() * 1000.0,
             fit_other.as_secs_f64() * 1000.0,
-            stages.local_residual.as_secs_f64() * 1000.0,
-            stages.field_hypothesis.as_secs_f64() * 1000.0,
-            stages.hypothesis_residual.as_secs_f64() * 1000.0,
             other.as_secs_f64() * 1000.0,
             pending,
             sample.stale,
@@ -257,9 +250,6 @@ fn print_profile_summary(samples: &[ProfileSample]) {
             |mut total, stage| {
                 total.prepare += stage.prepare;
                 total.planet_fit += stage.planet_fit;
-                total.local_residual += stage.local_residual;
-                total.field_hypothesis += stage.field_hypothesis;
-                total.hypothesis_residual += stage.hypothesis_residual;
                 total.fit_contact_seeding += stage.fit_contact_seeding;
                 total.fit_optimizer += stage.fit_optimizer;
                 total.fit_final_residual += stage.fit_final_residual;
@@ -268,11 +258,7 @@ fn print_profile_summary(samples: &[ProfileSample]) {
                 total
             },
         );
-        let stage_sum = stages.prepare
-            + stages.planet_fit
-            + stages.local_residual
-            + stages.field_hypothesis
-            + stages.hypothesis_residual;
+        let stage_sum = stages.prepare + stages.planet_fit;
         let fit_substage_sum = stages.fit_contact_seeding
             + stages.fit_optimizer
             + stages.fit_final_residual
@@ -293,7 +279,7 @@ fn print_profile_summary(samples: &[ProfileSample]) {
             .map(|sample| sample.queue_wait)
             .sum::<std::time::Duration>();
         println!(
-            "  summary kind={event} active={} stale_rows={} stale_service_ms={:.3} stale_queue_ms={:.3} service_ms[p50/p95/max]={}/{}/{} queue_ms[p50/p95/max]={}/{}/{} stage_total_ms[prepare/planet_fit/local_residual/field_hypothesis/hypothesis_residual/other]={:.3}/{:.3}/{:.3}/{:.3}/{:.3}/{:.3} fit_breakdown_ms[contact_seeding/optimizer/final_residual/final_jacobian_covariance/path_validation/other]={:.3}/{:.3}/{:.3}/{:.3}/{:.3}/{:.3} max_backlog={}",
+            "  summary kind={event} active={} stale_rows={} stale_service_ms={:.3} stale_queue_ms={:.3} service_ms[p50/p95/max]={}/{}/{} queue_ms[p50/p95/max]={}/{}/{} stage_total_ms[prepare/planet_fit/other]={:.3}/{:.3}/{:.3} fit_breakdown_ms[contact_seeding/optimizer/final_residual/final_jacobian_covariance/path_validation/other]={:.3}/{:.3}/{:.3}/{:.3}/{:.3}/{:.3} max_backlog={}",
             active.len(),
             stale_rows,
             stale_service.as_secs_f64() * 1000.0,
@@ -310,9 +296,6 @@ fn print_profile_summary(samples: &[ProfileSample]) {
                 .map_or_else(|| "n/a".to_owned(), |value| format!("{value:.3}")),
             stages.prepare.as_secs_f64() * 1000.0,
             stages.planet_fit.as_secs_f64() * 1000.0,
-            stages.local_residual.as_secs_f64() * 1000.0,
-            stages.field_hypothesis.as_secs_f64() * 1000.0,
-            stages.hypothesis_residual.as_secs_f64() * 1000.0,
             service_total.saturating_sub(stage_sum).as_secs_f64() * 1000.0,
             stages.fit_contact_seeding.as_secs_f64() * 1000.0,
             stages.fit_optimizer.as_secs_f64() * 1000.0,

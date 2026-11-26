@@ -52,10 +52,6 @@ impl ScenarioCapture {
     ) {
         let belief_json = belief.map(|belief| serde_json::json!({
             "planets": belief.map.planets,
-            "local_field": belief.local_field,
-            "field_hypothesis": belief.field_hypothesis,
-            "provisional_field_hypothesis": belief.provisional_field_hypothesis,
-            "hypothesis_local_field": belief.hypothesis_local_field,
             "contact_points": belief.contact_points,
             "covariance": belief.parameter_covariance.as_ref().map(|matrix| {
                 (0..matrix.nrows()).map(|row| (0..matrix.ncols()).map(|col| matrix[(row, col)]).collect::<Vec<_>>()).collect::<Vec<_>>()
@@ -86,7 +82,6 @@ impl ScenarioCapture {
                 "miss_distance": choice.miss_distance,
                 "predicted_hit": choice.predicted_hit,
                 "predicted_victim": choice.predicted_victim,
-                "used_field_hypothesis": choice.used_field_hypothesis,
                 "contact_before_target": choice.contact_before_target,
             })
         });

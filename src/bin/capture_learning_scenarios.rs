@@ -4,10 +4,7 @@ use einsteinbot::estimator::shot_position_rmse;
 use einsteinbot::map::{PlanetMap, Vec2};
 use einsteinbot::online_map::OnlineEstimator;
 use einsteinbot::protocol::{RecordedEvent, ServerEvent};
-use einsteinbot::simulation::{
-    ShotObservation, WorldParameters, simulate_sampled_positions_with_hypothesis,
-    simulate_sampled_positions_with_local_field, simulate_targeting_shot,
-};
+use einsteinbot::simulation::{ShotObservation, WorldParameters, simulate_targeting_shot};
 use einsteinbot::strategy::{BotState, MapBelief, TargetingPolicy};
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
@@ -19,7 +16,6 @@ struct Evaluation {
     shot_index: usize,
     flat_rmse: f64,
     learned_rmse: f64,
-    full_belief_rmse: f64,
     oracle_rmse: Option<f64>,
 }
 struct Checkpoint {
@@ -137,12 +133,7 @@ fn replay(
                                     .ok()
                                     .flatten()
                             });
-                            let Some(full_belief_rmse) = belief_rmse(&snapshot.belief, &shot)
-                            else {
-                                continue;
-                            };
                             evaluations.push(Evaluation {
-                                full_belief_rmse,
                                 epoch,
                                 prefix: snapshot.prefix,
                                 shot_index: count,
@@ -202,77 +193,36 @@ fn benchmark_targeting(state: &BotState, belief: &MapBelief, oracle: Option<&Pla
         .iter()
         .map(|(&id, p)| (id, Vec2::new(f64::from(p.x), f64::from(p.y))))
         .collect::<Vec<_>>();
-    for with_field in [false, true] {
-        let mut scenario = state.clone();
-        let mut map = belief.clone();
-        if !with_field {
-            map.local_field = Default::default();
-            map.field_hypothesis = None;
-            map.hypothesis_local_field = None;
-        }
-        scenario.set_map_belief(Some(map));
-        let started = Instant::now();
-        let choice = TargetingPolicy::default().choose(&scenario, 20.0);
-        let elapsed = started.elapsed().as_millis();
-        if let Some(choice) = choice {
-            let observed = oracle
-                .and_then(|map| {
-                    simulate_targeting_shot(
-                        map,
-                        &ShotObservation {
-                            player_id: id,
-                            angle_degrees: f64::from(choice.angle_degrees),
-                            velocity: f64::from(choice.velocity),
-                            points: vec![start.clone()],
-                        },
-                        WorldParameters::default(),
-                        2000,
-                        &players,
-                        4.0,
-                    )
-                    .ok()
-                })
-                .map(|path| path.termination);
-            println!(
-                "target_benchmark prefix=8 local_field={with_field} elapsed_ms={elapsed} choice={choice:?} actual_oracle_termination={observed:?}"
-            );
-        } else {
-            println!(
-                "target_benchmark prefix=8 local_field={with_field} elapsed_ms={elapsed} no_choice"
-            );
-        }
+    let mut scenario = state.clone();
+    scenario.set_map_belief(Some(belief.clone()));
+    let started = Instant::now();
+    let choice = TargetingPolicy::default().choose(&scenario, 20.0);
+    let elapsed = started.elapsed().as_millis();
+    if let Some(choice) = choice {
+        let observed = oracle
+            .and_then(|map| {
+                simulate_targeting_shot(
+                    map,
+                    &ShotObservation {
+                        player_id: id,
+                        angle_degrees: f64::from(choice.angle_degrees),
+                        velocity: f64::from(choice.velocity),
+                        points: vec![start.clone()],
+                    },
+                    WorldParameters::default(),
+                    2000,
+                    &players,
+                    4.0,
+                )
+                .ok()
+            })
+            .map(|path| path.termination);
+        println!(
+            "target_benchmark prefix=8 elapsed_ms={elapsed} choice={choice:?} actual_oracle_termination={observed:?}"
+        );
+    } else {
+        println!("target_benchmark prefix=8 elapsed_ms={elapsed} no_choice");
     }
-}
-
-fn belief_rmse(belief: &MapBelief, shot: &ShotObservation) -> Option<f64> {
-    let count = shot.points.len().saturating_sub(1);
-    if count < 2 {
-        return None;
-    }
-    let predicted = match (&belief.field_hypothesis, &belief.hypothesis_local_field) {
-        (Some(hypothesis), Some(field)) => simulate_sampled_positions_with_hypothesis(
-            &belief.map,
-            field,
-            hypothesis,
-            shot,
-            WorldParameters::default(),
-            count,
-        ),
-        _ => simulate_sampled_positions_with_local_field(
-            &belief.map,
-            &belief.local_field,
-            shot,
-            WorldParameters::default(),
-            count,
-        ),
-    }
-    .ok()?;
-    let sum = shot.points[1..count]
-        .iter()
-        .zip(&predicted[1..])
-        .map(|(a, b)| (f64::from(a.x) - b.x).powi(2) + (f64::from(a.y) - b.y).powi(2))
-        .sum::<f64>();
-    Some((sum / (2 * (count - 1)) as f64).sqrt())
 }
 
 fn print_incomplete(
@@ -327,7 +277,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "--benchmark-targeting" => benchmark = true,
             "--help" | "-h" => {
                 println!(
-                    "Usage: capture_learning_scenarios [--capture-id ID] [--db-path PATH] [--checkpoints 0,1,4,8,16] [--holdout N] [--benchmark-targeting]\nSequentially fit only completed prefix trajectories. Each checkpoint scores the next N shots LAUNCHED after that snapshot when their ShotFin arrives; earlier in-flight shots cannot leak into the snapshot. Disclosed planets score predictions only and define epochs. The planet_map_only score excludes residual field and field-only hypothesis; full_belief uses the hypothesis and its residual field when available, otherwise the local field. Empty maps are evaluated as flat. Cumulative fit time excludes read and scoring time. Replays fit synchronously and do not reconstruct actual asynchronous live publications.\nScores exclude launch and terminal sample and are coordinate RMSE; full-path integrations do not stop at collisions. Unfinished shots and failed/inadequate comparisons are omitted. Multiple checkpoints can score the same held-out trajectory."
+                    "Usage: capture_learning_scenarios [--capture-id ID] [--db-path PATH] [--checkpoints 0,1,4,8,16] [--holdout N] [--benchmark-targeting]\nSequentially fit only completed prefix trajectories. Each checkpoint scores the next N shots LAUNCHED after that snapshot when their ShotFin arrives; earlier in-flight shots cannot leak into the snapshot. Disclosed planets score predictions only and define epochs. Scores use the physical planet map only. Empty maps are evaluated as flat. Cumulative fit time excludes read and scoring time. Replays fit synchronously and do not reconstruct actual asynchronous live publications.\nScores exclude launch and terminal sample and are coordinate RMSE; full-path integrations do not stop at collisions. Unfinished shots and failed/inadequate comparisons are omitted. Multiple checkpoints can score the same held-out trajectory."
                 );
                 return Ok(());
             }
@@ -359,13 +309,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     for result in replay(&events, &checkpoints, holdout, benchmark) {
         println!(
-            "heldout epoch={} prefix={} completion_index={} flat_rmse={:.4} planet_map_only_rmse={:.4} full_belief_rmse={:.4} oracle_rmse={:?}",
+            "heldout epoch={} prefix={} completion_index={} flat_rmse={:.4} planet_map_only_rmse={:.4} oracle_rmse={:?}",
             result.epoch,
             result.prefix,
             result.shot_index,
             result.flat_rmse,
             result.learned_rmse,
-            result.full_belief_rmse,
             result.oracle_rmse
         );
     }
@@ -382,80 +331,6 @@ fn main() {
 mod tests {
     use super::*;
     use einsteinbot::protocol::Point;
-    #[test]
-    fn full_belief_score_uses_hypothesis_when_present() {
-        let map = PlanetMap { planets: vec![] };
-        let mut belief = MapBelief::new(map.clone(), None);
-        let hypothesis = einsteinbot::field_hypothesis::FieldHypothesis {
-            x: 30.0,
-            y: 20.0,
-            mass: 100.0,
-            support: vec![],
-            support_paths: vec![],
-            baseline_continuation_rmse: 1.0,
-            continuation_rmse: 0.5,
-            training_paths: 1,
-            validation_paths: 1,
-            relative_improvement: 0.5,
-        };
-        let mut shot = ShotObservation {
-            player_id: 1,
-            angle_degrees: 0.0,
-            velocity: 2.0,
-            points: vec![Point { x: 0.0, y: 0.0 }],
-        };
-        let predicted = simulate_sampled_positions_with_hypothesis(
-            &map,
-            &Default::default(),
-            &hypothesis,
-            &shot,
-            WorldParameters::default(),
-            20,
-        )
-        .unwrap();
-        shot.points = predicted
-            .into_iter()
-            .map(|p| Point {
-                x: p.x as f32,
-                y: p.y as f32,
-            })
-            .collect();
-        let baseline = belief_rmse(&belief, &shot).unwrap();
-        belief.field_hypothesis = Some(hypothesis);
-        belief.hypothesis_local_field = Some(Default::default());
-        let full = belief_rmse(&belief, &shot).unwrap();
-        assert!(full < baseline / 100.0, "full={full} baseline={baseline}");
-    }
-
-    #[test]
-    fn full_belief_score_uses_recorded_local_gravity() {
-        let map = PlanetMap { planets: vec![] };
-        let trajectory = ShotObservation {
-            player_id: 1,
-            angle_degrees: 0.0,
-            velocity: 1.0,
-            points: (0..15)
-                .map(|t| Point {
-                    x: t as f32,
-                    y: (t * t) as f32 * 0.05,
-                })
-                .collect(),
-        };
-        let mut belief = MapBelief::new(map.clone(), None);
-        belief.local_field = einsteinbot::local_field::LocalField::from_observations(
-            &map,
-            std::slice::from_ref(&trajectory),
-        );
-        let planet_error = shot_position_rmse(&map, &trajectory, WorldParameters::default())
-            .unwrap()
-            .unwrap();
-        let learned_error = belief_rmse(&belief, &trajectory).unwrap();
-        assert!(
-            learned_error < planet_error,
-            "full={learned_error} planet_only={planet_error}"
-        );
-    }
-
     #[test]
     fn checkpoint_scores_a_future_path_without_fitting_it() {
         let begin = |velocity| ServerEvent::ShotBegin {

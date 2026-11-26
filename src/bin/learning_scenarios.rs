@@ -126,107 +126,11 @@ fn observe_launch(
         belief.model_position_rmse,
         belief.parameter_covariance.is_some()
     );
-    if let Some(provisional) = &belief.provisional_field_hypothesis {
-        let source = &provisional.source;
-        let nearest = truth
-            .planets
-            .iter()
-            .map(|planet| {
-                (
-                    (planet.x - source.x).hypot(planet.y - source.y),
-                    (planet.mass - source.mass).abs(),
-                )
-            })
-            .min_by(|a, b| a.0.total_cmp(&b.0));
-        let field = PlanetMap {
-            planets: vec![Planet {
-                x: source.x,
-                y: source.y,
-                mass: source.mass,
-                radius: 0.0,
-            }],
-        };
-        let count = scenario.target_tick + 1;
-        let witness = einsteinbot::simulation::simulate_sampled_positions(
-            truth,
-            &shot(scenario.trial),
-            WorldParameters::default(),
-            count,
-        )
-        .unwrap();
-        let predicted = einsteinbot::simulation::simulate_sampled_positions(
-            &field,
-            &shot(scenario.trial),
-            WorldParameters::default(),
-            count,
-        )
-        .unwrap();
-        let flat = einsteinbot::simulation::simulate_sampled_positions(
-            &PlanetMap { planets: vec![] },
-            &shot(scenario.trial),
-            WorldParameters::default(),
-            count,
-        )
-        .unwrap();
-        let rmse = |prediction: &[Vec2]| {
-            (witness
-                .iter()
-                .zip(prediction)
-                .map(|(a, b)| (a.x - b.x).powi(2) + (a.y - b.y).powi(2))
-                .sum::<f64>()
-                / (2 * count) as f64)
-                .sqrt()
-        };
-        let witness_rmse = rmse(&predicted);
-        let flat_witness_rmse = rmse(&flat);
-        println!(
-            "    provisional_source nearest_center_mass_error={nearest:?} tail_rmse={:.6} baseline_tail_rmse={:.6} witness_rmse={witness_rmse:.6} flat_witness_rmse={flat_witness_rmse:.6}",
-            source.continuation_rmse, source.baseline_continuation_rmse
-        );
-    }
 }
 fn distance_to_path(path: &[Point], target: &Point) -> f64 {
     path.iter()
         .map(|p| f64::from(p.x - target.x).hypot(f64::from(p.y - target.y)))
         .fold(f64::INFINITY, f64::min)
-}
-fn predict_belief(
-    belief: &MapBelief,
-    shot: &ShotObservation,
-    count: usize,
-    use_hypothesis: bool,
-) -> Result<Vec<Point>, String> {
-    let world = WorldParameters::default();
-    let positions = if use_hypothesis {
-        let (Some(hypothesis), Some(field)) =
-            (&belief.field_hypothesis, &belief.hypothesis_local_field)
-        else {
-            return Err("selected hypothesis or matching residual field missing".into());
-        };
-        einsteinbot::simulation::simulate_sampled_positions_with_hypothesis(
-            &belief.map,
-            field,
-            hypothesis,
-            shot,
-            world,
-            count,
-        )
-    } else {
-        einsteinbot::simulation::simulate_sampled_positions_with_local_field(
-            &belief.map,
-            &belief.local_field,
-            shot,
-            world,
-            count,
-        )
-    }?;
-    Ok(positions
-        .into_iter()
-        .map(|position| Point {
-            x: position.x as f32,
-            y: position.y as f32,
-        })
-        .collect())
 }
 fn evaluate(
     label: &str,
@@ -264,18 +168,14 @@ fn evaluate(
     .unwrap();
     let hit = path.termination == Termination::PlayerCollision(2);
     println!(
-        "  {label}: actual={} predicted={:?} angle={} speed={} true_termination={:?} closest_sample={:.2} search_ms={} used_field_hypothesis={} alternative_agrees={:?} hypothesis_uncertainty_proxy={:?} local_support_fraction={:?}",
+        "  {label}: actual={} predicted={:?} angle={} speed={} true_termination={:?} closest_sample={:.2} search_ms={}",
         if hit { "HIT" } else { "MISS" },
         choice.reason,
         choice.angle_degrees,
         choice.velocity,
         path.termination,
         distance_to_path(&path.points, &target),
-        elapsed,
-        choice.used_field_hypothesis,
-        choice.alternative_agrees,
-        choice.hypothesis_uncertainty_proxy,
-        choice.local_support_fraction
+        elapsed
     );
     // Held-out comparison evaluates the same candidate's regular samples, ending at the
     // first truth collision. Exclude the launch and untimed terminal sample.
@@ -299,36 +199,13 @@ fn evaluate(
             regular_count - 1,
             residual.rmse
         );
-        if let Some(belief) = &belief {
-            let predicted = match predict_belief(
-                belief,
-                &candidate,
-                regular_count,
-                choice.used_field_hypothesis,
-            ) {
-                Ok(predicted) => predicted,
-                Err(error) => {
-                    println!("    selected_model_prediction_error={error}");
-                    return Some(choice);
-                }
-            };
-            let residual = einsteinbot::simulation::compare_trajectories(
-                &path.points[1..regular_count],
-                &predicted[1..],
-            );
-            println!(
-                "    held_out_regular_samples={} selected_model_coordinate_rmse={:.3}",
-                regular_count - 1,
-                residual.rmse
-            );
-        }
     }
     Some(choice)
 }
 
 fn run(scenario: Scenario, mut capture: Option<ScenarioCapture>) {
     println!("scenario={}", scenario.name);
-    let mut estimator = OnlineEstimator::default().with_provisional_field();
+    let mut estimator = OnlineEstimator::default();
     let mut state = BotState::default();
     if let Some(capture) = &mut capture {
         capture.event(
@@ -482,67 +359,6 @@ fn run(scenario: Scenario, mut capture: Option<ScenarioCapture>) {
             error.rmse,
             count - 1
         );
-    }
-    if let Some(belief) = &learned {
-        if let Some(provisional) = &belief.provisional_field_hypothesis {
-            let source = &provisional.source;
-            let nearest = scenario
-                .truth
-                .planets
-                .iter()
-                .map(|p| {
-                    (
-                        (p.x - source.x).hypot(p.y - source.y),
-                        (p.mass - source.mass).abs(),
-                    )
-                })
-                .min_by(|a, b| a.0.total_cmp(&b.0));
-            let field = PlanetMap {
-                planets: vec![Planet {
-                    x: source.x,
-                    y: source.y,
-                    mass: source.mass,
-                    radius: 0.0,
-                }],
-            };
-            let predicted = einsteinbot::simulation::simulate_sampled_path(
-                &field,
-                &shot(scenario.trial),
-                WorldParameters::default(),
-                count,
-            )
-            .unwrap();
-            let error = einsteinbot::simulation::compare_trajectories(
-                &witness.points[1..count],
-                &predicted[1..],
-            );
-            println!(
-                "  provisional_source nearest_center_mass_error={nearest:?} heldout_witness_coordinate_rmse={:.6} tail_rmse={:.6} baseline_tail_rmse={:.6} approximate_covariance={}",
-                error.rmse,
-                source.continuation_rmse,
-                source.baseline_continuation_rmse,
-                provisional.approximate_covariance.is_some()
-            );
-        }
-        let use_hypothesis =
-            belief.field_hypothesis.is_some() && belief.hypothesis_local_field.is_some();
-        let predicted = predict_belief(belief, &shot(scenario.trial), count, use_hypothesis);
-        if let Ok(predicted) = predicted {
-            let error = einsteinbot::simulation::compare_trajectories(
-                &witness.points[1..count],
-                &predicted[1..],
-            );
-            println!(
-                "  fixed_witness_full_belief_coordinate_rmse={:.3} samples={}",
-                error.rmse,
-                count - 1
-            );
-        } else {
-            println!(
-                "  fixed_witness_full_belief_prediction_error={}",
-                predicted.unwrap_err()
-            );
-        }
     }
     evaluate(
         "flat",
@@ -1086,34 +902,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn selected_model_prediction_uses_chosen_hypothesis_mode() {
-        let mut belief = MapBelief::new(PlanetMap { planets: vec![] }, None);
-        belief.field_hypothesis = Some(einsteinbot::field_hypothesis::FieldHypothesis {
-            x: 200.0,
-            y: 120.0,
-            mass: 2700.0,
-            support: vec![],
-            support_paths: vec![],
-            baseline_continuation_rmse: 2.0,
-            continuation_rmse: 1.0,
-            training_paths: 1,
-            validation_paths: 1,
-            relative_improvement: 0.5,
-        });
-        belief.hypothesis_local_field = Some(Default::default());
-        let trial = shot(Launch {
-            x: 100.0,
-            y: 100.0,
-            angle: 0,
-            speed: 5,
-        });
-        let local_only = predict_belief(&belief, &trial, 10, false).unwrap();
-        let with_hypothesis = predict_belief(&belief, &trial, 10, true).unwrap();
-        assert_eq!(local_only.last().unwrap().y, 100.0);
-        assert!(with_hypothesis.last().unwrap().y > 100.0);
-    }
-
-    #[test]
     fn training_and_witness_paths_are_physically_valid() {
         for scenario in scenarios() {
             for (launch, expected) in scenario.observations.iter().copied() {
@@ -1331,65 +1119,6 @@ mod tests {
         assert!(!scenario_capture_exists(&path, "one_planet", "rev-a").unwrap());
         drop(connection);
         std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn noncontact_flyby_helps_next_shot_approach_target() {
-        let scenario = scenarios()
-            .into_iter()
-            .find(|case| case.name == "one_planet_noncontact_flyby")
-            .unwrap();
-        let mut estimator = OnlineEstimator::default().with_provisional_field();
-        let mut state = BotState::default();
-        state.observe(&ServerEvent::OwnId { player_id: 1 });
-        for (stage, (launch, expected)) in scenario.observations.iter().copied().enumerate() {
-            observe_launch(
-                &mut estimator,
-                &mut state,
-                &scenario.truth,
-                launch,
-                expected,
-                None,
-                &scenario,
-                stage + 1,
-            );
-        }
-        let trial = shot(scenario.trial);
-        let witness =
-            simulate_shot(&scenario.truth, &trial, WorldParameters::default(), 2000).unwrap();
-        let target = witness.points[scenario.target_tick].clone();
-        let start = &trial.points[0];
-        state.set_player_position(1, start.clone());
-        state.set_player_position(2, target.clone());
-        let players = [
-            (1, Vec2::new(f64::from(start.x), f64::from(start.y))),
-            (2, Vec2::new(f64::from(target.x), f64::from(target.y))),
-        ];
-        let closest = |state: &BotState| {
-            let choice = TargetingPolicy::default().choose(state, 20.0).unwrap();
-            let candidate = shot(Launch {
-                angle: choice.angle_degrees,
-                speed: choice.velocity,
-                ..scenario.trial
-            });
-            let actual = simulate_targeting_shot(
-                &scenario.truth,
-                &candidate,
-                WorldParameters::default(),
-                2000,
-                &players,
-                4.0,
-            )
-            .unwrap();
-            distance_to_path(&actual.points, &target)
-        };
-        let flat_distance = closest(&state);
-        state.set_map_belief(estimator.belief().cloned());
-        let learned_distance = closest(&state);
-        assert!(
-            learned_distance + 50.0 < flat_distance,
-            "flat={flat_distance} learned={learned_distance}"
-        );
     }
 
     #[test]

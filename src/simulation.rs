@@ -1,5 +1,3 @@
-use crate::field_hypothesis::FieldHypothesis;
-use crate::local_field::LocalField;
 use crate::map::{PlanetMap, Vec2};
 use crate::protocol::{Point, ServerEvent};
 
@@ -88,7 +86,7 @@ pub fn simulate_shot(
     world: WorldParameters,
     max_samples: usize,
 ) -> Result<PredictedTrajectory, String> {
-    simulate_shot_with_players(map, shot, world, max_samples, &[], 0.0, None, None)
+    simulate_shot_with_players(map, shot, world, max_samples, &[], 0.0)
 }
 
 /// Simulate collisions against the latest known player positions, in server slot order.
@@ -101,62 +99,7 @@ pub fn simulate_targeting_shot(
     players: &[(u32, Vec2)],
     player_radius: f64,
 ) -> Result<PredictedTrajectory, String> {
-    simulate_shot_with_players(
-        map,
-        shot,
-        world,
-        max_samples,
-        players,
-        player_radius,
-        None,
-        None,
-    )
-}
-
-/// Target using a locally observed residual field in addition to the physical planets.
-pub fn simulate_targeting_shot_with_local_field(
-    map: &PlanetMap,
-    field: &LocalField,
-    shot: &ShotObservation,
-    world: WorldParameters,
-    max_samples: usize,
-    players: &[(u32, Vec2)],
-    player_radius: f64,
-) -> Result<PredictedTrajectory, String> {
-    simulate_shot_with_players(
-        map,
-        shot,
-        world,
-        max_samples,
-        players,
-        player_radius,
-        Some(field),
-        None,
-    )
-}
-
-/// Integrate an additional field hypothesis without giving it collision geometry.
-/// The local field must contain residuals relative to both the physical map and hypothesis.
-pub fn simulate_targeting_shot_with_hypothesis(
-    map: &PlanetMap,
-    field: &LocalField,
-    hypothesis: &FieldHypothesis,
-    shot: &ShotObservation,
-    world: WorldParameters,
-    max_samples: usize,
-    players: &[(u32, Vec2)],
-    player_radius: f64,
-) -> Result<PredictedTrajectory, String> {
-    simulate_shot_with_players(
-        map,
-        shot,
-        world,
-        max_samples,
-        players,
-        player_radius,
-        Some(field),
-        Some(hypothesis),
-    )
+    simulate_shot_with_players(map, shot, world, max_samples, players, player_radius)
 }
 
 fn simulate_shot_with_players(
@@ -166,8 +109,6 @@ fn simulate_shot_with_players(
     max_samples: usize,
     players: &[(u32, Vec2)],
     player_radius: f64,
-    field: Option<&LocalField>,
-    hypothesis: Option<&FieldHypothesis>,
 ) -> Result<PredictedTrajectory, String> {
     if shot.points.is_empty() {
         return Err("shot observation has no launch position".to_owned());
@@ -180,7 +121,9 @@ fn simulate_shot_with_players(
     let mut position = Vec2::new(f64::from(start.x), f64::from(start.y));
     let angle = shot.angle_degrees.to_radians();
     let mut velocity = Vec2::new(shot.velocity * angle.cos(), -shot.velocity * angle.sin());
-    let mut acceleration = field_acceleration(map, field, hypothesis, position)?;
+    let mut acceleration = map
+        .acceleration(position)
+        .map_err(|error| error.to_string())?;
     let mut points = vec![Point {
         x: position.x as f32,
         y: position.y as f32,
@@ -196,8 +139,6 @@ fn simulate_shot_with_players(
                 &mut velocity,
                 &mut acceleration,
                 world.substeps_per_tick,
-                field,
-                hypothesis,
             )?;
 
             if let Some((planet_index, _)) = map.planets.iter().enumerate().find(|(_, planet)| {
@@ -273,42 +214,11 @@ pub fn simulate_sampled_positions(
     world: WorldParameters,
     sample_count: usize,
 ) -> Result<Vec<Vec2>, String> {
-    simulate_sampled_positions_impl(map, None, None, shot, world, sample_count)
-}
-
-pub fn simulate_sampled_positions_with_local_field(
-    map: &PlanetMap,
-    field: &LocalField,
-    shot: &ShotObservation,
-    world: WorldParameters,
-    sample_count: usize,
-) -> Result<Vec<Vec2>, String> {
-    simulate_sampled_positions_impl(map, Some(field), None, shot, world, sample_count)
-}
-
-/// Integrate timed samples with a field-only hypothesis and its matching local residual.
-pub fn simulate_sampled_positions_with_hypothesis(
-    map: &PlanetMap,
-    field: &LocalField,
-    hypothesis: &FieldHypothesis,
-    shot: &ShotObservation,
-    world: WorldParameters,
-    sample_count: usize,
-) -> Result<Vec<Vec2>, String> {
-    simulate_sampled_positions_impl(
-        map,
-        Some(field),
-        Some(hypothesis),
-        shot,
-        world,
-        sample_count,
-    )
+    simulate_sampled_positions_impl(map, shot, world, sample_count)
 }
 
 fn simulate_sampled_positions_impl(
     map: &PlanetMap,
-    field: Option<&LocalField>,
-    hypothesis: Option<&FieldHypothesis>,
     shot: &ShotObservation,
     world: WorldParameters,
     sample_count: usize,
@@ -324,7 +234,9 @@ fn simulate_sampled_positions_impl(
     let mut position = Vec2::new(f64::from(start.x), f64::from(start.y));
     let angle = shot.angle_degrees.to_radians();
     let mut velocity = Vec2::new(shot.velocity * angle.cos(), -shot.velocity * angle.sin());
-    let mut acceleration = field_acceleration(map, field, hypothesis, position)?;
+    let mut acceleration = map
+        .acceleration(position)
+        .map_err(|error| error.to_string())?;
     let mut points = vec![position];
     while points.len() < sample_count {
         for _ in 0..world.substeps_per_tick {
@@ -334,8 +246,6 @@ fn simulate_sampled_positions_impl(
                 &mut velocity,
                 &mut acceleration,
                 world.substeps_per_tick,
-                field,
-                hypothesis,
             )?;
         }
         points.push(position);
@@ -407,54 +317,21 @@ fn to_point(point: Vec2) -> Point {
     }
 }
 
-/// Evaluate the same physical, source and residual field used by the simulator.
-pub fn field_acceleration(
-    map: &PlanetMap,
-    field: Option<&LocalField>,
-    hypothesis: Option<&FieldHypothesis>,
-    position: Vec2,
-) -> Result<Vec2, String> {
-    let mut acceleration = map
-        .acceleration(position)
-        .map_err(|error| error.to_string())?;
-    if let Some(hypothesis) = hypothesis {
-        let extra = hypothesis
-            .acceleration(position)
-            .ok_or("singular field hypothesis")?;
-        if !extra.x.is_finite() || !extra.y.is_finite() {
-            return Err("nonfinite field hypothesis acceleration".to_owned());
-        }
-        acceleration.x += extra.x;
-        acceleration.y += extra.y;
-    }
-    if let Some(residual) = field.and_then(|field| field.residual(position)) {
-        acceleration.x += residual.x;
-        acceleration.y += residual.y;
-    }
-    if hypothesis.is_some() && (!acceleration.x.is_finite() || !acceleration.y.is_finite()) {
-        return Err("nonfinite combined acceleration".to_owned());
-    }
-    Ok(acceleration)
-}
-
 fn integrate_substep(
     map: &PlanetMap,
     position: &mut Vec2,
     velocity: &mut Vec2,
     acceleration: &mut Vec2,
     substeps_per_tick: usize,
-    field: Option<&LocalField>,
-    hypothesis: Option<&FieldHypothesis>,
 ) -> Result<(), String> {
     let dt = 1.0 / substeps_per_tick as f64;
     let next_position = Vec2::new(
         position.x + velocity.x * dt + acceleration.x * 0.5 * dt * dt,
         position.y + velocity.y * dt + acceleration.y * 0.5 * dt * dt,
     );
-    if hypothesis.is_some() && (!next_position.x.is_finite() || !next_position.y.is_finite()) {
-        return Err("nonfinite trajectory position".to_owned());
-    }
-    let next_acceleration = field_acceleration(map, field, hypothesis, next_position)?;
+    let next_acceleration = map
+        .acceleration(next_position)
+        .map_err(|error| error.to_string())?;
     velocity.x += (acceleration.x + next_acceleration.x) * 0.5 * dt;
     velocity.y += (acceleration.y + next_acceleration.y) * 0.5 * dt;
     *position = next_position;
@@ -465,125 +342,6 @@ fn integrate_substep(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn field_source(x: f64, y: f64, mass: f64) -> crate::field_hypothesis::FieldHypothesis {
-        crate::field_hypothesis::FieldHypothesis {
-            x,
-            y,
-            mass,
-            support: vec![],
-            support_paths: vec![],
-            baseline_continuation_rmse: 1.0,
-            continuation_rmse: 0.5,
-            training_paths: 1,
-            validation_paths: 1,
-            relative_improvement: 0.5,
-        }
-    }
-
-    #[test]
-    fn field_hypothesis_bends_path_without_creating_an_obstacle() {
-        let map = PlanetMap { planets: vec![] };
-        let field = LocalField::default();
-        let hypothesis = field_source(10.0, 1.0, 0.001);
-        let shot = ShotObservation {
-            player_id: 1,
-            angle_degrees: 0.0,
-            velocity: 2.0,
-            points: vec![Point { x: 0.0, y: 0.0 }],
-        };
-        let world = WorldParameters::default();
-        let trajectory = simulate_targeting_shot_with_hypothesis(
-            &map,
-            &field,
-            &hypothesis,
-            &shot,
-            world,
-            11,
-            &[],
-            4.0,
-        )
-        .unwrap();
-        assert_eq!(trajectory.termination, Termination::SampleLimit);
-        assert!(trajectory.points.last().unwrap().y > 0.0);
-        let sampled =
-            simulate_sampled_positions_with_hypothesis(&map, &field, &hypothesis, &shot, world, 11)
-                .unwrap();
-        assert!(sampled.last().unwrap().y > 0.0);
-    }
-
-    #[test]
-    fn singular_or_nonfinite_hypothesis_cannot_produce_a_trajectory() {
-        let map = PlanetMap { planets: vec![] };
-        let field = LocalField::default();
-        let shot = ShotObservation {
-            player_id: 1,
-            angle_degrees: 0.0,
-            velocity: 2.0,
-            points: vec![Point { x: 0.0, y: 0.0 }],
-        };
-        for hypothesis in [
-            field_source(0.0, 0.0, 1.0),
-            field_source(1.0, 0.0, f64::NAN),
-        ] {
-            assert!(
-                simulate_targeting_shot_with_hypothesis(
-                    &map,
-                    &field,
-                    &hypothesis,
-                    &shot,
-                    WorldParameters::default(),
-                    10,
-                    &[],
-                    4.0
-                )
-                .is_err()
-            );
-            assert!(
-                simulate_sampled_positions_with_hypothesis(
-                    &map,
-                    &field,
-                    &hypothesis,
-                    &shot,
-                    WorldParameters::default(),
-                    10
-                )
-                .is_err()
-            );
-        }
-    }
-
-    #[test]
-    fn field_hypothesis_does_not_hide_physical_planet_collision() {
-        let map = PlanetMap {
-            planets: vec![crate::protocol::Planet {
-                x: 10.0,
-                y: 0.0,
-                radius: 1.0,
-                mass: 0.0,
-            }],
-        };
-        let field = LocalField::default();
-        let hypothesis = field_source(10.0, 100.0, 0.001);
-        let shot = ShotObservation {
-            player_id: 1,
-            angle_degrees: 0.0,
-            velocity: 2.0,
-            points: vec![Point { x: 0.0, y: 0.0 }],
-        };
-        let trajectory = simulate_targeting_shot_with_hypothesis(
-            &map,
-            &field,
-            &hypothesis,
-            &shot,
-            WorldParameters::default(),
-            11,
-            &[],
-            4.0,
-        )
-        .unwrap();
-        assert_eq!(trajectory.termination, Termination::PlanetCollision(0));
-    }
 
     #[test]
     fn targeting_stops_at_first_player_after_leaving_source() {

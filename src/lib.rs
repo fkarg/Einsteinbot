@@ -17,7 +17,4 @@ mod live_map;
 pub mod online_map;
 pub mod online_profile;
 
-pub mod local_field;
-
-pub mod field_hypothesis;
 pub mod field_score;

@@ -1,24 +1,11 @@
 //! Offline truth-scoring of a frozen belief on a common spatial grid.
 //! Truth is an input only to this scorer and never to an estimator.
 use crate::coverage::{CELL_SIZE, path_cells};
-use crate::local_field::LocalField;
 use crate::map::{PlanetMap, Vec2};
-use crate::protocol::Planet;
-use crate::simulation::{ShotObservation, WorldParameters, field_acceleration};
+use crate::simulation::{ShotObservation, WorldParameters};
 use crate::strategy::MapBelief;
 use serde::Serialize;
 use std::collections::BTreeSet;
-
-#[derive(Clone, Copy, Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FieldModel {
-    Physical,
-    NoSource,
-    Validated,
-    ValidatedSourceOnly,
-    Provisional,
-    ProvisionalSourceOnly,
-}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct FieldStats {
@@ -27,8 +14,6 @@ pub struct FieldStats {
     pub finite_samples: usize,
     /// Diagnostic conditional on finite predictions; never replaces the complete score.
     pub finite_only_vector_rmse: Option<f64>,
-    /// Number of sampled locations with local residual support, if this model uses one.
-    pub residual_supported: Option<usize>,
     pub vector_rmse: Option<f64>,
     pub median_error: Option<f64>,
     pub p90_error: Option<f64>,
@@ -36,7 +21,6 @@ pub struct FieldStats {
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct FieldScore {
-    pub model: FieldModel,
     pub explored_cells: usize,
     pub unexplored_cells: usize,
     pub explored: Option<FieldStats>,
@@ -45,19 +29,13 @@ pub struct FieldScore {
     pub excluded_truth_interior: usize,
 }
 
-fn stats(errors: Vec<(Option<f64>, Option<bool>)>) -> Option<FieldStats> {
+fn stats(errors: Vec<Option<f64>>) -> Option<FieldStats> {
     if errors.is_empty() {
         return None;
     }
     let samples = errors.len();
-    let invalid = errors.iter().filter(|(error, _)| error.is_none()).count();
-    let residual_supported = errors.first().and_then(|(_, support)| {
-        support.map(|_| errors.iter().filter(|(_, s)| *s == Some(true)).count())
-    });
-    let mut values = errors
-        .into_iter()
-        .filter_map(|(error, _)| error)
-        .collect::<Vec<_>>();
+    let invalid = errors.iter().filter(|error| error.is_none()).count();
+    let mut values = errors.into_iter().flatten().collect::<Vec<_>>();
     values.sort_by(f64::total_cmp);
     let finite_samples = values.len();
     // Scale before squaring so a finite but large field error cannot overflow
@@ -86,7 +64,6 @@ fn stats(errors: Vec<(Option<f64>, Option<bool>)>) -> Option<FieldStats> {
         invalid,
         finite_samples,
         finite_only_vector_rmse,
-        residual_supported,
         vector_rmse: metrics.map(|m| m.0),
         median_error: metrics.map(|m| m.1),
         p90_error: metrics.map(|m| m.2),
@@ -94,14 +71,13 @@ fn stats(errors: Vec<(Option<f64>, Option<bool>)>) -> Option<FieldStats> {
     })
 }
 
-/// Score identical battlefield grid centers for all models, splitting by cells visited
-/// by completed, timed trajectory segments. An unavailable model returns None.
+/// Score the belief's physical-planet field on battlefield grid centers, splitting by cells visited
+/// by completed, timed trajectory segments.
 pub fn score_field(
     truth: &PlanetMap,
     belief: &MapBelief,
     observations: &[ShotObservation],
     world: WorldParameters,
-    model: FieldModel,
 ) -> Option<FieldScore> {
     if !world.battlefield_width.is_finite()
         || !world.battlefield_height.is_finite()
@@ -115,38 +91,6 @@ pub fn score_field(
         let timed = &shot.points[..shot.points.len().saturating_sub(1)];
         explored_cells.extend(path_cells(timed));
     }
-    let provisional = match model {
-        FieldModel::Provisional | FieldModel::ProvisionalSourceOnly => {
-            Some(belief.provisional_field_hypothesis.as_ref()?)
-        }
-        _ => None,
-    };
-    let provisional_residual = provisional
-        .filter(|_| matches!(model, FieldModel::Provisional))
-        .map(|p| {
-            let mut sources = belief.map.clone();
-            sources.planets.push(Planet {
-                x: p.source.x,
-                y: p.source.y,
-                mass: p.source.mass,
-                radius: 0.0,
-            });
-            LocalField::from_observations(&sources, observations)
-        });
-    let (residual, hypothesis) = match model {
-        FieldModel::Physical => (None, None),
-        FieldModel::NoSource => (Some(&belief.local_field), None),
-        FieldModel::Validated => (
-            Some(belief.hypothesis_local_field.as_ref()?),
-            Some(belief.field_hypothesis.as_ref()?),
-        ),
-        FieldModel::ValidatedSourceOnly => (None, Some(belief.field_hypothesis.as_ref()?)),
-        FieldModel::Provisional => (
-            provisional_residual.as_ref(),
-            provisional.map(|p| &p.source),
-        ),
-        FieldModel::ProvisionalSourceOnly => (None, provisional.map(|p| &p.source)),
-    };
     let mut inside = 0;
     let mut explored = Vec::new();
     let mut unexplored = Vec::new();
@@ -170,18 +114,15 @@ pub fn score_field(
                 continue;
             }
             let error = truth.acceleration(position).ok().and_then(|actual| {
-                field_acceleration(&belief.map, residual, hypothesis, position)
-                    .ok()
-                    .and_then(|estimate| {
-                        let error = (actual.x - estimate.x).hypot(actual.y - estimate.y);
-                        error.is_finite().then_some(error)
-                    })
+                belief.map.acceleration(position).ok().and_then(|estimate| {
+                    let error = (actual.x - estimate.x).hypot(actual.y - estimate.y);
+                    error.is_finite().then_some(error)
+                })
             });
-            let support = residual.map(|field| field.residual(position).is_some());
             if explored_cells.contains(&(x, y)) {
-                explored.push((error, support));
+                explored.push(error);
             } else {
-                unexplored.push((error, support));
+                unexplored.push(error);
             }
         }
     }
@@ -189,7 +130,6 @@ pub fn score_field(
     let unexplored_cells = unexplored.len();
     let whole = explored.iter().chain(&unexplored).copied().collect();
     Some(FieldScore {
-        model,
         explored_cells,
         unexplored_cells,
         explored: stats(explored),

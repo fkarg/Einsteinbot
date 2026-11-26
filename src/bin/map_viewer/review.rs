@@ -124,91 +124,22 @@ fn observed_shots(events: Vec<(i64, Value)>) -> Vec<ObservedShot> {
     shots
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum Model {
-    /// Fitted planets only.
-    Physical,
-    /// Fitted planets plus the observed local residual correction.
-    Local,
-    /// Fitted planets plus the field-only source and its matched residual.
-    Hypothesis,
-}
-
-impl Model {
-    fn key(self) -> &'static str {
-        match self {
-            Self::Physical => "physical",
-            Self::Local => "local",
-            Self::Hypothesis => "hypothesis",
-        }
-    }
-    fn label(self) -> &'static str {
-        match self {
-            Self::Physical => "Fitted planets only",
-            Self::Local => "Planets + residual correction",
-            Self::Hypothesis => "Planets + field-only source",
-        }
-    }
-}
-
-/// The model the bot's own search used for this decision.
-fn model_used(data: &Value) -> Model {
-    if data["choice"]["used_field_hypothesis"].as_bool() == Some(true) {
-        Model::Hypothesis
-    } else if local_field_recorded(data) {
-        Model::Local
-    } else {
-        Model::Physical
-    }
-}
-
-/// Older records may lack the residual correction entirely; that is not an empty correction.
-fn local_field_recorded(data: &Value) -> bool {
-    !data["map_belief"]["local_field"].is_null()
-}
-
-/// Simulates `shot` under a recorded belief; `Ok(None)` when the belief lacks what the model needs.
+/// Simulates `shot` on `map`, the fitted planets of a recorded belief.
 fn predict(
-    belief: &MapBelief,
     map: &PlanetMap,
-    model: Model,
     shot: &ShotObservation,
     players: &[(u32, Vec2)],
     samples: usize,
-) -> Result<Option<PredictedTrajectory>, String> {
-    let world = WorldParameters::default();
+) -> Result<PredictedTrajectory, String> {
     let samples = samples.clamp(3, MAX_SAMPLES);
-    Ok(Some(match model {
-        Model::Physical => {
-            simulate_targeting_shot(map, shot, world, samples, players, PLAYER_RADIUS)?
-        }
-        Model::Local => simulate_targeting_shot_with_local_field(
-            map,
-            &belief.local_field,
-            shot,
-            world,
-            samples,
-            players,
-            PLAYER_RADIUS,
-        )?,
-        Model::Hypothesis => {
-            let (Some(hypothesis), Some(field)) =
-                (&belief.field_hypothesis, &belief.hypothesis_local_field)
-            else {
-                return Ok(None);
-            };
-            simulate_targeting_shot_with_hypothesis(
-                map,
-                field,
-                hypothesis,
-                shot,
-                world,
-                samples,
-                players,
-                PLAYER_RADIUS,
-            )?
-        }
-    }))
+    simulate_targeting_shot(
+        map,
+        shot,
+        WorldParameters::default(),
+        samples,
+        players,
+        PLAYER_RADIUS,
+    )
 }
 
 struct PathScore {
@@ -325,7 +256,6 @@ pub fn shot_review(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Result<
         "predicted_hit": choice["predicted_hit"],
         "predicted_victim": choice["predicted_victim"],
         "miss_distance": choice["miss_distance"],
-        "used_field_hypothesis": choice["used_field_hypothesis"],
     });
     let (Some(velocity), Some(angle)) = (
         choice["velocity"].as_f64(),
@@ -385,38 +315,19 @@ pub fn shot_review(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Result<
         .map(|b| b.map.planets.clone())
         .unwrap_or_default();
     let observation = shot.observation();
-    let used = model_used(&data);
     let samples = shot.points.len() + 2;
     let mut variants = Vec::new();
     let mut divergence = Value::Null;
     if let Some(belief) = &belief {
-        for model in [Model::Physical, Model::Local, Model::Hypothesis] {
-            let predicted = if model == Model::Local && !local_field_recorded(&data) {
-                None
-            } else {
-                predict(
-                    belief,
-                    &belief.map,
-                    model,
-                    &observation,
-                    &shot.players,
-                    samples,
-                )?
-            };
-            variants.push(variant_json(
-                model.key(),
-                model.label(),
-                model == used,
-                predicted.as_ref(),
-                &shot.points,
-            ));
-            if model == used
-                && let Some(predicted) = &predicted
-            {
-                divergence =
-                    divergence_json(&shot.points, predicted, &belief_planets, actual.as_deref());
-            }
-        }
+        let predicted = predict(&belief.map, &observation, &shot.players, samples)?;
+        variants.push(variant_json(
+            "physical",
+            "Fitted planets only",
+            true,
+            Some(&predicted),
+            &shot.points,
+        ));
+        divergence = divergence_json(&shot.points, &predicted, &belief_planets, actual.as_deref());
         if let Some(planets) = &actual {
             let map = PlanetMap {
                 planets: planets.clone(),
@@ -441,7 +352,7 @@ pub fn shot_review(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Result<
     let repairs = if want_repairs {
         match (&belief, &actual) {
             (Some(belief), Some(actual)) => {
-                repair_experiments(belief, actual, &observation, &shot.players, used, samples)?
+                repair_experiments(belief, actual, &observation, &shot.players, samples)?
             }
             _ => json!({"error": "repairs need a recorded belief and a disclosed map"}),
         }
@@ -523,13 +434,14 @@ fn repair_experiments(
     actual: &[Planet],
     observation: &ShotObservation,
     players: &[(u32, Vec2)],
-    model: Model,
     samples: usize,
 ) -> Result<Value, String> {
     let rmse_with = |map: &PlanetMap| -> Result<Option<f64>, String> {
-        Ok(predict(belief, map, model, observation, players, samples)?
-            .and_then(|predicted| score_path(&observation.points, &predicted))
-            .map(|score| score.rmse))
+        Ok(score_path(
+            &observation.points,
+            &predict(map, observation, players, samples)?,
+        )
+        .map(|score| score.rmse))
     };
     let baseline = rmse_with(&belief.map)?;
     let pairs = match_planets(&belief.map.planets, actual);
@@ -574,7 +486,7 @@ fn repair_experiments(
         "baseline_rmse": baseline,
         "all_repaired_rmse": rmse_with(&all)?,
         "rows": rows,
-        "note": "Model sensitivity, not proof of cause: each row changes one planet of the recorded belief and keeps its residual correction.",
+        "note": "Model sensitivity, not proof of cause: each row changes one planet of the recorded belief.",
     }))
 }
 
@@ -626,14 +538,13 @@ pub fn predictive_error(
             decisions.push(json!({"sequence": sequence, "shots": 0, "median_rmse": null, "status": "no_belief"}));
             continue;
         };
-        let model = model_used(&data);
         // Shots after a new disclosed map belong to another map epoch.
         let epoch_end = planets_sequences
             .iter()
             .copied()
             .find(|planets| *planets > sequence);
         let mut errors = Vec::new();
-        let (mut later_shots, mut modelled) = (0, 0);
+        let mut later_shots = 0;
         for shot in shots
             .iter()
             .filter(|shot| shot.begin_sequence > sequence)
@@ -642,23 +553,18 @@ pub fn predictive_error(
         {
             later_shots += 1;
             let predicted = predict(
-                &belief,
                 &belief.map,
-                model,
                 &shot.observation(),
                 &shot.players,
                 shot.points.len() + 2,
             )?;
-            modelled += usize::from(predicted.is_some());
-            if let Some(score) = predicted.and_then(|p| score_path(&shot.points, &p)) {
+            if let Some(score) = score_path(&shot.points, &predicted) {
                 errors.push(score.rmse);
             }
         }
         errors.sort_by(f64::total_cmp);
         let status = if later_shots == 0 {
             "no_later_shots"
-        } else if modelled == 0 {
-            "model_unavailable"
         } else if errors.is_empty() {
             "too_short_to_score"
         } else {

@@ -1,11 +1,8 @@
 //! Read-only local inspector for recorded targeting decisions.
-use einsteinbot::field_hypothesis::FieldHypothesis;
-use einsteinbot::local_field::LocalField;
 use einsteinbot::map::{PlanetMap, Vec2};
 use einsteinbot::protocol::{Planet, Point, RecordedEvent, ServerEvent};
 use einsteinbot::simulation::{
     ShotObservation, Termination, WorldParameters, simulate_shot, simulate_targeting_shot,
-    simulate_targeting_shot_with_hypothesis, simulate_targeting_shot_with_local_field,
 };
 use einsteinbot::strategy::{
     BotState, FieldEvidence, MapBelief, ShotChoice, TargetingPolicy, TargetingSettings,
@@ -668,19 +665,7 @@ fn selected_snapshot(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Resul
     let events = read_events_before(&connection, capture_id, sequence.saturating_add(1))?;
     let actual_planets = latest_actual_planets(&events);
     let display_field = parameters.get("field").copied().unwrap_or("delta");
-    if ![
-        "delta",
-        "total",
-        "physical",
-        "residual",
-        "oracle",
-        "hypothesis_source",
-        "hypothesis_residual",
-        "hypothesis_total",
-        "hypothesis_delta",
-    ]
-    .contains(&display_field)
-    {
+    if !["delta", "total", "physical", "oracle"].contains(&display_field) {
         return Err("unknown vector field".to_owned());
     }
     let grid_step = parameters.get("step").map_or(Ok(FIELD_GRID_STEP), |step| {
@@ -854,28 +839,7 @@ fn decode_belief(value: &Value) -> Result<Option<MapBelief>, String> {
         .map_err(|error| format!("invalid captured planets: {error}"))?;
     let map = PlanetMap { planets };
     let mut belief = MapBelief::new(map, None);
-    if let Some(samples) = value.get("local_field") {
-        belief.local_field = serde_json::from_value::<LocalField>(samples.clone())
-            .map_err(|error| format!("invalid captured local field: {error}"))?;
-    }
-    if let Some(hypothesis) = value
-        .get("field_hypothesis")
-        .filter(|value| !value.is_null())
-    {
-        belief.field_hypothesis = Some(
-            serde_json::from_value::<FieldHypothesis>(hypothesis.clone())
-                .map_err(|error| format!("invalid captured field hypothesis: {error}"))?,
-        );
-    }
-    if let Some(field) = value
-        .get("hypothesis_local_field")
-        .filter(|value| !value.is_null())
-    {
-        belief.hypothesis_local_field = Some(
-            serde_json::from_value::<LocalField>(field.clone())
-                .map_err(|error| format!("invalid hypothesis local field: {error}"))?,
-        );
-    }
+    // Captures from before the residual removal may carry local_field / field_hypothesis keys; ignored.
     belief.parameter_covariance = matrix_from_json(&value["covariance"]);
     belief.approximate_parameter_covariance = matrix_from_json(&value["approximate_covariance"]);
     if let (Some(resolution), Some(parameter_to_physical)) = (
@@ -960,49 +924,11 @@ fn make_field_grid(
                 continue;
             };
             let physical = belief.map.acceleration(position).ok();
-            let residual_observed = belief.local_field.residual(position);
-            let has_residual = residual_observed.is_some();
-            let residual = residual_observed.unwrap_or_default();
-            let gravity =
-                physical.map(|physical| (physical.x + residual.x, physical.y + residual.y));
+            let gravity = physical.map(|physical| (physical.x, physical.y));
             let actual_vector = actual_map
                 .as_ref()
                 .and_then(|map| map.acceleration(position).ok());
             let delta = gravity
-                .zip(actual_vector)
-                .map(|(estimate, oracle)| (estimate.0 - oracle.x, estimate.1 - oracle.y));
-            let wants_source = matches!(
-                display_field,
-                "hypothesis_source" | "hypothesis_total" | "hypothesis_delta"
-            );
-            let wants_hypothesis_residual = matches!(
-                display_field,
-                "hypothesis_residual" | "hypothesis_total" | "hypothesis_delta"
-            );
-            let hypothesis_source = wants_source
-                .then(|| {
-                    belief
-                        .field_hypothesis
-                        .as_ref()
-                        .and_then(|hypothesis| hypothesis.acceleration(position))
-                })
-                .flatten();
-            let hypothesis_residual = wants_hypothesis_residual
-                .then(|| {
-                    belief
-                        .hypothesis_local_field
-                        .as_ref()
-                        .and_then(|field| field.residual(position))
-                })
-                .flatten();
-            let hypothesis_total = physical.zip(hypothesis_source).map(|(physical, source)| {
-                let residual = hypothesis_residual.unwrap_or_default();
-                (
-                    physical.x + source.x + residual.x,
-                    physical.y + source.y + residual.y,
-                )
-            });
-            let hypothesis_delta = hypothesis_total
                 .zip(actual_vector)
                 .map(|(estimate, oracle)| (estimate.0 - oracle.x, estimate.1 - oracle.y));
             let sigma = covariance
@@ -1015,12 +941,7 @@ fn make_field_grid(
                 "delta" => delta,
                 "total" => gravity,
                 "physical" => physical.map(|v| (v.x, v.y)),
-                "residual" => residual_observed.map(|v| (v.x, v.y)),
                 "oracle" => actual_vector.map(|v| (v.x, v.y)),
-                "hypothesis_source" => hypothesis_source.map(|v| (v.x, v.y)),
-                "hypothesis_residual" => hypothesis_residual.map(|v| (v.x, v.y)),
-                "hypothesis_total" => hypothesis_total,
-                "hypothesis_delta" => hypothesis_delta,
                 _ => unreachable!("display field is validated by selected_snapshot"),
             };
             samples.push(json!([
@@ -1032,13 +953,13 @@ fn make_field_grid(
                 gravity.map(|v| v.1),
                 physical.map(|v| v.x),
                 physical.map(|v| v.y),
-                residual.x,
-                residual.y,
+                Option::<f64>::None,
+                Option::<f64>::None,
                 actual_vector.map(|v| v.x),
                 actual_vector.map(|v| v.y),
                 sigma,
-                has_residual,
-                belief.model_disagreement_at(position),
+                false,
+                Option::<f64>::None,
                 belief.evidence_availability_at(position),
                 approximate_sigma
             ]));
@@ -1119,11 +1040,11 @@ fn simulate_request(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Result
         "actual" => PlanetMap {
             planets: actual.ok_or("this capture has no disclosed planet map at this decision")?,
         },
-        "belief" | "hypothesis" => belief
+        "belief" => belief
             .as_ref()
             .map(|belief| belief.map.clone())
             .unwrap_or(PlanetMap { planets: vec![] }),
-        _ => return Err("model must be belief, hypothesis, or actual".to_owned()),
+        _ => return Err("model must be belief or actual".to_owned()),
     };
     let shot = ShotObservation {
         player_id: own_id,
@@ -1131,51 +1052,14 @@ fn simulate_request(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Result
         velocity,
         points: vec![start],
     };
-    let result = match model {
-        "hypothesis" => {
-            let belief = belief.as_ref().ok_or("belief is unavailable")?;
-            let hypothesis = belief
-                .field_hypothesis
-                .as_ref()
-                .ok_or("field hypothesis is unavailable")?;
-            let field = belief
-                .hypothesis_local_field
-                .as_ref()
-                .ok_or("hypothesis local field is unavailable")?;
-            simulate_targeting_shot_with_hypothesis(
-                &map,
-                field,
-                hypothesis,
-                &shot,
-                WorldParameters::default(),
-                180,
-                &players,
-                PLAYER_RADIUS,
-            )
-        }
-        "belief" => {
-            let empty = LocalField::default();
-            let field = belief.as_ref().map_or(&empty, |belief| &belief.local_field);
-            simulate_targeting_shot_with_local_field(
-                &map,
-                field,
-                &shot,
-                WorldParameters::default(),
-                180,
-                &players,
-                PLAYER_RADIUS,
-            )
-        }
-        "actual" => simulate_targeting_shot(
-            &map,
-            &shot,
-            WorldParameters::default(),
-            180,
-            &players,
-            PLAYER_RADIUS,
-        ),
-        _ => unreachable!(),
-    }
+    let result = simulate_targeting_shot(
+        &map,
+        &shot,
+        WorldParameters::default(),
+        180,
+        &players,
+        PLAYER_RADIUS,
+    )
     .map_err(|error| error.to_string())?;
     Ok(json!({
         "model": model,
@@ -1623,7 +1507,7 @@ mod tests {
 
     #[test]
     fn field_grid_returns_compact_rows_for_the_selected_layer() {
-        let data = json!({"map_belief":{"planets":[],"local_field":{"samples":[]}}});
+        let data = json!({"map_belief":{"planets":[]}});
         let actual = [];
         let grid = make_field_grid(
             &data,
@@ -1643,7 +1527,7 @@ mod tests {
         assert_eq!(sample[2], 0.0);
         assert_eq!(sample[3], 0.0);
         assert_eq!(sample[13], false);
-        // No validated field-only source: model disagreement is unavailable, not zero.
+        // Residual/model-disagreement slots are retained for the web client and always unavailable.
         assert!(sample[14].is_null());
         // No recorded field evidence (older captures): availability is unavailable, not zero.
         assert!(sample[15].is_null());
@@ -1656,7 +1540,6 @@ mod tests {
         let data = json!({
             "map_belief": {
                 "planets": [{"x": 10.0, "y": 0.0, "radius": 2.0, "mass": 50.0}],
-                "local_field": {"samples": []},
                 "approximate_covariance": identity
             }
         });
@@ -1679,7 +1562,6 @@ mod tests {
         let data = json!({
             "map_belief": {
                 "planets": [planet],
-                "local_field": {"samples": []},
                 "field_evidence": {"resolution": identity, "parameter_to_physical": identity}
             }
         });
@@ -1700,36 +1582,17 @@ mod tests {
     }
 
     #[test]
-    fn field_grid_can_select_a_field_only_hypothesis_vector() {
+    fn captures_with_removed_residual_fields_still_decode_and_ignore_them() {
         let data = json!({
             "map_belief": {
-                "planets": [],
-                "local_field": {"samples": []},
-                "field_hypothesis": {
-                    "x": 5.0,
-                    "y": 5.0,
-                    "mass": 100.0,
-                    "support": [],
-                    "baseline_continuation_rmse": 10.0,
-                    "continuation_rmse": 1.0
-                }
+                "planets": [{"x": 10.0, "y": 0.0, "radius": 2.0, "mass": 50.0}],
+                "local_field": {"samples": [{"x": 1.0}]},
+                "field_hypothesis": {"x": 5.0, "y": 5.0, "mass": 100.0},
+                "provisional_field_hypothesis": null,
+                "hypothesis_local_field": {"samples": []}
             }
         });
-        let grid = make_field_grid(
-            &data,
-            None,
-            1,
-            Viewport {
-                x: 0.0,
-                y: 0.0,
-                width: 1.0,
-                height: 1.0,
-            },
-            "hypothesis_source",
-        )
-        .unwrap();
-        let sample = &grid["samples"][0];
-        assert!(sample[2].as_f64().is_some_and(|x| x > 0.0));
-        assert!(sample[3].as_f64().is_some_and(|y| y > 0.0));
+        let belief = decode_belief(&data["map_belief"]).unwrap().unwrap();
+        assert_eq!(belief.map.planets.len(), 1);
     }
 }
