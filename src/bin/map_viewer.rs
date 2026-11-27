@@ -28,6 +28,8 @@ const DEFAULT_PORT: u16 = 8765;
 const PLAYER_RADIUS: f64 = 4.0;
 const FIELD_GRID_STEP: usize = 3;
 const MAX_FIELD_SAMPLES: usize = 300_000;
+/// Drawn paths keep the points farther than this many world units from their simplified line.
+const PATH_THINNING: f64 = 0.5;
 /// Largest center distance at which an estimated planet may be paired with a disclosed one.
 const MATCH_DISTANCE: f64 = 80.0;
 
@@ -773,16 +775,13 @@ fn selected_snapshot(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Resul
     };
     let events = read_events_before(&connection, capture_id, sequence.saturating_add(1))?;
     let actual_planets = latest_actual_planets(&events);
-    let display_field = parameters.get("field").copied().unwrap_or("delta");
-    if !["delta", "total", "physical", "oracle"].contains(&display_field) {
-        return Err("unknown vector field".to_owned());
-    }
+    // `field` is accepted and ignored for older clients; every channel is always returned.
     let grid_step = parameters.get("step").map_or(Ok(FIELD_GRID_STEP), |step| {
         step.parse::<usize>()
             .map_err(|_| "invalid grid step".to_owned())
     })?;
-    if ![1, 2, 3, 5, 10, 25].contains(&grid_step) {
-        return Err("grid step must be 1, 2, 3, 5, 10, or 25 world units".to_owned());
+    if !(1..=25).contains(&grid_step) {
+        return Err("grid step must be 1 to 25 world units".to_owned());
     }
     let world = WorldParameters::default();
     let view = Viewport {
@@ -812,13 +811,7 @@ fn selected_snapshot(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Resul
             "viewport at {grid_step}-unit spacing requests {sample_count} samples; zoom in or choose a coarser grid"
         ));
     }
-    let field_grid = make_field_grid(
-        &data,
-        actual_planets.as_deref(),
-        grid_step,
-        view,
-        display_field,
-    )?;
+    let field_grid = make_field_grid(&data, actual_planets.as_deref(), grid_step, view)?;
     let roles = scenario::ShotRoles::load(&connection, capture_id)?;
     let selected_shot = selection.strip_prefix("event:").and_then(|_| {
         events
@@ -839,28 +832,42 @@ fn selected_snapshot(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Resul
         .rev()
         .find(|(_, record)| record["event"]["type"] == "planets")
         .map_or(0, |(sequence, _)| *sequence);
-    let trajectories = events
+    // Every path of the current map epoch, thinned for drawing, with its inferred outcome.
+    let with_residuals = parameters.get("residuals") == Some(&"1");
+    let belief_planets = trace_map
+        .as_ref()
+        .map_or(&[][..], |map| map.planets.as_slice());
+    let outcomes = review::path_outcomes(&events, belief_planets, actual_planets.as_deref());
+    let paths = events
         .iter()
-        .filter(|(_, record)| record["event"]["type"] == "shot_fin")
-        .rev()
-        .take(60)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
+        .filter(|(sequence, record)| {
+            *sequence > map_epoch_start && record["event"]["type"] == "shot_fin"
+        })
         .map(|(sequence, record)| {
-            let points = serde_json::from_value::<Vec<Point>>(record["event"]["points"].clone())
-                .unwrap_or_default();
+            let event = &record["event"];
+            let points =
+                serde_json::from_value::<Vec<Point>>(event["points"].clone()).unwrap_or_default();
             let residual_samples = trace_map
                 .as_ref()
-                .map(|map| {
-                    trajectory_residual_samples_in_epoch(*sequence, map_epoch_start, &points, map)
-                })
+                .filter(|_| with_residuals)
+                .map(|map| trajectory_residual_samples(&points, map))
                 .unwrap_or_default();
+            let thinned = thin_path(&points, PATH_THINNING)
+                .iter()
+                .flat_map(|point| {
+                    [point.x, point.y].map(|value| (f64::from(value) * 10.0).round() / 10.0)
+                })
+                .collect::<Vec<_>>();
             json!({
                 "sequence": sequence,
-                "record": record,
+                "player_id": event["player_id"],
+                "velocity": event["velocity"],
+                "angle": event["angle"],
+                "samples": points.len(),
+                "points": thinned,
+                "outcome": outcomes.get(sequence).copied().unwrap_or("unknown"),
                 "residual_samples": residual_samples,
-                "label": roles.label(*sequence, &record["event"]),
+                "label": roles.label(*sequence, event),
             })
         })
         .collect::<Vec<_>>();
@@ -891,7 +898,7 @@ fn selected_snapshot(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Resul
         "diagnostic_sequence": diagnostic_sequence,
         "selected_shot": selected_shot,
         "selection_kind": if is_decision {"decision"} else if selection.starts_with("event:") {"timeline_event"} else {"latest_capture_state"},
-        "events": trajectories,
+        "paths": paths,
         "actual_planets": actual_planets,
         "planet_match": planet_match,
         "world": world_state(&events, data["bot_state"]["own_id"].as_u64()),
@@ -963,12 +970,16 @@ fn decode_belief(value: &Value) -> Result<Option<MapBelief>, String> {
     Ok(Some(belief))
 }
 
+/// The field grid over `view` at `grid_step` spacing, row-major from (`origin_x`, `origin_y`),
+/// as base64 little-endian f32 channels (`NaN` where a value is unavailable): `gravity_x/y` (the
+/// belief's planets), `truth_x/y` (the disclosed map) and `sigma` (field σ from the fit
+/// covariance). A channel is null when it has no value anywhere (no belief, no truth map, no
+/// covariance).
 fn make_field_grid(
     data: &Value,
     actual: Option<&[Planet]>,
     grid_step: usize,
     view: Viewport,
-    display_field: &str,
 ) -> Result<Value, String> {
     let belief = decode_belief(&data["map_belief"])?;
     let covariance = belief
@@ -978,69 +989,55 @@ fn make_field_grid(
         planets: planets.to_vec(),
     });
     let world = WorldParameters::default();
-    let mut samples = Vec::new();
     let start_x = (view.x as usize / grid_step) * grid_step;
     let start_y = (view.y as usize / grid_step) * grid_step;
     let end_x = (view.x + view.width).ceil() as usize;
     let end_y = (view.y + view.height).ceil() as usize;
+    let mut channels: [Vec<f32>; 5] = Default::default();
     for y in (start_y..=end_y).step_by(grid_step) {
         for x in (start_x..=end_x).step_by(grid_step) {
             let position = Vec2::new(x as f64, y as f64);
-            let Some(belief) = &belief else {
-                let oracle = actual_map
-                    .as_ref()
-                    .and_then(|map| map.acceleration(position).ok());
-                let selected = (display_field == "oracle").then_some(oracle).flatten();
-                samples.push(json!([
-                    x,
-                    y,
-                    selected.map(|v| v.x),
-                    selected.map(|v| v.y),
-                    Option::<f64>::None,
-                    Option::<f64>::None,
-                    Option::<f64>::None,
-                    Option::<f64>::None,
-                    oracle.map(|v| v.x),
-                    oracle.map(|v| v.y),
-                    Option::<f64>::None
-                ]));
-                continue;
-            };
-            let physical = belief.map.acceleration(position).ok();
-            let gravity = physical.map(|physical| (physical.x, physical.y));
-            let actual_vector = actual_map
+            let gravity = belief
+                .as_ref()
+                .and_then(|belief| belief.map.acceleration(position).ok());
+            let truth = actual_map
                 .as_ref()
                 .and_then(|map| map.acceleration(position).ok());
-            let delta = gravity
-                .zip(actual_vector)
-                .map(|(estimate, oracle)| (estimate.0 - oracle.x, estimate.1 - oracle.y));
-            let sigma = covariance
-                .and_then(|matrix| belief.map.acceleration_covariance(position, matrix).ok())
-                .map(|covariance| (covariance.xx + covariance.yy).max(0.0).sqrt());
-            let selected = match display_field {
-                "delta" => delta,
-                "total" => gravity,
-                "physical" => physical.map(|v| (v.x, v.y)),
-                "oracle" => actual_vector.map(|v| (v.x, v.y)),
-                _ => unreachable!("display field is validated by selected_snapshot"),
-            };
-            samples.push(json!([
-                x,
-                y,
-                selected.map(|v| v.0),
-                selected.map(|v| v.1),
-                gravity.map(|v| v.0),
-                gravity.map(|v| v.1),
-                physical.map(|v| v.x),
-                physical.map(|v| v.y),
-                actual_vector.map(|v| v.x),
-                actual_vector.map(|v| v.y),
-                sigma
-            ]));
+            let sigma = belief
+                .as_ref()
+                .zip(covariance)
+                .and_then(|(belief, matrix)| {
+                    belief
+                        .map
+                        .acceleration_covariance(position, matrix)
+                        .ok()
+                        .map(|covariance| (covariance.xx + covariance.yy).max(0.0).sqrt())
+                });
+            let values = [
+                gravity.map(|v| v.x),
+                gravity.map(|v| v.y),
+                truth.map(|v| v.x),
+                truth.map(|v| v.y),
+                sigma,
+            ];
+            for (channel, value) in channels.iter_mut().zip(values) {
+                channel.push(value.map_or(f32::NAN, |value| value as f32));
+            }
         }
     }
+    let [gravity_x, gravity_y, truth_x, truth_y, sigma] = channels.map(|channel| {
+        if channel.iter().any(|value| value.is_finite()) {
+            json!(base64_f32(&channel))
+        } else {
+            Value::Null
+        }
+    });
     Ok(json!({
-        "samples": samples,
+        "gravity_x": gravity_x,
+        "gravity_y": gravity_y,
+        "truth_x": truth_x,
+        "truth_y": truth_y,
+        "sigma": sigma,
         "width": world.battlefield_width,
         "height": world.battlefield_height,
         "step": grid_step,
@@ -1051,6 +1048,70 @@ fn make_field_grid(
         "has_covariance": covariance.is_some(),
         "has_belief": belief.is_some(),
     }))
+}
+
+/// Standard base64 (with padding) of `values` as little-endian f32 bytes.
+fn base64_f32(values: &[f32]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes: Vec<u8> = values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let word = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        for (index, shift) in [18, 12, 6, 0].into_iter().enumerate() {
+            out.push(if index <= chunk.len() {
+                char::from(ALPHABET[(word >> shift) as usize & 63])
+            } else {
+                '='
+            });
+        }
+    }
+    out
+}
+
+/// The polyline with points farther than `tolerance` world units from the simplified line kept
+/// (Ramer-Douglas-Peucker), always with the first and last point.
+fn thin_path(points: &[Point], tolerance: f64) -> Vec<Point> {
+    if points.len() <= 2 {
+        return points.to_vec();
+    }
+    let mut keep = vec![false; points.len()];
+    keep[0] = true;
+    keep[points.len() - 1] = true;
+    let mut stack = vec![(0, points.len() - 1)];
+    let coordinates = |point: &Point| (f64::from(point.x), f64::from(point.y));
+    while let Some((first, last)) = stack.pop() {
+        let (ax, ay) = coordinates(&points[first]);
+        let (bx, by) = coordinates(&points[last]);
+        let (dx, dy) = (bx - ax, by - ay);
+        let length = dx.hypot(dy);
+        let mut farthest = (0.0, first);
+        for (index, point) in points.iter().enumerate().take(last).skip(first + 1) {
+            let (px, py) = coordinates(point);
+            let distance = if length > 0.0 {
+                ((px - ax) * dy - (py - ay) * dx).abs() / length
+            } else {
+                (px - ax).hypot(py - ay)
+            };
+            if distance > farthest.0 {
+                farthest = (distance, index);
+            }
+        }
+        if farthest.0 > tolerance {
+            keep[farthest.1] = true;
+            stack.push((first, farthest.1));
+            stack.push((farthest.1, last));
+        }
+    }
+    points
+        .iter()
+        .zip(keep)
+        .filter_map(|(point, keep)| keep.then(|| point.clone()))
+        .collect()
 }
 
 fn trajectory_residual_samples(points: &[Point], map: &PlanetMap) -> Vec<[f64; 4]> {
@@ -1066,19 +1127,6 @@ fn trajectory_residual_samples(points: &[Point], map: &PlanetMap) -> Vec<[f64; 4
             ])
         })
         .collect()
-}
-
-fn trajectory_residual_samples_in_epoch(
-    sequence: i64,
-    map_epoch_start: i64,
-    points: &[Point],
-    map: &PlanetMap,
-) -> Vec<[f64; 4]> {
-    if sequence > map_epoch_start {
-        trajectory_residual_samples(points, map)
-    } else {
-        Vec::new()
-    }
 }
 
 fn simulate_request(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Result<Value, String> {
@@ -1562,45 +1610,43 @@ mod tests {
     }
 
     #[test]
-    fn trajectory_residual_samples_do_not_cross_planet_map_epochs() {
-        let map = PlanetMap { planets: vec![] };
-        let points = vec![
-            Point { x: 1.0, y: 2.0 },
-            Point { x: 2.0, y: 4.0 },
-            Point { x: 3.0, y: 6.0 },
-            Point { x: 4.0, y: 8.0 },
-            Point { x: 5.0, y: 10.0 },
-        ];
-        assert!(trajectory_residual_samples_in_epoch(9, 10, &points, &map).is_empty());
+    fn field_grid_returns_binary_channels_and_null_for_unavailable_ones() {
+        let data =
+            json!({"map_belief":{"planets":[{"x": 10.0, "y": 0.0, "radius": 2.0, "mass": 50.0}]}});
+        let view = Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+        };
+        let grid = make_field_grid(&data, None, 1, view).unwrap();
         assert_eq!(
-            trajectory_residual_samples_in_epoch(11, 10, &points, &map).len(),
-            2
+            (grid["columns"].as_u64(), grid["rows"].as_u64()),
+            (Some(2), Some(2))
         );
+        // 4 f32 values = 16 bytes = 24 base64 characters.
+        assert_eq!(grid["gravity_x"].as_str().unwrap().len(), 24);
+        // No truth map and no covariance: unavailable, not zero.
+        assert!(grid["truth_x"].is_null());
+        assert!(grid["sigma"].is_null());
     }
 
     #[test]
-    fn field_grid_returns_compact_rows_for_the_selected_layer() {
-        let data = json!({"map_belief":{"planets":[]}});
-        let actual = [];
-        let grid = make_field_grid(
-            &data,
-            Some(&actual),
-            1,
-            Viewport {
-                x: 0.0,
-                y: 0.0,
-                width: 1.0,
-                height: 1.0,
-            },
-            "delta",
-        )
-        .unwrap();
-        let sample = &grid["samples"][0];
-        assert_eq!(sample.as_array().unwrap().len(), 11);
-        assert_eq!(sample[2], 0.0);
-        assert_eq!(sample[3], 0.0);
-        // No covariance: field sigma is unavailable, not zero.
-        assert!(sample[10].is_null());
+    fn base64_f32_matches_the_standard_encoding() {
+        // 1.0f32 is 00 00 80 3f little-endian.
+        assert_eq!(base64_f32(&[1.0]), "AACAPw==");
+        assert_eq!(base64_f32(&[1.0, 1.0]), "AACAPwAAgD8=");
+    }
+
+    #[test]
+    fn path_thinning_keeps_ends_and_corners_and_drops_collinear_points() {
+        let points = [(0.0, 0.0), (1.0, 0.0), (2.0, 0.0), (3.0, 3.0), (4.0, 6.0)]
+            .map(|(x, y)| Point { x, y });
+        let thinned = thin_path(&points, 0.5);
+        assert_eq!(
+            thinned.iter().map(|p| (p.x, p.y)).collect::<Vec<_>>(),
+            [(0.0, 0.0), (2.0, 0.0), (4.0, 6.0)]
+        );
     }
 
     #[test]
