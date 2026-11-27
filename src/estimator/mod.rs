@@ -227,6 +227,9 @@ pub struct EstimatorSummary {
     /// fitted count).
     pub unseen: f64,
     pub expected_total: f64,
+    /// The most probable total count: the known one, else the prior's mode given `N >= K`
+    /// (`max(K, 24)`). The data say no more about the count than that `K` were found.
+    pub likely_total: usize,
     /// Near cutoff of the latest path's noise (`None` before the first path).
     pub rho0: Option<f64>,
 }
@@ -395,6 +398,7 @@ impl Estimator {
             model: ResidualModel::new(self.model, self.settings.planets),
             unseen,
             expected_total: planets as f64 + unseen,
+            likely_total: noise::likely_total(planets, self.settings.planets),
             rho0: self.last_rho0,
         }
     }

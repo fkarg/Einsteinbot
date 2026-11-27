@@ -382,8 +382,9 @@ pub fn settled_report(settled: &Settled, truth: Option<&[Planet]>) -> String {
     summary_line(&mut out, &settled.summary);
     let _ = writeln!(
         out,
-        "    planet count: {} found, expected total {:.1}{}",
+        "    planet count: {} found, estimate {} (expected total {:.1}){}",
         settled.summary.planets,
+        settled.summary.likely_total,
         settled.summary.expected_total,
         truth.map_or(String::new(), |t| format!(", disclosed {}", t.len()))
     );
@@ -523,7 +524,9 @@ mod tests {
             settle_ms: 1000.0,
         };
         let text = settled_report(&settled, Some(&truth));
-        assert!(text.contains("planet count: 0 found, expected total 22.0, disclosed 1"));
+        assert!(
+            text.contains("planet count: 0 found, estimate 22 (expected total 22.0), disclosed 1")
+        );
         assert!(text.contains("recall 0/1 within 2, 0/1 within 15, spurious 0"));
     }
 }

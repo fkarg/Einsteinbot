@@ -324,6 +324,16 @@ const PRIOR_PLANETS_MAX: usize = 64;
 /// missing planets).
 const MIN_UNSEEN: f64 = 0.5;
 
+/// The most probable total planet count with `found` planets: the known `total`, else the mode
+/// of the prior given `N >= found`.
+pub(super) fn likely_total(found: usize, total: Option<usize>) -> usize {
+    total.unwrap_or_else(|| {
+        found
+            .max(PRIOR_PLANETS_CENTRE as usize)
+            .min(PRIOR_PLANETS_MAX)
+    })
+}
+
 /// Expected number of unseen planets of a map with `found` planets. With a known `total`,
 /// `total - found`; otherwise the prior mean of `N - found` given `N >= found` (the map's planets
 /// are a lower bound on the count). Never below `MIN_UNSEEN`.
@@ -1049,6 +1059,20 @@ mod tests {
 
     /// Extending the tick mask path by path gives the mask of all the paths at once, and a mask
     /// that covers more paths than asked for is rebuilt.
+    /// A known count fixes the unseen planets; the prior gives the mean excess over the planets
+    /// found, about 24 for an empty map and a few planets once 24 are found.
+    #[test]
+    fn unseen_planets_from_a_known_count_or_the_prior() {
+        assert_eq!(unseen(20, Some(26)), 6.0);
+        assert_eq!(unseen(26, Some(26)), MIN_UNSEEN);
+        assert!((unseen(0, None) - 24.0).abs() < 0.01);
+        let complete = unseen(24, None);
+        assert!((2.5..3.5).contains(&complete), "{complete}");
+        assert!(unseen(30, None) < complete);
+        assert_eq!((likely_total(10, None), likely_total(27, None)), (24, 27));
+        assert_eq!(likely_total(10, Some(22)), 22);
+    }
+
     #[test]
     fn tick_mask_extended_path_by_path_equals_the_mask_of_all_paths() {
         let shot = |dx: f32, dy: f32| {
