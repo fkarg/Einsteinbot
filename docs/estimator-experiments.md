@@ -1122,3 +1122,18 @@ Falsifier, synthetic 7001 (the 20/24 stall), `rec2/rec15/spur`:
 | own exclusion zones only (`N_u` fixed at 4) | 6/10/0 | 16/19/0 | 23/24/0 | 24/24/0 | 1 of 24 births | 24 s |
 
 Option A does not pass: births come early and fast, but two thirds of them are adopted mainly because each birth lowers `N_u` and so shrinks the noise of every row (log-det gains of 35-675 nats against chi-square gains that are often small or negative), and the map hits the planet cap with wrong planets (18 of 24 found at 32 paths, 20 at 60). Each path costs 3-14 s of wall time (the search never idles). Map-dependent exclusion zones alone behave like the frozen noise (16 at 16 paths, the stall is not removed). `planet_replay_uses_paths_not_oracle_and_resets_physical_map` still fails with both variants; the library tests pass with both. Dev and held-out runs were not started (plan: stop if the falsifier does not improve).
+
+#### P13 follow-up: Gaussian background for distant unseen planets only (main-session hypothesis; observed, Mac, seconds)
+
+On top of the frozen-noise P13 (option A reverted): the distance in both the scale (`1 / d`) and the length (`d`) of the process is `max(d_U, rho0)` with `rho0 = sqrt(|U| / (pi N_u))` (`|U|` the admissible area of the raster, `N_u = max(24 - K_published, 0.5)`), from the published map and frozen per operation, so the background should cover only the unseen planets farther than the typical nearest one. Honest calibration falsifier (`diagnose_matern_model_error`, 32 paths, maps not fitted):
+
+| case | map | rho0 | s*100 | l | chi2/row | lag-1 |
+|---|---|---|---|---|---|---|
+| synthetic 7001 | true | 805 | 0 | 2665 | 0.831 | -0.071 |
+| synthetic 7001 | missing 4 | 287 | 100 (bound) | 81 | 1.332 | 0.587 |
+| synthetic 7002 | true | 814 | 0 | 2504 | 0.843 | -0.056 |
+| synthetic 7002 | missing 4 | 290 | 82.9 | 56 | 1.001 | 0.565 |
+| live 40 | true | 954 | 0 | 901 | 0.824 | -0.061 |
+| live 40 | missing 4 | 340 | 100 (bound) | 89 | 1.041 | 0.452 |
+
+Fails check 1 (|lag-1| < 0.15 for missing-4): with `rho0` about 290-340 units the distance is `rho0` almost everywhere, so the process is close to the stationary one the P13 prototype already rejected (lag-1 0.42-0.58), and its scale runs to the upper bound. The missing planets' residuals are near-field signatures, which this split deliberately leaves out of the background, so in this test nothing whitens them; the 7001 replay and dev runs were not started.

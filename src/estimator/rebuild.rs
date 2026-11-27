@@ -1,12 +1,12 @@
 //! Planet maps built from scratch from every path: births on thinned rows at growing row caps,
-//! then a final births-and-deaths stage on all rows, every map under its own noise from one
-//! frozen noise model (`noise.rs`). It is the audit of the maintained map (`audit.rs` runs it on a background
+//! then a final births-and-deaths stage on all rows, everything under one frozen noise
+//! (`noise.rs`). It is the audit of the maintained map (`audit.rs` runs it on a background
 //! thread).
 use super::Shot;
-use super::fit::{Budget, theta_of};
-use super::noise::NoiseModel;
+use super::fit::{Budget, Fit, theta_of};
+use super::noise::{Noise, apply, with_noise};
 use super::rows::thin_rows;
-use super::search::{DEATH_DEPTH, Limits, Models, Run, best, grow, mode_at, prune, refit};
+use super::search::{DEATH_DEPTH, Limits, Run, best, grow, mode_at, prune, refit};
 use super::work::{PartCeilings, Stats};
 use crate::simulation::WorldParameters;
 use std::sync::atomic::AtomicBool;
@@ -18,12 +18,11 @@ const CASCADE_EVALUATIONS: u64 = 28_000;
 const FINAL_EVALUATIONS: (u64, u64) = (8_000, 12_000);
 const FINAL_LARGE_PATHS: usize = 32;
 
-/// A map from scratch on all of `exact` (full-row floor shots), each map under its own noise from
-/// `noise`. `None` when
+/// A map from scratch on all of `exact` (full-row floor shots) under `noise`. `None` when
 /// cancelled.
 pub(super) fn from_scratch(
     exact: &[Shot],
-    noise: &NoiseModel,
+    noise: &Noise,
     max_planets: usize,
     threads: usize,
     cancelled: &AtomicBool,
@@ -49,21 +48,17 @@ pub(super) fn from_scratch(
     };
     let mut modes = Vec::new();
     for (i, cap) in CASCADE.into_iter().enumerate() {
-        let shots = thin_rows(exact, cap);
-        let models = Models {
-            shots: &shots,
-            noise,
-            cancelled,
-            stats: &stats,
-        };
+        let mut shots = thin_rows(exact, cap);
+        apply(&mut shots, noise);
+        let joint = Fit::new(&shots, world, cancelled, true, vec![]).with_stats(&stats);
         if i == 0 {
-            modes = vec![mode_at(&models, &[])?];
+            modes = vec![mode_at(&joint, &[])?];
         } else {
             let theta: Vec<[f64; 3]> = best(&modes).planets.iter().map(theta_of).collect();
-            modes = vec![mode_at(&models, &theta)?];
-            modes.extend(refit(&models, &theta, &unlimited));
+            modes = vec![mode_at(&joint, &theta)?];
+            modes.extend(refit(&joint, &theta, &unlimited));
         }
-        grow(&models, &mut modes, &run, world);
+        grow(&joint, &shots, &mut modes, &run, world);
     }
     let theta: Vec<[f64; 3]> = best(&modes).planets.iter().map(theta_of).collect();
 
@@ -83,23 +78,19 @@ pub(super) fn from_scratch(
         stats: &stats,
         cancelled,
     };
-    let models = Models {
-        shots: exact,
-        noise,
-        cancelled,
-        stats: &stats,
-    };
-    let mut modes = vec![mode_at(&models, &theta)?];
+    let shots = with_noise(exact, noise);
+    let joint = Fit::new(&shots, world, cancelled, true, vec![]).with_stats(&stats);
+    let mut modes = vec![mode_at(&joint, &theta)?];
     modes.extend(refit(
-        &models,
+        &joint,
         &theta,
         &Budget {
             evaluations: budget / 4,
             ..unlimited
         },
     ));
-    grow(&models, &mut modes, &run, world);
-    prune(&models, &mut modes, &run, DEATH_DEPTH);
+    grow(&joint, &shots, &mut modes, &run, world);
+    prune(&joint, &mut modes, &run, DEATH_DEPTH);
     let theta: Vec<[f64; 3]> = best(&modes).planets.iter().map(theta_of).collect();
     (!cancelled.load(std::sync::atomic::Ordering::Relaxed)).then_some(theta)
 }

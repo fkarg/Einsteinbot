@@ -18,7 +18,7 @@
 //! surface constraints.
 use super::Shot;
 use super::fit::{Budget, Evidence, Fit, planet_at, theta_of};
-use super::noise::NoiseModel;
+use super::noise::{Noise, apply};
 use super::rows::thin_rows;
 use super::work::{Part, PartCeilings, Stats, par_map};
 use crate::protocol::Planet;
@@ -59,46 +59,8 @@ const MAX_CANDIDATES: usize = 24;
 #[derive(Clone, Debug)]
 pub(super) struct Mode {
     pub planets: Vec<Planet>,
-    /// Approximate log evidence under the map's own noise: `-0.5 (chi2 + log_det)`, the Occam
-    /// term and the planet prior.
+    /// Approximate log evidence including the planet prior; the flat model's is `-0.5 * chi2`.
     pub log_evidence: f64,
-    pub chi2: f64,
-    pub log_det: f64,
-}
-
-/// The maps compared in one operation: the rows (floor noise) they are fitted to and the noise
-/// model that gives each map its own noise.
-pub(super) struct Models<'a> {
-    pub shots: &'a [Shot],
-    pub noise: &'a NoiseModel,
-    pub cancelled: &'a AtomicBool,
-    pub stats: &'a Stats,
-}
-
-impl Models<'_> {
-    /// The rows under the noise of the map `theta`.
-    pub(super) fn rows_for(&self, theta: &[[f64; 3]]) -> Vec<Shot> {
-        self.noise.rows_for(self.shots, theta)
-    }
-}
-
-/// An adopted birth or death of the live search: its evidence gain split into the chi-square and
-/// the log-determinant parts (`-0.5` times each change). A gain mainly from the log-determinant
-/// is a map adopted for shrinking its own noise rather than for explaining the data.
-#[derive(Clone, Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
-pub(super) struct Adoption {
-    pub paths: usize,
-    pub birth: bool,
-    pub chi2_gain: f64,
-    pub log_det_gain: f64,
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-impl Adoption {
-    pub fn from_log_det(&self) -> bool {
-        self.log_det_gain > self.chi2_gain
-    }
 }
 
 /// Limits of a from-scratch run (the cascade).
@@ -156,42 +118,17 @@ fn distance(a: &[f64; 3], b: &[f64; 3]) -> f64 {
     (a[0] - b[0]).hypot(a[1] - b[1])
 }
 
-/// The map `theta` under its own noise.
-pub(super) fn mode_at(models: &Models, theta: &[[f64; 3]]) -> Option<Mode> {
-    let rows = models.rows_for(theta);
-    let fit = Fit::new(
-        &rows,
-        WorldParameters::default(),
-        models.cancelled,
-        true,
-        vec![],
-    )
-    .with_stats(models.stats);
-    let Evidence {
-        log_evidence, chi2, ..
-    } = fit.evidence(theta)?;
-    let log_det = fit.log_det();
+pub(super) fn mode_at(joint: &Fit, theta: &[[f64; 3]]) -> Option<Mode> {
+    let Evidence { log_evidence, .. } = joint.evidence(theta)?;
     Some(Mode {
         planets: theta.iter().map(|th| planet_at(*th)).collect(),
-        log_evidence: log_evidence - 0.5 * log_det,
-        chi2,
-        log_det,
+        log_evidence,
     })
 }
 
-/// A refit from `start` under the noise of `start`, scored under the noise of its result.
-pub(super) fn refit(models: &Models, start: &[[f64; 3]], budget: &Budget) -> Option<Mode> {
-    let rows = models.rows_for(start);
-    let fit = Fit::new(
-        &rows,
-        WorldParameters::default(),
-        models.cancelled,
-        true,
-        vec![],
-    )
-    .with_stats(models.stats);
-    let (theta, _) = fit.refine(start, budget)?;
-    mode_at(models, &theta)
+pub(super) fn refit(joint: &Fit, start: &[[f64; 3]], budget: &Budget) -> Option<Mode> {
+    let (theta, _) = joint.refine(start, budget)?;
+    mode_at(joint, &theta)
 }
 
 /// Seed planets from the largest unexplained windows of the paths under `theta`.
@@ -226,20 +163,23 @@ fn seeds(joint: &Fit, theta: &[[f64; 3]], world: WorldParameters) -> Vec<[f64; 3
 }
 
 /// Joint refits of `parent` plus one more planet, best evidence first.
-fn births(models: &Models, parent: &Mode, world: WorldParameters, run: &Run) -> Vec<Mode> {
+fn births(
+    shots: &[Shot],
+    joint: &Fit,
+    parent: &Mode,
+    world: WorldParameters,
+    run: &Run,
+) -> Vec<Mode> {
     let stats = run.stats;
     let threads = run.limits.threads;
     let theta: Vec<[f64; 3]> = parent.planets.iter().map(theta_of).collect();
-    // Seeds and alone fits under the parent's noise.
-    let rows = models.rows_for(&theta);
-    let joint = Fit::new(&rows, world, run.cancelled, true, vec![]).with_stats(stats);
-    let seeds = stats.time(Part::Seeding, || seeds(&joint, &theta, world));
+    let seeds = stats.time(Part::Seeding, || seeds(joint, &theta, world));
     if seeds.is_empty() {
         return Vec::new();
     }
     // Stage 1: the new planet alone against the field the parent leaves over.
     let alone =
-        Fit::new(&rows, world, run.cancelled, false, parent.planets.clone()).with_stats(stats);
+        Fit::new(shots, world, run.cancelled, false, parent.planets.clone()).with_stats(stats);
     let budget = run.budget(seeds.len(), Part::BirthAlone);
     let mut fitted: Vec<([f64; 3], f64)> = stats
         .time(Part::BirthAlone, || {
@@ -267,7 +207,7 @@ fn births(models: &Models, parent: &Mode, world: WorldParameters, run: &Run) -> 
             par_map(&distinct, threads, |planet| {
                 let mut start = theta.clone();
                 start.push(*planet);
-                refit(models, &start, &budget)
+                refit(joint, &start, &budget)
             })
         })
         .into_iter()
@@ -278,17 +218,8 @@ fn births(models: &Models, parent: &Mode, world: WorldParameters, run: &Run) -> 
 }
 
 /// Joint refits of `parent` without each of its weakest planets, best evidence first.
-fn deaths(models: &Models, parent: &Mode, run: &Run) -> Vec<Mode> {
+fn deaths(joint: &Fit, parent: &Mode, run: &Run) -> Vec<Mode> {
     let theta: Vec<[f64; 3]> = parent.planets.iter().map(theta_of).collect();
-    // The weakest planets by their chi-square under the parent's noise.
-    let rows = models.rows_for(&theta);
-    let joint = Fit::new(
-        &rows,
-        WorldParameters::default(),
-        run.cancelled,
-        true,
-        vec![],
-    );
     let Some(full) = joint.chi2(&theta) else {
         return Vec::new();
     };
@@ -307,7 +238,7 @@ fn deaths(models: &Models, parent: &Mode, run: &Run) -> Vec<Mode> {
         .stats
         .time(Part::Deaths, || {
             par_map(&weakest, run.limits.threads, |(i, _)| {
-                refit(models, &without(*i), &budget)
+                refit(joint, &without(*i), &budget)
             })
         })
         .into_iter()
@@ -326,7 +257,13 @@ pub(super) fn best(modes: &[Mode]) -> &Mode {
 
 /// Greedy births from the best mode until no birth improves the evidence, the planet cap or the
 /// work limit is reached.
-pub(super) fn grow(models: &Models, modes: &mut Vec<Mode>, run: &Run, world: WorldParameters) {
+pub(super) fn grow(
+    joint: &Fit,
+    shots: &[Shot],
+    modes: &mut Vec<Mode>,
+    run: &Run,
+    world: WorldParameters,
+) {
     loop {
         let parent = best(modes).clone();
         if parent.planets.len() >= run.limits.max_planets
@@ -335,7 +272,7 @@ pub(super) fn grow(models: &Models, modes: &mut Vec<Mode>, run: &Run, world: Wor
         {
             break;
         }
-        let children = births(models, &parent, world, run);
+        let children = births(shots, joint, &parent, world, run);
         let improved = children
             .first()
             .is_some_and(|child| child.log_evidence > parent.log_evidence);
@@ -349,7 +286,7 @@ pub(super) fn grow(models: &Models, modes: &mut Vec<Mode>, run: &Run, world: Wor
 /// Death descent from the best mode: always continuing from the best child even when it is worse,
 /// because planets that cancel each other (spurious leftovers of earlier, thinner data) only look
 /// useful one at a time.
-pub(super) fn prune(models: &Models, modes: &mut Vec<Mode>, run: &Run, depth: usize) {
+pub(super) fn prune(joint: &Fit, modes: &mut Vec<Mode>, run: &Run, depth: usize) {
     let mut parent = best(modes).clone();
     for _ in 0..depth {
         if parent.planets.is_empty()
@@ -358,7 +295,7 @@ pub(super) fn prune(models: &Models, modes: &mut Vec<Mode>, run: &Run, depth: us
         {
             break;
         }
-        let children = deaths(models, &parent, run);
+        let children = deaths(joint, &parent, run);
         let Some(next) = children.first().cloned() else {
             break;
         };
@@ -390,8 +327,8 @@ pub(super) struct Slice<'a> {
     pub max_planets: usize,
     pub cancelled: &'a AtomicBool,
     pub stats: &'a Stats,
-    /// The noise model of every fit of the slice.
-    pub noise: &'a NoiseModel,
+    /// The noise of every fit of the slice.
+    pub noise: &'a Noise,
 }
 
 /// The live map and its pending birth work.
@@ -412,8 +349,28 @@ pub(super) struct Search {
     /// At the planet cap a death trial has run since the last path or adoption (a successful one
     /// frees a slot, so the next birth makes it a swap).
     cap_trial_done: bool,
-    /// Every adopted birth and death, with its evidence split.
+    /// Every adopted birth and death, with its evidence gain split.
     pub adoptions: Vec<Adoption>,
+}
+
+/// An adopted birth or death of the live search: its evidence gain split into the chi-square and
+/// the log-determinant parts (`-0.5` times each change; the log-determinant part is 0 while every
+/// compared map shares one noise). A gain mainly from the log-determinant would be a map adopted
+/// for shrinking its own noise rather than for explaining the data.
+#[derive(Clone, Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) struct Adoption {
+    pub paths: usize,
+    pub birth: bool,
+    pub chi2_gain: f64,
+    pub log_det_gain: f64,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl Adoption {
+    pub fn from_log_det(&self) -> bool {
+        self.log_det_gain > self.chi2_gain
+    }
 }
 
 impl Search {
@@ -425,9 +382,11 @@ impl Search {
         !self.pending
     }
 
-    /// The thinned rows of every path (floor noise).
-    fn thin(&self) -> Vec<Shot> {
-        thin_rows(&self.paths, ROW_CAP)
+    /// The thinned rows of every path under `noise`.
+    fn thin(&self, noise: &Noise) -> Vec<Shot> {
+        let mut shots = thin_rows(&self.paths, ROW_CAP);
+        apply(&mut shots, noise);
+        shots
     }
 
     fn clear_pending(&mut self) {
@@ -468,7 +427,7 @@ impl Search {
         let (free, fixed): (Vec<[f64; 3]>, Vec<[f64; 3]>) =
             self.theta.iter().partition(|t| near(t));
         if !free.is_empty() && !slice.cancelled.load(Ordering::Relaxed) {
-            let shots = slice.noise.rows_for(&self.thin(), &self.theta);
+            let shots = self.thin(slice.noise);
             let local = Fit::new(
                 &shots,
                 WorldParameters::default(),
@@ -504,15 +463,8 @@ impl Search {
         let (stats, cancelled) = (slice.stats, slice.cancelled);
         let first = stats.evaluations();
         let mut changed = false;
-        // The paths and the noise model do not change within a slice; every map gets its own
-        // noise from them.
-        let floor = self.thin();
-        let models = Models {
-            shots: &floor,
-            noise: slice.noise,
-            cancelled,
-            stats,
-        };
+        // The paths and the noise do not change within a slice.
+        let shots = self.thin(slice.noise);
         while !self.idle()
             && stats.evaluations() - first < slice.evaluations
             && Instant::now() < slice.deadline
@@ -530,8 +482,6 @@ impl Search {
                 self.deaths_due = true;
                 continue;
             }
-            // Rankings, seeds and alone fits under the current map's noise.
-            let shots = models.rows_for(&self.theta);
             let joint = Fit::new(&shots, world, cancelled, true, vec![])
                 .with_deadline(slice.deadline)
                 .with_stats(stats);
@@ -695,9 +645,7 @@ impl Search {
                 let fits = stats.time(part, || {
                     par_map(&todo, slice.threads, |&i| {
                         let counter = Stats::default();
-                        // Each partial is refit under its own noise.
-                        let rows = models.rows_for(&self.partials[i].theta);
-                        let out = Fit::new(&rows, world, cancelled, true, vec![])
+                        let out = Fit::new(&shots, world, cancelled, true, vec![])
                             .with_deadline(slice.deadline)
                             .with_stats(&counter)
                             .refine(&self.partials[i].theta, &budget);
@@ -718,30 +666,29 @@ impl Search {
                 continue;
             }
             // Every joint refit has settled: adopt the best if it beats the map's evidence.
-            // Each map under its own noise.
-            let parent = mode_at(&models, &self.theta);
+            let parent = mode_at(&joint, &self.theta).map_or(f64::NEG_INFINITY, |m| m.log_evidence);
             let child = self
                 .partials
                 .iter()
-                .filter_map(|p| mode_at(&models, &p.theta).map(|m| (m, &p.theta)))
-                .max_by(|a, b| a.0.log_evidence.total_cmp(&b.0.log_evidence));
+                .filter_map(|p| mode_at(&joint, &p.theta).map(|m| (m.log_evidence, &p.theta)))
+                .max_by(|a, b| a.0.total_cmp(&b.0));
             let deaths = self.deaths_due;
             self.deaths_due = false;
-            let parent_evidence = parent
-                .as_ref()
-                .map_or(f64::NEG_INFINITY, |m| m.log_evidence);
             match child {
-                Some((mode, theta))
-                    if mode.log_evidence > parent_evidence
-                        && (deaths || theta.len() <= slice.max_planets) =>
+                Some((evidence, theta))
+                    if evidence > parent && (deaths || theta.len() <= slice.max_planets) =>
                 {
                     let theta = theta.clone();
-                    if let Some(parent) = &parent {
+                    // Bookkeeping only: no stats, so the slice's evaluation count is unchanged.
+                    let record = Fit::new(&shots, world, cancelled, true, vec![]);
+                    if let (Some(before), Some(after)) =
+                        (record.chi2(&self.theta), record.chi2(&theta))
+                    {
                         self.adoptions.push(Adoption {
                             paths: self.paths.len(),
                             birth: !deaths,
-                            chi2_gain: -0.5 * (mode.chi2 - parent.chi2),
-                            log_det_gain: -0.5 * (mode.log_det - parent.log_det),
+                            chi2_gain: -0.5 * (after - before),
+                            log_det_gain: 0.0,
                         });
                     }
                     self.deaths_due = !deaths;
@@ -820,7 +767,7 @@ mod tests {
     fn slice<'a>(
         cancelled: &'a AtomicBool,
         stats: &'a Stats,
-        noise: &'a NoiseModel,
+        noise: &'a Noise,
         evaluations: u64,
     ) -> Slice<'a> {
         Slice {
@@ -839,7 +786,7 @@ mod tests {
     #[test]
     fn a_new_path_keeps_pending_work() {
         let (cancelled, stats) = (AtomicBool::new(false), Stats::default());
-        let noise = NoiseModel::new(ModelError::PRIOR, &shots());
+        let noise = Noise::new(ModelError::PRIOR, &[], &shots());
         let shots = shots();
         let mut search = Search::new();
         search.add_path(&shots[0], &slice(&cancelled, &stats, &noise, 20));
@@ -858,7 +805,7 @@ mod tests {
     #[test]
     fn slices_grow_the_map_until_idle() {
         let (cancelled, stats) = (AtomicBool::new(false), Stats::default());
-        let noise = NoiseModel::new(ModelError::PRIOR, &shots());
+        let noise = Noise::new(ModelError::PRIOR, &[], &shots());
         let mut search = Search::new();
         for shot in &shots() {
             search.add_path(shot, &slice(&cancelled, &stats, &noise, 300));

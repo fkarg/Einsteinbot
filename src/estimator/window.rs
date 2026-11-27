@@ -270,11 +270,6 @@ impl PathData {
         self.whitener = [0, 1].map(|axis| Gains::new(&self.floor, axis, &self.shape));
     }
 
-    /// `sum ln S` of the innovation variances of both axes (the noise's log-determinant).
-    pub fn log_det(&self) -> f64 {
-        self.whitener[0].log_det + self.whitener[1].log_det
-    }
-
     /// Position on the path at the centre of row `r`.
     pub fn center(&self, r: usize) -> V2 {
         self.centers.as_ref().map_or(self.ticks[r + 1], |c| c[r])
