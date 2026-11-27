@@ -928,3 +928,72 @@ Hypothesis, not tested here: publishing a full map is only worth it past the poi
 Reproduction. Build once: `cargo test --release --lib --no-run` in the worktree; with `einsteinbot.sqlite3` in the working directory and `SEEDS=-` (no synthetic worlds) run, per capture `C`:
 `LIVE=C SEEDS=- PATHS=60 THREADS=4 CACHE=/tmp/P8/cache PROD_EVALS=2000 cargo test --release --lib diagnose_baseline -- --ignored --nocapture --test-threads=1` (flat, prod, cascade; `METHODS=flat,prod,rebuild` default) and
 `LIVE=C SEEDS=- PATHS=60 THREADS=2 CACHE=/tmp/P8/cache CHECKPOINTS=1000 CONFIGS=lv=0.02/0.005:cap=1000:rf=300:ev=1500:lr=100:dl=30:dn=4 cargo test --release --lib diagnose_incremental -- --ignored --nocapture --test-threads=1` (B*; `CHECKPOINTS=1000` keeps only the last path count). Tables: `python3 -I scripts/p8_tables.py {rows,summary,csv} OUTPUT_FILES... [--min-paths N] [--max-paths N]`.
+
+### P11 results (2026-11-27, branch `p11`, built on `p7` and `p8`; harness `src/estimator/diagnose/replay.rs` (ignored test `diagnose_replay`) and `diagnose/baseline.rs` (`diagnose_baseline`); tables from `scripts/p6_tables.py quality`, `scripts/p7_tables.py timeline` and `scripts/p8_tables.py`)
+
+Decision (user, 2026-11-27): v2 stays the estimator and the measured search improvements become the production default, replacing the greedy-birth search wholesale. The question of this step: does the production code, run through the real `Estimator` API, reproduce the P7 numbers, and what does the audit add? Truth scores only; contacts create nothing (the replayed paths carry no contacts, so the contact path is covered by unit tests only). Grades: observed unless marked.
+
+#### What the production estimator is now
+
+- Per path (`Estimator::observe_batch`): local refit of the planets within 100 units of the path (300 evaluations, thinned rows, relative sd 0.02 then 0.005), the map is published at once.
+- Then up to 6 slices of 300 evaluations (250 ms wall ceiling each), run by `Estimator::step` (the live map's worker calls it while no event is queued): resumable births (`search.rs`, the P7 `Search`: candidates, alone fits, joint partials, death trial after each birth), state surviving across slices and paths.
+- After the slices, one polish step (`rebuild::exact_refit`): the guarded exact refit (accepted only if the exact chi2 falls and no planet moves more than 3 units or chi2/row <= 1.5) of the published map, cut by the slice ceiling; the covariance comes from the exact evidence of the refit map when the refit finished in time. The polished map is published, the search state keeps its own map.
+- Audit (`audit.rs`, off by default in `Settings`, on in the live map): at 8 paths, then every 16, a background thread builds a map from scratch (`rebuild::from_scratch`: the E9 cascade `500/0.1, 1000/0.02, 2000/0.005` then the E9c polish `0.005gd, 0.001gd, 0` with the guarded exact refit). When it is done a second thread compares it with the maintained map on all paths known then (both refit on all rows at relative 0.005, 1500 evaluations, Laplace evidence); only a higher evidence replaces the maintained map. Both threads use half of `Settings::threads`; neither blocks publication.
+- Deleted: the greedy `search()` and its `Limits::deadline`/`parallel_evaluations`, mode retention and weights (`MapBelief::map_weight` and `alternatives` stay in the struct, always `None`/empty), the warm-start refit, the 0.1 absolute noise level and the whole multi-level noise machinery (`PathData::levels`, `new_relative`'s level list, `Fit` coarse-to-fine loop), `Estimator::{time_budget, max_evaluations, parallel_evaluations, noise_levels}`, the test-only Jacobian-radius/normal-equations/tolerance variants of `Fit`, the diagnosis harnesses of E9/E9c/P6/P7 (`thinning.rs`, `polish.rs`, `incremental.rs`, `resumable.rs`) and the greedy-search diagnoses of `diagnose.rs`. Git history is the fallback (last commit with them: `6b03eb1` plus the p8 merge).
+
+#### Regression against the P7 numbers (observed; deterministic replay, `CEIL_MS=0`, 60 paths, final checkpoint per world)
+
+Recall(2) of the true planets, dev worlds (synthetic 7001-7008; live 33, 39, 40, 41, 45, 48), at 16 / 32 / final paths. Raw output on jolly `/tmp/P11/out/f_dev_off`, `f_dev_audit`, `f_held`; the numbers of P7 are copied from its table.
+
+| method | dev synthetic | dev live |
+|---|---|---|
+| P7 resumable ns=6 (harness, no polish in the state, no audit) | 61% / 100% / 100% | 44% / 66% / 89% |
+| P11 production, no audit | 81% / 96% / 95% (spurious 0.5, K 24.0) | 46% / 73% / 83% (spurious 2.2, K 23.2) |
+| P11 production + audit (adopted when better, run to completion right after the path that starts it) | 83% / 100% / 100% (spurious 0.0) | 44% / 74% / 92% (spurious 0.7, K 23.2) |
+
+Held-out (one pass, final configuration = audit on; synthetic 7101-7108, live 34, 35, 37, 42, 43; live 34 has 2 paths and 43 has 41, so the live final row is the three worlds with 60 or 61 paths): synthetic 82% / 98% / 100% (spurious 0.0); live 47% / 80% / 92% (spurious 0.7; P7 resumable 27% / 46% / 85%, B* uncapped 92%). Per live world at the end: 35 24/24, 37 22/24, 42 20/24.
+
+Reading: within noise of P7 or better. The audit decides the end state: without it three synthetic dev worlds stay at 19-22 of 24 planets and live 45 at 17 of 24 with 7 spurious; with it every dev synthetic world ends at 24/24 with the exact chi2 of the truth (ratio 0.99) and live 33 and 48 at 24/24. Adoption: 36 of 55 audits on the dev worlds (all 14 at 8 paths, 10 of 14 at 24, 6 of 14 at 40, 6 of 13 at 56), 29 of 47 on the held-out worlds. Recall at 16 paths is higher than P7's (81-83% against 61% synthetic) mainly because the audit at 8 paths adopts a better map and the review fixes below. The sync audit adopts at the path that starts it, which is optimistic: the audit takes 50-140 s on average per stage-one rebuild (2 threads, jolly under load 20-30; the Mac at 5 threads was not timed separately) so a map is adopted some paths later. The schedule runs on the Mac below include that (final recall in the 500 ms / 2 s schedule runs: live 33 19 / 16, live 40 16 / 19, live 45 18 / 21 of 24, inside the spread of the deterministic runs; one run per cell).
+
+Evaluations per path (all 14 dev worlds, audit off): median 2.2k for paths 1-8 and 2.3k for 9-16 (max 2.9k, the owed slices run), 596 for 17-32, 207 for 33-61 (steady state: the slices find nothing and only the polish remains).
+
+Bugs found by the measurements (fixed before these numbers): (1) an audit compared at the paths of its snapshot and then adopted minutes later threw away everything learned since (live 33 at 500 ms per path: recall(2) 17 -> 5 at the adoption), hence the two-stage audit (rebuild, then a comparison on the paths known when the rebuild ends) and an adoption that is a plain map swap; (2) the exact refit of the published map ran uncut and took 3 s at 34 paths (live 40; publish lag 2.6-10 s), hence the wall ceiling on it (one ceiling for the refit, none on the Jacobian of the covariance, which is skipped when the ceiling is used up). A reviewer pass found and I fixed: partials cut by the slice deadline were marked converged, new seeds were dropped from a full candidate list, a cancelled update could leave paths out of the search, the live worker did not adopt a finished audit while idle.
+
+#### P8 comparison, pilot captures 33, 40, 45 (observed; 61 paths)
+
+Replaces the old `prod` column (P8: the greedy search with 2000 evaluations per update; 111-123k evaluations and 8-21 minutes per capture):
+
+| capture | old prod rec2 (spurious) | cascade (from scratch) | B* | new prod, no audit | new prod + audit |
+|---|---|---|---|---|---|
+| 33 | 2 (17) | 18 (6) | 22 (1) | 22 (1), 83k evaluations | 24 (0), chi2 ratio 0.996 |
+| 40 | 19 (1) | 20 (1) | 19 (1) | 18 (2), 64k | 20 (1) |
+| 45 | 14 (3) | 16 (2) | 21 (1) | 17 (7), 107k | 21 (1) |
+
+Without the audit capture 40 is one planet below the old production (18 against 19; within the 1-3 planets P6 saw between configurations on live worlds), with it recall is at least equal everywhere and far above on 33 and 45. The production-run chi2 ratios and field errors are in the raw output (`f_base_*`). The no-audit 33 and audit 45 rows reproduce B* exactly (chi2 ratio 4.67e7 and 8.52e6 as in P8), which is the check that the production path equals the harness.
+
+#### Latency (observed; Mac, 10 threads, release test binary, audit on with 5 threads, one process, nothing built during the runs; Mac load average 4-6 during the runs from other sessions, 3-4 before)
+
+A path arrives every 500 ms or 2 s of wall clock; between arrivals the estimator takes slices as the live worker does. Publish lag = from a path's arrival to its map being published (61 paths on each live capture):
+
+| capture | period | median | p90 | max |
+|---|---|---|---|---|
+| 33 | 500 ms | 143 ms | 249 | 378 |
+| 33 | 2 s | 26 | 64 | 150 |
+| 40 | 500 ms | 84 | 225 | 265 |
+| 40 | 2 s | 23 | 40 | 64 |
+| 45 | 500 ms | 130 | 238 | 264 |
+| 45 | 2 s | 24 | 47 | 85 |
+
+Worst publish lag 64-378 ms; five of six runs are at or below the 350 ms target, the 378 ms run (live 33, 500 ms) is 8% above it. The lag is the unfinished step (a slice is cut at 250 ms but a batch of refits can run a little over; the polish is cut at 250 ms plus the covariance Jacobian) plus the local refit. Before the fixes above the worst lags were 1.2-10 s. Without the audit thread live 40 at 500 ms had 269 ms (one run), with it 265-325 ms.
+
+#### Test suite and known limitations
+
+`cargo test --lib` takes 2.0 s on jolly for both the base commit and this one (94 tests, 8 ignored heavy harnesses); `cargo fmt --check` clean.
+
+Limitations: early updates (under 8 paths) have no special rule and recall is low there (13% synthetic and 10% live at 8 paths without the audit; the audit at 8 paths lifts it afterwards); deaths run only after a birth, so a spurious planet stays until the next birth or the next audit; the comparison of an audit uses the Laplace evidence at the relative level (a heuristic, not calibrated); one run per cell, no repeats; live truth is degenerate in the sense of P6, so 1-3 planets of difference on live worlds are within what different configurations showed; the contact constraint is not exercised by the replay harness; the final map of a live game is the published polished map, whose covariance is absent (`not_computed`) while a path's slices are still running or when the refit used up its time.
+
+#### Viewer-visible changes (for a later UI sync; the viewer UI itself was not touched)
+
+`map_belief` diagnostics keep every key. Meaning changes: `map_weight` always `null`, `alternatives` always `[]`; `search_limit` is `planet_cap`, `work_budget` (search work pending, also right after every path) or `time_budget` (a slice hit its ceiling); `covariance`/`covariance_unavailable_reason`: a belief published right after a path says `not_computed`, the covariance arrives with the polished publication that follows. `update_report` parts (scorecard JSON): `warm_start` removed, `polish` added, `warm_refit` is the local refit of a new path. Several beliefs can now be published per path (local refit, slice changes, polish, audit adoption); captures still record the belief at decisions. `web/map_viewer.js` still reads the removed `fit_converged`, `approximate_covariance` and `field_evidence` (not fixed). `field_scorecard` flags removed: `--time-budget-ms`, `--max-evaluations`, `--serial-evaluations`, `--noise-sd`; added: `--slice-evaluations`, `--slice-ceiling-ms`, `--slices-per-path`, `--threads`, `--audit`.
+
+Reproduction (worktree with `einsteinbot.sqlite3` in the working directory): deterministic replay `cargo test --release --lib diagnose_replay -- --ignored --nocapture --test-threads=1` with `SEEDS=7001 LIVE=- PATHS=60 THREADS=2 CEIL_MS=0 AUDIT=0 NAME=prod` (or `SEEDS=- LIVE=33`; `AUDIT=1` runs the audit to completion after the path that starts it); schedule `SCHEDULE=500` (or 2000) with `AUDIT=1` and the default threads; baseline `diagnose_baseline` with `METHODS=flat,prod,rebuild`. Tables: `python3 -I scripts/p6_tables.py quality FILES --worlds synthetic|live`, `python3 -I scripts/p7_tables.py timeline FILES`, `python3 -I scripts/p8_tables.py ...`. The harnesses of P6-P7 that the older sections cite were removed with this change; their last version is in git at `6b03eb1`.
