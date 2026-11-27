@@ -1019,3 +1019,91 @@ Limitations: early updates (under 8 paths) have no special rule and recall is lo
 `map_belief` diagnostics keep every key. Meaning changes: `map_weight` always `null`, `alternatives` always `[]`; `search_limit` is `planet_cap`, `work_budget` (search work pending, also right after every path) or `time_budget` (a slice hit its ceiling); `covariance`/`covariance_unavailable_reason`: a belief published right after a path says `not_computed`, the covariance arrives with the polished publication that follows. `update_report` parts (scorecard JSON): `warm_start` removed, `polish` added, `warm_refit` is the local refit of a new path. Several beliefs can now be published per path (local refit, slice changes, polish, audit adoption); captures still record the belief at decisions. `web/map_viewer.js` still reads the removed `fit_converged`, `approximate_covariance` and `field_evidence` (not fixed). `field_scorecard` flags removed: `--time-budget-ms`, `--max-evaluations`, `--serial-evaluations`, `--noise-sd`; added: `--slice-evaluations`, `--slice-ceiling-ms`, `--slices-per-path`, `--threads`, `--audit`.
 
 Reproduction (worktree with `einsteinbot.sqlite3` in the working directory): deterministic replay `cargo test --release --lib diagnose_replay -- --ignored --nocapture --test-threads=1` with `SEEDS=7001 LIVE=- PATHS=60 THREADS=2 CEIL_MS=0 AUDIT=0 NAME=prod` (or `SEEDS=- LIVE=33`; `AUDIT=1` runs the audit to completion after the path that starts it); schedule `SCHEDULE=500` (or 2000) with `AUDIT=1` and the default threads; baseline `diagnose_baseline` with `METHODS=flat,prod,rebuild`. Tables: `python3 -I scripts/p6_tables.py quality FILES --worlds synthetic|live`, `python3 -I scripts/p7_tables.py timeline FILES`, `python3 -I scripts/p8_tables.py ...`. The harnesses of P6-P7 that the older sections cite were removed with this change; their last version is in git at `6b03eb1`.
+
+### P13 results (2026-11-27, branch `p13` from main 16adc7f; `src/estimator/noise.rs`; harness `diagnose/replay.rs` (`diagnose_replay`) and `diagnose_matern_model_error`)
+
+**What changed.** The relative noise term (search levels 0.02/0.005, rebuild cascade 0.1/0.02/0.005, polish levels) is replaced by one likelihood: the exact measurement floor (f32 rounding covariance plus interpolation variance) plus a model-error process for planets not found yet. Per path and axis the process is Matern-3/2 in arc length along the row centres with sd `s * 100 / d_U` and length `l * d_U / 100`, `d_U` the distance from the row centre to the admissible region `U` of unseen planet centres (10-unit raster over the battlefield and its 500-unit margin: in the battlefield by 20, farther than `r + 20` from every found planet and 20 from every observed tick; exact Euclidean distance transform with nearest-node tracking), clamped below at 20. Floor and process are one state-space model (state `[f, f', n_r, n_r+1, n_r+2]`), whitened by a Kalman filter whose gains do not depend on the data, so residuals and Jacobian columns share one O(rows) pass; thinned rows keep the marginal (white) floor and step the process by arc length. `s` and `l` are the type-II MAP (pattern search in log space; log-normal hyperprior, log-sd 1, around 0.07 and 600; `s <= 1`) of the prequential residuals of the last 8 paths: each new path's raw residuals against the map published before its local refit, with the `d_U` of that moment; rows within `r + 20` of a published planet are treated as missing there (they carry that planet's parameter error, not the unseen field). The noise is computed at the start of each local refit, slice, polish, audit rebuild and audit comparison from the published map and all paths, and every map compared in that operation uses it, so evidence differences need no log-determinant. The guarded exact refit of the published map is now a full-row refit under the same likelihood (600 evaluations, no guard; covariance from it, still all-or-nothing). The rebuild keeps its thinned growth (row caps 500, 1000, 2000) and ends with births and deaths on all rows, all under the frozen noise. Deleted: `relative` in `PathData::new`/`Shot::new`, `Shot::at_relative_level`, `LEVELS`, the rebuild's `POLISH` levels, `guard`/`exact_refit`/`GUARD_*`, the banded `Whitener`, and the ignored diagnostics `diagnose_residual_correlation` and `diagnose_campbell_model_error` (git history). `UpdateReport` gains the phase part `noise`.
+
+**Planet-count prior: not changed (observed).** The brief asked for Poisson(24) on K with the `ln K!` label factor. That gives `ln P(K+1) - ln P(K) + ln (K+1) = ln 24` per birth. With it, and also with 0 per planet, `flat_world_with_small_position_noise_keeps_no_planet` grows five nearly identical planets in a battlefield corner: their Occam term is near 0 because the data barely constrain them, so any per-birth term `>= 0` makes them free. The count factor says that a planet exists somewhere, not that the data localized one here, and the contract says a planet is born only from trajectory evidence; the per-planet odds stay 1/20. The admissible area as the position prior volume was not used either: the no-tick-inside-a-disk constraint is already in the likelihood (interior penalty), so it would be counted twice. Peer (Codex): agrees that the count prior and localization are separate questions and that 1/20 is not principled either; a principled form needs one joint model of K, positions and the unseen-planet process (for example `N_u = N - K` in the process prior), not settled here.
+
+**First check (observed, Mac, seconds).** Unit tests: with the process off the innovations equal the dense Cholesky whitening of the banded floor (1e-9) and the log-determinant matches; with the process on they whiten the dense floor-plus-Matern covariance; the distance transform equals the brute-force distance to the nearest admissible node (2000 random points over battlefield and margin plus 900 ticks, worst difference < 1e-9). The first version clamped margin points to the battlefield raster and was off by up to 35 units on paths leaving the battlefield (found by comparing against the prototype path by path); the raster now covers the margin. `diagnose_matern_model_error` ported to the production whitener and estimator (`SEEDS=7001,7002 LIVE=40 PATHS=32`, all paths' residuals, maps not fitted):
+
+| case | map | s*100 | l | chi2/row | lag-1 |
+|---|---|---|---|---|---|
+| synthetic 7001 | true | 0.000 | 1e5 (bound) | 0.826 | -0.076 |
+| synthetic 7001 | missing 4 | 14.8 | 600 | 1.002 | -0.037 |
+| synthetic 7002 | true | 0.000 | 1e5 | 0.839 | -0.060 |
+| synthetic 7002 | missing 4 | 11.9 | 600 | 0.966 | -0.040 |
+| live 40 | true | 0.000 | 1e5 | 0.820 | -0.067 |
+| live 40 | missing 4 | 5.45 | 901 | 1.014 | 0.018 |
+
+The true map's lag-1 is now about -0.07 instead of the prototype's -0.66 (the exact banded floor). Estimate cost 10-25 ms for 32 series.
+
+**Dev replays (observed; jolly, release test binary, deterministic `CEIL_MS=0`, `THREADS=2`, 60 paths (48 on live 48), one run each).** Base = main 16adc7f, cached in `/tmp/P13/base_*` on jolly. Cells are `rec2/rec15/spur` base -> P13; fe/fu are the explored/unexplored field RMSE at the last path.
+
+No audit, all 14 dev worlds:
+
+| world | n=8 | n=16 | n=32 | n=60 | final fe | final fu | CPU s |
+|---|---|---|---|---|---|---|---|
+| live_33 | 1/9/4 -> 5/8/1 | 8/12/7 -> 6/13/1 | 17/20/4 -> 18/20/0 | 18/20/3 -> 24/24/0 | 1.4e-01 -> 3.2e-05 | 2.7e+00 -> 5.1e-05 | 364 -> 64 |
+| live_39 | 2/5/7 -> 4/6/0 | 12/14/5 -> 7/11/1 | 19/19/3 -> 15/19/1 | 21/22/1 -> 17/20/1 | 4.4e-04 -> 4.4e-02 | 2.4e+00 -> 3.8e-01 | 235 -> 57 |
+| live_40 | 4/6/5 -> 1/5/1 | 12/15/4 -> 6/8/2 | 12/15/4 -> 11/15/4 | 19/21/1 -> 16/18/3 | 1.6e-03 -> 1.1e-02 | 4.6e+00 -> 2.0e+00 | 182 -> 86 |
+| live_41 | 0/3/9 -> 3/6/2 | 16/16/4 -> 8/13/1 | 21/22/1 -> 15/19/1 | 22/22/1 -> 22/22/1 | 1.0e-03 -> 1.3e-03 | 6.9e+01 -> 1.1e+00 | 464 -> 75 |
+| live_45 | 2/5/6 -> 1/2/0 | 6/10/7 -> 5/7/1 | 19/21/1 -> 17/18/2 | 21/21/1 -> 21/21/2 | 1.4e-03 -> 7.8e-04 | 1.7e+00 -> 2.5e+00 | 173 -> 75 |
+| live_48 | 6/10/5 -> 2/7/0 | 14/16/4 -> 10/14/1 | 20/22/1 -> 18/19/2 | 20/22/1 -> 22/22/1 | 3.6e-04 -> 9.8e-04 | 4.5e+00 -> 1.1e+00 | 177 -> 70 |
+| syn_7001 | 3/8/6 -> 5/9/1 | 24/24/0 -> 16/20/0 | 24/24/0 -> 24/24/0 | 24/24/0 -> 24/24/0 | 4.6e-07 -> 8.7e-07 | 7.6e-07 -> 1.1e-06 | 67 -> 39 |
+| syn_7002 | 0/8/6 -> 4/10/1 | 24/24/0 -> 11/17/0 | 24/24/0 -> 18/19/2 | 24/24/0 -> 24/24/0 | 1.0e-06 -> 2.3e-06 | 1.4e-06 -> 2.4e-06 | 70 -> 61 |
+| syn_7003 | 0/3/9 -> 1/8/0 | 13/15/7 -> 6/12/3 | 20/21/3 -> 23/24/0 | 24/24/0 -> 24/24/0 | 3.1e-06 -> 6.0e-06 | 8.5e-06 -> 1.6e-05 | 329 -> 51 |
+| syn_7004 | 0/4/8 -> 5/9/0 | 16/17/4 -> 11/15/0 | 24/24/0 -> 24/24/0 | 24/24/0 -> 24/24/0 | 2.2e-06 -> 1.9e-06 | 1.7e-06 -> 1.7e-06 | 126 -> 51 |
+| syn_7005 | 4/12/3 -> 8/11/1 | 19/20/2 -> 11/13/1 | 24/24/0 -> 24/24/0 | 24/24/0 -> 24/24/0 | 1.7e-06 -> 2.8e-06 | 3.6e-06 -> 2.6e-06 | 127 -> 41 |
+| syn_7006 | 4/13/3 -> 8/11/0 | 24/24/0 -> 15/16/2 | 24/24/0 -> 24/24/0 | 24/24/0 -> 24/24/0 | 1.6e-06 -> 2.2e-06 | 1.9e-06 -> 2.7e-06 | 91 -> 56 |
+| syn_7007 | 11/12/5 -> 9/11/2 | 24/24/0 -> 14/18/1 | 24/24/0 -> 24/24/0 | 24/24/0 -> 24/24/0 | 4.4e-06 -> 2.6e-06 | 3.4e-06 -> 4.2e-06 | 146 -> 68 |
+| syn_7008 | 4/9/3 -> 6/8/0 | 17/17/6 -> 12/15/0 | 24/24/0 -> 15/20/0 | 24/24/0 -> 24/24/0 | 2.3e-06 -> 5.7e-06 | 5.4e-06 -> 1.8e-05 | 175 -> 42 |
+| **total** | 41/107/79 -> 62/111/9 | 229/248/50 -> 138/192/14 | 296/308/17 -> 270/293/12 | 313/320/8 -> 314/319/8 | | | 2726 -> 837 |
+
+With the audit (`AUDIT=1`, run to completion after the path that starts it), 8 dev worlds (the 6 live captures and the two costliest synthetic ones; the other synthetic worlds are already 24/24 at 60 paths without it):
+
+| world | n=8 | n=16 | n=32 | n=60 | final fe | final fu | CPU s |
+|---|---|---|---|---|---|---|---|
+| live_33 | 7/13/5 -> 5/8/1 | 11/13/7 -> 6/13/1 | 22/22/1 -> 18/20/0 | 22/22/1 -> 24/24/0 | 9.4e-04 -> 2.9e-05 | 1.7e+00 -> 5.6e-05 | 464 -> 121 |
+| live_39 | 9/12/5 -> 4/6/0 | 13/15/5 -> 7/11/1 | 19/21/1 -> 15/19/1 | 22/22/1 -> 20/20/2 | 2.1e-04 -> 7.3e-03 | 9.6e-01 -> 2.3e+00 | 528 -> 111 |
+| live_40 | 8/10/6 -> 1/5/1 | 8/12/6 -> 6/8/2 | 12/15/4 -> 11/15/4 | 20/22/1 -> 19/20/2 | 7.8e-05 -> 1.4e-03 | 1.2e+00 -> 2.0e+00 | 536 -> 188 |
+| live_41 | 3/10/7 -> 3/6/2 | 15/17/4 -> 8/13/1 | 21/22/1 -> 15/19/1 | 22/22/1 -> 22/22/1 | 9.7e-04 -> 1.5e-03 | 4.7e+01 -> 1.2e+00 | 731 -> 176 |
+| live_45 | 5/8/5 -> 2/2/1 | 3/9/6 -> 5/7/1 | 13/15/6 -> 17/18/2 | 21/21/1 -> 20/21/1 | 1.4e-03 -> 1.5e-03 | 1.7e+00 -> 1.1e+00 | 367 -> 101 |
+| live_48 | 9/13/7 -> 2/7/0 | 13/16/4 -> 10/14/1 | 20/22/1 -> 18/19/2 | 20/22/1 -> 24/24/0 | 3.5e-04 -> 5.2e-05 | 6.4e+00 -> 6.5e-03 | 237 -> 91 |
+| syn_7003 | 6/11/8 -> 1/7/1 | 21/22/1 -> 6/12/3 | 24/24/0 -> 23/24/0 | 24/24/0 -> 24/24/0 | 3.1e-06 -> 6.0e-06 | 8.5e-06 -> 1.6e-05 | 416 -> 123 |
+| syn_7008 | 13/15/5 -> 6/8/0 | 17/20/3 -> 12/15/0 | 24/24/0 -> 15/20/0 | 24/24/0 -> 24/24/0 | 2.3e-06 -> 5.7e-06 | 5.4e-06 -> 1.8e-05 | 317 -> 105 |
+| **total** | 60/92/48 -> 24/49/6 | 101/124/36 -> 60/93/10 | 155/165/14 -> 132/154/10 | 175/179/6 -> 177/179/6 | | | 3597 -> 1015 |
+
+Reading (inferred from these single runs): at 60 paths the new likelihood ties main on recall and spurious planets (no audit 314 vs 313 recall(2), 8 vs 8 spurious; audit 177 vs 175, 6 vs 6) at 3.3-3.5 times less CPU, and the unexplored-field error at the last path is lower on 5 of 6 live worlds without the audit (4 of 6 with it; synthetic worlds are at the true-map level, about 1e-6, in both). Spurious planets are far fewer at every earlier checkpoint (no audit 79 -> 9 at 8 paths, 50 -> 14 at 16). But recall is clearly lower at 16 and 32 paths (no audit 229 -> 138 and 296 -> 270 recall(2)), and the main audit's early boost (n=8: 60 recall(2) with the audit against 41 without) is lost: the new audit rebuild grows little at 8 paths. One run per world; the live worlds alone vary by several planets between runs of similar configurations (P6), the totals less.
+
+**Why recall lags at 16-32 paths (observed on synthetic 7001; inferred mechanism).** The search idles at 20 of 24 planets from path 15 to 21 with about 40 evaluations per path (local refit and polish only), while `s * 100` is 5-10: the honest level for a map missing 4 planets (the falsifier table above: 5.5-15). The process then explains part of the missing planets' own signal, so their births do not gain enough evidence; recall resumes when older series leave the window (`s * 100` 3.7 at path 22, 24 planets at path 23). Lowering `SEED_SIGNIFICANCE` from 4 to 2.5 (4 worlds, 32 paths) barely helped (7001 still 16 at 16 paths), so adoption, not seeding, is the limit. The same mechanism makes one-path cases weaker: after the first path the scale comes from that path's own residual against the flat map, so the planet's own field counts as model error. `a_hit_is_recovered_from_one_path_through_the_estimator` now accepts 2 units with a covariance that covers the error (the position sd is about 5 units instead of below 1; the old name and bounds asserted the floor-only tightness), and `targeting_report`'s `planet_replay_uses_paths_not_oracle_and_resets_physical_map` FAILS on this branch (a 60-unit hit path from one shot creates no planet). Excluding the new path's own series from the scale used to fit it (tried) makes the two-hit test lose its second planet and the noisy flat world grow planets, so it was reverted. Candidate fixes, not implemented (design decision): (C) make `d_U` depend on the compared map, so a birth candidate gets its own exclusion zone and lower process variance near it, and compare maps by the full Gaussian objective including the log-determinant (peer: required, and test that a planet is not adopted merely because it shrinks the process variance); (D) tie the process prior to the number of unseen planets `N_u = N - K`; (B) estimate the scale on residuals against the current map (no lag, but in-sample, so too small; risk of spurious planets).
+
+**Held-out pass (observed; same settings but `THREADS=1`, no audit, one run each; synthetic 7101-7108, live 34, 35, 37, 42, 43; live 34 has 2 paths, 35 has 48, 43 has 41).** Run once, for this configuration, not used for any choice:
+
+| world | n=8 | n=16 | n=32 | n=60 | final fe | final fu | CPU s |
+|---|---|---|---|---|---|---|---|
+| live_34 | 0/2/2 -> 1/1/0 | | | | 4.3e-01 -> 4.9e-01 | 1.6e+00 -> 5.4e-01 | 0 -> 0 |
+| live_35 | 5/8/6 -> 5/6/2 | 6/11/8 -> 11/11/5 | 15/16/5 -> 16/18/2 | 20/21/2 -> 24/24/0 | 1.4e-01 -> 5.0e-04 | 9.8e-01 -> 1.8e-02 | 613 -> 145 |
+| live_37 | 2/8/4 -> 3/6/1 | 12/14/4 -> 3/10/1 | 17/19/2 -> 14/18/1 | 21/22/1 -> 21/22/1 | 1.0e-03 -> 1.2e-03 | 4.4e+00 -> 6.4e-01 | 121 -> 34 |
+| live_42 | 5/9/4 -> 2/5/0 | 15/16/3 -> 3/9/0 | 17/19/2 -> 15/18/0 | 20/21/1 -> 20/20/2 | 1.1e-03 -> 1.0e-03 | 1.6e-01 -> 1.7e-01 | 112 -> 56 |
+| live_43 | 0/6/7 -> 1/7/1 | 6/13/10 -> 4/12/1 | 24/24/0 -> 19/20/1 | 24/24/0 -> 21/22/1 | 4.4e-06 -> 3.2e-02 | 2.1e-06 -> 1.7e+00 | 182 -> 62 |
+| syn_7101 | 2/8/4 -> 6/10/3 | 19/20/3 -> 11/16/2 | 20/22/1 -> 21/23/0 | 24/24/0 -> 24/24/0 | 1.8e-06 -> 4.0e-06 | 2.8e-06 -> 9.2e-06 | 555 -> 125 |
+| syn_7102 | 0/5/5 -> 2/9/1 | 9/14/6 -> 8/15/0 | 18/19/4 -> 19/20/0 | 24/24/0 -> 24/24/0 | 1.7e-06 -> 1.8e-05 | 1.2e-06 -> 1.2e-04 | 260 -> 39 |
+| syn_7103 | 3/10/4 -> 7/9/2 | 15/20/4 -> 15/17/0 | 17/20/3 -> 21/21/1 | 24/24/0 -> 24/24/0 | 1.5e-06 -> 5.9e-05 | 9.1e-07 -> 7.6e-04 | 308 -> 64 |
+| syn_7104 | 0/3/6 -> 8/12/1 | 16/19/3 -> 14/18/0 | 24/24/0 -> 21/21/0 | 24/24/0 -> 24/24/0 | 1.9e-06 -> 2.5e-06 | 4.3e-06 -> 4.2e-06 | 145 -> 67 |
+| syn_7105 | 1/4/8 -> 5/10/1 | 24/24/0 -> 10/16/1 | 24/24/0 -> 20/22/1 | 24/24/0 -> 24/24/0 | 1.1e-05 -> 2.8e-05 | 5.3e-06 -> 1.4e-05 | 130 -> 68 |
+| syn_7106 | 11/15/1 -> 4/8/1 | 24/24/0 -> 10/15/1 | 24/24/0 -> 24/24/0 | 24/24/0 -> 24/24/0 | 2.4e-06 -> 2.5e-06 | 3.3e-06 -> 2.6e-06 | 74 -> 74 |
+| syn_7107 | 1/7/6 -> 0/5/1 | 15/19/3 -> 6/15/2 | 24/24/0 -> 23/23/0 | 24/24/0 -> 24/24/0 | 2.1e-06 -> 5.6e-06 | 2.3e-06 -> 4.9e-06 | 126 -> 71 |
+| syn_7108 | 0/1/8 -> 4/8/0 | 12/16/3 -> 8/13/0 | 22/23/0 -> 21/22/0 | 19/22/1 -> 24/24/0 | 1.7e-01 -> 6.8e-06 | 1.7e-01 -> 1.3e-05 | 595 -> 69 |
+| **total** | 30/86/65 -> 48/96/14 | 173/212/49 -> 104/168/13 | 246/260/19 -> 235/251/6 | 272/280/7 -> 279/281/4 | | | 3221 -> 874 |
+
+The held-out worlds repeat the dev pattern: at the last path recall is equal or higher (279 vs 272 recall(2)) with fewer spurious planets (4 vs 7) at 3.7 times less CPU, the unexplored error is lower on 4 of 5 live captures (live 43 is the exception: 24 -> 21 planets, fu 2e-6 -> 1.7), and recall at 16 paths is again much lower (173 -> 104).
+
+**Latency (observed; Mac, 10 threads, `SCHEDULE=500`, audit on, binaries built before, sequential runs, Mac load average 2.1 rising to 4.3 from other sessions).** Worst publish lag base -> P13: live 33 331 -> 270 ms, live 40 259 -> 268 ms, live 45 269 -> 265 ms. The model-error estimate adds 10-25 ms per path.
+
+**Test suite.** `cargo test --lib` 1.86 s (97 passed, 9 ignored); `cargo fmt --check` clean; `cargo test` (all targets) has the one failing `targeting_report` test above.
+
+**Compute used.** jolly: base dev no audit 2726 s, base dev audit 3597 s, P13 versions 818 + 837 (no audit), 1015 (audit), seed check 158 s, held-out 3221 (base) + 874; total about 13,250 CPU-s (3.7 CPU-h); Mac: falsifier runs and latency, a few CPU-minutes.
+
+**Reproduction.** Worktree with `einsteinbot.sqlite3` in the working directory: `PATHS=60 CEIL_MS=0 THREADS=2 SEEDS=7001 LIVE=- NAME=p13 cargo test --release --lib diagnose_replay -- --ignored --nocapture --test-threads=1` (`SEEDS=- LIVE=33` for a capture; `AUDIT=1` for the audit; `SCHEDULE=500 THREADS=10 AUDIT=1` for latency). `UPD` lines now carry `s100` and `l`. Falsifier: `SEEDS=7001,7002 LIVE=40 PATHS=32 cargo test --release --lib diagnose_matern_model_error -- --ignored --nocapture --test-threads=1` (`FLOOR=white` treats the floor as white, `MODEL=off` uses the floor alone, `GRID=1` prints the likelihood surface).
