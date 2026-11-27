@@ -343,6 +343,7 @@ cargo run --release --bin devtool -- games --from 53
 - **`games`** lists the independent games of a database: maps with the same planets that share a recorded path are one game (for example capture 54's maps are captures 53 and 55).
 - **`capture-report`** (formerly `targeting_report`) analyzes recorded paths without fitting: exact repeats, spatial overlap, short paths, oracle path RMSE; `--compare-policy` compares the coverage penalty against zero on the same histories.
 - **`schedule`** replays a world under live timing (one path every `--period-ms`, slices in between) and reports the publish lag. Not deterministic.
+- **Tuning loop.** `scripts/p14_study.py` tunes estimator search constants and targeting constants with Optuna (TPE, Wilcoxon racing over worlds, CPU and spurious-planet constraints) on `devtool eval` metrics, keeps the default configuration in every comparison and evaluates a fixed held-out set once at the end; `scripts/p14_holdout_report.py` prints the paired comparison (`docs/estimator-experiments.md`, "P14 results").
 
 ### Library modules
 

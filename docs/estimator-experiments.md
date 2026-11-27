@@ -1468,3 +1468,25 @@ Reproduction: `cargo test --release --lib diagnose_replay -- --ignored --nocaptu
 **Budget (announced before launch).** Study at most 18 CPU-h on jolly (32 cores, shared with other workers; my processes at most ~20 at a time), held-out evaluation at most ~4 CPU-h, degradation ladders under 1 CPU-h. Total target <= 25 CPU-h. Optuna 5.1.0 (PyPI, released 2026-11-16), scipy 1.18.1, in a venv on jolly.
 
 **Design.** Ask-and-tell TPE (multivariate, constant liar, constraints) with `WilcoxonPruner` (p 0.1, 8 startup worlds) racing over worlds in a per-trial shuffled order. Per world the score is (true hits + 1) / (default's true hits + 1). Training pool: 60 synthetic 24-planet worlds (seeds 1001-1060; 60 paths; 8 generated decisions at 16, 32 and 60 paths on the configuration's own estimator beliefs) and 14 older captures (29-42, 53, 55, 56, 57; one map each; recorded decisions with recorded beliefs, so only targeting knobs act there). Constraints: estimator CPU on the evaluated synthetic worlds <= 1.5 times the default's, spurious planets <= 1.1 times the default's + 2. The default configuration is trial 0. Fixed held-out set, evaluated once at the end for the default and the chosen configuration: synthetic seeds 9001-9020 and the newest live maps, captures 59-71 (13 independent games by `devtool games`).
+
+**Degradation ladders D1-D6 (observed; `devtool degrade`, build 8ec5b48, default targeting, 0.9 CPU-h).** 20 synthetic worlds (seeds 1001-1020, 16 generated decisions each, 32-path shot history) and 17 capture maps (53, 55, 56, 57, 59-71; 16 recorded decisions each, evenly spaced). A case counts when the policy fires on the true map (313 synthetic, 162 capture cases; the true map hits 99% of them). Hit rate on the true map, and the predicted-hit rate minus it (the overconfidence gap), per rung:
+
+| Rung (one error, truth otherwise) | synthetic hit % | gap | capture hit % | gap |
+|---|---|---|---|---|
+| true map | 99 | 0 | 99 | -1 |
+| D1 drop the planet nearest the shot | 58 | 41 | 33 | 52 |
+| D1 drop the two nearest | 31 | 68 | 19 | 70 |
+| D1 drop the largest | 63 | 36 | 31 | 55 |
+| D1 drop a random planet | 69 | 31 | 36 | 48 |
+| D1 drop the farthest planet | 82 | 17 | 52 | 33 |
+| D2 move the nearest planet 2 / 5 / 10 / 20 / 40 units | 93 / 91 / 86 / 82 / 77 | 6-21 | 87 / 81 / 75 / 60 / 49 | 7-38 |
+| D3 nearest planet radius -2 / +2 (mass follows r^3) | 77 / 77 | 22 | 48 / 51 | 36 |
+| D3 nearest planet radius -5 / +5 | 68 / 65 | 31-34 | 43 / 40 | 42-48 |
+| D3 nearest planet radius -10 / +10 | 64 / 53 | 35-46 | 37 / 30 | 52-57 |
+| D4 phantom planet (r 30) 50 / 100 / 200 units from the path | 59 / 62 / 64 | 35-39 | 26 / 24 / 31 | 54-62 |
+| D5 targets moved 5 / 10 / 20 / 40 units after the decision | 63 / 32 / 18 / 8 | 36-91 | 65 / 41 / 19 / 9 | 33-90 |
+| D6 every planet jittered, sd 1 / 2 / 5 / 10 (radius sd half of it) | 69 / 60 / 41 / 32 | 30-66 | 40 / 33 / 15 / 11 | 46-73 |
+
+Reading (inferred from the table): (1) **Mass (radius) errors cost far more hits than centre errors**: a 2-unit radius error (about 20% mass for a 30-unit planet) costs as much as moving the planet 20-40 units; D6 at sd 1 (radius sd 0.5) already loses 30-60% of the hits. (2) **Every missing planet costs hits, even the farthest** (17-48% lost for one random planet): the field is long-range and shots fly 50-150 ticks, so the map is only as good as its least-known planet near the long path. (3) **Phantoms cost as much as missing planets** (35-62%), so spurious planets are not cheap. (4) **Stale targets are the steepest single factor**: 5 units of target motion loses a third of the hits, 10 units two thirds. (5) The policy's claimed hit rate never drops (84-99% predicted on every rung): it has no signal of its own map error, so the gap equals the loss. Captures lose more than synthetic worlds for the same error (their recorded decisions fire longer shots, inferred from the larger miss distances). For P14 this means the estimator's objective should weigh recall and mass accuracy over centre accuracy (recall within 15 units is not enough to hit), and spurious planets should stay a constraint.
+
+**W1 (one unseen planet in an established map; observed, `devtool eval --world w1:SEED:DIST`, 30 worlds, default config).** Three W7-generator planets plus one more at least 150, 300 or 500 units from their surfaces that no path touches: the extra planet is found (within 15 units) in 10/10 worlds at every distance by 32 paths (8/10 at 500 units with 16 paths), with no spurious planet. In a sparse map a planet is found from path bending alone. For comparison, on the 60 training synthetic 24-planet worlds the default finds a median 22 of 24 planets (within 15 units) at 32 paths and 24 of 24 at 60 (23-24 within 2 units), with no spurious planet; live captures are harder (fewer long paths early in a map).
