@@ -21,6 +21,8 @@ pub struct AppConfig {
     /// The known total planet count of the server's maps (its `planets` setting, 1-64), used as
     /// fixed by the estimator; `None`: estimated with a broad prior.
     pub planets: Option<usize>,
+    /// Show the live terminal view when stdout is a terminal (`--no-tui`: plain logging).
+    pub tui: bool,
 }
 
 #[derive(Debug, Default)]
@@ -36,6 +38,7 @@ struct CliOptions {
     clients: Option<String>,
     db_path: Option<PathBuf>,
     planets: Option<String>,
+    tui: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -51,6 +54,7 @@ struct FileOptions {
     clients: Option<usize>,
     db_path: Option<PathBuf>,
     planets: Option<usize>,
+    tui: Option<bool>,
 }
 
 #[derive(Debug, Default)]
@@ -65,6 +69,7 @@ struct EnvOptions {
     clients: Option<String>,
     db_path: Option<PathBuf>,
     planets: Option<String>,
+    tui: Option<String>,
 }
 
 enum ParsedCli {
@@ -112,6 +117,7 @@ impl EnvOptions {
             clients: get("EINSTEINBOT_CLIENTS"),
             db_path: get("EINSTEINBOT_DB_PATH").map(PathBuf::from),
             planets: get("EINSTEINBOT_PLANETS"),
+            tui: get("EINSTEINBOT_TUI"),
         })
     }
 }
@@ -214,6 +220,13 @@ fn resolve(cli: CliOptions, env: EnvOptions, file: FileOptions) -> Result<AppCon
             .or(file.db_path)
             .unwrap_or_else(|| PathBuf::from("einsteinbot.sqlite3")),
         planets,
+        tui: if let Some(tui) = cli.tui {
+            tui
+        } else if let Some(value) = env.tui {
+            parse_bool(&value, "EINSTEINBOT_TUI")?
+        } else {
+            file.tui.unwrap_or(true)
+        },
     })
 }
 
@@ -247,6 +260,8 @@ where
             "--no-oracle-map" => options.oracle_map_for_policy = Some(false),
             "--clients" => options.clients = Some(value(&mut args, &arg)?),
             "--planets" => options.planets = Some(value(&mut args, &arg)?),
+            "--tui" => options.tui = Some(true),
+            "--no-tui" => options.tui = Some(false),
             _ => return Err(format!("unknown argument: {arg}\n\n{}", help_text())),
         }
     }
@@ -312,10 +327,11 @@ fn help_text() -> &'static str {
        --clients N         Run N local bot connections (default: 1, max: 16)\n\
        --db-path PATH      SQLite file (default: einsteinbot.sqlite3)\n\
        --planets N         Known planet count of the server's maps (fixed; default: estimated)\n\
+       --no-tui            Plain logging instead of the live terminal view\n\
        -h, --help          Show this help\n\
      \n\
      Precedence: command line, environment, TOML config, defaults.\n\
-     Environment: EINSTEINBOT_CONFIG, _HOST, _PORT, _NAME, _RECORD, _DUMMY, _TARGETING, _ORACLE_MAP, _CLIENTS, _DB_PATH, _PLANETS.\n"
+     Environment: EINSTEINBOT_CONFIG, _HOST, _PORT, _NAME, _RECORD, _DUMMY, _TARGETING, _ORACLE_MAP, _CLIENTS, _DB_PATH, _PLANETS, _TUI.\n"
 }
 
 #[cfg(test)]
@@ -412,6 +428,22 @@ mod tests {
         let config = resolve(cli, EnvOptions::default(), FileOptions::default()).unwrap();
 
         assert!(!config.record);
+    }
+
+    #[test]
+    fn live_view_defaults_on_and_no_tui_turns_it_off() {
+        let config = resolve(
+            CliOptions::default(),
+            EnvOptions::default(),
+            FileOptions::default(),
+        )
+        .unwrap();
+        assert!(config.tui);
+        let ParsedCli::Options(cli) = parse_args(["--no-tui".to_owned()]).unwrap() else {
+            panic!("expected options");
+        };
+        let config = resolve(cli, EnvOptions::default(), FileOptions::default()).unwrap();
+        assert!(!config.tui);
     }
 
     #[test]

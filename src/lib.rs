@@ -15,3 +15,4 @@ pub mod map_change;
 
 pub mod field_score;
 pub mod game_stats;
+mod tui;
