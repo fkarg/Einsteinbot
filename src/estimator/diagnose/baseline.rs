@@ -54,9 +54,8 @@ fn diagnose_baseline() {
                 "rebuild" => {
                     let never = AtomicBool::new(false);
                     let started = Instant::now();
-                    let noise = crate::estimator::noise::Noise::new(
+                    let noise = crate::estimator::noise::NoiseModel::new(
                         crate::estimator::noise::ModelError::PRIOR,
-                        &[],
                         &case.shots,
                     );
                     let theta = from_scratch(&case.shots, &noise, 32, cores(), &never)

@@ -1107,3 +1107,18 @@ The held-out worlds repeat the dev pattern: at the last path recall is equal or 
 **Compute used.** jolly: base dev no audit 2726 s, base dev audit 3597 s, P13 versions 818 + 837 (no audit), 1015 (audit), seed check 158 s, held-out 3221 (base) + 874; total about 13,250 CPU-s (3.7 CPU-h); Mac: falsifier runs and latency, a few CPU-minutes.
 
 **Reproduction.** Worktree with `einsteinbot.sqlite3` in the working directory: `PATHS=60 CEIL_MS=0 THREADS=2 SEEDS=7001 LIVE=- NAME=p13 cargo test --release --lib diagnose_replay -- --ignored --nocapture --test-threads=1` (`SEEDS=- LIVE=33` for a capture; `AUDIT=1` for the audit; `SCHEDULE=500 THREADS=10 AUDIT=1` for latency). `UPD` lines now carry `s100` and `l`. Falsifier: `SEEDS=7001,7002 LIVE=40 PATHS=32 cargo test --release --lib diagnose_matern_model_error -- --ignored --nocapture --test-threads=1` (`FLOOR=white` treats the floor as white, `MODEL=off` uses the floor alone, `GRID=1` prints the likelihood surface).
+
+#### P13 follow-up: per-model noise (user decision Q16, option A; observed, Mac, `THREADS=4`, deterministic, one run each)
+
+Each compared map gets its own noise: its own admissible region (its planets' exclusion zones) and a process variance proportional to its unseen count `N_u = max(24 - K, 0.5)` (scale now per square root of an unseen planet, prior 0.035), shared `(s, l)` from the prequential estimate (whose series store the published map's `N_u`); maps are compared by `-0.5 (chi2 + log-det)` plus the Laplace Occam term and the 1/20 odds (`search::mode_at`, `Models`); every refit runs under the noise of its start map. Every adopted birth and death of the live search records its gain split (`ADOPT` lines of `diagnose_replay`); "from log-det" means the log-determinant part is larger than the chi-square part.
+
+Falsifier, synthetic 7001 (the 20/24 stall), `rec2/rec15/spur`:
+
+| variant | n=8 | n=16 | n=32 | n=60 | adoptions from log-det | wall (60 paths) |
+|---|---|---|---|---|---|---|
+| main 16adc7f | 3/8/6 | 24/24/0 | 24/24/0 | 24/24/0 | | |
+| P13 v2 (frozen noise) | 5/9/1 | 16/20/0 | 24/24/0 | 24/24/0 | | |
+| A: own exclusion zones and `N_u` scaling | 9/11/4 | 12/17/2 | 18/20/2 | 20/22/0 | 18 of 27 births | 539 s |
+| own exclusion zones only (`N_u` fixed at 4) | 6/10/0 | 16/19/0 | 23/24/0 | 24/24/0 | 1 of 24 births | 24 s |
+
+Option A does not pass: births come early and fast, but two thirds of them are adopted mainly because each birth lowers `N_u` and so shrinks the noise of every row (log-det gains of 35-675 nats against chi-square gains that are often small or negative), and the map hits the planet cap with wrong planets (18 of 24 found at 32 paths, 20 at 60). Each path costs 3-14 s of wall time (the search never idles). Map-dependent exclusion zones alone behave like the frozen noise (16 at 16 paths, the stall is not removed). `planet_replay_uses_paths_not_oracle_and_resets_physical_map` still fails with both variants; the library tests pass with both. Dev and held-out runs were not started (plan: stop if the falsifier does not improve).

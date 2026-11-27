@@ -88,6 +88,23 @@ fn replay_deterministic(case: &Case, settings: Settings) {
             );
         }
     }
+    // Every adopted birth and death of the live search and the split of its evidence gain.
+    let adoptions = &estimator.search.adoptions;
+    for a in adoptions {
+        println!(
+            "ADOPT world={id} cfg={name} n={} kind={} chi2_gain={:.2} log_det_gain={:.2} from_log_det={}",
+            a.paths,
+            if a.birth { "birth" } else { "death" },
+            a.chi2_gain,
+            a.log_det_gain,
+            a.from_log_det()
+        );
+    }
+    println!(
+        "ADOPTSUM world={id} cfg={name} adoptions={} from_log_det={}",
+        adoptions.len(),
+        adoptions.iter().filter(|a| a.from_log_det()).count()
+    );
 }
 
 /// Prints what a step that took over 100 ms spent its time on (`SLOW` lines): the parts of the

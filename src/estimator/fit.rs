@@ -100,7 +100,10 @@ pub(super) struct Unexplained {
 }
 
 pub(super) struct Evidence {
+    /// Without the noise's log-determinant (the same for every map under one noise).
     pub log_evidence: f64,
+    /// Chi-square of all residuals (data, interior penalties, contacts).
+    pub chi2: f64,
     /// `[x, y, radius]` covariance of all planets, `None` when the data leave the parameters
     /// under-identified or a planet sits at a bound.
     pub covariance: Option<DMatrix<f64>>,
@@ -400,6 +403,15 @@ impl<'a> Fit<'a> {
             .then(|| (DVector::from_vec(res), jacobian))
     }
 
+    /// The noise's log-determinant over every path.
+    pub fn log_det(&self) -> f64 {
+        self.shots
+            .iter()
+            .filter_map(|shot| shot.path.as_ref())
+            .map(PathData::log_det)
+            .sum()
+    }
+
     /// Chi-square.
     pub fn chi2(&self, theta: &[[f64; 3]]) -> Option<f64> {
         self.evaluate(theta, false, 1)
@@ -500,6 +512,7 @@ impl<'a> Fit<'a> {
         if k == 0 {
             return Some(Evidence {
                 log_evidence: -0.5 * chi2,
+                chi2,
                 covariance: None,
             });
         }
@@ -541,6 +554,7 @@ impl<'a> Fit<'a> {
         }
         log_evidence.is_finite().then_some(Evidence {
             log_evidence,
+            chi2,
             covariance,
         })
     }

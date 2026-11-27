@@ -280,7 +280,7 @@ fn residual_rows(shots: &[Shot]) -> usize {
 #[test]
 #[ignore]
 fn diagnose_matern_model_error() {
-    use super::noise::{ModelError, Noise, Series, estimate, with_noise};
+    use super::noise::{ModelError, NoiseModel, Series, estimate, with_noise};
     let drop: usize = std::env::var("DROP")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -314,13 +314,13 @@ fn diagnose_matern_model_error() {
         for (label, theta) in [("true", &truth), ("missing", &partial)] {
             let planets: Vec<Planet> = theta.iter().map(|t| planet_at(*t)).collect();
             let started = Instant::now();
-            let mut noise = Noise::new(ModelError::PRIOR, &planets, &case.shots);
+            let mut noise = NoiseModel::new(ModelError::PRIOR, &case.shots).noise(&planets);
             let raster_ms = started.elapsed().as_secs_f64() * 1e3;
             let series: Vec<Series> = case
                 .shots
                 .iter()
                 .filter_map(|s| s.path.as_ref())
-                .map(|p| Series::new(p, &planets, &noise.admissible))
+                .map(|p| Series::new(p, &planets, &noise))
                 .collect();
             let started = Instant::now();
             noise.model = if off {
@@ -371,8 +371,9 @@ fn diagnose_matern_model_error() {
                 }
             }
             println!(
-                "MATERN case={:?} shape=prod map={label} s100={:.3} l={:.1} rows={rows} chi2_per_row={:.3} lag1={:.3} raster_ms={raster_ms:.1} estimate_ms={estimate_ms:.0}",
+                "MATERN case={:?} shape=prod map={label} unseen={:.1} s100={:.3} l={:.1} rows={rows} chi2_per_row={:.3} lag1={:.3} raster_ms={raster_ms:.1} estimate_ms={estimate_ms:.0}",
                 case.name,
+                noise.unseen,
                 noise.model.scale * 100.0,
                 noise.model.length,
                 chi2 / rows as f64,

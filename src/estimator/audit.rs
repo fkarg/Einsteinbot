@@ -4,11 +4,11 @@
 //! own threads, so an audit never delays the publication of a map; the estimator collects a
 //! finished half between slices.
 use super::Shot;
-use super::fit::{Budget, Fit, theta_of};
-use super::noise::{Noise, with_noise};
+use super::fit::{Budget, theta_of};
+use super::noise::NoiseModel;
 use super::rebuild::from_scratch;
-use super::search::refit;
-use crate::simulation::WorldParameters;
+use super::search::{Models, mode_at, refit};
+use super::work::Stats;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -46,7 +46,7 @@ impl Audit {
     /// adopted) on those.
     pub(super) fn rebuild(
         shots: Vec<Shot>,
-        noise: Noise,
+        noise: NoiseModel,
         max_planets: usize,
         threads: usize,
     ) -> Self {
@@ -55,32 +55,36 @@ impl Audit {
         })
     }
 
-    /// Start comparing `candidate` with `maintained` on all of `shots` under `noise` (both maps
-    /// see the same noise): both refit on all rows, and the result is the refit candidate if its
+    /// Start comparing `candidate` with `maintained` on all of `shots`, each under its own noise
+    /// from `noise`: both refit on all rows, and the result is the refit candidate if its
     /// evidence is higher.
     pub(super) fn compare(
         shots: Vec<Shot>,
-        noise: Noise,
+        noise: NoiseModel,
         maintained: Vec<[f64; 3]>,
         candidate: Vec<[f64; 3]>,
         threads: usize,
     ) -> Self {
         Self::spawn(Stage::Compare, move |cancelled| {
-            let world = WorldParameters::default();
-            let rows = with_noise(&shots, &noise);
-            let joint = Fit::new(&rows, world, cancelled, true, vec![]);
+            let stats = Stats::default();
+            let models = Models {
+                shots: &shots,
+                noise: &noise,
+                cancelled,
+                stats: &stats,
+            };
             let budget = Budget {
                 evaluations: REFIT_EVALUATIONS,
                 deadline: None,
                 threads,
             };
             let refit_of = |start: Vec<[f64; 3]>| {
-                refit(&joint, &start, &budget)
+                refit(&models, &start, &budget)
                     .map(|mode| mode.planets.iter().map(theta_of).collect())
                     .unwrap_or(start)
             };
             let (maintained, candidate) = (refit_of(maintained), refit_of(candidate));
-            let evidence = |theta: &[[f64; 3]]| joint.evidence(theta).map(|e| e.log_evidence);
+            let evidence = |theta: &[[f64; 3]]| mode_at(&models, theta).map(|m| m.log_evidence);
             let better = match (evidence(&maintained), evidence(&candidate)) {
                 (Some(old), Some(new)) => new > old,
                 (None, Some(_)) => true,

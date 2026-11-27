@@ -5,7 +5,7 @@
 //! Model error: per path and axis a Matern-3/2 process in arc length along the row centres. Its
 //! shape follows the field of unseen planets (Campbell's theorem: the variance of a Poisson field
 //! of point masses grows as `1 / d^2`, `d` the distance to where they can be, and its correlation
-//! length as `d`): at a row centre `c`, sd `scale * 100 / d_U(c)` and length
+//! length as `d`): at a row centre `c`, sd `sqrt(unseen) * scale * 100 / d_U(c)` and length
 //! `length * d_U(c) / 100`, where `d_U` is the distance to the admissible region `U` of unseen
 //! planet centres (`Admissible`), clamped below at `MIN_DISTANCE`. The two scalars are estimated
 //! by type-II maximum a posteriori on prequential residuals (`Series`, `estimate`): each new
@@ -19,18 +19,21 @@
 //! that do not depend on the data (`Gains`). With the process off this is the exact Cholesky
 //! whitening of the banded floor. A thinned path's floor is its rows' marginal (white) variance.
 //!
-//! The noise is frozen within an operation (`Noise`): a slice, a local refit, a polish or an audit
-//! comparison computes it once from the published map and the paths, and every map it compares
-//! uses the same noise, so evidence differences need no log-determinant.
+//! Each compared map has its own noise (`NoiseModel::noise`): its own admissible region (its
+//! planets' exclusion zones) and a process variance proportional to its unseen count
+//! `unseen(K)`, with the scalars shared and frozen within an operation (a slice, a local refit, a
+//! polish, an audit rebuild or comparison). Maps are compared by the full Gaussian marginal
+//! likelihood, so the log-determinant enters every evidence (`search::mode_at`).
 use super::Shot;
+use super::fit::planet_at;
 use super::window::PathData;
 use crate::protocol::Planet;
 use crate::simulation::WorldParameters;
 
-/// Prior (and starting) model-error scalars; `diagnose_matern_model_error` estimated
-/// `scale` 0.056-0.10 and `length` 500-900, and the Campbell prior for 4 unseen planets gives
-/// `scale` about 0.064.
-const PRIOR_SCALE: f64 = 0.07;
+/// Prior (and starting) model-error scalars. `scale` is per square root of an unseen planet:
+/// `diagnose_matern_model_error` estimated 0.056-0.15 for 4 missing planets (0.03-0.07 per root),
+/// and the Campbell prior for 4 unseen planets gives about 0.064 (0.032 per root).
+const PRIOR_SCALE: f64 = 0.035;
 const PRIOR_LENGTH: f64 = 600.0;
 /// Standard deviation of the log-normal hyperprior of each scalar (weak: a factor e).
 const HYPERPRIOR_LOG_SD: f64 = 1.0;
@@ -44,7 +47,8 @@ const SPACING: f64 = 10.0;
 const ORIGIN: f64 = 25.0;
 const CLEARANCE: f64 = 20.0;
 
-/// The model-error scalars: row sd `scale * 100 / d_U`, length `length * d_U / 100`.
+/// The model-error scalars: row sd `sqrt(unseen) * scale * 100 / d_U`, length
+/// `length * d_U / 100`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct ModelError {
     pub scale: f64,
@@ -77,12 +81,18 @@ pub(super) struct Admissible {
     nearest: Vec<u32>,
 }
 
-impl Admissible {
-    pub fn new<'a>(
-        planets: &[Planet],
-        ticks: impl Iterator<Item = &'a [f64; 2]>,
-        world: WorldParameters,
-    ) -> Self {
+/// The raster of candidate centres with the observed ticks' clearance stamped out: what every
+/// map's admissible region shares (`TickRaster::admissible` adds a map's planets).
+#[derive(Clone, Debug)]
+pub(super) struct TickRaster {
+    nx: usize,
+    ny: usize,
+    offset: [usize; 2],
+    free: Vec<bool>,
+}
+
+impl TickRaster {
+    pub fn new<'a>(ticks: impl Iterator<Item = &'a [f64; 2]>, world: WorldParameters) -> Self {
         // Battlefield nodes `ORIGIN + SPACING * k` below `extent - CLEARANCE`, plus the margin.
         let count =
             |extent: f64| ((extent - CLEARANCE - ORIGIN) / SPACING).ceil().max(0.0) as usize;
@@ -91,43 +101,58 @@ impl Admissible {
             count(world.battlefield_height),
         ];
         let pad = ((world.margin + ORIGIN) / SPACING).ceil() as usize;
-        let offset = [pad, pad];
         let (nx, ny) = (inside[0] + 2 * pad, inside[1] + 2 * pad);
-        let mut free = vec![false; nx * ny];
-        for j in pad..pad + inside[1] {
-            free[j * nx + pad..j * nx + pad + inside[0]].fill(true);
-        }
-        let position = |k: usize, axis: usize| ORIGIN + SPACING * (k as f64 - offset[axis] as f64);
-        let mut stamp = |x: f64, y: f64, radius: f64| {
-            let range = |c: f64, axis: usize, n: usize| {
-                let node = |v: f64| (v - ORIGIN) / SPACING + offset[axis] as f64;
-                let lo = node(c - radius).ceil().clamp(0.0, n as f64) as usize;
-                let hi = (node(c + radius).floor() + 1.0).clamp(0.0, n as f64) as usize;
-                (lo, hi)
-            };
-            let ((i0, i1), (j0, j1)) = (range(x, 0, nx), range(y, 1, ny));
-            for j in j0..j1 {
-                for i in i0..i1 {
-                    if (position(i, 0) - x).hypot(position(j, 1) - y) <= radius {
-                        free[j * nx + i] = false;
-                    }
-                }
-            }
-        };
-        for p in planets {
-            stamp(p.x, p.y, p.radius + CLEARANCE);
-        }
-        for t in ticks {
-            stamp(t[0], t[1], CLEARANCE);
-        }
-        Self {
+        let mut raster = Self {
             nx,
             ny,
-            offset,
-            nearest: nearest_free(&free, nx, ny),
+            offset: [pad, pad],
+            free: vec![false; nx * ny],
+        };
+        for j in pad..pad + inside[1] {
+            raster.free[j * nx + pad..j * nx + pad + inside[0]].fill(true);
+        }
+        for t in ticks {
+            raster.stamp(t[0], t[1], CLEARANCE);
+        }
+        raster
+    }
+
+    /// Mark the nodes within `radius` of `(x, y)` inadmissible.
+    fn stamp(&mut self, x: f64, y: f64, radius: f64) {
+        let (nx, ny, offset) = (self.nx, self.ny, self.offset);
+        let position = |k: usize, axis: usize| ORIGIN + SPACING * (k as f64 - offset[axis] as f64);
+        let range = |c: f64, axis: usize, n: usize| {
+            let node = |v: f64| (v - ORIGIN) / SPACING + offset[axis] as f64;
+            let lo = node(c - radius).ceil().clamp(0.0, n as f64) as usize;
+            let hi = (node(c + radius).floor() + 1.0).clamp(0.0, n as f64) as usize;
+            (lo, hi)
+        };
+        let ((i0, i1), (j0, j1)) = (range(x, 0, nx), range(y, 1, ny));
+        for j in j0..j1 {
+            for i in i0..i1 {
+                if (position(i, 0) - x).hypot(position(j, 1) - y) <= radius {
+                    self.free[j * nx + i] = false;
+                }
+            }
         }
     }
 
+    /// The admissible region of the map `planets`.
+    pub fn admissible(&self, planets: &[Planet]) -> Admissible {
+        let mut raster = self.clone();
+        for p in planets {
+            raster.stamp(p.x, p.y, p.radius + CLEARANCE);
+        }
+        Admissible {
+            nx: self.nx,
+            ny: self.ny,
+            offset: self.offset,
+            nearest: nearest_free(&raster.free, self.nx, self.ny),
+        }
+    }
+}
+
+impl Admissible {
     fn node(&self, index: u32) -> [f64; 2] {
         let index = index as usize;
         [
@@ -230,30 +255,69 @@ fn nearest_free(free: &[bool], nx: usize, ny: usize) -> Vec<u32> {
     nearest
 }
 
-/// The noise of one operation: the model-error scalars and the admissible region they are
-/// shaped by.
+/// Expected number of planets (the local generator's default; the server does not send it).
+const PLANETS_EXPECTED: f64 = 24.0;
+/// Unseen planets of a map are `PLANETS_EXPECTED - K`, but never fewer than this: a complete (or
+/// overfull) map keeps a small allowance for planets beyond the default count and for the found
+/// planets' own error.
+const MIN_UNSEEN: f64 = 0.5;
+
+/// Expected unseen planets of a map with `k` planets.
+pub(super) fn unseen(k: usize) -> f64 {
+    (PLANETS_EXPECTED - k as f64).max(MIN_UNSEEN)
+}
+
+/// The noise of one map: the model-error scalars, its admissible region and its unseen count.
+/// The process variance is proportional to the unseen count (Campbell: to the density of unseen
+/// planets), so its sd is `sqrt(unseen) * scale * 100 / d_U`.
 #[derive(Clone, Debug)]
 pub(super) struct Noise {
     pub model: ModelError,
     pub admissible: Admissible,
+    pub unseen: f64,
 }
 
 impl Noise {
-    /// The noise for the map `planets` (the published one) and the paths `shots`.
-    pub fn new(model: ModelError, planets: &[Planet], shots: &[Shot]) -> Self {
+    /// (sd, length) of the process at `p`.
+    pub fn shape(&self, p: [f64; 2]) -> (f64, f64) {
+        let (sd, length) = self.model.shape(self.admissible.distance(p));
+        (sd * self.unseen.sqrt(), length)
+    }
+}
+
+/// The noise of one operation: the model-error scalars and the observed ticks, from which every
+/// compared map gets its own noise (`noise`: its own exclusion zones and unseen count).
+#[derive(Clone, Debug)]
+pub(super) struct NoiseModel {
+    pub model: ModelError,
+    ticks: TickRaster,
+}
+
+impl NoiseModel {
+    pub fn new(model: ModelError, shots: &[Shot]) -> Self {
         let ticks = shots
             .iter()
             .filter_map(|shot| shot.path.as_ref())
             .flat_map(|path| path.ticks.iter());
         Self {
             model,
-            admissible: Admissible::new(planets, ticks, WorldParameters::default()),
+            ticks: TickRaster::new(ticks, WorldParameters::default()),
         }
     }
 
-    /// (sd, length) of the process at `p`.
-    pub fn shape(&self, p: [f64; 2]) -> (f64, f64) {
-        self.model.shape(self.admissible.distance(p))
+    /// The noise of the map `planets`.
+    pub fn noise(&self, planets: &[Planet]) -> Noise {
+        Noise {
+            model: self.model,
+            admissible: self.ticks.admissible(planets),
+            unseen: unseen(planets.len()),
+        }
+    }
+
+    /// `shots` under the noise of the map `theta`.
+    pub fn rows_for(&self, shots: &[Shot], theta: &[[f64; 3]]) -> Vec<Shot> {
+        let planets: Vec<Planet> = theta.iter().map(|t| planet_at(*t)).collect();
+        with_noise(shots, &self.noise(&planets))
     }
 }
 
@@ -434,6 +498,8 @@ impl Gains {
 pub(super) struct Series {
     floor: Floor,
     distance: Vec<f64>,
+    /// Unseen planets of the published map.
+    unseen: f64,
     raw: [Vec<f64>; 2],
     /// Rows within `CLEARANCE` of a published planet's surface: their residual is dominated by
     /// that planet's parameter error (or by a wrong planet), not by the field of unseen planets,
@@ -442,7 +508,7 @@ pub(super) struct Series {
 }
 
 impl Series {
-    pub fn new(path: &PathData, planets: &[Planet], admissible: &Admissible) -> Self {
+    pub fn new(path: &PathData, planets: &[Planet], noise: &Noise) -> Self {
         let rows = path.row_count();
         let mut prediction = [vec![0.0; rows], vec![0.0; rows]];
         for p in planets {
@@ -464,8 +530,9 @@ impl Series {
         Self {
             floor: path.floor().clone(),
             distance: (0..rows)
-                .map(|r| admissible.distance(path.center(r)))
+                .map(|r| noise.admissible.distance(path.center(r)))
                 .collect(),
+            unseen: noise.unseen,
             raw,
             missing,
         }
@@ -473,7 +540,14 @@ impl Series {
 
     /// Gaussian log-likelihood of the residuals under `model` (without the `2 pi` constant).
     pub fn log_likelihood(&self, model: ModelError) -> f64 {
-        let shape: Vec<(f64, f64)> = self.distance.iter().map(|d| model.shape(*d)).collect();
+        let shape: Vec<(f64, f64)> = self
+            .distance
+            .iter()
+            .map(|d| {
+                let (sd, length) = model.shape(*d);
+                (sd * self.unseen.sqrt(), length)
+            })
+            .collect();
         (0..2)
             .map(|axis| {
                 let gains = Gains::with_missing(&self.floor, axis, &shape, &self.missing);
@@ -649,7 +723,7 @@ mod tests {
             })
             .chain((0..300).map(|i| [-200.0 + 3.0 * i as f64, 1300.0 - 2.5 * i as f64]))
             .collect();
-        let admissible = Admissible::new(&planets, ticks.iter(), world);
+        let admissible = TickRaster::new(ticks.iter(), world).admissible(&planets);
         let mut nodes = Vec::new();
         let mut y = ORIGIN;
         while y < world.battlefield_height - CLEARANCE {
@@ -695,15 +769,15 @@ mod tests {
             worst = worst.max((admissible.distance(*t) - brute).abs());
         }
         assert!(worst < 1e-9, "worst difference {worst}");
-        let empty = Admissible::new(
-            &[],
+        let empty = TickRaster::new(
             std::iter::empty(),
             WorldParameters {
                 battlefield_width: 30.0,
                 battlefield_height: 30.0,
                 ..world
             },
-        );
+        )
+        .admissible(&[]);
         assert_eq!(empty.distance([10.0, 10.0]), f64::INFINITY);
     }
 }

@@ -39,7 +39,7 @@ use crate::simulation::{ShotObservation, WorldParameters};
 use crate::strategy::MapBelief;
 use audit::{Audit, Stage};
 use fit::{CONTACT_FULL, Evidence, Fit, planet_at};
-use noise::{ModelError, Noise};
+use noise::{ModelError, NoiseModel};
 use search::{Search, Slice};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -145,7 +145,7 @@ impl Settings {
         &'a self,
         cancelled: &'a AtomicBool,
         stats: &'a Stats,
-        noise: &'a Noise,
+        noise: &'a NoiseModel,
     ) -> Slice<'a> {
         Slice {
             noise,
@@ -273,10 +273,11 @@ impl Estimator {
             // model-error estimate and the local refit under it.
             let started = Instant::now();
             let published = self.published_planets();
-            let mut noise = Noise::new(self.model, &published, &self.shots[..=self.searched]);
+            let mut noise = NoiseModel::new(self.model, &self.shots[..=self.searched]);
             if let Some(path) = &self.shots[self.searched].path {
+                let published_noise = noise.noise(&published);
                 self.series
-                    .push(noise::Series::new(path, &published, &noise.admissible));
+                    .push(noise::Series::new(path, &published, &published_noise));
                 if self.series.len() > noise::WINDOW {
                     self.series.remove(0);
                 }
@@ -368,7 +369,7 @@ impl Estimator {
         if self.polish_due {
             self.polish_due = false;
             let started = Instant::now();
-            let shots = noise::with_noise(&self.shots, &self.noise());
+            let shots = self.noise().rows_for(&self.shots, &self.search.theta);
             let full = Fit::new(&shots, WorldParameters::default(), cancelled, true, vec![])
                 .with_stats(&self.stats);
             let theta = self.search.theta.clone();
@@ -453,10 +454,10 @@ impl Estimator {
             .unwrap_or_default()
     }
 
-    /// The noise of an operation starting now: the current model-error estimate, shaped by the
-    /// published map and every path.
-    fn noise(&self) -> Noise {
-        Noise::new(self.model, &self.published_planets(), &self.shots)
+    /// The noise model of an operation starting now: the current model-error estimate and every
+    /// path (each compared map adds its own planets).
+    fn noise(&self) -> NoiseModel {
+        NoiseModel::new(self.model, &self.shots)
     }
 
     /// Forget the map epoch's evidence. Player positions survive: the server announces a
