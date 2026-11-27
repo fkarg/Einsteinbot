@@ -136,7 +136,8 @@ fn rungs(case: &Case, path: &[Point]) -> Vec<(&'static str, String, Vec<Planet>,
     for d in [5.0, 10.0, 20.0, 40.0] {
         out.push(("D5_stale_player", format!("{d}"), t.clone(), Some(d)));
     }
-    // D6: every planet's centre and radius jittered with sd sigma (uniform draws).
+    // D6: every planet's centre jittered with sd sigma per axis, its radius with sd sigma / 2
+    // (uniform draws; mass follows radius cubed).
     for sigma in [1.0, 2.0, 5.0, 10.0] {
         let s3 = sigma * 3f64.sqrt();
         let m = t
@@ -244,12 +245,13 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             "--paths" => paths = num(value()?)?,
             "--situations" => count = num(value()?)?,
             "--threads" => threads = num(value()?)?.max(1),
-            _ => {
+            "-h" | "--help" => {
                 println!(
                     "Usage: devtool degrade --worlds SPEC,SPEC,... [--situations N (16; recorded decisions for captures, evenly spaced)] [--paths N (32: synthetic shot history)] [--config cfg.json] [--threads N] [--db PATH]\nOne JSON line per world and rung, then one summary line per rung over all worlds. A case counts when the policy fires on the perfect map."
                 );
                 return Ok(());
             }
+            other => return Err(format!("unknown argument {other} (--help for usage)")),
         }
     }
     let config = Config::load(config_path.as_deref())?;
@@ -257,6 +259,9 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     let mut total: BTreeMap<(String, String), Tally> = BTreeMap::new();
     for spec in specs.split(',').filter(|s| !s.is_empty()) {
         let world = world::load(spec, paths, &db)?;
+        if world.truth.is_empty() {
+            return Err(format!("{spec}: no planets to degrade"));
+        }
         let all = cases(&world, paths, count);
         let per_case = par_map(all.len(), threads, |i| {
             let case = &all[i];

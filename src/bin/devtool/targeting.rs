@@ -292,8 +292,14 @@ pub fn replay_capture(
     let mut last_pos: HashMap<u32, (f32, f32)> = HashMap::new();
     let mut begins: Vec<(u32, f64, f64, i64)> = vec![];
     let mut fins: Vec<(i64, i64, ShotObservation)> = vec![];
-    for e in &events[world.start..] {
+    for (i, e) in events.iter().enumerate() {
         match &e.event {
+            // Positions before the map keep `last_pos` current, so the first in-map reposition
+            // can be attributed too.
+            ServerEvent::PlayerPosition { player_id, x, y } if i < world.start => {
+                last_pos.insert(*player_id, (*x, *y));
+            }
+            _ if i < world.start => {}
             ServerEvent::PlayerPosition { player_id, x, y } => {
                 let old = last_pos.insert(*player_id, (*x, *y));
                 let killer = old.and_then(|(ox, oy)| {
@@ -390,6 +396,10 @@ pub fn replay_capture(
         loop {
             let e = e0 + ENERGY_RATE * k as f64;
             let step_ts = dts + k * 1000;
+            // The map ended while waiting: no shot in this map.
+            if step_ts >= world.end_ts {
+                break;
+            }
             let mut st = if k == 0 {
                 st0.clone()
             } else {
@@ -408,7 +418,10 @@ pub fn replay_capture(
             let choice = policy.choose(&st, e);
             o.choose_ms += started.elapsed().as_secs_f64() * 1e3;
             if let Some(c) = choice {
-                let (path, players) = fly(&truth, &st, own, c.velocity, c.angle_degrees)?;
+                let Some((path, players)) = fly(&truth, &st, own, c.velocity, c.angle_degrees)
+                else {
+                    break;
+                };
                 let fire = step_ts as f64 + FIRE_LATENCY_MS;
                 let impact = fire + (path.points.len() - 1) as f64 * 1000.0 / st.step_rate();
                 o.fired = true;

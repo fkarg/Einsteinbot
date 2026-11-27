@@ -26,12 +26,13 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             "--from" => from = value()?.parse().map_err(|e| format!("{e}"))?,
             "--to" => to = value()?.parse().map_err(|e| format!("{e}"))?,
             "--min-paths" => min_paths = value()?.parse().map_err(|e| format!("{e}"))?,
-            _ => {
+            "-h" | "--help" => {
                 println!(
                     "Usage: devtool games [--db PATH] [--from ID] [--to ID] [--min-paths N (8)]\nOne JSON line per independent game with disclosed planets and at least N distinct paths: its world spec, duplicates, paths, decisions, start time."
                 );
                 return Ok(());
             }
+            other => return Err(format!("unknown argument {other} (--help for usage)")),
         }
     }
     let connection = open(&db)?;

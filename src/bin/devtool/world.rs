@@ -35,6 +35,8 @@ pub struct World {
     pub start: usize,
     /// Recorded targeting decisions of the map (captures only).
     pub decisions: Vec<Decision>,
+    /// Time of the first event after the map (`i64::MAX` when the map runs to the end).
+    pub end_ts: i64,
     /// Truth planets the world means to be hard (W1: the unseen one).
     pub intended: Vec<usize>,
 }
@@ -100,6 +102,7 @@ pub fn load(spec: &str, paths: usize, db: &str) -> Result<World, String> {
                 events: path_events(&shots),
                 start: 0,
                 decisions: vec![],
+                end_ts: i64::MAX,
                 intended: vec![],
             })
         }
@@ -113,6 +116,7 @@ pub fn load(spec: &str, paths: usize, db: &str) -> Result<World, String> {
                 events: path_events(&shots),
                 start: 0,
                 decisions: vec![],
+                end_ts: i64::MAX,
             })
         }
         "capture" => {
@@ -247,6 +251,7 @@ fn load_capture(db: &str, capture: i64, map: usize) -> Result<World, String> {
         events[start].seq,
         events.get(end).map_or(i64::MAX, |e| e.seq),
     );
+    let end_ts = events.get(end).map_or(i64::MAX, |e| e.ts);
     events.truncate(end);
     let mut q = connection
         .prepare("SELECT sequence, timestamp_unix_ms, bot_name, data_json FROM diagnostics WHERE capture_id = ?1 AND kind = 'target_decision' ORDER BY sequence")
@@ -278,6 +283,7 @@ fn load_capture(db: &str, capture: i64, map: usize) -> Result<World, String> {
         events,
         start,
         decisions,
+        end_ts,
         intended: vec![],
     })
 }

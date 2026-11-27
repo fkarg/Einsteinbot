@@ -99,8 +99,16 @@ pub fn revision() -> (String, bool) {
 pub fn run(args: Args) -> Result<(), String> {
     let config = Config::load(args.config.as_deref())?;
     let (revision, dirty) = revision();
+    // A capture world depends on the database it is read from (and on its size while recording).
+    let source = if args.world.starts_with("capture:") {
+        let meta = std::fs::metadata(&args.db).map_err(|e| format!("{}: {e}", args.db))?;
+        let path = std::fs::canonicalize(&args.db).map_err(|e| e.to_string())?;
+        format!("{}@{}", path.display(), meta.len())
+    } else {
+        String::new()
+    };
     let key = format!(
-        "{revision}|{}|{}|paths={}|mode={}|belief={}|situations={}|checkpoints={:?}",
+        "{revision}|{}|{}{source}|paths={}|mode={}|belief={}|situations={}|checkpoints={:?}",
         config.hash(),
         args.world,
         args.paths,
@@ -274,22 +282,25 @@ fn replay(world: &World, config: &Config, args: &Args) -> Replay {
         let next = out.after_path.len();
         let is_new_path = paths.get(next).is_some_and(|(j, _)| *j == i);
         if !is_new_path {
-            if !matches!(ev.event, ServerEvent::ShotFin { .. }) {
+            // What the live map feed passes (no `Planets`: a fresh estimator needs no reset, and a
+            // repeated identical `Planets` event inside the map must not wipe it).
+            if matches!(
+                ev.event,
+                ServerEvent::PlayerPosition { .. } | ServerEvent::PlayerLeave { .. }
+            ) {
                 estimator.observe(&ev.event, &never);
             }
             continue;
         }
         let obs = &paths[next].1;
         // Prequential: the new path against the map published before it.
-        if next < args.paths {
-            let map = estimator.belief().map_or(flat.clone(), |b| b.map.clone());
-            if let (Ok(Some(a)), Ok(Some(b))) = (
-                shot_position_rmse(&map, obs, world_params),
-                shot_position_rmse(&flat, obs, world_params),
-            ) {
-                pred.push(a);
-                pred_flat.push(b);
-            }
+        let map = estimator.belief().map_or(flat.clone(), |b| b.map.clone());
+        if let (Ok(Some(a)), Ok(Some(b))) = (
+            shot_position_rmse(&map, obs, world_params),
+            shot_position_rmse(&flat, obs, world_params),
+        ) {
+            pred.push(a);
+            pred_flat.push(b);
         }
         let started = Instant::now();
         estimator.observe(&ev.event, &never);
@@ -367,7 +378,7 @@ fn evaluate(world: &World, config: &Config, args: &Args) -> Value {
                 if d.seq >= limit_seq {
                     return None;
                 }
-                match &replay {
+                match replay.as_ref().filter(|_| args.belief == "refit") {
                     None => Some(BeliefRecord::recorded(&d.data)),
                     Some(r) => {
                         let n = r
