@@ -503,9 +503,10 @@ fn diagnose_full_event_planet() {
             .shots
             .iter()
             .filter(|s| {
-                s.obs.points.iter().any(|p| {
-                    (f64::from(p.x) - t.x).hypot(f64::from(p.y) - t.y) < t.radius + 60.0
-                })
+                s.obs
+                    .points
+                    .iter()
+                    .any(|p| (f64::from(p.x) - t.x).hypot(f64::from(p.y) - t.y) < t.radius + 60.0)
             })
             .count();
         println!(
@@ -546,6 +547,8 @@ fn diagnose_full_event_planet() {
             }
         }
     }
-    println!("EPOCH capture={capture} planets_events={planets_events} identical_repeats={identical} paths={shots}");
+    println!(
+        "EPOCH capture={capture} planets_events={planets_events} identical_repeats={identical} paths={shots}"
+    );
     report(&estimator, shots, &truth);
 }
