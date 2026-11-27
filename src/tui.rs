@@ -329,6 +329,9 @@ pub fn status_lines(view: &View) -> Vec<String> {
             if let Some(disclosed) = status.disclosed {
                 let _ = write!(line, " (disclosed {disclosed})");
             }
+            if let Some(learned) = status.summary.as_ref().and_then(|s| s.learned.as_ref()) {
+                let _ = write!(line, "  N {} learned", learned.planets);
+            }
             if let Some(limit) = status
                 .summary
                 .as_ref()

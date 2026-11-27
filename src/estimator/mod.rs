@@ -21,6 +21,7 @@
 //! flat model has none. Oracle planets are never an input.
 mod audit;
 mod contacts;
+mod count;
 mod eval;
 mod fit;
 mod lm;
@@ -33,6 +34,7 @@ mod tuning;
 mod window;
 mod work;
 
+pub use count::{CountChange, LearnedCount};
 pub use eval::{exact_chi2, position_rmse, shot_observations, shot_position_rmse, synthetic_world};
 pub use residual::{GATE_ACCELERATION, ResidualCorrection, ResidualGate, ResidualModel};
 pub use tuning::SearchTuning;
@@ -169,6 +171,10 @@ pub struct Settings {
     /// unseen count comes from a broad prior on the total (`noise::unseen`), capped by
     /// `max_planets`.
     pub planets: Option<usize>,
+    /// Dynamic planet count (P25, `count.rs`): without `planets`, fix the count at
+    /// `count::LEARN_START`, raise it by one on the count-limit warning and lower it by one on the
+    /// too-high signal; `Estimator::carry_count` takes it to the next map. Ignored with `planets`.
+    pub learn_planets: bool,
     /// Evaluations of one search slice (checked between batches of refits, so a slice may exceed
     /// it a little). Deterministic: the same paths and limits give the same belief whatever the
     /// load, as long as `slice_ceiling` does not cut a slice and no audit is adopted. The polish
@@ -198,6 +204,7 @@ impl Default for Settings {
         Self {
             max_planets: DEFAULT_MAX_PLANETS,
             planets: None,
+            learn_planets: false,
             slice_evaluations: DEFAULT_SLICE_EVALUATIONS,
             slice_ceiling: Some(DEFAULT_SLICE_CEILING),
             slices_per_path: DEFAULT_SLICES_PER_PATH,
@@ -270,6 +277,8 @@ pub struct Estimator {
     cap_magnitudes: Vec<Option<f64>>,
     /// Paths when the count-limit rule first held in this epoch.
     count_limited_at: Option<usize>,
+    /// The dynamic planet count (`Settings::learn_planets`), which sets `settings.planets`.
+    learner: Option<count::Learner>,
 }
 
 /// What the estimator holds about its map epoch, for status output (cheap: no fit).
@@ -297,6 +306,8 @@ pub struct EstimatorSummary {
     pub rho0: Option<f64>,
     /// The count-limit warning as of the latest publication.
     pub count_limit: CountLimit,
+    /// The dynamic planet count, when `Settings::learn_planets` is on.
+    pub learned: Option<LearnedCount>,
 }
 
 impl Default for Estimator {
@@ -321,6 +332,7 @@ impl Default for Estimator {
             last_rho0: None,
             cap_magnitudes: Vec::new(),
             count_limited_at: None,
+            learner: None,
         }
     }
 }
@@ -446,10 +458,12 @@ impl Estimator {
 
     /// An estimator with `settings`.
     pub fn new(settings: Settings) -> Self {
-        Self {
+        let mut estimator = Self {
             settings,
             ..Self::default()
-        }
+        };
+        estimator.start_learning();
+        estimator
     }
 
     /// The state of the map epoch (`EstimatorSummary`).
@@ -468,6 +482,7 @@ impl Estimator {
             likely_total: noise::likely_total(planets, self.settings.planets),
             rho0: self.last_rho0,
             count_limit: self.count_limit(planets),
+            learned: self.learner.as_ref().map(|l| l.learned.clone()),
         }
     }
 
@@ -634,6 +649,7 @@ impl Estimator {
         *self = Self {
             players: std::mem::take(&mut self.players),
             settings: self.settings.clone(),
+            learner: self.learner.as_ref().map(count::Learner::next_map),
             ..Self::default()
         };
     }
@@ -740,6 +756,10 @@ impl Estimator {
             }
         }
         belief.count_limit = Some(self.count_limit(theta.len()));
+        if polished {
+            let magnitude = belief.residual_correction.as_ref().map(|c| c.max_magnitude);
+            self.learn(&belief.map.planets, magnitude);
+        }
         self.last_report = Some(self.stats.report(&self.settings.ceilings));
         self.belief = Some(belief.clone());
         belief

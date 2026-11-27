@@ -73,6 +73,7 @@ targeting = true
 oracle_map_for_policy = false
 clients = 1
 # planets = 24   # known planet count of the server's maps; omit to estimate
+# learn_planets = true   # learn the count over the session (ignored with planets)
 ```
 
 ```sh
@@ -92,6 +93,7 @@ cargo run -- --config einsteinbot.toml
 | oracle map | `--oracle-map`, `--no-oracle-map` | `EINSTEINBOT_ORACLE_MAP` | off |
 | clients | `--clients N` | `EINSTEINBOT_CLIENTS` | 1 |
 | planet count | `--planets N` | `EINSTEINBOT_PLANETS` | estimated |
+| learn planet count | `--learn-planets` | `EINSTEINBOT_LEARN_PLANETS` | off |
 | live view | `--tui`, `--no-tui` | `EINSTEINBOT_TUI` | on when stdout is a terminal |
 
 `cargo run -- --help` prints the same list.
@@ -103,18 +105,37 @@ For example, `record = false`, `EINSTEINBOT_RECORD=false` or `--no-record` all d
 NewtonWars generates `planets` planets per map (server option, 1-64, default 24) and never sends the number.
 
 - **If you know it**, pass `--planets N` (`planets = N`, `EINSTEINBOT_PLANETS`). The estimator then uses it as fixed: with $K$ planets found, $N - K$ are still unseen, and it never fits more than $N$.
-- **Without it**, the unseen count is the mean excess over $K$ of a broad prior on the total: a discrete Gaussian centred on 24 with sd 4 over 1-64, conditioned on at least $K$ planets. That is about 2.9 unseen once 24 are found. The cap is `DEFAULT_MAX_PLANETS` (32, the top of the prior's plausible range). The prior is a choice, not calibrated.
+- **To learn it over the session**, pass `--learn-planets` (see below).
+- **Without either**, the unseen count is the mean excess over $K$ of a broad prior on the total: a discrete Gaussian centred on 24 with sd 4 over 1-64, conditioned on at least $K$ planets. That is about 2.9 unseen once 24 are found. The cap is `DEFAULT_MAX_PLANETS` (32, the top of the prior's plausible range). The prior is a choice, not calibrated.
 
 Measured on replays (P18, P21, [estimator-experiments.md](estimator-experiments.md)): a wrong fixed count costs planets when it is too low (the cap) and little when it is too high. A server with more than 32 planets needs `--planets`.
 
 **Count-limit warning (P23).** When the map holds as many planets as the cap allows and still leaves a planet-sized unexplained pull, the estimator flags the map as *count limited*: the residual correction (the smoothed unexplained pull along the observed paths) exceeds 0.03 acceleration units on 3 of the last 5 fully refit maps at the cap. The flag stays for the rest of the map. It is a warning only: the cap is never raised automatically; restart with a larger `--planets` if you see it. On replays it was raised 2 paths after reaching the cap (median) whenever 1-4 planets were left out, and never in 20 replays with the right count at the cap. It uses the correction the estimator computes anyway, so it costs nothing measurable. A map below its cap is never flagged, and no flag is not proof that the count is right (a planet no path passes near leaves no pull), and a misplaced planet at a correct cap could in principle raise it (not seen).
+
+**Learning the count (P25, `--learn-planets`).** The estimator works with a fixed count $N$, as with `--planets`, starting at 24. When the count-limit warning comes up, $N$ goes up by one, the warning starts over and the same map continues with the larger cap. When the map looks complete below $N$, $N$ goes down by one (the *too-high signal*, below). The learned $N$ carries over to the next maps of the session, since a server's count does not change. The stop report prints it on a `count` line (`learned 25 (start 24): 24→25 map 0 path 48`), and the live view shows `N 25 learned`. `--planets N` wins: with it the count stays exactly `N` and `--learn-planets` is ignored. The default without either flag is unchanged (the prior above).
+
+The too-high signal fires on a fully refit map with $K < N$ planets when all of these hold:
+
+- the residual correction stayed below 0.01 on the last 8 refit maps, so no planet-sized pull is left;
+- $K$ has not changed for 8 refit maps;
+- $N - 1$ planets explain the map better than $N$: with $f$ the fraction of possible planet centres farther than 200 units from every observed path tick (and not overlapping a found planet), the $N - K$ missing planets would all have to hide there, and $N f / (N - K) < 1$.
+
+The last condition is a likelihood ratio: for $N$ planets placed uniformly, the chance that exactly $K$ are within reach and the rest hidden is $\binom{N}{K}(1-f)^K f^{N-K}$. After a raise to $v$ the count never drops below $v$, so it cannot oscillate. Measured on replays (P25, [estimator-experiments.md](estimator-experiments.md)), one run each:
+
+- With the count too high by 1-4, the signal fired in 30 of 33 runs, 32-75 paths into a synthetic map and 43-123 into a real game. The 3 misses were maps the estimator itself never completed.
+- Started at 26 on 15 held-out 24-planet maps (12 real games), the count reached 24 in 14 and 25 in one within 160 paths.
+- With the right count it never fired in 16 design runs. In 15 held-out runs it fired once, on a real game, and the count-limit warning raised the count back 9 paths later. The final rule (a window of 8 instead of 5) would not have fired there.
+- Started at 24, 22-planet worlds went to 22 (4 of 4). 26-planet worlds went to 26 and stayed there in 6 of 7. In the seventh the count-limit warning fired at the right count, just after the 26th planet was found, and the count stopped at 27. The floor keeps it there; a count one too high costs little (P18).
+- No run changed direction more than once.
+
+Not tested: real servers with other counts than 24, and more than one map per session (unit-tested only).
 
 ## Live view
 
 When stdout is a terminal, the client shows a live terminal view instead of the scrolling log:
 
 - **Per bot:** energy, shots and hits in the current map (counted as in the stop report), and what it is doing (aiming, waiting for energy, map wait, end card).
-- **Current map:** index, elapsed time, paths seen, planets `K` (and the disclosed count with `sendplanets 1`), `COUNT LIMITED (cap N: more planets?)` when the count-limit warning is up, queued paths, last and largest publish lag, search state.
+- **Current map:** index, elapsed time, paths seen, planets `K` (and the disclosed count with `sendplanets 1`), `COUNT LIMITED (cap N: more planets?)` when the count-limit warning is up, `N n learned` with `--learn-planets`, queued paths, last and largest publish lag, search state.
 - **Events:** map boundaries, the end card, lost connections.
 
 It redraws four times a second from small snapshots on its own thread and never calls the estimator (about 0.1% of a core, measured; the client prints the figure when the view closes). While it is up, stdout and stderr go to a run log next to the SQLite file (`einsteinbot.log` by default, appended, not rotated). Ctrl+C closes the view and restores the terminal first, then prints the stop report; the terminal is also restored on errors and panics. `--no-tui` (`tui = false`, `EINSTEINBOT_TUI=false`) keeps plain logging, which is also used when stdout is not a terminal.
