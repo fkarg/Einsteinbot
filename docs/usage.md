@@ -280,13 +280,14 @@ Targeting is on by default; `--no-target` (`targeting = false`) makes the bot pa
 - Predicted hits rank by flight time to impact, shorter first, with the predicted impact offset as a small penalty (5 ticks per unit) and lower velocity as the tie-breaker. Map error grows along the path, so short flights hit far more often than central long ones.
 - Replaying the decisions of captures 53-55 against the true maps (truth used for scoring only), this ranking raised true hits per shot from 0.10-0.21 to 0.15-0.28.
 - Player positions are snapshots and can move before impact. A nominal hit is not a calibrated hit probability.
+- A kill on the round leader scores two points (the server's default extra-points mode `best`: a bounty of one on the player with the most kills, then fewest deaths). The bot infers the round score from the kills it sees (below) and ranks such a hit as worth two kills: `HIT_TICKS_PER_EFOLD` (55 flight ticks) times ln 2, about 38 ticks of bonus (`bounty_value` 1). In the replays (P24) this scored 2% more points on captures 53 and 55-68 (1,140 → 1,165, true hits 995 → 985) and 5% more on held-out 69-71 (250 → 262, hits 205 → 208).
+- The same ranking can value the energy a kill transfers (`energy_value`, off): it changed nothing measurable (true hits 995 → 994, energy gained +3%).
 
 **Without a predicted hit.**
 
 - If no information shot applies, the bot waits for energy: it fires its best approach shot only once it has at least 15 energy (`APPROACH_MIN_ENERGY`), and otherwise skips that energy report. Cheap approach shots almost never hit (capture 55: 5 of 58 on the true map), and by about 15 energy the policy nearly always finds a predicted hit.
 - If it sees no opponent, it does not fire.
-- An information bonus is considered only when no predicted hit is available and the average field uncertainty along the path clears a threshold. It propagates local physical-field variance from the full fitted parameter covariance. It is an uncertainty-exposure proxy, not a full posterior information gain.
-- Missing covariance makes this signal unavailable, so the policy then has no uncertainty-derived information score. Absence of covariance does not mean there is little to learn, and it cannot trigger the uncertainty branch.
+- Information probes are off (`information_threshold` infinite). With a threshold, a bot without a predicted hit fires the shot whose predicted path crosses the most coverage cells no observed path has crossed yet, per unit of energy, if it crosses at least that many (`ShotReason::Information`). This replaced the covariance-based score (P24), which needed a parameter covariance that is usually not computed at decision time and fired 58 times in captures 53-71 (44 of them at velocity 2). In a closed-loop game on a local server (P24: three managers of two bots each in the same games, about 55 maps), probing at 10 new cells cost kills: ABRESULT. Approach shots at 15 energy still prefer unexplored space (coverage, below).
 
 **Coverage.** Completed trajectories from all players populate a 20-unit spatial coverage grid, reset at each map boundary. The policy discounts probes by their fraction of new cells, and adds up to 40 world units of miss-distance penalty to covered non-hit approaches. Predicted hits still take priority. This is a diversity heuristic, not evidence of higher hit probability.
 
@@ -300,6 +301,18 @@ Targeting is on by default; `--no-target` (`targeting = false`) makes the bot pa
 - If every predicted hit is doomed, the bot waits for the next energy report (`wait_reason` `all_hits_doomed`). The decision records the victim's doom chance, how many doomed hits were skipped, and for the best hits which in-flight shots doom their victims and when (`top_hits[].doomed_by`).
 - Shots the server drops silently (a 17th shot reusing a player's slot) are dropped from the list too.
 - A higher energy bar early in a map was measured and left out.
+
+**Round time, energies and scores (P24)** ([`src/round_clock.rs`](../src/round_clock.rs), [`src/players.rs`](../src/players.rs)). The server sends none of these to bots, so each bot infers them from the broadcast events:
+
+- Round time: the playing phase of the latest map observed from its boundary to its last finished shot (at least 10 s) estimates the current one; before a full map it is unknown, never guessed. Recorded as `round_time_left_ms`; rounds measured on one server varied by a few seconds with its step pace.
+- Energies: 20 at every spawn (new map, respawn, join), minus each shot's velocity (a shot proves its shooter had at least that much), plus half the victim's energy for a kill, plus the regeneration rate measured from the bot's own energy reports, capped at 200. Players already present when the bot joined stay unknown until they respawn. Checked against the energies other bots of the same manager recorded at the same moments: median error 1.6-2.2, 90th percentile 9-15 (captures 55-69).
+- Scores: kills (1 plus the victim's bounty) and deaths per player since the observed boundary, a death only when a shot ended at the victim. Other extra-points modes (`random`, `oldest`, `off`) are not detected; on such servers the bounty is a guess.
+
+Measured and left out (P24 replays; game state held still while the bot waits):
+
+- Spending the remaining energy in the last 3 or 6 s of the estimated round (any energy, no wait for doomed targets, only hits landing before the end): true hits 1,001 → 1,001 and 999 on captures 53 and 55-68. Weak shots near the end do not hit.
+- Firing whatever it has when an in-flight shot is predicted to kill the bot within 1.5 s (chance at least 0.3; weak approach shots allowed, the best doomed hit if all were doomed): true hits 1,001 → 982, fewer on 11 of 15 captures and more on none. In three captures examined, the doomed hits it fired were all wasted (17 of 17) and its weak approach shots all missed (49 of 49). A respawn refills the energy to 20 anyway, and the bot's newest shot survives its first death (debris takes the victim's ten oldest shot slots; a second death before impact destroys it). Ranking hits by flight time more steeply while threatened changed true hits by 2 of 979. The decision records the threat (`own_doom`).
+- Aiming at likely respawn points: the server respawns players uniformly at random over the battlefield (`initPlayer`: within the spawn potential range, more than 208 units from every other player, outside planets), so there is no predictable point.
 
 **Timing.**
 

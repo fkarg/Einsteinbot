@@ -435,6 +435,8 @@ pub struct TargetingSettings {
     /// victim's energy); 0 ranks hits by flight and offset only.
     pub energy_value: f64,
     /// Weight of the victim's inferred bounty (extra score points) when ranking hits; 0 off.
+    /// At 1 a kill on the round leader counts as the two points it scores (P24 replays: score
+    /// +2% on captures 53 and 55-68, +5% held out on 69-71).
     pub bounty_value: f64,
 }
 
@@ -448,7 +450,7 @@ impl Default for TargetingSettings {
             coverage_penalty: 40.0,
             doom_threshold: 0.05,
             energy_value: 0.0,
-            bounty_value: 0.0,
+            bounty_value: 1.0,
         }
     }
 }
@@ -1665,14 +1667,14 @@ mod tests {
             1_500,
         );
         assert_eq!(state.player_bounty(2), Some(1));
-        let plain = TargetingPolicy::default().choose(&state, 8.0).unwrap();
-        assert_eq!(plain.predicted_victim, Some(3), "player 3 is still nearer");
-        let valued = TargetingPolicy::new(TargetingSettings {
-            bounty_value: 1.0,
+        let plain = TargetingPolicy::new(TargetingSettings {
+            bounty_value: 0.0,
             ..TargetingSettings::default()
         })
         .choose(&state, 8.0)
         .unwrap();
+        assert_eq!(plain.predicted_victim, Some(3), "player 3 is still nearer");
+        let valued = TargetingPolicy::default().choose(&state, 8.0).unwrap();
         assert_eq!(
             (valued.predicted_victim, valued.victim_bounty),
             (Some(2), Some(1))
