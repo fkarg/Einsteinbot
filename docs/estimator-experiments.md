@@ -561,3 +561,104 @@ Thinned row set of 1000 rows (at most 2 per 14-unit cell, strongest first; 2000 
 Reproduction (from the worktree, with `einsteinbot.sqlite3` present; `CACHE` holds from-scratch rebuilds so audits reuse them):
 `cargo test --release --lib diagnose_rebuild -- --ignored --nocapture --test-threads=1` with `CACHE=/tmp/P6cache THREADS=2 PATHS=60 SEEDS=7001 LIVE=-` (also `COUNTS=4,8,...`) fills the cache and prints the from-scratch rows.
 `cargo test --release --lib diagnose_incremental -- --ignored --nocapture --test-threads=1` with `CONFIGS="lv=0.02/0.005:rf=300:ev=1500:lr=100:dl=30:dn=4:cap=1000:probe=8"`, `PLANETS=1` for the Q4 lines, `PROD=1` for the production update, `THREADS=8`, `SEEDS`/`KS`/`LIVE`/`PATHS` as in the other harnesses (`audit=16`, `audit=8` instead of `probe=8` for the adopting runs; held-out `SEEDS=7101,...,7108`, `LIVE=34,35,37,42,43`). Tables: `python3 -I scripts/p6_tables.py {cost,latency,quality,audit,support} FILES [--worlds synthetic|live]`.
+
+### P7 results (2026-11-27, branch `p7`, built on `p6`; harness `src/estimator/diagnose/resumable.rs`, ignored test `diagnose_resumable`; tables from `scripts/p7_tables.py` and `scripts/p6_tables.py quality`)
+
+Question: can the planet search be resumable, so that new paths join a running search instead of restarting it, and a best-estimate map is always available? Production search unchanged (option-gated, diagnosis harness only). Truth scores only; contacts create nothing. Short answer (grades: observed unless marked): the live-sized behaviour is good. A new path's map is published 50-350 ms after it arrives (B* blocks 1-122 s), the worst update (local refit plus one slice) is 291-341 ms on the Mac at 8 and at 10 threads, and under a path-every-500 ms schedule the final recall equals uncapped B* on the three synthetic worlds and is within 1-4 planets on live. Absorbing new information beats restarting only at very tight budgets; at 3-6 slices per path restarting is as good.
+
+#### What was built (`Search`)
+
+State: the paths at each relative level (0.02, 0.005; full rows, thinned per step to 1000 rows by the P6 rule), the published map, the level being searched, candidate planets (seed positions with their alone fits, at most 24, duplicates within 30 units dropped), partial joint refits (map plus a candidate, at most 3) and a pending death trial. `add_path` = the B* local refit (planets within 100 units of the new path, 300 evaluations, per level), then the map is published; pending candidates and partials are kept (`restart=1` drops them). `step(evals, deadline)` = a bounded slice: seeds from the unexplained windows, alone fits of unfitted candidates (batches of 8, 15-150 evaluations each), re-scoring of fitted candidates against the current rows and map (one chi2 evaluation each), up to 3 joint refits resumed from where the last slice left them (a refit is settled when it uses less than its budget, or after 6 rounds), adoption of the best child if its Laplace evidence beats the map's, then a death trial (the 2 planets whose removal costs least chi2, refit jointly, kept if the evidence rises, as the depth-1 prune of B*). A level ends when no birth improves the evidence. The slice stops at the evaluation limit (checked between batches, so it can overshoot by one batch) or the wall ceiling (also passed to the fits). Slice size 300 evaluations, ceiling 250-300 ms. Not built: from-scratch background audit on the resumable map (the harness can adopt the cached P6 rebuilds with `audit=N`; not run), and the early-update (<8 paths) from-scratch rule; the planet cap is 32 as in P6.
+
+#### Live-sized behaviour (Mac, release; load average 2-4 from other sessions; one run per cell)
+
+Arrival schedule: a new path every 500 ms or every 2 s; between arrivals the resumable search takes slices (300 evaluations, 250 ms ceiling, 8 threads); B* is the P6 blocking update (births cap 300 or 1500) on the same schedule, a backlog processed one path at a time. "Publish lag" = the worst time from a path's arrival to its map being published (B*: end of its update). Final = recall(2) (spurious) after the last event (61 paths on live, 60 synthetic, plus one period of tail). First correct = first planet within 2 units. t50 = time to half the final recall. The live 33, 500 ms resumable cell ran while I compiled on the Mac (its final 18 against 19 in a quiet standalone run), so it may be slightly pessimistic.
+
+| world | period | method | final rec2 (spur) | t50 s | rec2 at 10 s / 20 s | worst publish lag ms |
+|---|---|---|---|---|---|---|
+| live 33 | 500 | resumable | 18 (3) | 6.5 | 7 / 19 | 200 |
+| | | B* cap 300 | 18 (3) | 9.0 | 9 / 19 | 958 |
+| | | B* cap 1500 | 22 (1) | 9.6 | 11 / 22 | 5582 |
+| live 33 | 2000 | resumable | 16 (8) | 15.2 | 6 / 8 | 349 |
+| | | B* cap 300 | 18 (3) | 32.7 | 0 / 1 | 932 |
+| | | B* cap 1500 | 22 (1) | 20.3 | 3 / 7 | 4440 |
+| live 40 | 500 | resumable | 17 (3) | 4.6 | 9 / 13 | 93 |
+| | | B* cap 300 | 17 (4) | 13.5 | 6 / 14 | 1251 |
+| | | B* cap 1500 | 19 (1) | 17.9 | 7 / 10 | 18554 |
+| live 40 | 2000 | resumable | 16 (3) | 14.6 | 5 / 9 | 78 |
+| | | B* cap 300 | 17 (4) | 50.6 | 1 / 4 | 1234 |
+| | | B* cap 1500 | 19 (1) | 59.8 | 5 / 6 | 9729 |
+| live 45 | 500 | resumable | 21 (1) | 6.0 | 7 / 15 | 50 |
+| | | B* cap 300 | 13 (3) | 19.0 | 4 / 11 | 905 |
+| | | B* cap 1500 | 21 (1) | 10.3 | 6 / 6 | 122382 |
+| live 45 | 2000 | resumable | 21 (1) | 22.5 | 2 / 8 | 48 |
+| | | B* cap 300 | 13 (3) | 74.5 | 0 / 1 | 877 |
+| | | B* cap 1500 | 21 (1) | 28.3 | 1 / 4 | 89570 |
+| synthetic 7001 | 500 | resumable | 24 (0) | 12.0 | 7 / 24 | 61 |
+| | | B* cap 300 | 24 (0) | 7.2 | 18 / 24 | 1876 |
+| | | B* cap 1500 | 24 (0) | 7.5 | 12 / 24 | 10161 |
+| synthetic 7002 | 500 | resumable | 24 (0) | 16.0 | 0 / 18 | 247 |
+| | | B* cap 300 | 24 (0) | 8.7 | 14 / 20 | 2069 |
+| | | B* cap 1500 | 24 (0) | 6.2 | 24 / 24 | 4844 |
+| synthetic 7003 | 500 | resumable | 24 (0) | 11.5 | 5 / 20 | 88 |
+| | | B* cap 300 | 24 (0) | 11.3 | 9 / 20 | 8083 |
+| | | B* cap 1500 | 24 (0) | 28.4 | 6 / 10 | 41370 |
+| synthetic 7001-7003 | 2000 | resumable | 24 / 24 / 24 | 14.1 / 14.0 / 22.5 | 6 / 7 / 4 | 293 / 59 / 74 |
+| | | B* cap 300 | 24 / 24 / 24 | 26.7 / 30.7 / 38.7 | 0 / 0 / 0 | 993 / 1204 / 1290 |
+| | | B* cap 1500 | 24 / 24 / 24 | 16.0 / 15.8 / 39.8 | 4 / 3 / 0 | 5304 / 2675 / 28916 |
+
+(Time to first correct planet is 0-2 s for every method on most worlds, so it does not separate them; the full timelines are in the raw `TL` lines.) Reading: the resumable search never blocks; its publish lag is the local refit (50-350 ms), where B* cap 300 blocks 0.9-8 s and cap 1500 up to 2 minutes (live 45, whose map stays incomplete). At 500 ms it reaches half of its final recall earlier than either B* variant on all three live worlds with a comparable final map; on the synthetic worlds B* is faster to half recall on 7001 and 7002 (7.2-7.5 s and 6.2-8.7 s against 12.0 and 16.0 s) and the resumable search is the one that does not block; at 2 s the cap-300 B* ends higher on live 33 and 40 (18 and 17 against 16 and 16) but is late to get there. Uncapped B* still ends 1-4 planets higher on live 33 and 40 and has fewer spurious planets (inferred cause: deeper search per path; not tested).
+
+Per-update latency, resumable, 1 slice per path (300 evaluations, 250 ms ceiling), live 33 / 40 / 45, 60 paths, median / p90 / max ms of local refit plus slice:
+
+| threads | live 33 | live 40 | live 45 |
+|---|---|---|---|
+| 8 (load 2-3) | 242 / 264 / 291 | 261 / 280 / 341 | 221 / 272 / 313 |
+| 10 (load 4) | 252 / 264 / 298 | 261 / 269 / 341 | 205 / 275 / 314 |
+
+Acceptance (worst update about 1 s or less): met, at 291-341 ms. The slice is cut by its 250 ms ceiling, so these numbers are the ceiling plus the refit (23-150 ms) and the work, not the algorithm's speed; 8 and 10 threads are indistinguishable (observed). I did not pin threads to P or E cores and cannot say anything about P/E effects (the Mac load from other sessions was 2-4). The Mac binary for these latency runs and the schedule runs is the build before the `dt` flag and work counters were added (same algorithm, death trial on).
+
+#### Quality at live-sized budgets (deterministic: 300 evaluations per slice, wall ceiling off, jolly; evaluation counts do not depend on threads)
+
+Recall(2) of the true planets at n paths (all dev worlds; `ns` = slices per path; absorb = pending work kept, restart = dropped at every path). Total evaluations over 60 paths per world: ns=1 about 18k; ns=3 about 34k synthetic / 47k live; B* cap 300 28k / 40k; B* cap 1500 44k / 63k.
+
+| method | dev synthetic 16 / 32 / 60 paths | dev live 16 / 32 / 60 paths |
+|---|---|---|
+| resumable ns=1 | 4% / 33% / 76% | 0% / 10% / 48% |
+| restart ns=1 | 0% / 0% / 0% | 0% / 0% / 0% |
+| resumable ns=3 | 39% / 89% / 92% | 23% / 60% / 75% |
+| restart ns=3 | 13% / 90% / 97% | 6% / 48% / 82% |
+| resumable ns=6 | 61% / 100% / 100% | 44% / 66% / 89% |
+| restart ns=6 | 85% / 97% / 100% | 42% / 74% / 87% |
+| resumable ns=3, no death trial | 24% / 54% / 68% | 28% / 52% / 63% |
+| B* cap 300 | 60% / 91% / 100% | 26% / 58% / 76% |
+| B* cap 1500 (P6 output) | 90% / 100% / 100% | 51% / 72% / 88% |
+
+After the 60th path, with slices continued until the search is idle (at most 150 slices): ns=1 99% synthetic / 78% live, ns=3 100% / 85% (live at 61 paths).
+
+Absorbing against restarting (observed, dev): at one slice per path restarting never finishes a round and ends with an empty map (0%), while absorbing reaches 76% / 48% at 60 paths; so absorbing helps at tight budgets. From 3 slices per path on restarting is not worse (97% against 92% and 82% against 75% at ns=3; 85% against 61% at 16 paths and 100% against 100% at 60 for ns=6); absorbing's advantage there is at most 3 points at 32 paths. The mechanism is that candidate fits and joint refits are kept across paths, but at larger budgets a restart can redo them within one slice chain and also drops stale state (inferred). The death trial matters: without it K overshoots (25-26 planets) and recall at 60 paths drops from 92% to 68% (synthetic) and 75% to 63% (live) at ns=3.
+
+#### Held-out (one pass; final config ns=6, 300 evaluations, deterministic; synthetic 7101-7108, live 34, 35, 37, 42, 43; live 34 has 2 paths, 43 has 41, so live rows have 4 worlds at 16-32 and 3 at 60)
+
+| method | synthetic recall(2) 16 / 32 / 60, spurious at 60 | live 16 / 32 / 60, spurious at 60 |
+|---|---|---|
+| resumable ns=6 | 73% / 94% / 99%, 0.2 | 27% / 46% / 85%, 1.7 |
+| restart ns=6 | 77% / 93% / 98%, 0.6 | 43% / 76% / 92%, 1.0 |
+| B* cap 300 | 57% / 80% / 98%, 0.2 | 23% / 67% / 85%, 1.3 |
+| B* cap 1500 (P6) | 76% / 97% / 100%, 0.0 | 55% / 80% / 92%, 0.3 |
+
+Recall(2) at 60 paths is within the 1-2 planets asked for on synthetic data (99% against 100%, 0.2 planets) and 1.7 planets below uncapped B* on live (85% against 92%); it matches B* cap 300 (live 85%) while never blocking. Restart ns=6 is as good or better on live (92%), so the held-out data do not show an absorption benefit at that budget. The settle row (slices to idle, at most 150) is in the raw output only. The raw chi2 ratio after the run is 1e4-1e11 as in P6 (relative-level fit); the `+x` guarded exact refit rows are in the raw QUAL lines and were not tabulated.
+
+#### Verdict
+
+- Live behaviour (observed): the resumable search meets the update-latency target (worst 291-341 ms against about 1 s) and always has a fresh map (publish lag 50-350 ms against 1-122 s for B*). With a path every 500 ms its final recall equals B* cap 1500 on the three synthetic worlds (24/24 each; B* is faster to half recall on two of them) and is 18/17/21 against 22/19/21 on live 33/40/45, reaching half of it earlier than B* on all three live worlds. With a path every 2 s on live 33 it ends below B* (16 against 18-22) with 8 spurious planets.
+- Quality at fixed per-path budget: one 300-evaluation slice per path is too little by itself (76% synthetic, 48% live at 60 paths); 6 slices per path matches B* cap 300 and is within 0-4 planets of uncapped B*. What the 500 ms schedule delivers is roughly 1.5-2 slices per path (inferred from wall time), and it does better than the 1-slice replay (24/24 on all three synthetic worlds) because the idle search keeps working on the final map.
+- Absorbing new information helps only when the budget is too small to finish a round between paths; otherwise restart is equal. I would build the resumable form for the always-available map and the bounded update, not for the absorption itself.
+
+#### Not done, cut, limits
+
+- Cut: the from-scratch audit on the resumable map and the early-update (<8 paths) from-scratch rule (recall at 8 paths is 16% synthetic and 19% live for ns=6 against 46% and 27% for B* uncapped); noise 0.1; repeats (one run per cell, run-to-run spread unknown, and the wall-clock runs depend on load); P/E-core effects; schedule runs on synthetic worlds beyond 7001-7003 and on the held-out worlds; slice sizes other than 300 evaluations and ceilings other than 250-300 ms; `MAX_ROUNDS`, `BATCH`, candidate limits and the 30-unit duplicate radius are untuned. Reserved scorecard cases and capture 52 were not touched.
+- Limits: the Mac latency and schedule runs are one process at a time at 8 or 10 threads with the stated load; jolly quality runs used 2 threads per process (load 20-30), thread-independent by construction. Live truth is degenerate (several maps tie), so live recall differences of 1-3 planets are within what P6 saw between configurations. A slice may exceed its evaluation limit by one batch.
+- Local copies of the raw output: `/tmp/P7mac/{dev,dev2,b300,held,hb300,out}`; jolly `/tmp/P7/out/{dev_slice,dev_slice2,dev_b300,held_final,held_b300}` (and `dev_slice_nodeaths_partial`, an early killed run without the death trial).
+
+Reproduction (from the worktree with `einsteinbot.sqlite3` present and the P6 rebuild cache in `CACHE`): deterministic slice replay `cargo test --release --lib diagnose_resumable -- --ignored --nocapture --test-threads=1` with `SPECS="sl=300:ns=6:ceil=100000:settle=1 sl=300:ns=6:ceil=100000:restart=1"`, `THREADS=2 PATHS=60 SEEDS=7101 LIVE=-` (or `SEEDS=- LIVE=35`); latency `SPECS="sl=300:ns=1:ceil=250" THREADS=8 SEEDS=- LIVE=33`; schedule `SCHEDULE=500` (or 2000) with `B="lv=0.02/0.005:cap=1000:rf=300:ev=300:lr=100:dl=30:dn=4 lv=0.02/0.005:cap=1000:rf=300:ev=1500:lr=100:dl=30:dn=4"`; B* cap 300 quality `diagnose_incremental` with `CONFIGS="lv=0.02/0.005:cap=1000:rf=300:ev=300:lr=100:dl=30:dn=4"`. Tables: `python3 -I scripts/p7_tables.py {latency,timeline} FILES`, `python3 -I scripts/p6_tables.py quality FILES --worlds syn|live`.

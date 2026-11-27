@@ -30,9 +30,9 @@ const CASCADE: &str =
 /// evaluation cap of the warm refit of a level, `dv` evaluation cap of the deaths of a level, `dn`
 /// `lr` radius of the local warm refit, `dl` threshold of the local death test, run deaths every dn-th update (and after any birth), `audit=N` rebuild every N paths and adopt it when
 /// it fits better, `probe=N` the same without adopting.
-struct Config {
-    name: String,
-    levels: Vec<f64>,
+pub(super) struct Config {
+    pub(super) name: String,
+    pub(super) levels: Vec<f64>,
     cap: usize,
     depth: usize,
     births: u64,
@@ -53,7 +53,7 @@ struct Config {
 }
 
 impl Config {
-    fn parse(spec: &str) -> Config {
+    pub(super) fn parse(spec: &str) -> Config {
         let mut c = Config {
             name: spec.to_string(),
             levels: vec![0.005],
@@ -88,7 +88,7 @@ impl Config {
     }
 }
 
-fn env_list(name: &str, default: &str) -> Vec<usize> {
+pub(super) fn env_list(name: &str, default: &str) -> Vec<usize> {
     std::env::var(name)
         .unwrap_or_else(|_| default.into())
         .split(',')
@@ -100,7 +100,7 @@ fn cache_dir() -> String {
     std::env::var("CACHE").unwrap_or_else(|_| "/tmp/p6-cache".into())
 }
 
-fn world_id(case: &Case) -> String {
+pub(super) fn world_id(case: &Case) -> String {
     // Without the path count, so the id is the same whatever PATHS was.
     let name = case.name.split(" paths=").next().unwrap();
     name.chars()
@@ -116,7 +116,7 @@ fn rows_of(shots: &[Shot]) -> usize {
         .sum()
 }
 
-fn nodes_of(shots: &[Shot]) -> usize {
+pub(super) fn nodes_of(shots: &[Shot]) -> usize {
     shots
         .iter()
         .filter_map(|s| s.path.as_ref())
@@ -124,7 +124,7 @@ fn nodes_of(shots: &[Shot]) -> usize {
         .sum()
 }
 
-fn relative_shot(obs: &ShotObservation, level: f64, noise: f64) -> Shot {
+pub(super) fn relative_shot(obs: &ShotObservation, level: f64, noise: f64) -> Shot {
     Shot {
         obs: obs.clone(),
         contact: None,
@@ -149,17 +149,17 @@ fn limits<'a>(max: Option<u64>, ceilings: &'a PartCeilings, seconds: u64) -> Lim
     }
 }
 
-struct Metrics {
-    text: String,
-    k: usize,
-    rec2: usize,
-    spur: usize,
-    ratio: f64,
-    explored: f64,
+pub(super) struct Metrics {
+    pub text: String,
+    pub k: usize,
+    pub rec2: usize,
+    pub spur: usize,
+    pub ratio: f64,
+    pub explored: f64,
 }
 
 /// Quality of `theta` against the exact likelihood and the truth on the first `n` paths.
-fn quality(case: &Case, n: usize, theta: &[[f64; 3]]) -> Metrics {
+pub(super) fn quality(case: &Case, n: usize, theta: &[[f64; 3]]) -> Metrics {
     let never = AtomicBool::new(false);
     let world = WorldParameters::default();
     let shots = &case.shots[..n];
@@ -187,8 +187,8 @@ fn quality(case: &Case, n: usize, theta: &[[f64; 3]]) -> Metrics {
     }
 }
 
-struct Rebuilt {
-    theta: Vec<[f64; 3]>,
+pub(super) struct Rebuilt {
+    pub theta: Vec<[f64; 3]>,
     evals: u64,
     equiv: f64,
     wall: f64,
@@ -196,7 +196,7 @@ struct Rebuilt {
 
 /// From scratch on the first `n` paths: the E9 cascade (cap 28000 evaluations) and the E9c
 /// program `0.005gd+0.001gd+0` with the guarded exact refit (`G3C1.5`). Cached on disk.
-fn rebuild(case: &Case, n: usize, noise: f64) -> Rebuilt {
+pub(super) fn rebuild(case: &Case, n: usize, noise: f64) -> Rebuilt {
     let path = format!("{}/{}_{n}.txt", cache_dir(), world_id(case));
     if let Ok(text) = std::fs::read_to_string(&path) {
         let mut lines = text.lines();
@@ -329,35 +329,35 @@ fn rebuild(case: &Case, n: usize, noise: f64) -> Rebuilt {
     }
 }
 
-fn distance(a: &[f64; 3], b: &[f64; 3]) -> f64 {
+pub(super) fn distance(a: &[f64; 3], b: &[f64; 3]) -> f64 {
     (a[0] - b[0]).hypot(a[1] - b[1])
 }
 
-fn nearest_distance(p: &[f64; 3], set: &[[f64; 3]]) -> f64 {
+pub(super) fn nearest_distance(p: &[f64; 3], set: &[[f64; 3]]) -> f64 {
     set.iter()
         .map(|q| distance(p, q))
         .fold(f64::INFINITY, f64::min)
 }
 
-struct Replay<'a> {
-    case: &'a Case,
-    noise: f64,
+pub(super) struct Replay<'a> {
+    pub case: &'a Case,
+    pub noise: f64,
     /// Per relative level, the full-row shots of every path (built up front).
-    full: Vec<(f64, Vec<Shot>)>,
+    pub full: Vec<(f64, Vec<Shot>)>,
 }
 
 impl Replay<'_> {
-    fn list(&self, level: f64) -> &[Shot] {
+    pub(super) fn list(&self, level: f64) -> &[Shot] {
         &self.full.iter().find(|(l, _)| *l == level).unwrap().1
     }
 }
 
-struct UpdateCost {
+pub(super) struct UpdateCost {
     /// Milliseconds in thinning and setup, the warm refit, births, deaths.
-    phases_ms: [f64; 4],
-    wall_ms: f64,
-    evals: u64,
-    equiv: f64,
+    pub phases_ms: [f64; 4],
+    pub wall_ms: f64,
+    pub evals: u64,
+    pub equiv: f64,
 }
 
 /// Local death test: the two planets whose removal raises chi2 least are removed in turn, the
@@ -417,7 +417,7 @@ fn local_deaths(
 }
 
 /// One incremental update after path `n - 1` (0-based) arrived.
-fn update(rp: &Replay, theta: &mut Vec<[f64; 3]>, n: usize, cfg: &Config) -> UpdateCost {
+pub(super) fn update(rp: &Replay, theta: &mut Vec<[f64; 3]>, n: usize, cfg: &Config) -> UpdateCost {
     let never = AtomicBool::new(false);
     let world = WorldParameters::default();
     let ceilings = PartCeilings::default();
@@ -560,7 +560,7 @@ fn update(rp: &Replay, theta: &mut Vec<[f64; 3]>, n: usize, cfg: &Config) -> Upd
 
 /// Guarded exact refit (the E9c rule: accept when the exact chi2 falls and no planet moves 3 units
 /// or chi2/row <= 1.5), at most 600 evaluations.
-fn exact_polish(case: &Case, n: usize, theta: &[[f64; 3]]) -> Vec<[f64; 3]> {
+pub(super) fn exact_polish(case: &Case, n: usize, theta: &[[f64; 3]]) -> Vec<[f64; 3]> {
     let never = AtomicBool::new(false);
     let exact = Fit::new(
         &case.shots[..n],
@@ -586,7 +586,7 @@ fn exact_polish(case: &Case, n: usize, theta: &[[f64; 3]]) -> Vec<[f64; 3]> {
     }
 }
 
-fn checkpoints(total: usize) -> Vec<usize> {
+pub(super) fn checkpoints(total: usize) -> Vec<usize> {
     let mut v: Vec<usize> = env_list("CHECKPOINTS", "4,8,16,32,60")
         .into_iter()
         .filter(|&n| n <= total)
@@ -597,7 +597,7 @@ fn checkpoints(total: usize) -> Vec<usize> {
     v
 }
 
-fn setup() -> (f64, Vec<Config>) {
+pub(super) fn setup() -> (f64, Vec<Config>) {
     if let Some(t) = env_list("THREADS", "0").first() {
         TEST_THREADS.store(*t, std::sync::atomic::Ordering::Relaxed);
     }
@@ -695,7 +695,15 @@ fn diagnose_incremental() {
                 );
                 if let Some((cadence, adopt)) = cfg.audit {
                     if n % cadence == 0 {
-                        audit(&rp, &mut theta, n, cfg, adopt, noise);
+                        audit(
+                            &case,
+                            rp.list(0.005),
+                            &mut theta,
+                            n,
+                            &cfg.name,
+                            adopt,
+                            noise,
+                        );
                     }
                 }
                 if cps.contains(&n) {
@@ -752,14 +760,22 @@ fn diagnose_incremental() {
 }
 
 /// Audit: rebuild from scratch on the first `n` paths and compare it with the maintained map.
-fn audit(rp: &Replay, theta: &mut Vec<[f64; 3]>, n: usize, cfg: &Config, adopt: bool, noise: f64) {
+/// `list` holds the full-row shots of every path at relative level 0.005.
+pub(super) fn audit(
+    case: &Case,
+    list: &[Shot],
+    theta: &mut Vec<[f64; 3]>,
+    n: usize,
+    name: &str,
+    adopt: bool,
+    noise: f64,
+) -> bool {
     let never = AtomicBool::new(false);
     let world = WorldParameters::default();
-    let case = rp.case;
     let rb = rebuild(case, n, noise);
-    let full = Fit::new(&rp.list(0.005)[..n], world, &never, false, vec![]);
+    let full = Fit::new(&list[..n], world, &never, false, vec![]);
     let stats = Stats::default();
-    let counted = Fit::new(&rp.list(0.005)[..n], world, &never, false, vec![]).with_stats(&stats);
+    let counted = Fit::new(&list[..n], world, &never, false, vec![]).with_stats(&stats);
     // The maintained map is refit on all rows at the audit level first: a fair comparison with the
     // rebuild, whose polish already ran there.
     let b = Budget {
@@ -798,7 +814,7 @@ fn audit(rp: &Replay, theta: &mut Vec<[f64; 3]>, n: usize, cfg: &Config, adopt: 
     println!(
         "AUDIT world={} cfg={} n={n} k_inc={} k_rb={} same={same} moved={moved} removed={removed} added={added} ev_inc={} ev_rb={} better={better} adopt={adopt} rec2_inc={} rec2_rb={} spur_inc={} spur_rb={} ratio_inc={:.3e} ratio_rb={:.3e} fe_inc={:.3e} fe_rb={:.3e} rb_evals={} rb_equiv={:.0} rb_wall={:.1}",
         world_id(case),
-        cfg.name,
+        name,
         mi.k,
         mr.k,
         e_inc.map_or("none".into(), |v| format!("{v:.1}")),
@@ -817,7 +833,9 @@ fn audit(rp: &Replay, theta: &mut Vec<[f64; 3]>, n: usize, cfg: &Config, adopt: 
     );
     if adopt && better {
         *theta = rb.theta;
+        return true;
     }
+    false
 }
 
 /// The production update path by path (exact shots at the production noise level, warm modes of
