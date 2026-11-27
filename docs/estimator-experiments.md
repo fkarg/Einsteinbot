@@ -1517,7 +1517,7 @@ Reproduction: `cargo test --release --lib diagnose_replay -- --ignored --nocaptu
 
 ## Planet count (in the README until 2026-11-28)
 
-Does telling the bot the true count ($N = 24$ via `--planets 24`) help, compared with the default prior on the count (centre 24, sd 4, section 3)? The field error is the *explored-field RMSE*: the root mean square error of the estimated gravity vector against the truth, on the 20-unit grid cells that some earlier path crossed. An empty map (*flat*) scores about 0.63.
+Does telling the bot the true count ($N = 24$ via `--planets 24`) help, compared with the default prior on the count (centre 24, sd 4, README "How it works" section 3)? The field error is the *explored-field RMSE*: the root mean square error of the estimated gravity vector against the truth, on the 20-unit grid cells that some earlier path crossed. An empty map (*flat*) scores about 0.63.
 
 On the 14 dev worlds the fixed count was better around 32 paths (explored-field RMSE 0.0046 vs 0.0202, geometric means over the worlds). On real games it makes no systematic difference: 69 recorded maps with disclosed planets (all with 24 planets, captures up to 58, duplicate games counted once, captures reserved for final tests excluded; built before P21 added the no-overlap rule, cap 24; one run each). Maps with fewer paths drop out of the later rows:
 
