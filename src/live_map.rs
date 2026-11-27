@@ -7,12 +7,6 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-fn live_estimator() -> Estimator {
-    let mut estimator = Estimator::default();
-    estimator.settings.audit_enabled = true;
-    estimator
-}
-
 pub(crate) struct WorkItem {
     epoch: u64,
     watermark: u64,
@@ -69,7 +63,8 @@ impl LiveMap {
         let (sender, receiver) = mpsc::channel::<WorkItem>();
         let worker_state = Arc::clone(&published);
         let worker = thread::spawn(move || {
-            let mut estimator = live_estimator();
+            // Without the background audit (`Settings::audit_enabled`, off since P13).
+            let mut estimator = Estimator::default();
             let mut estimator_epoch = 0;
             loop {
                 // With search work left, events still go first; the work runs while none waits.
@@ -82,7 +77,7 @@ impl LiveMap {
                                 (state.epoch, Arc::clone(&state.fit_cancel))
                             };
                             if estimator_epoch != epoch {
-                                estimator = live_estimator();
+                                estimator = Estimator::default();
                                 estimator_epoch = epoch;
                                 continue;
                             }
@@ -122,7 +117,7 @@ impl LiveMap {
                 if estimator_epoch != epoch {
                     // The canonical connection sends a complete player snapshot
                     // after reset; old queued leave events may have been discarded.
-                    estimator = live_estimator();
+                    estimator = Estimator::default();
                     estimator_epoch = epoch;
                 }
                 let belief = fit(&mut estimator, &event, &cancelled);

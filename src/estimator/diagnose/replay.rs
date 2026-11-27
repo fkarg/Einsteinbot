@@ -61,9 +61,19 @@ fn replay_deterministic(case: &Case, settings: Settings) {
         estimator.settle(&never);
         let wall_ms = started.elapsed().as_secs_f64() * 1e3;
         let evals = estimator.last_report().map_or(0, |r| r.evaluations);
+        let noise_ms = estimator.last_report().map_or(0.0, |r| {
+            r.parts
+                .iter()
+                .filter(|p| p.part == Part::Noise)
+                .map(|p| p.total_ms)
+                .sum()
+        });
         println!(
-            "UPD world={id} cfg={name} n={n} k={} evals={evals} publish_ms={publish_ms:.1} wall_ms={wall_ms:.1}",
-            belief_theta(&estimator).len()
+            "UPD world={id} cfg={name} n={n} k={} evals={evals} publish_ms={publish_ms:.1} wall_ms={wall_ms:.1} noise_ms={noise_ms:.1} s100={:.3} l={:.0} white={:.1e}",
+            belief_theta(&estimator).len(),
+            estimator.model.scale * 100.0,
+            estimator.model.length,
+            estimator.model.white
         );
         if audit {
             let before = belief_theta(&estimator);

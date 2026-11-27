@@ -32,6 +32,8 @@ pub enum Part {
     Evidence,
     /// The covariance and conditioning part of an evidence evaluation (leaf).
     Covariance,
+    /// The model-error estimate and noise of a new path (phase).
+    Noise,
     /// Local refit of the planets near a new path (phase).
     WarmRefit,
     /// Finding birth seeds from the unexplained windows (phase).
@@ -42,13 +44,13 @@ pub enum Part {
     BirthJoint,
     /// Death trials and refits (phase).
     Deaths,
-    /// Exact refit and covariance of the published map (phase).
+    /// Full-row refit and covariance of the published map (phase).
     Polish,
     /// Diagnostics of a published belief (position RMSE, contact bookkeeping; phase).
     Diagnostics,
 }
 
-const PARTS: [Part; 14] = [
+const PARTS: [Part; 15] = [
     Part::WindowBuild,
     Part::Contacts,
     Part::ResidualEval,
@@ -56,6 +58,7 @@ const PARTS: [Part; 14] = [
     Part::LmSolve,
     Part::Evidence,
     Part::Covariance,
+    Part::Noise,
     Part::WarmRefit,
     Part::Seeding,
     Part::BirthAlone,
@@ -66,12 +69,13 @@ const PARTS: [Part; 14] = [
 ];
 
 impl Part {
-    pub const ALL: [Part; 14] = PARTS;
+    pub const ALL: [Part; 15] = PARTS;
 
     fn is_leaf(self) -> bool {
         !matches!(
             self,
-            Part::WarmRefit
+            Part::Noise
+                | Part::WarmRefit
                 | Part::Seeding
                 | Part::BirthAlone
                 | Part::BirthJoint
@@ -90,6 +94,7 @@ impl Part {
             Part::LmSolve => "lm_solve",
             Part::Evidence => "evidence",
             Part::Covariance => "covariance",
+            Part::Noise => "noise",
             Part::WarmRefit => "warm_refit",
             Part::Seeding => "seeding",
             Part::BirthAlone => "birth_alone",
