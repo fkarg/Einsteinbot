@@ -338,7 +338,7 @@ fn diagnose_matern_model_error() {
         for (label, theta) in [("true", &truth), ("missing", &partial)] {
             let planets: Vec<Planet> = theta.iter().map(|t| planet_at(*t)).collect();
             let started = Instant::now();
-            let mut noise = Noise::new(ModelError::PRIOR, &planets, &case.shots);
+            let mut noise = Noise::new(ModelError::PRIOR, &planets, &case.shots, Some(24));
             let raster_ms = started.elapsed().as_secs_f64() * 1e3;
             let series: Vec<Series> = case
                 .shots

@@ -1,7 +1,8 @@
 use crate::config::AppConfig;
 use crate::dummy::commands_for_energy;
-use crate::estimator::UpdateReport;
+use crate::estimator::{Settings, UpdateReport};
 use crate::event_store::{CaptureMetadata, EventLog};
+use crate::game_stats::{self, SessionTally};
 use crate::live_map::{LiveMap, MapProgress};
 use crate::map::PlanetMap;
 use crate::protocol::{ClientCommand, EventParser, RecordedEvent, ServerEvent};
@@ -12,7 +13,7 @@ use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const PROTOCOL_VERSION: u32 = 8;
@@ -25,11 +26,12 @@ const MAX_MAP_WAIT: Duration = Duration::from_millis(500);
 
 type ClientResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
+/// How long each recent map's estimate may settle before the stop-time statistics.
+const STOP_SETTLE: Duration = Duration::from_secs(1);
+
 pub fn run(config: &AppConfig) -> ClientResult<()> {
     let running = Arc::new(AtomicBool::new(true));
     let signal_running = Arc::clone(&running);
-    ctrlc::set_handler(move || signal_running.store(false, Ordering::SeqCst))?;
-
     if config.targeting && !config.dummy && !config.oracle_map_for_policy {
         eprintln!(
             "Targeting fits a live map from completed trajectories; early shots use a flat field until the first fit lands."
@@ -60,16 +62,64 @@ pub fn run(config: &AppConfig) -> ClientResult<()> {
     } else {
         None
     };
-    let (map_feed, map_worker) =
-        LiveMap::spawn(config.targeting && !config.dummy && !config.oracle_map_for_policy);
+    let (map_feed, map_worker) = LiveMap::spawn(
+        config.targeting && !config.dummy && !config.oracle_map_for_policy,
+        Settings {
+            planets: config.planets,
+            ..Settings::default()
+        },
+    );
+    let live_map = map_worker.is_some();
+    let tallies: Vec<Arc<Mutex<SessionTally>>> = names
+        .iter()
+        .map(|name| Arc::new(Mutex::new(SessionTally::new(name))))
+        .collect();
+    // What is in memory now (only the shot tallies without a live map); printed once.
+    let printed = Arc::new(AtomicBool::new(false));
+    let print_immediate = {
+        let (map_feed, tallies, printed) =
+            (map_feed.clone(), tallies.clone(), Arc::clone(&printed));
+        move || {
+            if printed.swap(true, Ordering::SeqCst) {
+                return Vec::new();
+            }
+            let maps = if live_map {
+                map_feed.maps()
+            } else {
+                Vec::new()
+            };
+            let tallies: Vec<SessionTally> =
+                tallies.iter().map(|t| t.lock().unwrap().clone()).collect();
+            eprint!("{}", game_stats::immediate_report(&maps, &tallies));
+            maps
+        }
+    };
+    // First Ctrl+C: stop the sessions (no new shots), print the statistics, settle each recent
+    // map, print it, exit. A second one prints the in-memory statistics if they are not out yet
+    // and exits at once.
+    let presses = AtomicUsize::new(0);
+    let print_on_exit = print_immediate.clone();
+    ctrlc::set_handler(move || {
+        if presses.fetch_add(1, Ordering::SeqCst) == 0 {
+            signal_running.store(false, Ordering::SeqCst);
+            eprintln!("Stopping: statistics follow (Ctrl+C again to exit now)");
+        } else {
+            print_on_exit();
+            eprintln!("Exiting now");
+            std::process::exit(130);
+        }
+    })?;
     let mut workers = Vec::new();
     for (index, name) in names.into_iter().enumerate() {
         let config = config.clone();
         let running = Arc::clone(&running);
         let event_log = event_log.clone();
         let map_feed = map_feed.clone();
+        let tally = Arc::clone(&tallies[index]);
         workers.push(std::thread::spawn(move || {
-            let result = run_worker(&config, index, &name, &running, event_log, &map_feed);
+            let result = run_worker(
+                &config, index, &name, &running, event_log, &map_feed, &tally,
+            );
             if result.is_err() {
                 running.store(false, Ordering::SeqCst);
             }
@@ -87,10 +137,17 @@ pub fn run(config: &AppConfig) -> ClientResult<()> {
             _ => {}
         }
     }
-    // Discard queued work and join the currently running fit before leaving the manager.
-    map_feed.reset();
-    drop(map_feed);
+    // Statistics: what is in memory now, then each recent map once it has settled.
+    let maps = print_immediate();
     if let Some(map_worker) = map_worker {
+        for settled in map_feed.settle(STOP_SETTLE) {
+            let truth = maps
+                .iter()
+                .find(|m| m.epoch == settled.epoch)
+                .and_then(|m| m.truth.as_deref());
+            eprint!("{}", game_stats::settled_report(&settled, truth));
+        }
+        drop(map_feed);
         if map_worker.join().is_err() && worker_error.is_none() {
             worker_error = Some("map fitter worker panicked".into());
         }
@@ -135,6 +192,7 @@ fn run_worker(
     running: &AtomicBool,
     event_log: Option<Arc<Mutex<EventLog>>>,
     map_feed: &LiveMap,
+    tally: &Mutex<SessionTally>,
 ) -> ClientResult<()> {
     let mut stream = TcpStream::connect((config.host.as_str(), config.port))?;
     run_session(
@@ -147,6 +205,7 @@ fn run_worker(
         running,
         event_log,
         map_feed,
+        tally,
     )
 }
 
@@ -160,6 +219,7 @@ fn run_session(
     running: &AtomicBool,
     event_log: Option<Arc<Mutex<EventLog>>>,
     map_feed: &LiveMap,
+    tally: &Mutex<SessionTally>,
 ) -> ClientResult<()> {
     let mut rate_limiter = ByteRateLimiter::new();
     stream.set_write_timeout(Some(SOCKET_POLL_INTERVAL))?;
@@ -225,6 +285,11 @@ fn run_session(
                         break 'session;
                     }
                     println!("{}", event_summary(&event));
+                    tally.lock().unwrap().observe(
+                        &event,
+                        bot_state.own_id(),
+                        bot_state.player_positions(),
+                    );
                     bot_state.observe(&event);
                     if oracle_map_for_policy {
                         if let ServerEvent::Planets { planets } = &event {
@@ -239,8 +304,8 @@ fn run_session(
                     }
                     if targeting && !dummy && !oracle_map_for_policy && bot_index == 0 {
                         match &event {
-                            ServerEvent::Planets { .. } => {
-                                map_feed.reset();
+                            ServerEvent::Planets { planets } => {
+                                map_feed.reset(Some(planets.clone()));
                                 // Upstream can send our new position before Planets. Carry
                                 // the tracked snapshot across the epoch's queue invalidation.
                                 for (player_id, position) in bot_state.player_positions() {
@@ -643,7 +708,7 @@ mod tests {
         use std::sync::mpsc;
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        let (feed, fitter) = LiveMap::spawn_with(move |_, _, _| {
+        let (feed, fitter) = LiveMap::spawn_with(Settings::default(), move |_, _, _| {
             started_tx.send(()).unwrap();
             release_rx.recv().unwrap();
             None
@@ -739,6 +804,7 @@ mod tests {
                 &worker_running,
                 Some(worker_log),
                 &worker_feed,
+                &Mutex::new(SessionTally::new("Einstein")),
             )
         });
         // The fit never finishes while the bot waits, so it fires after the bounded wait.
@@ -827,7 +893,7 @@ mod tests {
         });
         let (done_tx, done_rx) = mpsc::channel();
         let client = std::thread::spawn(move || {
-            let (feed, fitter) = LiveMap::spawn(false);
+            let (feed, fitter) = LiveMap::spawn(false, Settings::default());
             let mut socket = TcpStream::connect(address).unwrap();
             let result = run_session(
                 &mut socket,
@@ -839,6 +905,7 @@ mod tests {
                 &worker_running,
                 None,
                 &feed,
+                &Mutex::new(SessionTally::new("Einstein")),
             );
             drop(fitter);
             done_tx
@@ -893,6 +960,7 @@ mod tests {
             oracle_map_for_policy: false,
             clients: 3,
             db_path: "unused.sqlite".into(),
+            planets: None,
         };
         let names = (0..config.clients)
             .map(|index| client_name(&config, index))

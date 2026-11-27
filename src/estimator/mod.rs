@@ -110,8 +110,13 @@ impl Shot {
 /// Limits and switches of an estimator.
 #[derive(Clone, Debug)]
 pub struct Settings {
-    /// Maximum number of planets in a map.
+    /// Maximum number of planets in a map when the count is not known (`planets` is `None`).
     pub max_planets: usize,
+    /// The known total planet count of the map (the server's `planets` setting, which it does not
+    /// send). `Some(n)` fixes the count: `n - K` planets are unseen and the cap is `n`. `None`: the
+    /// unseen count comes from a broad prior on the total (`noise::unseen`), capped by
+    /// `max_planets`.
+    pub planets: Option<usize>,
     /// Evaluations of one search slice (checked between batches of refits, so a slice may exceed
     /// it a little). Deterministic: the same paths and limits give the same belief whatever the
     /// load, as long as `slice_ceiling` does not cut a slice and no audit is adopted. The polish
@@ -135,6 +140,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             max_planets: DEFAULT_MAX_PLANETS,
+            planets: None,
             slice_evaluations: DEFAULT_SLICE_EVALUATIONS,
             slice_ceiling: Some(DEFAULT_SLICE_CEILING),
             slices_per_path: DEFAULT_SLICES_PER_PATH,
@@ -146,6 +152,11 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// The planet cap: the known count, else `max_planets`.
+    pub fn cap(&self) -> usize {
+        self.planets.unwrap_or(self.max_planets)
+    }
+
     fn slice<'a>(
         &'a self,
         cancelled: &'a AtomicBool,
@@ -157,7 +168,7 @@ impl Settings {
             evaluations: self.slice_evaluations,
             deadline: Instant::now() + self.slice_ceiling.unwrap_or(Duration::from_secs(24 * 3600)),
             threads: self.threads,
-            max_planets: self.max_planets,
+            max_planets: self.cap(),
             cancelled,
             stats,
         }
@@ -194,6 +205,30 @@ pub struct Estimator {
     last_report: Option<UpdateReport>,
     /// Window-build and contact-classification times of shots ingested since the last update.
     pending_timings: Vec<(Part, Duration)>,
+    /// `rho0` of the latest path's noise.
+    last_rho0: Option<f64>,
+}
+
+/// What the estimator holds about its map epoch, for status output (cheap: no fit).
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct EstimatorSummary {
+    /// Distinct paths ingested and paths given to the search.
+    pub paths: usize,
+    pub searched: usize,
+    /// Planets of the maintained map.
+    pub planets: usize,
+    /// Whether `step` has work left (slices owed, a polish, an audit to adopt).
+    pub search_pending: bool,
+    pub search_limit: Option<SearchLimit>,
+    /// Model-error scalars and the known total planet count (`None`: the prior).
+    pub model: ResidualModel,
+    /// Expected unseen planets `N_u` for the maintained map, and the expected total `K + N_u`
+    /// (the known count when given; with the prior it is the prior's mean given `N >= K`, not a
+    /// fitted count).
+    pub unseen: f64,
+    pub expected_total: f64,
+    /// Near cutoff of the latest path's noise (`None` before the first path).
+    pub rho0: Option<f64>,
 }
 
 impl Default for Estimator {
@@ -215,6 +250,7 @@ impl Default for Estimator {
             stats: Stats::default(),
             last_report: None,
             pending_timings: Vec::new(),
+            last_rho0: None,
         }
     }
 }
@@ -287,13 +323,15 @@ impl Estimator {
             let started = Instant::now();
             let maintained = self.maintained_planets();
             self.mask.cover(&self.shots[..=self.searched]);
-            let mut noise = Noise::with_mask(self.model, &maintained, &self.mask);
+            let mut noise =
+                Noise::with_mask(self.model, &maintained, &self.mask, self.settings.planets);
             let current = self.shots[self.searched]
                 .path
                 .as_ref()
                 .map(|path| noise::Series::new(path, &maintained, &noise));
             self.model = noise::estimate(&self.series, current.as_ref());
             noise.model = self.model;
+            self.last_rho0 = Some(noise.rho0);
             if let Some(series) = current {
                 self.series.push(series);
                 if self.series.len() > noise::WINDOW {
@@ -318,7 +356,7 @@ impl Estimator {
             self.audit = Some(Audit::rebuild(
                 self.shots.clone(),
                 self.noise(),
-                self.settings.max_planets,
+                self.settings.cap(),
                 self.audit_threads(),
             ));
         }
@@ -334,6 +372,36 @@ impl Estimator {
     /// The most recently published belief.
     pub fn belief(&self) -> Option<&MapBelief> {
         self.belief.as_ref()
+    }
+
+    /// An estimator with `settings`.
+    pub fn new(settings: Settings) -> Self {
+        Self {
+            settings,
+            ..Self::default()
+        }
+    }
+
+    /// The state of the map epoch (`EstimatorSummary`).
+    pub fn summary(&self) -> EstimatorSummary {
+        let planets = self.search.theta.len();
+        let unseen = noise::unseen(planets, self.settings.planets);
+        EstimatorSummary {
+            paths: self.shots.len(),
+            searched: self.searched,
+            planets,
+            search_pending: self.search_pending() || self.searched < self.shots.len(),
+            search_limit: self.belief.as_ref().and_then(|b| b.search_limit),
+            model: ResidualModel::new(self.model, self.settings.planets),
+            unseen,
+            expected_total: planets as f64 + unseen,
+            rho0: self.last_rho0,
+        }
+    }
+
+    /// The completed paths of the map epoch.
+    pub fn observations(&self) -> Vec<ShotObservation> {
+        self.shots.iter().map(|shot| shot.obs.clone()).collect()
     }
 
     /// Work counts and per-part timings of the most recent update.
@@ -480,7 +548,12 @@ impl Estimator {
     /// maintained map and every path.
     fn noise(&mut self) -> Noise {
         self.mask.cover(&self.shots);
-        Noise::with_mask(self.model, &self.maintained_planets(), &self.mask)
+        Noise::with_mask(
+            self.model,
+            &self.maintained_planets(),
+            &self.mask,
+            self.settings.planets,
+        )
     }
 
     /// Forget the map epoch's evidence. Player positions survive: the server announces a
@@ -519,7 +592,7 @@ impl Estimator {
                 None
             }
         };
-        belief.search_limit = if theta.len() >= self.settings.max_planets {
+        belief.search_limit = if theta.len() >= self.settings.cap() {
             Some(SearchLimit::PlanetCap)
         } else {
             self.limit
@@ -547,8 +620,13 @@ impl Estimator {
         // The correction must match the published map (a birth explains part of the residual).
         let started = Instant::now();
         self.mask.cover(&self.shots);
-        let noise = Noise::with_mask(self.model, &belief.map.planets, &self.mask);
-        belief.residual_model = Some(self.model.into());
+        let noise = Noise::with_mask(
+            self.model,
+            &belief.map.planets,
+            &self.mask,
+            self.settings.planets,
+        );
+        belief.residual_model = Some(ResidualModel::new(self.model, self.settings.planets));
         match residual::build(
             &belief.map.planets,
             &self.shots,
@@ -569,9 +647,10 @@ impl Estimator {
 }
 
 /// The residual correction (`residual.rs`) of `map` from the paths `observations` of its epoch,
-/// for replays and recorded decisions. `model` is the recorded model-error scalars; without one
-/// they are estimated from the last `noise::WINDOW` paths' residuals against `map` (not
-/// prequential like the live estimator's, so the scale can come out lower).
+/// for replays and recorded decisions. `model` is the recorded model-error scalars (with the
+/// planet count they were used with); without one they are estimated from the last
+/// `noise::WINDOW` paths' residuals against `map` (not prequential like the live estimator's, so
+/// the scale can come out lower), with the count unknown.
 pub fn residual_correction(
     map: &PlanetMap,
     observations: &[ShotObservation],
@@ -582,8 +661,8 @@ pub fn residual_correction(
         .iter()
         .map(|obs| Shot::new(obs.clone(), None, world))
         .collect();
-    let model = model.map(ModelError::from).unwrap_or_else(|| {
-        let noise = Noise::new(ModelError::PRIOR, &map.planets, &shots);
+    let model = model.unwrap_or_else(|| {
+        let noise = Noise::new(ModelError::PRIOR, &map.planets, &shots, None);
         let series: Vec<noise::Series> = shots
             .iter()
             .rev()
@@ -591,11 +670,11 @@ pub fn residual_correction(
             .take(noise::WINDOW)
             .map(|path| noise::Series::new(path, &map.planets, &noise))
             .collect();
-        noise::estimate(&series, None)
+        ResidualModel::new(noise::estimate(&series, None), None)
     });
-    let noise = Noise::new(model, &map.planets, &shots);
+    let noise = Noise::new(model.into(), &map.planets, &shots, model.total_planets);
     (
-        model.into(),
+        model,
         residual::build(&map.planets, &shots, &noise, cores()),
     )
 }

@@ -43,14 +43,19 @@ pub struct ResidualModel {
     pub scale: f64,
     pub length: f64,
     pub white: f64,
+    /// The known total planet count the noise used (`None`: the prior; also in captures before
+    /// P18, which used a fixed 24).
+    #[serde(default)]
+    pub total_planets: Option<usize>,
 }
 
-impl From<ModelError> for ResidualModel {
-    fn from(m: ModelError) -> Self {
+impl ResidualModel {
+    pub(super) fn new(m: ModelError, total_planets: Option<usize>) -> Self {
         Self {
             scale: m.scale,
             length: m.length,
             white: m.white,
+            total_planets,
         }
     }
 }
@@ -205,7 +210,12 @@ pub(super) fn build(
     let mut lengths: Vec<f64> = rows.iter().map(|r| r.length).collect();
     lengths.sort_by(f64::total_cmp);
     let length = lengths[lengths.len() / 2];
-    let correction = spread(&rows, length, planets, noise.model.into());
+    let correction = spread(
+        &rows,
+        length,
+        planets,
+        ResidualModel::new(noise.model, noise.total),
+    );
     if correction.max_magnitude < GATE_ACCELERATION {
         return Err(ResidualGate::MagnitudeBelowThreshold);
     }
@@ -555,6 +565,7 @@ mod tests {
             scale: 1.0,
             length: 600.0,
             white: 0.0,
+            total_planets: Some(24),
         };
         let planet = Planet {
             x: 900.0,
@@ -612,6 +623,7 @@ mod tests {
             scale: 0.5,
             length: 600.0,
             white: 1e-6,
+            total_planets: Some(24),
         };
         let (_, built) =
             crate::estimator::residual_correction(&empty, &[observed.clone()], Some(model));

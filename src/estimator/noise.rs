@@ -314,11 +314,35 @@ fn nearest_free(free: &[bool], nx: usize, ny: usize) -> Vec<u32> {
     nearest
 }
 
-/// Expected number of planets (the local generator's default; the server does not send it).
-const PLANETS_EXPECTED: f64 = 24.0;
-/// The maintained map's unseen planets are `PLANETS_EXPECTED - K`, never fewer than this (a
-/// complete map keeps a small allowance for planets beyond the default count).
+/// Prior on the total planet count when it is not known: a discrete Gaussian on
+/// `1..=PRIOR_PLANETS_MAX` (the server's range) centred on the server default 24 with sd 4. A
+/// broad choice, not calibrated: live servers may be configured with any count.
+const PRIOR_PLANETS_CENTRE: f64 = 24.0;
+const PRIOR_PLANETS_SD: f64 = 4.0;
+const PRIOR_PLANETS_MAX: usize = 64;
+/// Unseen planets are never fewer than this (a complete map keeps a small allowance for wrong or
+/// missing planets).
 const MIN_UNSEEN: f64 = 0.5;
+
+/// Expected number of unseen planets of a map with `found` planets. With a known `total`,
+/// `total - found`; otherwise the prior mean of `N - found` given `N >= found` (the map's planets
+/// are a lower bound on the count). Never below `MIN_UNSEEN`.
+pub(super) fn unseen(found: usize, total: Option<usize>) -> f64 {
+    let expected = match total {
+        Some(total) => total.saturating_sub(found) as f64,
+        None => {
+            let (mut weight, mut excess) = (0.0, 0.0);
+            for n in found.max(1)..=PRIOR_PLANETS_MAX {
+                let w =
+                    (-0.5 * ((n as f64 - PRIOR_PLANETS_CENTRE) / PRIOR_PLANETS_SD).powi(2)).exp();
+                weight += w;
+                excess += w * (n - found) as f64;
+            }
+            if weight > 0.0 { excess / weight } else { 0.0 }
+        }
+    };
+    expected.max(MIN_UNSEEN)
+}
 
 /// The noise of one operation: the model-error scalars, the admissible region they are shaped by,
 /// and the near cutoff `rho0`.
@@ -332,25 +356,39 @@ const MIN_UNSEEN: f64 = 0.5;
 pub(super) struct Noise {
     pub model: ModelError,
     pub admissible: Admissible,
+    /// The known total planet count (`None`: the prior).
+    pub total: Option<usize>,
     pub rho0: f64,
 }
 
 impl Noise {
-    /// The noise for the map `planets` (the maintained one) and the paths `shots`.
-    pub fn new(model: ModelError, planets: &[Planet], shots: &[Shot]) -> Self {
-        Self::with_mask(model, planets, &TickMask::of(shots))
+    /// The noise for the map `planets` (the maintained one) and the paths `shots`; `total` is the
+    /// known planet count (`None`: the prior).
+    pub fn new(
+        model: ModelError,
+        planets: &[Planet],
+        shots: &[Shot],
+        total: Option<usize>,
+    ) -> Self {
+        Self::with_mask(model, planets, &TickMask::of(shots), total)
     }
 
     /// As `new`, with the paths' ticks already stamped in `mask`.
-    pub fn with_mask(model: ModelError, planets: &[Planet], mask: &TickMask) -> Self {
+    pub fn with_mask(
+        model: ModelError,
+        planets: &[Planet],
+        mask: &TickMask,
+        total: Option<usize>,
+    ) -> Self {
         let admissible = Admissible::new(planets, mask);
-        let unseen = (PLANETS_EXPECTED - planets.len() as f64).max(MIN_UNSEEN);
+        let unseen = unseen(planets.len(), total);
         // An empty `U` (every candidate centre excluded) gives `rho0 = 0` and an infinite distance
         // everywhere: no process (sd 0, infinite length), so the gains carry the floor alone.
         let rho0 = (admissible.area / (std::f64::consts::PI * unseen)).sqrt();
         Self {
             model,
             admissible,
+            total,
             rho0,
         }
     }

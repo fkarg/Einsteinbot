@@ -18,6 +18,9 @@ pub struct AppConfig {
     pub oracle_map_for_policy: bool,
     pub clients: usize,
     pub db_path: PathBuf,
+    /// The known total planet count of the server's maps (its `planets` setting, 1-64), used as
+    /// fixed by the estimator; `None`: estimated with a broad prior.
+    pub planets: Option<usize>,
 }
 
 #[derive(Debug, Default)]
@@ -32,6 +35,7 @@ struct CliOptions {
     oracle_map_for_policy: Option<bool>,
     clients: Option<String>,
     db_path: Option<PathBuf>,
+    planets: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -46,6 +50,7 @@ struct FileOptions {
     oracle_map_for_policy: Option<bool>,
     clients: Option<usize>,
     db_path: Option<PathBuf>,
+    planets: Option<usize>,
 }
 
 #[derive(Debug, Default)]
@@ -59,6 +64,7 @@ struct EnvOptions {
     oracle_map_for_policy: Option<String>,
     clients: Option<String>,
     db_path: Option<PathBuf>,
+    planets: Option<String>,
 }
 
 enum ParsedCli {
@@ -105,6 +111,7 @@ impl EnvOptions {
             oracle_map_for_policy: get("EINSTEINBOT_ORACLE_MAP"),
             clients: get("EINSTEINBOT_CLIENTS"),
             db_path: get("EINSTEINBOT_DB_PATH").map(PathBuf::from),
+            planets: get("EINSTEINBOT_PLANETS"),
         })
     }
 }
@@ -145,9 +152,9 @@ fn resolve(cli: CliOptions, env: EnvOptions, file: FileOptions) -> Result<AppCon
         return Err("name must contain printable ASCII only".to_owned());
     }
     let clients = if let Some(value) = cli.clients {
-        parse_clients(&value, "--clients")?
+        parse_count(&value, "--clients")?
     } else if let Some(value) = env.clients {
-        parse_clients(&value, "EINSTEINBOT_CLIENTS")?
+        parse_count(&value, "EINSTEINBOT_CLIENTS")?
     } else {
         file.clients.unwrap_or(1)
     };
@@ -156,6 +163,16 @@ fn resolve(cli: CliOptions, env: EnvOptions, file: FileOptions) -> Result<AppCon
     }
     if clients > 1 && !is_loopback_host(&host) {
         return Err("multiple clients are supported only for a loopback host".to_owned());
+    }
+    let planets = if let Some(value) = cli.planets {
+        Some(parse_count(&value, "--planets")?)
+    } else if let Some(value) = env.planets {
+        Some(parse_count(&value, "EINSTEINBOT_PLANETS")?)
+    } else {
+        file.planets
+    };
+    if planets.is_some_and(|n| !(1..=64).contains(&n)) {
+        return Err("planets must be between 1 and 64 (the server's range)".to_owned());
     }
 
     Ok(AppConfig {
@@ -196,6 +213,7 @@ fn resolve(cli: CliOptions, env: EnvOptions, file: FileOptions) -> Result<AppCon
             .or(env.db_path)
             .or(file.db_path)
             .unwrap_or_else(|| PathBuf::from("einsteinbot.sqlite3")),
+        planets,
     })
 }
 
@@ -228,13 +246,14 @@ where
             "--oracle-map" => options.oracle_map_for_policy = Some(true),
             "--no-oracle-map" => options.oracle_map_for_policy = Some(false),
             "--clients" => options.clients = Some(value(&mut args, &arg)?),
+            "--planets" => options.planets = Some(value(&mut args, &arg)?),
             _ => return Err(format!("unknown argument: {arg}\n\n{}", help_text())),
         }
     }
     Ok(ParsedCli::Options(options))
 }
 
-fn parse_clients(value: &str, source: &str) -> Result<usize, String> {
+fn parse_count(value: &str, source: &str) -> Result<usize, String> {
     value
         .parse::<usize>()
         .map_err(|error| format!("invalid {source} value {value:?}: {error}"))
@@ -292,10 +311,11 @@ fn help_text() -> &'static str {
        --no-oracle-map     Ignore Planets events for targeting (default)\n\
        --clients N         Run N local bot connections (default: 1, max: 16)\n\
        --db-path PATH      SQLite file (default: einsteinbot.sqlite3)\n\
+       --planets N         Known planet count of the server's maps (fixed; default: estimated)\n\
        -h, --help          Show this help\n\
      \n\
      Precedence: command line, environment, TOML config, defaults.\n\
-     Environment: EINSTEINBOT_CONFIG, _HOST, _PORT, _NAME, _RECORD, _DUMMY, _TARGETING, _ORACLE_MAP, _CLIENTS, _DB_PATH.\n"
+     Environment: EINSTEINBOT_CONFIG, _HOST, _PORT, _NAME, _RECORD, _DUMMY, _TARGETING, _ORACLE_MAP, _CLIENTS, _DB_PATH, _PLANETS.\n"
 }
 
 #[cfg(test)]
@@ -449,6 +469,38 @@ mod tests {
         assert!(resolve(cli, EnvOptions::default(), FileOptions::default()).is_err());
 
         let ParsedCli::Options(cli) = parse_args(["--clients", "17"].map(str::to_owned)).unwrap()
+        else {
+            panic!("expected parsed options");
+        };
+        assert!(resolve(cli, EnvOptions::default(), FileOptions::default()).is_err());
+    }
+
+    #[test]
+    fn planet_count_is_optional_and_within_the_server_range() {
+        let default = resolve(
+            CliOptions::default(),
+            EnvOptions::default(),
+            FileOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(default.planets, None);
+        let ParsedCli::Options(cli) = parse_args(["--planets", "26"].map(str::to_owned)).unwrap()
+        else {
+            panic!("expected parsed options");
+        };
+        let file: FileOptions = toml::from_str("planets = 22\n").unwrap();
+        assert_eq!(
+            resolve(cli, EnvOptions::default(), file).unwrap().planets,
+            Some(26)
+        );
+        let file: FileOptions = toml::from_str("planets = 22\n").unwrap();
+        assert_eq!(
+            resolve(CliOptions::default(), EnvOptions::default(), file)
+                .unwrap()
+                .planets,
+            Some(22)
+        );
+        let ParsedCli::Options(cli) = parse_args(["--planets", "65"].map(str::to_owned)).unwrap()
         else {
             panic!("expected parsed options");
         };

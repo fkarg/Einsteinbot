@@ -11,7 +11,7 @@
 //!
 //! Environment (besides those of `diagnose.rs`): `NAME` (the `cfg=` label), `SLICES`,
 //! `SLICE_EVALS`, `CEIL_MS` (slice wall ceiling, 0 for none; default the production 250),
-//! `AUDIT`, `SCHEDULE`.
+//! `AUDIT`, `SCHEDULE`, `PLANETS` (known total count; absent: the prior), `CAP` (`max_planets`).
 use super::*;
 
 fn settings() -> Settings {
@@ -23,6 +23,11 @@ fn settings() -> Settings {
         settings.slice_ceiling = (*ms > 0).then(|| Duration::from_millis(*ms as u64));
     }
     settings.audit_enabled = env_list("AUDIT", "0")[0] == 1;
+    // `PLANETS=n`: the known total count (fixed); absent: the prior. `CAP=n`: the cap without it.
+    settings.planets = env_list("PLANETS", "-").first().copied();
+    if let Some(cap) = env_list("CAP", "-").first() {
+        settings.max_planets = *cap;
+    }
     settings
 }
 
