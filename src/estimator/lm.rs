@@ -251,7 +251,7 @@ impl Reduced {
         }
         let mut r = DMatrix::zeros(n, n);
         for c in 0..n {
-            for i in 0..c.min(max_rank) {
+            for i in 0..c.min(max_rank).min(m) {
                 r[(i, c)] = a[c * m + i];
             }
             if c < max_rank && c < m {
@@ -672,5 +672,19 @@ mod tests {
         assert!((r.tr_mul(&r) - &information).amax() < 1e-11 * information.amax());
         let gradient = a.tr_mul(&b);
         assert!((r.tr_mul(&qtb) - &gradient).amax() < 1e-11 * gradient.amax());
+    }
+
+    // A Jacobian whose rows are all zero (every row left out) is a zero factor, not a panic.
+    #[test]
+    fn an_all_zero_jacobian_reduces_to_a_zero_factor() {
+        let mut folder = Folder::new(3);
+        folder.add(&[0.0; 12], &[1.0, 2.0, 3.0, 4.0]);
+        assert!(folder.finish().is_none());
+        let reduced = Reduced::new(&[], &[], &[], 3, 4);
+        assert_eq!(
+            reduced.unpivoted(),
+            (DMatrix::zeros(3, 3), DVector::zeros(3))
+        );
+        assert_eq!(reduced.max_a_t_b_scaled(1.0), Some(0.0));
     }
 }
