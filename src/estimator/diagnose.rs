@@ -462,3 +462,90 @@ fn diagnose_matern_model_error() {
         }
     }
 }
+
+/// Capture `CAPTURE` (default 55), first epoch, through the full event path (`observe` on every
+/// recorded inbound event, so contacts are classified with the known players; `settle` after
+/// each shot): whether a published planet lies within 2 / 15 units of truth planet `PLANET`
+/// (default 6, the viewer's 0-based numbering) at 16, 32, 64, 128 paths and at the end, plus the
+/// shots and contacts near it.
+#[test]
+#[ignore]
+fn diagnose_full_event_planet() {
+    let capture = env_list("CAPTURE", "55")[0] as i64;
+    let index = env_list("PLANET", "6")[0];
+    if let Some(threads) = env_list("THREADS", "0").first() {
+        TEST_THREADS.store(*threads, Ordering::Relaxed);
+    }
+    let events = EventLog::read_capture("einsteinbot.sqlite3", capture).unwrap();
+    let mut estimator = Estimator::default();
+    let never = AtomicBool::new(false);
+    let mut truth: Vec<Planet> = Vec::new();
+    let (mut planets_events, mut identical, mut shots) = (0, 0, 0usize);
+    let checkpoints = [16usize, 32, 64, 128];
+    let max_paths = env_list("MAXPATHS", "128")[0];
+    let report = |estimator: &Estimator, n: usize, truth: &[Planet]| {
+        let t = &truth[index];
+        let theta = belief_theta(estimator);
+        let nearest = theta
+            .iter()
+            .map(|p| (p[0] - t.x).hypot(p[1] - t.y))
+            .fold(f64::INFINITY, f64::min);
+        let contacts = estimator
+            .shots
+            .iter()
+            .filter_map(|s| s.contact.as_ref())
+            .filter(|c| {
+                ((f64::from(c.point.x) - t.x).hypot(f64::from(c.point.y) - t.y) - t.radius).abs()
+                    < 15.0
+            })
+            .count();
+        let near_paths = estimator
+            .shots
+            .iter()
+            .filter(|s| {
+                s.obs.points.iter().any(|p| {
+                    (f64::from(p.x) - t.x).hypot(f64::from(p.y) - t.y) < t.radius + 60.0
+                })
+            })
+            .count();
+        println!(
+            "PLANET capture={capture} index={index} n={n} k={} nearest={nearest:.1} within2={} within15={} contacts_on_surface={contacts} paths_within_r+60={near_paths} truth=({:.0},{:.0},r{:.0})",
+            theta.len(),
+            nearest <= 2.0,
+            nearest <= 15.0,
+            t.x,
+            t.y,
+            t.radius
+        );
+    };
+    for stored in events {
+        let RecordedEvent::Inbound(event) = stored.event else {
+            continue;
+        };
+        if let ServerEvent::Planets { planets } = &event {
+            planets_events += 1;
+            if truth.is_empty() {
+                truth = planets.clone();
+            } else if *planets == truth {
+                // The estimator resets on every `Planets` event; the live map does the same.
+                identical += 1;
+            } else {
+                break;
+            }
+        }
+        let before = estimator.shots.len();
+        estimator.observe(&event, &never);
+        if estimator.shots.len() > before {
+            estimator.settle(&never);
+            shots = estimator.shots.len();
+            if checkpoints.contains(&shots) {
+                report(&estimator, shots, &truth);
+            }
+            if shots >= max_paths {
+                break;
+            }
+        }
+    }
+    println!("EPOCH capture={capture} planets_events={planets_events} identical_repeats={identical} paths={shots}");
+    report(&estimator, shots, &truth);
+}

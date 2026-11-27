@@ -1226,3 +1226,42 @@ Tried first: the white sd from earlier plus current with the background held fix
 Result: all tests pass (`cargo test --no-fail-fast`: library 97 tests in 1.86 s, all binaries), including the flat-world test and `planet_replay_uses_paths_not_oracle_and_resets_physical_map`. Falsifier true-map chi2/row unchanged (0.830 / 0.842 / 0.824). Dev, no audit, 14 worlds, totals against `a5060f3`: 104/116/1, 179/194/1, 276/285/3 -> 283/290/3, 321/326/4 at 8/16/32/60 paths, CPU 592 -> 589 s. The largest white sd estimated on a live world is 3.9e-5.
 
 Mac latency spot check (live 33, 10 threads, `SCHEDULE=500`, no audit, load average 3.3-3.6): worst publish lag 325 ms (243 ms for `a5060f3` and 266 ms for main earlier, at load 2.4-3.4). The noise phase now takes up to 55 ms per path (two three-scalar searches) against 10-25 ms before. Evaluating the series in parallel did not reduce it (311 ms, 55 ms) and was reverted.
+
+#### P13 review fixes and the high-rate captures 54-55 (observed; one run each)
+
+Review fixes (`f685f5c`):
+- Every noise (admissible region, `rho0`, prequential residuals) is built from the maintained search map, never from the polished published one, so a polish cut by its wall ceiling cannot change later search.
+- The adoption bookkeeping is removed. The Kalman covariance step uses the sparse transition, the polish applies its noise in place, and thinned paths build no gains until their noise is set.
+- New tests: dense-covariance whitening with a varying shape, missing rows and white excess (innovations and log-det); recovery of an injected white sd, with exact floor residuals keeping it below 0.3 of the floor sd.
+- Dev, no audit, 14 worlds, against `4509143`: 104/116/1, 179/194/1, 283/290/3 -> 283/292/1, 321/326/4 -> 321/325/6 (one more spurious planet each on live 39 and 45). CPU 589 -> 716 s, but this run shared jolly with six long capture replays, so the CPU comparison is inflated.
+- Noise phase per path on jolly: median 18 ms, p99 62 ms, max 110 ms. Mac live 33: max 50 ms (55 before).
+- Mac latency, live 33, 10 threads, `SCHEDULE=500`, no server running, load average 3.9-5.3: worst publish lag 325 ms (325 before the fixes; main 266 earlier, at load 2.4-3.4).
+
+New fact (main session, captures 53-55, the user's server config): 7-9 usable paths per second and 250-550 paths per map epoch, so 16 paths arrive within about 2 s. Capture 54's second epoch and capture 55's first are the same game recorded by two connections (identical replay results in both binaries).
+
+Deterministic replays (jolly, `EPOCH` selects a map epoch, at most 400 paths; main -> P13; `rec2/rec15/spur`):
+
+| epoch | n=8 | n=16 | n=32 | n=64 | n=128 | last | CPU s |
+|---|---|---|---|---|---|---|---|
+| 54 e0 (283 paths) | 2/8/6 -> 8/9/1 | 13/17/6 -> 20/21/0 | 24/24/0 -> 23/23/0 | 24/24/0 -> 24/24/0 | 24/24/0 -> 24/24/0 | 24/24/0 -> 24/24/0 | 623 -> 396 |
+| 55 e0 = 54 e1 (first 401 paths) | 5/10/5 -> 4/6/0 | 7/13/5 -> 6/8/0 | 8/13/7 -> 13/15/3 | 19/21/2 -> 19/19/0 | 24/24/0 -> 24/24/0 | 24/24/0 -> 24/24/0 | 780 -> 564 |
+
+Real-time replay, capture 55 epoch 0 (Mac, 10 threads, a path every 110 ms as recorded, all 545 paths; main with its audit, P13 without, as each runs live; no contacts in this harness; load average 4.2-5.3):
+
+| | n=16 (1.7 s) | n=32 | n=64 | n=128 (14 s) | n=256 | n=545 (60 s) | worst publish lag | slices |
+|---|---|---|---|---|---|---|---|---|
+| main | 15 planets, 6 within 2 units, 4 spurious | 15 / 4 / 5 | 15 / 5 / 3 | 18 / 11 / 2 | 18 / 15 / 2 | 18 / 16 / 0 | 922 ms | 203 |
+| P13 | 8 / 6 / 0 | 11 / 10 / 0 | 17 / 16 / 0 | 24 / 24 / 0 | 24 / 24 / 0 | 24 / 24 / 0 | 794 ms | 187 |
+
+At this rate a path gets about a third of a slice instead of the 6 owed, so main's search falls behind: it is still at 18 planets after 60 s. P13 is complete after 128 paths (14 s). The publish lag means up to about 7-8 paths wait behind the update in progress.
+
+Truth planet #6 of capture 55 (viewer numbering, 0-based; at (1032, 156), radius 25), full event path with contacts (`diagnose_full_event_planet`; `observe` on every recorded inbound event, `settle` after each shot; one `Planets` event in the epoch, no identical repeats):
+
+| | n=16 | n=32 | n=64 | n=128 | end (545) |
+|---|---|---|---|---|---|
+| main, distance of the nearest planet | 162 | 165 | 1.7 | 0.0 | 0.0 |
+| P13 | 229 | 164 | 180 | 0.0 | 0.0 |
+
+No path comes within its radius plus 60 before about 128 paths. By the end, 16 paths come within that distance and 6 recorded contacts lie on its surface. When every update is allowed to finish, main finds it, and so does P13. In the recorded live decisions of capture 55 (the build of that time, with the audit), the nearest belief planet stayed about 180 units from #6 for the whole epoch (19-23 planets). That is the falling-behind above, not a missed seed or evidence. The recorded choices were 108 `Hit`, 58 `Approach` and 1 without a choice, with `Approach` rising to about 40% after 20 s. No shots were uncertainty probes.
+
+Compute: jolly about 4,000 CPU-s (dev 716, the six long capture replays about 3,300, a third of it the duplicated epoch); Mac about 20 CPU-minutes.
