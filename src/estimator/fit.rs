@@ -3,8 +3,9 @@
 //!
 //! Mass is tied to the radius (`MASS_PER_RADIUS_CUBED`, as the local NewtonWars generator does).
 //! The residual vector is: the whitened window residuals of every path, one interior-sample
-//! penalty per (path, planet) (an observed regular tick inside a disk is impossible), and one
-//! gated surface-contact term per contact. Jacobians are analytic. The fit is a continuous
+//! penalty per (path, planet) (an observed regular tick inside a disk is impossible), one gated
+//! surface-contact term per contact, and one overlap penalty per pair of planets (free-free and
+//! free-fixed; the generator never lets two planets overlap or even touch). Jacobians are analytic. The fit is a continuous
 //! Levenberg-Marquardt refinement in logistic coordinates; no grid is searched.
 //!
 //! Evidence is `-chi2/2 - Occam(Laplace) - K ln 20`, under the noise the shots carry
@@ -22,6 +23,14 @@ use std::time::Instant;
 
 /// Scale of the interior-sample penalty residual, in world units.
 const PENALTY_SIGMA: f64 = 0.5;
+/// Hard rule for maps and birth seeds: two planets whose disks overlap by at least this much
+/// (`distance <= r_i + r_j - OVERLAP_TOLERANCE`) are rejected. The local generator redraws a
+/// planet until `distance > r_i + r_j` for every earlier one (`initPlanets` in NewtonWars
+/// `simulation.c`), so any overlap is estimation error; positions and radii of found planets are
+/// typically within a unit or two (one-path position sd about 5), so 5 units leaves room for that
+/// error while excluding concentric or deeply nested splits. The fit's overlap penalty starts at
+/// touching (the generator's rule itself), so fits are pushed apart well before this bound.
+const OVERLAP_TOLERANCE: f64 = 5.0;
 const MIN_CONTACT_SIGMA: f64 = 0.25;
 /// A contact constrains the planet only near its surface: full weight within `CONTACT_FULL`,
 /// tapering smoothly to nothing at `CONTACT_GATE`. Farther contacts stay unexplained, so a
@@ -73,6 +82,19 @@ pub(super) fn covariance_xym(covariance: &DMatrix<f64>, planets: &[Planet]) -> D
         transform[(3 * i + 2, 3 * i + 2)] = 3.0 * MASS_PER_RADIUS_CUBED * planet.radius.powi(2);
     }
     &transform * covariance * transform.transpose()
+}
+
+/// Whether planets `a` and `b` (`[x, y, radius]`) overlap by at least `OVERLAP_TOLERANCE`.
+pub(super) fn overlapping(a: &[f64; 3], b: &[f64; 3]) -> bool {
+    (a[0] - b[0]).hypot(a[1] - b[1]) <= a[2] + b[2] - OVERLAP_TOLERANCE
+}
+
+/// Whether any two planets of `theta` overlap by at least `OVERLAP_TOLERANCE`.
+pub(super) fn any_overlap(theta: &[[f64; 3]]) -> bool {
+    theta
+        .iter()
+        .enumerate()
+        .any(|(i, a)| theta[i + 1..].iter().any(|b| overlapping(a, b)))
 }
 
 fn surface_error(theta: &[f64; 3], point: &Point) -> f64 {
@@ -338,6 +360,69 @@ impl<'a> Fit<'a> {
         (res, jacobian)
     }
 
+    /// One overlap penalty per pair of free planets and per (free, fixed) pair: the depth by which
+    /// the disks overlap (`max(0, r_i + r_j - distance)`) over `PENALTY_SIGMA`, with its Jacobian
+    /// with respect to the free planets (column-major) if wanted.
+    fn overlap_rows(
+        &self,
+        theta: &[[f64; 3]],
+        want_jacobian: bool,
+    ) -> (Vec<f64>, Option<Vec<f64>>) {
+        let k = theta.len();
+        let fixed: Vec<[f64; 3]> = self.fixed.iter().map(theta_of).collect();
+        let pairs: Vec<(usize, Option<usize>, [f64; 3])> = (0..k)
+            .flat_map(|i| {
+                let free = (i + 1..k).map(move |j| (i, Some(j), theta[j]));
+                free.chain(fixed.iter().map(move |f| (i, None, *f)))
+            })
+            .collect();
+        let rows = pairs.len();
+        let mut res = vec![0.0; rows];
+        let mut jacobian = want_jacobian.then(|| vec![0.0; rows * 3 * k]);
+        for (row, &(i, j, other)) in pairs.iter().enumerate() {
+            let a = &theta[i];
+            let (dx, dy) = (a[0] - other[0], a[1] - other[1]);
+            let distance = dx.hypot(dy);
+            let depth = a[2] + other[2] - distance;
+            if depth <= 0.0 {
+                continue;
+            }
+            res[row] = depth / PENALTY_SIGMA;
+            if let Some(block) = jacobian.as_mut() {
+                let (ux, uy) = (dx / distance.max(1e-9), dy / distance.max(1e-9));
+                let mut set = |planet: usize, sign: f64| {
+                    block[3 * planet * rows + row] = -sign * ux / PENALTY_SIGMA;
+                    block[(3 * planet + 1) * rows + row] = -sign * uy / PENALTY_SIGMA;
+                    block[(3 * planet + 2) * rows + row] = 1.0 / PENALTY_SIGMA;
+                };
+                set(i, 1.0);
+                if let Some(j) = j {
+                    set(j, -1.0);
+                }
+            }
+        }
+        (res, jacobian)
+    }
+
+    /// The rows not tied to a path, contacts then overlaps, as one column-major block.
+    fn global_rows(&self, theta: &[[f64; 3]], want_jacobian: bool) -> (Vec<f64>, Option<Vec<f64>>) {
+        let (mut res, contacts) = self.contact_rows(theta, want_jacobian);
+        let (overlaps, overlap_block) = self.overlap_rows(theta, want_jacobian);
+        let (a, b) = (res.len(), overlaps.len());
+        res.extend(overlaps);
+        let jacobian = contacts.zip(overlap_block).map(|(first, second)| {
+            (0..3 * theta.len())
+                .flat_map(|c| {
+                    first[c * a..(c + 1) * a]
+                        .iter()
+                        .chain(&second[c * b..(c + 1) * b])
+                        .copied()
+                })
+                .collect()
+        });
+        (res, jacobian)
+    }
+
     /// Threads one evaluation uses: they only pay off when there is enough work to share
     /// (measured in `diagnose.rs`).
     fn evaluation_threads(&self, k: usize, threads: usize) -> usize {
@@ -379,7 +464,7 @@ impl<'a> Fit<'a> {
         let mut blocks = par_map(&self.path_indices(), workers, |&index| {
             self.path_block(index, theta, want_jacobian)
         });
-        blocks.push(self.contact_rows(theta, want_jacobian));
+        blocks.push(self.global_rows(theta, want_jacobian));
         let total: usize = blocks.iter().map(|(res, _)| res.len()).sum();
         let mut res = Vec::with_capacity(total);
         let mut jacobian = want_jacobian.then(|| DMatrix::zeros(total, 3 * k));
@@ -403,7 +488,7 @@ impl<'a> Fit<'a> {
     /// and `Q^T` of the residuals, without forming the full Jacobian: consecutive paths are
     /// grouped by rows (from the data alone, so the result does not depend on `threads`), each
     /// group's blocks are folded into one triangle on its own thread, and the triangles and the
-    /// contact rows are reduced last. `None` if cancelled or a residual is not finite.
+    /// contact and overlap rows are reduced last. `None` if cancelled or a residual is not finite.
     fn reduce(&self, theta: &[[f64; 3]], u: &DVector<f64>, threads: usize) -> Option<Reduced> {
         if self.cancelled.load(Ordering::Relaxed) {
             return None;
@@ -444,7 +529,7 @@ impl<'a> Fit<'a> {
             .into_iter()
             .flatten()
             .collect();
-        let (res, block) = self.contact_rows(theta, true);
+        let (res, block) = self.global_rows(theta, true);
         if !res.iter().all(|v| v.is_finite()) {
             return None;
         }
@@ -478,6 +563,15 @@ impl<'a> Fit<'a> {
                 jr[i] = x * dx_dur + y * dy_dur + r * radius_slope;
             }
         }
+    }
+
+    /// Whether no two planets of `theta`, nor one of `theta` and a fixed planet, overlap by
+    /// `OVERLAP_TOLERANCE` or more. `refine` only accepts steps to such points.
+    pub fn feasible(&self, theta: &[[f64; 3]]) -> bool {
+        !any_overlap(theta)
+            && !theta
+                .iter()
+                .any(|a| self.fixed.iter().any(|f| overlapping(a, &theta_of(f))))
     }
 
     /// Chi-square.
@@ -679,9 +773,13 @@ impl lm::Problem for Lm<'_> {
         if !self.spend() {
             return None;
         }
-        let (residuals, _) = self
-            .fit
-            .evaluate(&self.fit.decode(u), false, self.budget.threads)?;
+        let theta = self.fit.decode(u);
+        // An overlapping point counts as infinitely bad: the step is rejected and the trust
+        // region shrinks, so iterates stay feasible (an infeasible start does not move).
+        if !self.fit.feasible(&theta) {
+            return Some(f64::INFINITY);
+        }
+        let (residuals, _) = self.fit.evaluate(&theta, false, self.budget.threads)?;
         let norm = residuals.norm();
         if self.best.as_ref().is_none_or(|(lowest, _)| norm < *lowest) {
             self.best = Some((norm, u.clone()));
@@ -774,6 +872,121 @@ mod tests {
             let other = fit.reduce(&theta, &u, threads).unwrap().unpivoted();
             assert!(other.0 == r && other.1 == qtb, "{threads} threads");
         }
+    }
+
+    /// Shots around one planet of radius 36 at (800, 500), the planet P18 split into three.
+    fn one_large_planet() -> Vec<Shot> {
+        shots(
+            vec![planet(800.0, 500.0, 36.0)],
+            &[
+                ((650.0, 500.0), 0.0),
+                ((800.0, 650.0), 270.0),
+                ((950.0, 520.0), 180.0),
+                ((800.0, 350.0), 90.0),
+                ((600.0, 700.0), 330.0),
+            ],
+        )
+    }
+
+    // The overlap rows' Jacobian is their derivative (free-free and free-fixed pairs), and the
+    // reduction of an overlapping map is still the QR of its full Jacobian.
+    #[test]
+    fn overlap_rows_have_the_jacobian_of_their_residuals() {
+        let cancelled = AtomicBool::new(false);
+        let shots = three_planets();
+        let fixed = vec![planet(540.0, 500.0, 30.0)];
+        let fit = Fit::new(&shots, WorldParameters::default(), &cancelled, true, fixed);
+        let theta = [
+            [505.0, 497.0, 30.5],
+            [520.0, 470.0, 27.0],
+            [905.0, 255.0, 25.5],
+        ];
+        let (residuals, jacobian) = fit.overlap_rows(&theta, true);
+        let jacobian = jacobian.unwrap();
+        let rows = residuals.len();
+        assert_eq!(rows, 3 + 3);
+        assert!(residuals.iter().filter(|v| **v > 0.0).count() >= 3);
+        for c in 0..9 {
+            let h = 1e-6;
+            let shifted = |delta: f64| {
+                let mut t = theta;
+                t[c / 3][c % 3] += delta;
+                fit.overlap_rows(&t, false).0
+            };
+            let (plus, minus) = (shifted(h), shifted(-h));
+            for row in 0..rows {
+                let numeric = (plus[row] - minus[row]) / (2.0 * h);
+                let analytic = jacobian[c * rows + row];
+                assert!(
+                    (numeric - analytic).abs() < 1e-5,
+                    "column {c} row {row}: {numeric} vs {analytic}"
+                );
+            }
+        }
+        let u = fit.encode(&theta);
+        let (residuals, jacobian) = dense(&fit, &u);
+        let (r, qtb) = fit.reduce(&theta, &u, 1).unwrap().unpivoted();
+        let information = jacobian.tr_mul(&jacobian);
+        assert!((r.tr_mul(&r) - &information).amax() < 1e-10 * information.amax());
+        let gradient = jacobian.tr_mul(&residuals);
+        assert!((r.tr_mul(&qtb) - &gradient).amax() < 1e-10 * gradient.amax());
+    }
+
+    // One true planet and two estimated ones beside it: the data pull both to the true centre
+    // (P18's concentric split, masses adding up to the true one), the fit stops short of
+    // overlapping. Without the step barrier (overlap penalty alone) both end at the centre.
+    #[test]
+    fn a_fit_cannot_converge_into_overlap() {
+        let cancelled = AtomicBool::new(false);
+        let shots = one_large_planet();
+        let fit = Fit::new(&shots, WorldParameters::default(), &cancelled, true, vec![]);
+        let start = [[770.0, 500.0, 28.0], [830.0, 505.0, 26.0]];
+        assert!(fit.feasible(&start));
+        let (theta, _) = fit.refine(&start, &Budget::UNLIMITED).unwrap();
+        assert!(!any_overlap(&theta), "{theta:?}");
+        // A fixed planet (too small for the field) holds a free one off the same way.
+        let fixed = planet(800.0, 500.0, 25.0);
+        let alone = Fit::new(
+            &shots,
+            WorldParameters::default(),
+            &cancelled,
+            false,
+            vec![fixed.clone()],
+        );
+        let (theta, _) = alone
+            .refine(&[[870.0, 500.0, 30.0]], &Budget::UNLIMITED)
+            .unwrap();
+        assert!(!overlapping(&theta[0], &theta_of(&fixed)), "{theta:?}");
+    }
+
+    // A planet whose disk crosses the battlefield edge (which the generator never places) is
+    // fitted inside it: the centre stays within `[r, W - r] x [r, H - r]`.
+    #[test]
+    fn fitted_planets_stay_inside_the_battlefield() {
+        let cancelled = AtomicBool::new(false);
+        let shots = shots(
+            vec![planet(10.0, 500.0, 30.0)],
+            &[
+                ((150.0, 500.0), 170.0),
+                ((150.0, 650.0), 200.0),
+                ((120.0, 300.0), 120.0),
+            ],
+        );
+        let fit = Fit::new(
+            &shots,
+            WorldParameters::default(),
+            &cancelled,
+            false,
+            vec![],
+        );
+        let (theta, _) = fit
+            .refine(&[[60.0, 500.0, 30.0]], &Budget::UNLIMITED)
+            .unwrap();
+        assert!(fit.in_bounds(&theta, 0.0), "{theta:?}");
+        assert!(
+            theta[0][0] - theta[0][2] < 1.0,
+            "pressed against the edge: {theta:?}"
+        );
     }
 
     /// The crate's minimizer on the dense problem, as `refine` ran before.
