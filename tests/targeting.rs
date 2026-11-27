@@ -1,6 +1,8 @@
 use einsteinbot::map::PlanetMap;
 use einsteinbot::protocol::{Planet, ServerEvent};
-use einsteinbot::strategy::{BotState, MapBelief, ShotReason, TargetingPolicy, TargetingSettings};
+use einsteinbot::strategy::{
+    APPROACH_MIN_ENERGY, BotState, MapBelief, ShotReason, TargetingPolicy, TargetingSettings,
+};
 use nalgebra::DMatrix;
 
 fn state_with_enemy(enemy_x: f32, enemy_y: f32) -> BotState {
@@ -109,8 +111,8 @@ fn information_shot_requires_uncertainty_above_the_threshold() {
         },
         Some(DMatrix::identity(3, 3) * 1e-12),
     )));
-    let conservative_choice = policy.choose(&uncertain_state, 8.0).unwrap();
-    assert_ne!(conservative_choice.reason, ShotReason::Information);
+    // Without a predicted hit or an information shot, the bot waits for energy.
+    assert_eq!(policy.choose(&uncertain_state, 8.0), None);
 }
 
 #[test]
@@ -129,24 +131,30 @@ fn covered_non_hit_corridor_is_penalized_and_reset_restores_it() {
         max_simulation_ticks: 30,
         ..TargetingSettings::default()
     });
-    let first = policy.choose(&state, 2.0).unwrap();
+    let first = policy.choose(&state, APPROACH_MIN_ENERGY).unwrap();
     assert_eq!(first.angle_degrees, 0);
     state.observe(&ServerEvent::ShotFin {
         player_id: 9,
         angle: 1.0,
         velocity: 2.0,
-        points: (0..=60)
+        points: (0..=450)
             .map(|x| Point {
                 x: x as f32,
                 y: 0.0,
             })
             .collect(),
     });
-    let next = policy.choose(&state, 2.0).unwrap();
+    let next = policy.choose(&state, APPROACH_MIN_ENERGY).unwrap();
     assert_ne!(next.angle_degrees, 0);
     assert_eq!(next.reason, ShotReason::Approach);
     state.observe(&ServerEvent::Planets { planets: vec![] });
-    assert_eq!(policy.choose(&state, 2.0).unwrap().angle_degrees, 0);
+    assert_eq!(
+        policy
+            .choose(&state, APPROACH_MIN_ENERGY)
+            .unwrap()
+            .angle_degrees,
+        0
+    );
 }
 
 #[test]

@@ -19,8 +19,9 @@ const PROTOCOL_VERSION: u32 = 8;
 const ENERGY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const MAP_QUIET_PERIOD: Duration = Duration::from_millis(300);
-// Games last about 30 seconds, so don't spend a large fraction of a match waiting on a fit.
-const MAX_MAP_WAIT: Duration = Duration::from_secs(5);
+// A busy game queues paths faster than they are fitted; a 5 s wait stalled every bot for
+// seconds (capture 55). Wait briefly, then aim with the latest published belief.
+const MAX_MAP_WAIT: Duration = Duration::from_millis(500);
 
 type ClientResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -311,7 +312,6 @@ fn run_session(
                                     "online"
                                 },
                             )?
-                            .or_else(|| commands_for_energy(energy, &mut rand::rng()))
                         } else {
                             None
                         };
@@ -362,8 +362,7 @@ fn run_session(
                     name,
                     running,
                     "online",
-                )?
-                .or_else(|| commands_for_energy(pending.energy, &mut rand::rng()));
+                )?;
                 for command in commands.into_iter().flatten() {
                     if !running.load(Ordering::SeqCst) {
                         break 'session;
@@ -594,7 +593,7 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
-    fn map_wait_allows_slow_fits_but_has_a_five_second_maximum() {
+    fn map_wait_allows_slow_fits_but_has_a_short_maximum() {
         let now = Instant::now();
         let pending = PendingEnergy {
             energy: 8.0,
@@ -610,7 +609,7 @@ mod tests {
         };
 
         assert_eq!(
-            pending.map_wait_status(progress, now + Duration::from_secs(4)),
+            pending.map_wait_status(progress, now + MAX_MAP_WAIT - Duration::from_millis(1)),
             (false, false)
         );
         assert_eq!(
@@ -638,7 +637,7 @@ mod tests {
     }
 
     #[test]
-    fn targeting_defers_a_shot_until_submitted_map_work_finishes() {
+    fn targeting_fires_with_the_latest_belief_after_a_bounded_map_wait() {
         use std::io::{BufRead, BufReader};
         use std::net::TcpListener;
         use std::sync::mpsc;
@@ -654,7 +653,6 @@ mod tests {
         started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
-        let (early_tx, early_rx) = mpsc::channel();
         let (shots_tx, shots_rx) = mpsc::channel();
         let server = std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
@@ -685,27 +683,9 @@ mod tests {
             frames.extend(1u32.to_ne_bytes());
             frames.extend(8f64.to_ne_bytes());
             socket.write_all(&frames).unwrap();
+            let energy_sent = Instant::now();
 
-            socket
-                .set_read_timeout(Some(Duration::from_millis(500)))
-                .unwrap();
-            let mut early_shots = 0;
-            loop {
-                line.clear();
-                match reader.read_line(&mut line) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) if line.trim().parse::<f64>().is_ok() || line.starts_with("v ") => {
-                        early_shots += 1
-                    }
-                    _ => {}
-                }
-            }
-            early_tx.send(early_shots).unwrap();
-
-            socket
-                .set_read_timeout(Some(Duration::from_secs(3)))
-                .unwrap();
-            let mut shots = early_shots;
+            let mut shots = 0;
             while shots < 2 {
                 line.clear();
                 match reader.read_line(&mut line) {
@@ -716,7 +696,7 @@ mod tests {
                     _ => {}
                 }
             }
-            shots_tx.send(shots).unwrap();
+            shots_tx.send((shots, energy_sent.elapsed())).unwrap();
             loop {
                 line.clear();
                 if reader.read_line(&mut line).unwrap_or(0) == 0 {
@@ -761,13 +741,11 @@ mod tests {
                 &worker_feed,
             )
         });
-        assert_eq!(
-            early_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
-            0,
-            "targeting should wait while earlier map evidence is fitting"
-        );
+        // The fit never finishes while the bot waits, so it fires after the bounded wait.
+        let (shots, elapsed) = shots_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(shots, 2);
+        assert!(elapsed >= MAX_MAP_WAIT, "fired after {elapsed:?}");
         release_tx.send(()).unwrap();
-        assert_eq!(shots_rx.recv_timeout(Duration::from_secs(5)).unwrap(), 2);
         running.store(false, Ordering::SeqCst);
         client.join().unwrap().unwrap();
         server.join().unwrap();
@@ -781,7 +759,7 @@ mod tests {
         let decision: serde_json::Value = serde_json::from_str(&data).unwrap();
         assert_eq!(decision["energy"], 8.0);
         assert_eq!(decision["map_submitted_watermark"], 1);
-        assert_eq!(decision["map_processed_watermark"], 1);
+        assert_eq!(decision["map_processed_watermark"], 0);
         assert_eq!(decision["map_pending_paths"], 0);
         // The fake fit reports no update; the key is still recorded (null, not omitted).
         assert!(decision["map_update_report"].is_null());
@@ -791,8 +769,8 @@ mod tests {
                 .unwrap()
                 .contains_key("map_update_report")
         );
-        assert_eq!(decision["map_wait_fallback"], false);
-        assert!(decision["map_wait_ms"].as_u64().unwrap() >= 300);
+        assert_eq!(decision["map_wait_fallback"], true);
+        assert!(decision["map_wait_ms"].as_u64().unwrap() >= 500);
         drop(db);
         drop(log);
         std::fs::remove_file(path).unwrap();

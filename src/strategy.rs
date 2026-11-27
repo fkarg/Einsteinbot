@@ -260,6 +260,11 @@ impl BotState {
     }
 }
 
+/// Below this energy a shot without a predicted hit is not fired; the bot waits for energy.
+pub const APPROACH_MIN_ENERGY: f64 = 15.0;
+/// Hit ranking weight of one unit of predicted impact offset, in flight ticks.
+const MISS_DISTANCE_TICKS: f64 = 5.0;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TargetingSettings {
     pub angle_step_degrees: u16,
@@ -305,6 +310,8 @@ pub struct ShotChoice {
     pub reason: ShotReason,
     pub predicted_hit: bool,
     pub predicted_victim: Option<u32>,
+    /// Simulated ticks until the path ends (impact for a predicted hit).
+    pub flight_ticks: usize,
 }
 
 pub struct TargetingPolicy {
@@ -468,6 +475,7 @@ impl TargetingPolicy {
                     Termination::PlayerCollision(id) if id != own_id => Some(id),
                     _ => None,
                 },
+                flight_ticks: trajectory.points.len(),
             })
         };
         let mut candidates = Vec::new();
@@ -628,6 +636,11 @@ impl TargetingPolicy {
             });
         }
 
+        // A cheap shot without a predicted hit rarely hits (capture 55: 5 of 58 at a median
+        // energy of 3.6); saving energy until a hit is predicted pays off more.
+        if energy < APPROACH_MIN_ENERGY {
+            return None;
+        }
         pool.into_iter().min_by(|left, right| {
             left.contact_before_target
                 .cmp(&right.contact_before_target)
@@ -703,10 +716,14 @@ fn contact_before_target(planet: &crate::protocol::Planet, points: &[Point], pas
 }
 
 fn compare_hit_quality(left: &ShotChoice, right: &ShotChoice) -> Ordering {
-    // Until the model predicts hits reliably, prefer the most central impact. Save
-    // energy only when predicted aim quality is equal.
-    left.miss_distance
-        .total_cmp(&right.miss_distance)
+    // Map error grows along the path, so shorter flights hit far more often than central but
+    // long ones (capture 55: 5 of 7 under 30 ticks, 1 of 32 over 100). Rank by flight time,
+    // with the impact offset as a small penalty; save energy only on equal scores.
+    let score = |choice: &ShotChoice| {
+        choice.flight_ticks as f64 + MISS_DISTANCE_TICKS * choice.miss_distance
+    };
+    score(left)
+        .total_cmp(&score(right))
         .then_with(|| left.velocity.cmp(&right.velocity))
 }
 
@@ -877,33 +894,42 @@ mod tests {
     }
 
     #[test]
-    fn hit_quality_precedes_energy_conservation() {
-        let grazing_low_energy = ShotChoice {
-            velocity: 2,
+    fn hit_ranking_prefers_short_flights_over_central_long_ones() {
+        let central_long = ShotChoice {
+            flight_ticks: 120,
+            miss_distance: 0.0,
+            velocity: 3,
+            ..test_choice()
+        };
+        let grazing_short = ShotChoice {
+            flight_ticks: 40,
             miss_distance: 3.5,
+            velocity: 9,
             ..test_choice()
         };
-        let central_high_energy = ShotChoice {
-            velocity: 8,
-            miss_distance: 0.5,
-            ..test_choice()
-        };
-
         assert_eq!(
-            compare_hit_quality(&central_high_energy, &grazing_low_energy),
+            compare_hit_quality(&grazing_short, &central_long),
+            Ordering::Less
+        );
+
+        // At equal flight time the more central impact wins, then the cheaper shot.
+        let central_short = ShotChoice {
+            miss_distance: 0.5,
+            ..grazing_short
+        };
+        assert_eq!(
+            compare_hit_quality(&central_short, &grazing_short),
             Ordering::Less
         );
         assert_eq!(
             compare_hit_quality(
-                &grazing_low_energy,
                 &ShotChoice {
-                    miss_distance: 3.5,
                     velocity: 4,
-                    ..test_choice()
-                }
+                    ..central_short
+                },
+                &central_short
             ),
-            Ordering::Less,
-            "energy remains the tie-breaker when hit quality is equal"
+            Ordering::Less
         );
     }
 
@@ -919,6 +945,7 @@ mod tests {
             reason: ShotReason::Hit,
             predicted_hit: true,
             predicted_victim: Some(2),
+            flight_ticks: 30,
         }
     }
 
@@ -999,12 +1026,11 @@ mod tests {
         let mut state = flat_field_state();
         let policy = TargetingPolicy::default();
 
-        // Flat field, straight line at the target: the first velocity whose capped path
-        // reaches 400 units away is 3 (velocity 2 covers only 180 ticks * 2 units).
+        // Flat field, straight line at the target: the fastest legal shot lands soonest.
         let baseline = policy.choose(&state, 8.0).expect("baseline choice");
         assert_eq!(baseline.reason, ShotReason::Hit);
         assert_eq!(baseline.angle_degrees, 0);
-        assert_eq!(baseline.velocity, 3);
+        assert_eq!(baseline.velocity, 8);
 
         state.observe(&observed_shot(
             (100.0, 100.0),
@@ -1014,7 +1040,7 @@ mod tests {
         let next = policy.choose(&state, 8.0).expect("next choice");
         assert_eq!(next.reason, ShotReason::Hit);
         assert_eq!(next.angle_degrees, 0);
-        assert!(next.velocity > baseline.velocity);
+        assert!(next.velocity < baseline.velocity);
 
         // The same inputs observed from a different launch point do not constrain this one.
         let mut other_start_state = flat_field_state();
@@ -1034,7 +1060,7 @@ mod tests {
         let policy = TargetingPolicy::default();
         let baseline = policy.choose(&state, 8.0).expect("baseline choice");
         assert_eq!(baseline.reason, ShotReason::Hit);
-        assert_eq!(baseline.velocity, 3);
+        assert_eq!(baseline.velocity, 8);
 
         // The bot fired and the shot is in the air; before it lands, the next energy
         // response must produce a different choice.
@@ -1104,15 +1130,36 @@ mod tests {
     #[test]
     fn policy_falls_back_to_known_shots_when_every_candidate_is_known() {
         let mut state = flat_field_state();
+        state.observe(&ServerEvent::PlayerPosition {
+            player_id: 2,
+            x: 300.0,
+            y: 100.0,
+        });
         for angle in -180..=180 {
             state.observe(&observed_shot((100.0, 100.0), 2.0, angle));
         }
         let policy = TargetingPolicy::default();
 
         // Energy 2 allows only velocity 2; every angle is known, so the unfiltered best
-        // (angle 0, closest approach) is still fired rather than skipping the shot.
+        // (the straight hit) is still fired rather than skipping the shot.
         let choice = policy.choose(&state, 2.0).expect("fallback choice");
         assert_eq!((choice.velocity, choice.angle_degrees), (2, 0));
+        assert_eq!(choice.reason, ShotReason::Hit);
+    }
+
+    #[test]
+    fn policy_waits_for_energy_when_no_hit_is_predicted() {
+        // Two ticks reach no target, so no candidate is a predicted hit.
+        let policy = TargetingPolicy::new(TargetingSettings {
+            max_simulation_ticks: 2,
+            ..TargetingSettings::default()
+        });
+        let state = flat_field_state();
+
+        assert_eq!(policy.choose(&state, APPROACH_MIN_ENERGY - 0.1), None);
+        let choice = policy
+            .choose(&state, APPROACH_MIN_ENERGY)
+            .expect("enough energy for an approach shot");
         assert_eq!(choice.reason, ShotReason::Approach);
     }
 }

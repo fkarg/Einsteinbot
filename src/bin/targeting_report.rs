@@ -545,8 +545,17 @@ mod tests {
     }
     #[test]
     fn oracle_replay_compares_policies_on_the_same_observed_history() {
+        // A planet around the target blocks every hit, so the policy takes an approach shot;
+        // those wait for enough energy.
         let events = vec![
-            ServerEvent::Planets { planets: vec![] },
+            ServerEvent::Planets {
+                planets: vec![einsteinbot::protocol::Planet {
+                    x: 1100.0,
+                    y: 100.0,
+                    radius: 40.0,
+                    mass: 100.0,
+                }],
+            },
             ServerEvent::OwnId { player_id: 1 },
             ServerEvent::PlayerPosition {
                 player_id: 1,
@@ -562,15 +571,16 @@ mod tests {
                 player_id: 1,
                 velocity: 3.0,
                 angle: 0.0,
+                // Retraces the uncovered policy's best approach (velocity 6, angle 3).
                 points: vec![
                     Point { x: 100.0, y: 100.0 },
-                    Point { x: 460.0, y: 100.0 },
-                    Point { x: 461.0, y: 100.0 },
+                    Point { x: 1000.0, y: 52.8 },
+                    Point { x: 1001.0, y: 52.8 },
                 ],
             },
             ServerEvent::OwnEnergy {
                 player_id: 1,
-                energy: 2.0,
+                energy: einsteinbot::strategy::APPROACH_MIN_ENERGY,
             },
         ]
         .into_iter()
