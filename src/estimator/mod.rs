@@ -21,6 +21,7 @@
 //! flat model has none. Oracle planets are never an input.
 mod audit;
 mod contacts;
+mod count;
 mod eval;
 mod fit;
 mod lm;

@@ -57,6 +57,9 @@ fn replay_deterministic(case: &Case, settings: Settings) {
     let mut estimator = Estimator::default();
     estimator.settings = settings;
     let never = AtomicBool::new(false);
+    // P25 measurement: path coverage (hidden fractions) and the tick distance of missed planets.
+    let mut coverage = super::count::Coverage::new(WorldParameters::default());
+    let truth = theta_of_planets(&case.truth);
     println!(
         "WORLD {id} paths={total} threads={} cfg={name}",
         estimator.settings.threads
@@ -87,6 +90,28 @@ fn replay_deterministic(case: &Case, settings: Settings) {
             }
         });
         let limit = belief.and_then(|b| b.count_limit.as_ref());
+        coverage.cover(&estimator.shots);
+        let found = belief.map_or(vec![], |b| b.map.planets.clone());
+        let hid: Vec<String> = [60.0, 100.0, 150.0, 200.0, 300.0]
+            .iter()
+            .map(|r| format!("{:.4}", coverage.hidden_fraction(&found, *r)))
+            .collect();
+        let theta = belief_theta(&estimator);
+        let miss: Vec<String> = truth
+            .iter()
+            .filter(|t| !theta.iter().any(|p| distance(t, p) <= 15.0))
+            .map(|t| format!("{:.0}", coverage.tick_distance([t[0], t[1]])))
+            .collect();
+        println!(
+            "HID world={id} n={n} k={} hid={} miss={}",
+            theta.len(),
+            hid.join(","),
+            if miss.is_empty() {
+                "-".into()
+            } else {
+                miss.join(",")
+            }
+        );
         println!(
             "UPD world={id} cfg={name} n={n} k={} evals={evals} publish_ms={publish_ms:.1} wall_ms={wall_ms:.1} noise_ms={noise_ms:.1} s100={:.3} l={:.0} white={:.1e} cap={} limited={} gate={gate}",
             belief_theta(&estimator).len(),
