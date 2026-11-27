@@ -82,7 +82,7 @@
   // The estimator update that published the belief: one row per part; exceeded ceilings in orange.
   function renderUpdate(source){
     const el=$('updateReport');el.replaceChildren();const u=source?.update;
-    if(!u){el.textContent=snapshot?.diagnostic?'Not recorded for this belief (captures before 2026-11-27, or an oracle-map decision).':'';return;}
+    if(!u){if(snapshot?.diagnostic){const n=document.createElement('div');n.className='note';n.textContent='Not recorded for this belief (captures before 2026-11-27, or an oracle-map decision).';el.append(n);}return;}
     const hit=new Map((u.violations||[]).map(v=>[v.part,v])),cut=source.search_state==='time_budget';
     const note=document.createElement('div');note.className='note';
     note.textContent=`${u.evaluations} evaluations · phases ${fmt(u.phase_ms,0)} ms wall${hit.size?` · ceiling exceeded: ${[...hit.keys()].map(p=>PART_LABELS[p]||p).join(', ')}`:' · no part ceiling exceeded'}${cut?' · a search slice hit its wall ceiling (time cut)':''}. Covers the latest path's local refit and the slices and refit after it, up to this belief.`;
@@ -434,7 +434,7 @@
     if(scored.length){c.strokeStyle='#7de3a1';c.lineWidth=1.5;c.beginPath();scored.forEach((p,k)=>{const x=scrubX(p.i,w),y=yPred(predictive.get(p.d.sequence).median_rmse);k?c.lineTo(x,y):c.moveTo(x,y);});c.stroke();for(const p of scored){c.beginPath();c.arc(scrubX(p.i,w),yPred(predictive.get(p.d.sequence).median_rmse),2,0,Math.PI*2);c.fillStyle='#7de3a1';c.fill();}}
     c.strokeStyle='#6ec8ff';c.beginPath();let pen=false;for(const p of points){if(!Number.isFinite(p.d.fit_rmse)){pen=false;continue;}const x=scrubX(p.i,w),y=yRmse(p.d.fit_rmse);pen?c.lineTo(x,y):c.moveTo(x,y);pen=true;}c.stroke();
     for(const p of points){if(!Number.isFinite(p.d.fit_rmse))continue;c.beginPath();c.arc(scrubX(p.i,w),yRmse(p.d.fit_rmse),2.5,0,Math.PI*2);c.fillStyle='#6ec8ff';c.fill();}
-    c.font='10px ui-monospace,monospace';let lx=PAD_L;for(const [text,color] of [[`estimated planets ≤${maxPlanets}`,'#ffc45b'],...(withTruth.length?[['missing truth planets','#ff4d6a']]:[]),[`fit RMSE ≤${fmt(maxRmse,maxRmse<10?2:0)}`,'#6ec8ff'],...(scored.length?[[`next-${predictiveHorizon}-shot error ≤${fmt(maxPred,0)}`,'#7de3a1']]:[]),['bottom strips: ▮ belief lag (1 path dim, 2+ bright)','#ff5cc8'],['▮ covariance (dim: not computed yet)','#e8b84a'],['▮ search work left (orange: time cut, red: part ceiling exceeded)','#2aaa8c']]){c.fillStyle=color;c.fillText(text,lx,11);lx+=c.measureText(text).width+14;}
+    c.font='10px ui-monospace,monospace';let lx=PAD_L;for(const [text,color] of [[`estimated planets ≤${maxPlanets}`,'#ffc45b'],...(withTruth.length?[['missing truth planets','#ff4d6a']]:[]),[`fit RMSE ≤${fmt(maxRmse,maxRmse<10?2:0)}`,'#6ec8ff'],...(scored.length?[[`next-${predictiveHorizon}-shot error ≤${fmt(maxPred,0)}`,'#7de3a1']]:[]),['strips (see Help): ▮ belief lag','#ff5cc8'],['▮ covariance','#e8b84a'],['▮ search','#2aaa8c']]){c.fillStyle=color;c.fillText(text,lx,11);lx+=c.measureText(text).width+14;}
     // Event ticks: decisions tall and colored by bot, shot ends medium, map resets red, everything else faint.
     for(let i=0;i<timeline.length;i++){
       const item=timeline[i],x=scrubX(i,w);let top=TREND_B+22,color='#2c3a4d';
