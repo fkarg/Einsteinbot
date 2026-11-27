@@ -346,6 +346,9 @@ pub(super) struct Search {
     /// A death trial (the two planets whose removal costs least chi2, refit jointly, kept when
     /// the evidence rises) follows every birth.
     deaths_due: bool,
+    /// At the planet cap a death trial has run since the last path or adoption (a successful one
+    /// frees a slot, so the next birth makes it a swap).
+    cap_trial_done: bool,
 }
 
 impl Search {
@@ -382,6 +385,7 @@ impl Search {
         self.theta = theta;
         self.clear_pending();
         self.level = 0;
+        self.cap_trial_done = false;
     }
 
     /// A new path: refit the planets within `LOCAL_RADIUS` of its rows (the others are fixed
@@ -433,6 +437,7 @@ impl Search {
         }
         self.level = 0;
         self.seeded = false;
+        self.cap_trial_done = false;
         for partial in &mut self.partials {
             partial.done = false;
             partial.rounds = 0;
@@ -453,9 +458,15 @@ impl Search {
         {
             if self.theta.len() >= slice.max_planets && !self.deaths_due && self.partials.is_empty()
             {
-                // At the cap no birth is attempted.
-                self.level = LEVELS.len();
-                break;
+                // At the cap no birth is attempted, but a map holding a spurious planet must not
+                // freeze there: one death trial per path, whose success frees a slot.
+                if self.cap_trial_done {
+                    self.level = LEVELS.len();
+                    break;
+                }
+                self.cap_trial_done = true;
+                self.deaths_due = true;
+                continue;
             }
             let shots = self.thin(self.level);
             let joint = Fit::new(&shots, world, cancelled, true, vec![])
