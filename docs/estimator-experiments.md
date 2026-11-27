@@ -1137,3 +1137,29 @@ On top of the frozen-noise P13 (option A reverted): the distance in both the sca
 | live 40 | missing 4 | 340 | 100 (bound) | 89 | 1.041 | 0.452 |
 
 Fails check 1 (|lag-1| < 0.15 for missing-4): with `rho0` about 290-340 units the distance is `rho0` almost everywhere, so the process is close to the stationary one the P13 prototype already rejected (lag-1 0.42-0.58), and its scale runs to the upper bound. The missing planets' residuals are near-field signatures, which this split deliberately leaves out of the background, so in this test nothing whitens them; the 7001 replay and dev runs were not started.
+
+Follow-up checks (coordinator: check 1 above was the wrong criterion for this hypothesis, since the near-field signatures are left for births on purpose):
+
+- (1') Falsifier rescored on far rows only (rows within `rho0` of a missing planet are missing in both the estimate and the score; `FAR` lines): far rows 61% / 64% / 81%, chi2/row 0.912 / 0.983 / 0.892, lag-1 -0.010 / 0.257 / 0.043 (7001, 7002, live 40). Two of three cases meet |lag-1| < 0.15; 7002 does not.
+- (2) Synthetic 7001 replay (Mac, `THREADS=4`), `rec2/rec15/spur` at 8/16/32/60 paths: 10/10/0, 19/19/0, 24/24/0, 24/24/0 (main 3/8/6, 24/24/0, 24/24/0, 24/24/0; frozen P13 5/9/1, 16/20/0, 24/24/0, 24/24/0). `planet_replay_uses_paths_not_oracle_and_resets_physical_map` still fails.
+- (3) Dev, no audit, jolly, 14 worlds, same settings as the P13 tables (`/tmp/P13/rho_noaudit`), cells main -> rho0:
+
+| world | n=8 | n=16 | n=32 | n=60 | final fe | final fu | CPU s |
+|---|---|---|---|---|---|---|---|
+| live_33 | 1/9/4 -> 6/8/0 | 8/12/7 -> 8/11/0 | 17/20/4 -> 19/19/0 | 18/20/3 -> 24/24/0 | 1.4e-01 -> 2.1e-05 | 2.7e+00 -> 9.3e-05 | 364 -> 38 |
+| live_39 | 2/5/7 -> 4/5/0 | 12/14/5 -> 10/11/0 | 19/19/3 -> 19/19/0 | 21/22/1 -> 20/20/2 | 4.4e-04 -> 6.5e-03 | 2.4e+00 -> 2.3e+00 | 235 -> 54 |
+| live_40 | 4/6/5 -> 6/7/0 | 12/15/4 -> 8/9/0 | 12/15/4 -> 10/12/3 | 19/21/1 -> 20/22/1 | 1.6e-03 -> 1.3e-04 | 4.6e+00 -> 7.2e-01 | 182 -> 43 |
+| live_41 | 0/3/9 -> 6/7/1 | 16/16/4 -> 9/13/0 | 21/22/1 -> 15/16/1 | 22/22/1 -> 22/22/1 | 1.0e-03 -> 7.5e-04 | 6.9e+01 -> 2.1e+00 | 464 -> 42 |
+| live_45 | 2/5/6 -> 2/2/0 | 6/10/7 -> 7/8/0 | 19/21/1 -> 20/20/2 | 21/21/1 -> 24/24/0 | 1.4e-03 -> 4.5e-05 | 1.7e+00 -> 3.0e-03 | 173 -> 85 |
+| live_48 | 6/10/5 -> 8/8/0 | 14/16/4 -> 13/14/0 | 20/22/1 -> 18/18/0 | 20/22/1 -> 24/24/0 | 3.6e-04 -> 2.2e-05 | 4.5e+00 -> 5.1e-03 | 177 -> 31 |
+| syn_7001 | 3/8/6 -> 10/10/0 | 24/24/0 -> 19/19/0 | 24/24/0 -> 24/24/0 | 24/24/0 -> 24/24/0 | 4.6e-07 -> 9.2e-07 | 7.6e-07 -> 9.6e-07 | 67 -> 36 |
+| syn_7002 | 0/8/6 -> 11/11/0 | 24/24/0 -> 17/17/0 | 24/24/0 -> 17/19/0 | 24/24/0 -> 24/24/0 | 1.0e-06 -> 4.7e-06 | 1.4e-06 -> 6.0e-06 | 70 -> 30 |
+| syn_7003 | 0/3/9 -> 5/8/0 | 13/15/7 -> 11/13/0 | 20/21/3 -> 18/20/0 | 24/24/0 -> 24/24/0 | 3.1e-06 -> 8.1e-06 | 8.5e-06 -> 1.9e-05 | 329 -> 39 |
+| syn_7004 | 0/4/8 -> 11/11/0 | 16/17/4 -> 17/18/0 | 24/24/0 -> 23/23/0 | 24/24/0 -> 24/24/0 | 2.2e-06 -> 2.2e-06 | 1.7e-06 -> 1.9e-06 | 126 -> 41 |
+| syn_7005 | 4/12/3 -> 11/11/0 | 19/20/2 -> 12/13/0 | 24/24/0 -> 24/24/0 | 24/24/0 -> 24/24/0 | 1.7e-06 -> 2.4e-06 | 3.6e-06 -> 3.0e-06 | 127 -> 35 |
+| syn_7006 | 4/13/3 -> 8/10/0 | 24/24/0 -> 20/20/0 | 24/24/0 -> 24/24/0 | 24/24/0 -> 24/24/0 | 1.6e-06 -> 1.7e-06 | 1.9e-06 -> 2.0e-06 | 91 -> 49 |
+| syn_7007 | 11/12/5 -> 9/10/0 | 24/24/0 -> 15/17/0 | 24/24/0 -> 24/24/0 | 24/24/0 -> 24/24/0 | 4.4e-06 -> 3.0e-06 | 3.4e-06 -> 3.6e-06 | 146 -> 42 |
+| syn_7008 | 4/9/3 -> 6/6/1 | 17/17/6 -> 15/15/0 | 24/24/0 -> 18/19/0 | 24/24/0 -> 24/24/0 | 2.3e-06 -> 4.7e-06 | 5.4e-06 -> 7.4e-06 | 175 -> 39 |
+| **total** | 41/107/79 -> 103/114/2 | 229/248/50 -> 181/198/0 | 296/308/17 -> 273/281/6 | 313/320/8 -> 326/328/4 | | | 2726 -> 604 |
+
+Against the frozen P13 (v2) the totals are 62/111/9 -> 103/114/2 at 8 paths, 138/192/14 -> 181/198/0 at 16, 270/293/12 -> 273/281/6 at 32, 314/319/8 -> 326/328/4 at 60, CPU 837 -> 604 s. Unexplored error at the last path is lower than main's on all 6 live worlds. Recall at 16 paths is still below main's (181 vs 229), mostly on synthetic worlds where main is already complete; at 32 paths recall(15) is lower than both (281). During 12-22 paths the scale estimate often sits at its bound (`s * 100` = 100 on 7001), because the prequential series include near passes of missing planets. The adoption flag (`from_log_det`) marks 0-4 adoptions per world here: under frozen noise the log-det part is 0, so these are adoptions whose chi-square rose (deaths and Occam-driven moves), not variance shrink. One run each.

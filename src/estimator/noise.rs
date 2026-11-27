@@ -496,15 +496,35 @@ impl Series {
 
     /// Gaussian log-likelihood of the residuals under `model` (without the `2 pi` constant).
     pub fn log_likelihood(&self, model: ModelError) -> f64 {
-        let shape: Vec<(f64, f64)> = self.distance.iter().map(|d| model.shape(*d)).collect();
-        (0..2)
-            .map(|axis| {
-                let gains = Gains::with_missing(&self.floor, axis, &shape, &self.missing);
-                let mut v = self.raw[axis].clone();
-                gains.whiten(&mut v);
-                -0.5 * (v.iter().map(|x| x * x).sum::<f64>() + gains.log_det)
-            })
+        self.innovations(model)
+            .into_iter()
+            .map(|(v, log_det)| -0.5 * (v.iter().map(|x| x * x).sum::<f64>() + log_det))
             .sum()
+    }
+
+    /// Normalized innovations of each axis under `model` (0 at missing rows) and their
+    /// log-determinant.
+    pub fn innovations(&self, model: ModelError) -> [(Vec<f64>, f64); 2] {
+        let shape: Vec<(f64, f64)> = self.distance.iter().map(|d| model.shape(*d)).collect();
+        [0, 1].map(|axis| {
+            let gains = Gains::with_missing(&self.floor, axis, &shape, &self.missing);
+            let mut v = self.raw[axis].clone();
+            gains.whiten(&mut v);
+            (v, gains.log_det)
+        })
+    }
+
+    /// Also treat the rows with `missing[r]` true as missing.
+    #[cfg(test)]
+    pub fn drop_rows(&mut self, missing: &[bool]) {
+        for (m, extra) in self.missing.iter_mut().zip(missing) {
+            *m |= *extra;
+        }
+    }
+
+    #[cfg(test)]
+    pub fn missing(&self) -> &[bool] {
+        &self.missing
     }
 }
 

@@ -332,6 +332,58 @@ fn diagnose_matern_model_error() {
                 estimate(&series)
             };
             let estimate_ms = started.elapsed().as_secs_f64() * 1e3;
+            if label == "missing" {
+                // Far rows only: rows within `rho0` of a missing planet are near-field signatures
+                // left for births; they are missing in both the estimate and the score.
+                let missing_planets: Vec<[f64; 3]> = truth
+                    .iter()
+                    .filter(|t| !partial.contains(t))
+                    .copied()
+                    .collect();
+                let mut far_series = Vec::new();
+                for p in case.shots.iter().filter_map(|s| s.path.as_ref()) {
+                    let mut series = Series::new(p, &planets, &noise);
+                    let near: Vec<bool> = (0..p.row_count())
+                        .map(|r| {
+                            let c = p.center(r);
+                            missing_planets
+                                .iter()
+                                .any(|m| (m[0] - c[0]).hypot(m[1] - c[1]) < noise.rho0)
+                        })
+                        .collect();
+                    series.drop_rows(&near);
+                    far_series.push(series);
+                }
+                let model = estimate(&far_series);
+                let (mut chi2, mut used, mut total, mut num, mut den) =
+                    (0.0, 0usize, 0usize, 0.0, 0.0);
+                for series in &far_series {
+                    let missing = series.missing();
+                    for (v, _) in series.innovations(model) {
+                        for (r, x) in v.iter().enumerate() {
+                            total += 1;
+                            if !missing[r] {
+                                used += 1;
+                                chi2 += x * x;
+                                den += x * x;
+                                if r + 1 < v.len() && !missing[r + 1] {
+                                    num += x * v[r + 1];
+                                }
+                            }
+                        }
+                    }
+                }
+                println!(
+                    "FAR case={:?} rho0={:.1} s100={:.3} l={:.1} far_rows={used}/{total} ({:.0}%) chi2_per_row={:.3} lag1={:.3}",
+                    case.name,
+                    noise.rho0,
+                    model.scale * 100.0,
+                    model.length,
+                    100.0 * used as f64 / total as f64,
+                    chi2 / used.max(1) as f64,
+                    num / den
+                );
+            }
             if std::env::var("GRID").is_ok() {
                 for si in 0..9 {
                     let scale = 0.01 * 2f64.powf(si as f64 * 0.5);
