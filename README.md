@@ -2,6 +2,111 @@
 
 Rust client and eventual information-gathering bot for [NewtonWars](https://github.com/Draradech/NewtonWars).
 
+The server does not tell the bot where the planets are. The bot learns them from the paths of every shot it sees, keeps one best-estimate map, and aims by simulating candidate shots on that map. The two sections below explain why that works and how well it works today; the sections after them are operation and tooling.
+
+## How it works
+
+### The model the bot fits
+
+The bot assumes the NewtonWars physics (from the source, not disclosed by the server): planet $j$ with centre $c_j$ and radius $r_j$ has mass $m_j = r_j^3/10$, and a shot at $p$ accelerates with
+
+$$a(p) = \sum_j m_j \frac{c_j - p}{\lVert c_j - p\rVert^3}.$$
+
+The engine integrates with velocity Verlet at $n = 25$ substeps of length $h$ per tick, and the protocol reports positions once per tick as f32. So the unknowns are $\theta = (x_j, y_j, r_j)_{j=1..K}$ and the number $K$; everything else is fixed.
+
+### Observation model: compare fields, not simulated paths
+
+Velocity Verlet has the exact identity $x_{m+1} - 2x_m + x_{m-1} = h^2 a(x_m)$ for substep positions. Summing it over a tick gives, for the observed tick positions $X_s$,
+
+$$X_{s+1} - 2X_s + X_{s-1} = h^2 \sum_{|i|<n} (n - |i|)\, a\big(x_{ns+i}\big).$$
+
+Each such equation is one *row*: the observed second difference against the same triangle-weighted kernel applied to the model field at points on the observed path (a cubic Hermite interpolant between ticks). The fit never simulates a shot. A row depends only on the field within one tick of the path, so an error early in a path does not propagate to later rows, the residual is a smooth function of $\theta$ with analytic Jacobians, and every observed tick is evidence ([`src/estimator/window.rs`](src/estimator/window.rs)).
+
+### Likelihood: what the residuals really are
+
+A row residual has three parts, and the bot models each one ([`src/estimator/noise.rs`](src/estimator/noise.rs)):
+
+1. **Rounding.** Positions are f32, so each tick carries uniform rounding error with sd $\mathrm{ulp}/\sqrt{12}$. Neighbouring rows share ticks, so this floor is correlated (banded), and it is whitened exactly.
+2. **Interpolation.** The Hermite interpolant is inexact near planets; a per-row variance is estimated from the observed ticks alone. Without it the *true* map has a chi-square $10^3$ to $10^5$ times its degrees of freedom on a near pass.
+3. **Planets not found yet.** This is the part that decides whether the search works. The field of the unseen planets is smooth along a path, so its residuals are strongly correlated: with the earlier relative-noise likelihood, a map missing 4 planets had whitened residuals with lag-1 autocorrelation 0.85-0.97 along each path and chi-square per row of $10^3$ to $2.7\times10^4$ (brainstorm, observed). Treating such rows as independent makes $N$ rows count as $N$ votes, while an AR(1) series with correlation $\rho$ carries only about $N(1-\rho)/(1+\rho)$ independent ones (about $N/19$ at $\rho = 0.9$). The overconfident likelihood then pays for almost any extra planet that soaks up the correlated residual: spurious planets.
+
+The bot therefore models the unseen field explicitly. If unseen planets form a Poisson field of point masses whose centres lie in the admissible region $U$ (inside the battlefield, clear of the found planets and of every observed tick), Campbell's theorem gives a field variance at distance $d$ from $U$ that falls as $1/d^2$, and by scaling its correlation length grows $\propto d$. So along each path, per axis, the model error is a Matérn-3/2 process in arc length with
+
+$$\mathrm{sd}(c) = s\,\frac{100}{\max(d_U(c), \rho_0)}, \qquad \ell(c) = l\,\frac{\max(d_U(c), \rho_0)}{100}, \qquad \rho_0 = \sqrt{\frac{|U|}{\pi N_u}},$$
+
+where $d_U(c)$ is the distance of row centre $c$ to $U$ and $N_u$ the expected number of unseen planets. $\rho_0$ is the radius that holds one unseen planet on average: the process stands only for the *distant* population, and a single planet nearer than that is a localized signature that a planet birth must explain, not background. Adding this cutoff raised dev recall at 8 paths from 62 to 103 (summed over 14 worlds) and removed nearly all early spurious planets (P13 follow-up, `docs/estimator-experiments.md`). A white excess term (near zero on exact f32 captures) covers position noise beyond rounding.
+
+The scalars $s, l$ (and the white sd) are estimated by type-II maximum a posteriori with a weak log-normal hyperprior on *prequential* residuals: each of the last 8 paths' residuals against the map as it was just before that path was fitted. A new path is fitted under scalars estimated from the earlier paths only, so its own signature cannot be absorbed as noise. Rounding floor and process form one linear-Gaussian state-space model per path and axis, so a Kalman filter whitens residuals and Jacobian columns exactly in $O(\text{rows})$, with gains that do not depend on the data. Calibration check with the maps held fixed (P13, observed on 2 synthetic worlds and 1 live capture, 32 paths): the true maps give chi-square per row 0.82-0.84 and lag-1 about -0.07. For maps missing 4 planets, scored on the rows farther than $\rho_0$ from a missing planet (the nearer rows are left to births by design), chi-square per row is 0.89-0.98 and lag-1 is -0.01, 0.26 and 0.04.
+
+$N_u$ is $N - K$ when the planet count $N$ is given (`--planets`), otherwise the mean of $N - K$ under a discrete Gaussian prior on $N$ (centre 24, sd 4, conditioned on $N \ge K$). That prior is a choice, not calibrated.
+
+### Model selection: how many planets
+
+A map with $K$ planets is scored by its Laplace-approximated evidence
+
+$$\log Z_K \approx -\tfrac12 \chi^2(\hat\theta) \;-\; \tfrac12 \log\det\!\big(I + S^{1/2} J^\top J\, S^{1/2}\big) \;-\; K \ln 20,$$
+
+where $J$ is the whitened Jacobian at the fit and $S$ a Gaussian prior as wide as a uniform one over the battlefield and radii 20-40 ([`src/estimator/fit.rs`](src/estimator/fit.rs)). The middle term is the Occam factor: a planet whose parameters the data pin down tightly pays for the prior volume it gives up. The $1/20$ prior odds per planet are a heuristic; a Poisson(24) count prior made weakly constrained planets free and grew five planets in a corner of a flat test world (P13). Within one comparison the noise is frozen (computed once from the maintained map), so every compared map has the same log-determinant and evidence differences need only $\chi^2$ and Occam. The evidence is used to rank maps, not as a calibrated probability.
+
+### Search and solver
+
+Planets are born only from trajectory evidence ([`src/estimator/search.rs`](src/estimator/search.rs)). A birth seeds a planet where the unexplained mean acceleration of the rows is most significant (the residual points at the missing mass and $|a| = m/d^2$ gives its distance for a few radii), fits it alone against what the current planets leave over, refits the best seeds jointly with all planets, and adopts one if the evidence rises; a death trial (drop a weak planet, refit, compare) follows each birth. Surface contacts enter the fits as gated constraints but never create a planet, and an observed tick inside a planet disk is penalized.
+
+The search is resumable: each new path gets a local refit of the planets within 100 units and the map is published at once; then up to 6 slices of 300 evaluations (each with a 250 ms wall ceiling) continue the pending births in the background, and a full-row refit of the published map supplies the covariance. Evaluation counts, not wall time, bound the work, so a replay is deterministic unless a ceiling cuts. Fits use thinned rows (at most 1000, two per 14-unit cell). Every fit is Levenberg-Marquardt in logistic coordinates: a port of Moré's MINPACK trust region whose QR factor is built from per-path-group Householder triangles in parallel and pivoted only on the stacked triangles. That is the pivoted QR of the full Jacobian ($J = Q_1R_1 \Rightarrow JP = Q_1R_1P$) without forming it or the normal equations ([`src/estimator/lm.rs`](src/estimator/lm.rs)).
+
+### Aiming on an imperfect map
+
+While the map is incomplete the model-error process is not just noise: given a path's residuals, a Kalman filter plus Rauch-Tung-Striebel smoother gives the exact posterior mean of the unexplained field along that path ([`src/estimator/residual.rs`](src/estimator/residual.rs)). Targeting adds that correction to the planet field near observed paths. Spreading it off the paths (Matérn-3/2 decay at the process length on a 15-unit raster, zero near planets) is a heuristic, not a 2-D posterior. When the process sd is below $2\times10^{-4}$, as on a complete map, the correction is neither built nor applied.
+
+Targeting ([`src/strategy.rs`](src/strategy.rs)) simulates candidate shots on this belief: every legal integer velocity up to the available energy and server limit, angles in 8-12° steps refined to 1°, with planet and player collisions checked at substeps, for up to 180 ticks. Predicted hits rank by
+
+$$\text{score} = \text{flight ticks} + 5 \times \text{predicted miss distance},$$
+
+then lower velocity. Short flights win because map error grows along the path: on capture 55, the bot's shots, replayed on the true map, hit in 5 of 7 cases with flights under 30 ticks, 9 of 17 at 30-60 ticks, 3 of 20 at 60-100 and 1 of 32 at 100 or more. Without a predicted hit the bot waits until it has 15 energy rather than spend small shots that almost never hit. Before a decision it waits for the map to be quiet for 300 ms, at most 500 ms, and otherwise aims with the latest published belief.
+
+### Map changes and round ends
+
+The server does not announce a new map unless it runs with `sendplanets 1`. At a new map it repositions every player in one step, so the bot treats an uninterrupted run of position events that moves every known player (at least two) as a map boundary (plus a lone player's reposition that is not a self-kill, and any later `Planets` message), and resets its map, shot history and capture. During the end card no trajectory finishes, so once at least 3 shots have begun and none of anyone's shots has finished for 1.5 s, the bot stops sending shot commands ([`src/map_change.rs`](src/map_change.rs)).
+
+## How well it works
+
+Numbers as of 2026-11-27 (main at 58abdf9); each item names the change (P-number) it measured. Each comes from the experiment logs in [`docs/estimator-experiments.md`](docs/estimator-experiments.md) and the landing notes in [`docs/brainstorms/2026-11-13-newtonwars-bot.md`](docs/brainstorms/2026-11-13-newtonwars-bot.md). Unless stated otherwise each cell is **one run**; truth maps are used only for scoring. "Recall" counts true planets with an estimate within 2 units; "spurious" counts estimates with no true planet within 15 units. Captures 54 (second map) and 55 are the same game seen from two connections, so they count as one independent game.
+
+### Estimator
+
+P13 (the likelihood above) against the previous estimator (main 16adc7f, relative noise), deterministic replays, no audit, totals over 14 dev worlds (8 synthetic, 6 live captures) and, once, over 13 held-out worlds (8 synthetic, 5 live). Cells are recall / spurious.
+
+| set | 8 paths | 16 paths | 32 paths | 60 paths | CPU |
+|---|---|---|---|---|---|
+| dev, before | 41 / 79 | 229 / 50 | 296 / 17 | 313 / 8 | 2726 s |
+| dev, P13 | 104 / 1 | 179 / 1 | 276 / 3 | 321 / 4 | 592 s |
+| held-out, before | 30 / 65 | 173 / 49 | 246 / 19 | 272 / 7 | 3221 s |
+| held-out, P13 | 97 / 1 | 159 / 0 | 238 / 0 | 283 / 2 | 466 s |
+
+Spurious planets almost disappear and CPU falls 4.6-6.9 times; recall is much higher at 8 paths and equal or higher at 60, but lower at 16-32 paths (see limitations). Two later changes moved the dev totals slightly in one run each: a white excess-noise term (32 paths 276 → 283 recall) and the review fixes (60 paths 321 recall, 6 spurious; CPU 716 s on a shared machine). P12b's parallel QR solver kept the maps (dev recall at 60 paths 300 vs 299 in its own baseline run) and cut CPU 711 → 301 s.
+
+**Real time.** Capture 55, first map, replayed at its recorded rate of a path every 110 ms (about 9 paths/s, 545 paths, 10 threads on a Mac): P13 found all 24 planets within 2 units after 128 paths (14 s) with none spurious, while the previous estimator was still at 18 planets (16 within 2 units) after all 545 paths, because it fell behind. After P18 the publish lag (a path's arrival to the publication of a map that includes it) is median 62-71 ms, p90 134-142 ms and worst 216-317 ms over two runs (before: 99-101 / 183-184 / 462-600 ms), with at most 1-2 paths queued. Capture 55 is one game; the remaining worst lag comes from paths that arrive while a slice or full-row refit runs.
+
+**Planet count.** On the dev set, fixing $N = 24$ beats the default prior (24 ± 4) around 32 paths: explored-field RMSE 0.0046 vs 0.0202 (geometric means over 14 worlds), and is still somewhat better at 60 paths (1.1e-4 vs 1.7e-4). A fixed count that is too low stops at that count; on 26-planet synthetic worlds only `--planets 26` finds the last two planets under the default cap of 24.
+
+### Targeting
+
+Measured by replaying recorded decisions with the recorded belief, flying the chosen shot on the true map:
+
+- **P15** (rank hits by flight time, wait for energy, 500 ms map wait): true hits 15 → 37 (capture 53), 49 → 91 (54) and 22 → 47 (55); true hits per 100 energy 11-48% higher. That is 2 independent games, and the ranking was picked among about 9 variants on the same captures, so selection bias is possible.
+- **P17** (residual correction): true hits 79 → 84, 143 → 153, 97 → 104, 42 → 47 and 109 → 141 on five recorded maps of captures 53-57 (4 independent games), with the estimator settled at each decision. The gain is almost all in the first half of each map; deduplicated by victim position it is small but in the same direction. Cost: 2-6% estimator time and about 10 ms per decision. The spreading was designed on the same captures.
+
+Both replays hold the game still while the bot waits, so they overstate waiting. **Live**, one run on a shared local server with different opponents: hits per decision 0.154 after P15 vs 0.114 in capture 55; indicative only.
+
+**Map changes** (P19, recorded captures with `Planets` hidden): 294 of 294 later map boundaries detected with no false detection; 11 of 11 end cards caught, median 2.4 s after the last finished shot, with 13 false pauses (6.7 s in total) in captures 36-57.
+
+### Known limitations
+
+- Recall dips at 16-32 paths, mostly on synthetic worlds the old estimator had already completed: the model-error scale estimate then sits at its bound and absorbs part of the missing planets' signal. At about 9 paths/s this window passes in 2-4 s.
+- The default cap is 24 planets. Raising it let one true planet split into three concentric ones on capture 55; servers with more than 24 planets need `--planets N`.
+- The uncertainty-probe branch never fired in capture 55: covariance is usually `not_computed` at decision time because the full-row refit lags the latest path.
+- The evidence prior (1/20 per planet), the planet-count prior, the interpolation variance and the hyperprior are heuristics. Most cells above are one run, and live worlds vary by several planets between runs of similar configurations.
+
 ## Development builds
 
 The Cargo `dev` profile uses `opt-level = 1` for Einsteinbot and `opt-level = 2` for dependencies. This is a modest optimization intended to make local CPU-heavy fitting less sluggish without applying maximum optimization across the dependency graph; we have not benchmarked it against the previous profile yet. Debug information and incremental compilation keep Cargo's defaults. Cargo notes that higher optimization can improve runtime at the cost of compile time, and recommends measuring levels for the project rather than assuming level 3 wins ([profile reference](https://doc.rust-lang.org/cargo/reference/profiles.html)).
