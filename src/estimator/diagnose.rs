@@ -8,7 +8,8 @@
 //! Environment: `SEEDS` (default 7001,7002,7003) and `KS` (default 24) choose the synthetic worlds,
 //! `LIVE` (default 40,36,33) the live captures (`-` for none), `PATHS` (default 8) the number of
 //! paths (live captures get one more), `THREADS` the thread limit, `CHECKPOINTS` the path counts
-//! that are scored (default 4,8,16,32,60 and the last).
+//! that are scored (default 4,8,16,32,60 and the last), `MAPS` (any value) prints the missed true
+//! planets and the spurious estimated ones at each checkpoint (`MISS`, `SPUR`).
 //!
 //! Output lines are `TAG key=value ...` (`WORLD`, `UPD`, `QUAL`, `TL`, `TLEND`) for
 //! `scripts/p8_tables.py`, `scripts/p6_tables.py` and `scripts/p7_tables.py`.
@@ -258,6 +259,24 @@ fn quality(case: &Case, n: usize, theta: &[[f64; 3]]) -> String {
         .iter()
         .filter(|t| !truth.iter().any(|p| distance(t, p) < 15.0))
         .count();
+    if std::env::var("MAPS").is_ok() {
+        for t in &truth {
+            let near = theta
+                .iter()
+                .min_by(|a, b| distance(a, t).total_cmp(&distance(b, t)));
+            if let Some(e) = near.filter(|e| distance(e, t) >= 2.0) {
+                println!(
+                    "MISS n={n} truth={t:.1?} nearest={e:.1?} d={:.1}",
+                    distance(e, t)
+                );
+            }
+        }
+        for t in theta {
+            if !truth.iter().any(|p| distance(t, p) < 15.0) {
+                println!("SPUR n={n} est={t:.1?}");
+            }
+        }
+    }
     let (fe, fu, fw) = field_rmse(shots, theta, &truth);
     let (fe0, fu0, fw0) = field_rmse(shots, &[], &truth);
     format!(
