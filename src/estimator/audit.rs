@@ -1,8 +1,8 @@
 //! Background audit of the maintained map: a from-scratch map (`rebuild::from_scratch`) on a
 //! snapshot of the paths, adopted only if its evidence beats the maintained map's on all the rows
-//! known when the rebuild is done, under the noise of that moment. Both halves (the rebuild, then the comparison) run on their
-//! own threads, so an audit never delays the publication of a map; the estimator collects a
-//! finished half between slices.
+//! known when the rebuild is done, under the noise of that moment. Both halves (the rebuild, then
+//! the comparison) run on their own threads, so an audit never delays the publication of a map;
+//! the estimator collects a finished half between slices.
 use super::Shot;
 use super::fit::{Budget, Fit, theta_of};
 use super::noise::{Noise, with_noise};

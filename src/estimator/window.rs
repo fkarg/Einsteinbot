@@ -197,8 +197,8 @@ impl PathData {
 
     /// A path of only the rows `keep` (ascending), each with its own `2n - 1` nodes. The row
     /// floor is the original's marginal variance (its correlation between neighbouring rows is
-    /// dropped, an approximation); the model-error process is the original's at the kept rows,
-    /// stepped by arc length.
+    /// dropped, an approximation); the model-error process steps by arc length. It has no noise
+    /// until `set_noise` (whitening it before panics), because every user sets its own.
     pub fn thinned(&self, keep: &[usize]) -> Option<Self> {
         if keep.is_empty() || self.row_node.is_some() {
             return None;
@@ -227,8 +227,6 @@ impl PathData {
             white: [0, 1].map(|axis| keep.iter().map(|&r| self.floor.marginal(axis, r)).collect()),
             arc: keep.iter().map(|&r| self.floor.arc[r]).collect(),
         };
-        let shape: Vec<(f64, f64)> = keep.iter().map(|&r| self.shape[r]).collect();
-        let whitener = [0, 1].map(|axis| Gains::new(&floor, axis, &shape, self.excess));
         Some(Self {
             nodes,
             ticks: self.ticks.clone(),
@@ -236,9 +234,9 @@ impl PathData {
             substeps: n,
             y: [0, 1].map(|axis| keep.iter().map(|&r| self.y[axis][r]).collect()),
             floor,
-            shape,
-            excess: self.excess,
-            whitener,
+            shape: Vec::new(),
+            excess: 0.0,
+            whitener: Default::default(),
             row_node: Some(row_node),
             centers: Some(keep.iter().map(|&r| self.ticks[r + 1]).collect()),
             quad: keep.iter().map(|&r| self.quad[r]).collect(),

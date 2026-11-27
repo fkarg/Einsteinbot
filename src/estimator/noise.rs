@@ -9,7 +9,7 @@
 //! `length * d_U(c) / 100`, where `d_U` is the distance to the admissible region `U` of unseen
 //! planet centres (`Admissible`), clamped below at `MIN_DISTANCE`. The two scalars are estimated
 //! by type-II maximum a posteriori on prequential residuals (`Series`, `estimate`): each new
-//! path's raw residuals against the map published before that path's refit, the last `WINDOW` of
+//! path's raw residuals against the maintained map before that path's refit, the last `WINDOW` of
 //! them, with a weak log-normal hyperprior centred on `ModelError::PRIOR`. Validated by
 //! `diagnose_matern_model_error` (`docs/estimator-experiments.md`, P13).
 //!
@@ -20,7 +20,7 @@
 //! whitening of the banded floor. A thinned path's floor is its rows' marginal (white) variance.
 //!
 //! The noise is frozen within an operation (`Noise`): a slice, a local refit, a polish or an audit
-//! comparison computes it once from the published map and the paths, and every map it compares
+//! comparison computes it once from the maintained map and the paths, and every map it compares
 //! uses the same noise, so evidence differences need no log-determinant.
 use super::Shot;
 use super::window::PathData;
@@ -243,7 +243,7 @@ fn nearest_free(free: &[bool], nx: usize, ny: usize) -> Vec<u32> {
 
 /// Expected number of planets (the local generator's default; the server does not send it).
 const PLANETS_EXPECTED: f64 = 24.0;
-/// The published map's unseen planets are `PLANETS_EXPECTED - K`, never fewer than this (a
+/// The maintained map's unseen planets are `PLANETS_EXPECTED - K`, never fewer than this (a
 /// complete map keeps a small allowance for planets beyond the default count).
 const MIN_UNSEEN: f64 = 0.5;
 
@@ -254,7 +254,7 @@ const MIN_UNSEEN: f64 = 0.5;
 /// the admissible area `|U|`, the nearest one is typically `rho0 = sqrt(|U| / (pi N_u))` away, and
 /// a single planet nearer than that is a localized signature for a birth to explain, not
 /// background. So the distance in both the scale (`1 / d`) and the length (`d`) is
-/// `max(d_U, rho0)`. Computed from the published map and frozen per operation.
+/// `max(d_U, rho0)`. Computed from the maintained map and frozen per operation.
 #[derive(Clone, Debug)]
 pub(super) struct Noise {
     pub model: ModelError,
@@ -263,7 +263,7 @@ pub(super) struct Noise {
 }
 
 impl Noise {
-    /// The noise for the map `planets` (the published one) and the paths `shots`.
+    /// The noise for the map `planets` (the maintained one) and the paths `shots`.
     pub fn new(model: ModelError, planets: &[Planet], shots: &[Shot]) -> Self {
         let ticks = shots
             .iter()
@@ -271,6 +271,8 @@ impl Noise {
             .flat_map(|path| path.ticks.iter());
         let admissible = Admissible::new(planets, ticks, WorldParameters::default());
         let unseen = (PLANETS_EXPECTED - planets.len() as f64).max(MIN_UNSEEN);
+        // An empty `U` (every candidate centre excluded) gives `rho0 = 0` and an infinite distance
+        // everywhere: no process (sd 0, infinite length), so the gains carry the floor alone.
         let rho0 = (admissible.area / (std::f64::consts::PI * unseen)).sqrt();
         Self {
             model,
@@ -390,26 +392,30 @@ impl Gains {
                     e * (1.0 - lambda * d),
                 ];
                 transition = f.map(|v| v * ratio);
-                // Full transition: (f, f') by `transition`, the tick noises shift by one and a
-                // fresh one enters.
-                let mut full = [[0.0; 5]; 5];
-                full[0][0] = transition[0];
-                full[0][1] = transition[1];
-                full[1][0] = transition[2];
-                full[1][1] = transition[3];
-                full[2][3] = 1.0;
-                full[3][4] = 1.0;
-                let mut fp = [[0.0; 5]; 5];
-                for i in 0..5 {
-                    for k in 0..5 {
-                        fp[i][k] = (0..5).map(|j| full[i][j] * p[j][k]).sum();
+                // P <- F P F' for the sparse transition: (f, f') by `transition`, the tick noises
+                // shift by one (n_r drops out) and a fresh one enters (its variance is added below).
+                let tr = transition;
+                let mut q = [[0.0; 5]; 5];
+                for i in 0..2 {
+                    let (a0, a1) = (tr[2 * i], tr[2 * i + 1]);
+                    for k in 0..2 {
+                        let (b0, b1) = (tr[2 * k], tr[2 * k + 1]);
+                        q[i][k] =
+                            a0 * (b0 * p[0][0] + b1 * p[0][1]) + a1 * (b0 * p[1][0] + b1 * p[1][1]);
+                    }
+                    // Cross terms with the shifted tick noises.
+                    for j in 0..2 {
+                        let v = a0 * p[0][3 + j] + a1 * p[1][3 + j];
+                        q[i][2 + j] = v;
+                        q[2 + j][i] = v;
                     }
                 }
-                for i in 0..5 {
-                    for k in 0..5 {
-                        p[i][k] = (0..5).map(|j| fp[i][j] * full[k][j]).sum();
+                for i in 0..2 {
+                    for j in 0..2 {
+                        q[2 + i][2 + j] = p[3 + i][3 + j];
                     }
                 }
+                p = q;
                 // Process noise of the stationary step: P_inf - F P_inf F'.
                 let q00 =
                     stationary[0] - (f[0] * f[0] * stationary[0] + f[1] * f[1] * stationary[1]);
@@ -468,14 +474,14 @@ impl Gains {
     }
 }
 
-/// One path's prequential residuals: its raw residuals against the map published before the
+/// One path's prequential residuals: its raw residuals against the maintained map before the
 /// path was fitted, with its floor and the distance of each row centre to `U` at that moment.
 #[derive(Clone, Debug)]
 pub(super) struct Series {
     floor: Floor,
     distance: Vec<f64>,
     raw: [Vec<f64>; 2],
-    /// Rows within `CLEARANCE` of a published planet's surface: their residual is dominated by
+    /// Rows within `CLEARANCE` of a map planet's surface: their residual is dominated by
     /// that planet's parameter error (or by a wrong planet), not by the field of unseen planets,
     /// so the estimate treats them as missing.
     missing: Vec<bool>,
@@ -644,6 +650,187 @@ mod tests {
             })
             .collect();
         PathData::new(&points, 0.0, 3.0, WorldParameters::default()).unwrap()
+    }
+
+    /// The banded floor covariance of one axis plus `diagonal` on the diagonal.
+    fn floor_covariance(floor: &Floor, axis: usize, diagonal: f64) -> DMatrix<f64> {
+        let n = floor.arc.len();
+        let ticks = &floor.ticks.as_ref().unwrap()[axis];
+        DMatrix::from_fn(n, n, |i, j| {
+            let coefs = |r: usize| [(r, 1.0), (r + 1, -2.0), (r + 2, 1.0)];
+            let mut c = if i == j {
+                floor.white[axis][i] + diagonal
+            } else {
+                0.0
+            };
+            for (ti, ci) in coefs(i) {
+                for (tj, cj) in coefs(j) {
+                    if ti == tj {
+                        c += ci * cj * ticks[ti];
+                    }
+                }
+            }
+            c
+        })
+    }
+
+    /// With a varying process shape, missing rows and a white excess, the innovations at the
+    /// observed rows are the dense Cholesky whitening of the observed rows' joint covariance (the
+    /// process covariance built here by propagating the state covariance and transitions, not by
+    /// filtering), missing rows give 0, and the log-determinant is that covariance's.
+    #[test]
+    fn whitening_matches_the_dense_covariance_with_varying_shape_missing_rows_and_excess() {
+        let path = path();
+        let floor = path.floor();
+        let n = floor.arc.len();
+        let axis = 0;
+        let shape: Vec<(f64, f64)> = (0..n)
+            .map(|t| {
+                let t = t as f64;
+                (1e-3 * (1.0 + 0.5 * (0.3 * t).sin()), 30.0 + 2.0 * t)
+            })
+            .collect();
+        let excess = 4e-8;
+        let missing: Vec<bool> = (0..n).map(|t| t % 7 == 3).collect();
+        // Process: x_t = A_t x_(t-1) + w_t, the transitions and stationary variances of `Gains`.
+        type M2 = [[f64; 2]; 2];
+        let mul = |a: M2, b: M2| -> M2 {
+            let mut c = [[0.0; 2]; 2];
+            for i in 0..2 {
+                for j in 0..2 {
+                    c[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j];
+                }
+            }
+            c
+        };
+        let transpose = |a: M2| -> M2 { [[a[0][0], a[1][0]], [a[0][1], a[1][1]]] };
+        let mut step: Vec<M2> = vec![[[0.0; 2]; 2]; n];
+        let mut var: Vec<M2> = vec![[[0.0; 2]; 2]; n];
+        for t in 0..n {
+            let (sd, length) = shape[t];
+            let lambda = 3f64.sqrt() / length;
+            let stationary = [[sd * sd, 0.0], [0.0, lambda * lambda * sd * sd]];
+            if t == 0 {
+                var[0] = stationary;
+                continue;
+            }
+            let d = floor.arc[t] - floor.arc[t - 1];
+            let e = (-lambda * d).exp();
+            let f = [
+                [e * (1.0 + lambda * d), e * d],
+                [-e * lambda * lambda * d, e * (1.0 - lambda * d)],
+            ];
+            let ratio = sd / shape[t - 1].0;
+            step[t] = [
+                [f[0][0] * ratio, f[0][1] * ratio],
+                [f[1][0] * ratio, f[1][1] * ratio],
+            ];
+            let carried = mul(mul(step[t], var[t - 1]), transpose(step[t]));
+            let fsf = mul(mul(f, stationary), transpose(f));
+            for i in 0..2 {
+                for j in 0..2 {
+                    var[t][i][j] = carried[i][j] + stationary[i][j] - fsf[i][j];
+                }
+            }
+        }
+        let mut covariance = floor_covariance(floor, axis, excess);
+        for j in 0..n {
+            let mut propagated = var[j];
+            for i in j..n {
+                if i > j {
+                    propagated = mul(step[i], propagated);
+                }
+                covariance[(i, j)] += propagated[0][0];
+                if i != j {
+                    covariance[(j, i)] += propagated[0][0];
+                }
+            }
+        }
+        let observed: Vec<usize> = (0..n).filter(|t| !missing[*t]).collect();
+        let sub = DMatrix::from_fn(observed.len(), observed.len(), |i, j| {
+            covariance[(observed[i], observed[j])]
+        });
+        let cholesky = sub.cholesky().unwrap();
+        let v: Vec<f64> = (0..n)
+            .map(|i| ((i * 37) % 11) as f64 * 1e-4 - 5e-4)
+            .collect();
+        let v_observed: Vec<f64> = observed.iter().map(|&t| v[t]).collect();
+        let expected = cholesky
+            .l()
+            .solve_lower_triangular(&DMatrix::from_column_slice(observed.len(), 1, &v_observed))
+            .unwrap();
+        let gains = Gains::with_missing(floor, axis, &shape, excess, &missing);
+        let mut got = v.clone();
+        gains.whiten(&mut got);
+        let mut k = 0;
+        for t in 0..n {
+            if missing[t] {
+                assert_eq!(got[t], 0.0, "row {t}");
+                continue;
+            }
+            assert!(
+                (got[t] - expected[k]).abs() <= 1e-6 * expected[k].abs().max(1.0),
+                "row {t}: {} vs {}",
+                got[t],
+                expected[k]
+            );
+            k += 1;
+        }
+        let log_det: f64 = 2.0
+            * (0..observed.len())
+                .map(|i| cholesky.l()[(i, i)].ln())
+                .sum::<f64>();
+        assert!(
+            (gains.log_det - log_det).abs() < 1e-6 * log_det.abs(),
+            "{} vs {log_det}",
+            gains.log_det
+        );
+    }
+
+    /// The estimate recovers an injected white position noise and keeps the white sd far below
+    /// the floor on exact residuals.
+    #[test]
+    fn estimate_recovers_white_noise_and_ignores_it_on_exact_rows() {
+        let path = path();
+        let floor = path.floor().clone();
+        let n = floor.arc.len();
+        let mut state = 11u64;
+        let mut gaussian = || {
+            (0..12)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (state >> 11) as f64 / (1u64 << 53) as f64
+                })
+                .sum::<f64>()
+                - 6.0
+        };
+        let series = |raw: [Vec<f64>; 2]| Series {
+            floor: floor.clone(),
+            // No admissible region: no background process.
+            distance: vec![f64::INFINITY; n],
+            raw,
+            missing: vec![false; n],
+        };
+        let injected = 2e-3;
+        let noisy = series([0, 1].map(|_| (0..n).map(|_| injected * gaussian()).collect()));
+        let white = estimate(&[], Some(&noisy)).white;
+        assert!(
+            (white / injected - 1.0).abs() < 0.3,
+            "injected {injected}, estimated {white}"
+        );
+        // Exact rows: the floor's own noise (rounding of every tick, second-differenced).
+        let ticks = floor.ticks.clone().unwrap();
+        let exact = series([0, 1].map(|axis| {
+            let rounding: Vec<f64> = ticks[axis].iter().map(|v| v.sqrt() * gaussian()).collect();
+            (0..n)
+                .map(|r| rounding[r] - 2.0 * rounding[r + 1] + rounding[r + 2])
+                .collect()
+        }));
+        let white = estimate(&[], Some(&exact)).white;
+        let floor_sd = floor.marginal(0, 0).sqrt();
+        assert!(white < 0.3 * floor_sd, "white {white} floor {floor_sd}");
     }
 
     /// Without the process the innovations are the exact Cholesky whitening of the banded floor

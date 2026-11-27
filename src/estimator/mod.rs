@@ -111,7 +111,9 @@ pub struct Settings {
     pub max_planets: usize,
     /// Evaluations of one search slice (checked between batches of refits, so a slice may exceed
     /// it a little). Deterministic: the same paths and limits give the same belief whatever the
-    /// load, as long as `slice_ceiling` does not cut a slice and no audit is adopted.
+    /// load, as long as `slice_ceiling` does not cut a slice and no audit is adopted. The polish
+    /// of the published map may be cut by the ceiling, but it only shapes what is published: the
+    /// noise and the search use the maintained map.
     pub slice_evaluations: u64,
     /// Wall-clock ceiling of a slice (`None`: no ceiling); the best map so far is kept when it is hit.
     pub slice_ceiling: Option<Duration>,
@@ -120,7 +122,7 @@ pub struct Settings {
     /// Threads of the live search; the audit uses half of them.
     pub threads: usize,
     /// Run the background audit. Off by default, because an adopted audit depends on timing; the
-    /// live map turns it on.
+    /// live map leaves it off too (P13: no measured benefit at 2.2 times the CPU).
     pub audit_enabled: bool,
     /// Wall-clock ceilings per part of the update; exceeded ones are listed in `last_report`.
     pub ceilings: PartCeilings,
@@ -161,7 +163,8 @@ impl Settings {
 
 pub struct Estimator {
     players: BTreeMap<u32, Point>,
-    /// Every path of the map epoch, with the measurement floor as their noise.
+    /// Every path of the map epoch. Their noise is whatever the last polish set; every user sets
+    /// the noise it needs (`noise::apply`, `with_noise`).
     shots: Vec<Shot>,
     /// Prequential residuals of the latest paths (at most `noise::WINDOW`).
     series: Vec<noise::Series>,
@@ -270,17 +273,17 @@ impl Estimator {
             self.stats.add(part, elapsed);
         }
         while self.searched < self.shots.len() {
-            // The model-error estimate from the earlier paths' prequential residuals: a path is
-            // fitted (its local refit and the slices after it) under noise that has not seen it,
-            // so its own unexplained signature cannot widen the noise it is fitted with. Then its
-            // residuals against the published map join the window for the next path.
+            // The new path's prequential residuals against the maintained map before its local
+            // refit. The background scalars come from the earlier paths' residuals only, so a path
+            // is fitted (its local refit and the slices after it) under a background that has not
+            // seen it; its residuals join the window for the next path.
             let started = Instant::now();
-            let published = self.published_planets();
-            let mut noise = Noise::new(self.model, &published, &self.shots[..=self.searched]);
+            let maintained = self.maintained_planets();
+            let mut noise = Noise::new(self.model, &maintained, &self.shots[..=self.searched]);
             let current = self.shots[self.searched]
                 .path
                 .as_ref()
-                .map(|path| noise::Series::new(path, &published, &noise));
+                .map(|path| noise::Series::new(path, &maintained, &noise));
             self.model = noise::estimate(&self.series, current.as_ref());
             noise.model = self.model;
             if let Some(series) = current {
@@ -374,9 +377,17 @@ impl Estimator {
         if self.polish_due {
             self.polish_due = false;
             let started = Instant::now();
-            let shots = noise::with_noise(&self.shots, &self.noise());
-            let full = Fit::new(&shots, WorldParameters::default(), cancelled, true, vec![])
-                .with_stats(&self.stats);
+            // In place: every other user of `self.shots` sets its own noise.
+            let noise = self.noise();
+            noise::apply(&mut self.shots, &noise);
+            let full = Fit::new(
+                &self.shots,
+                WorldParameters::default(),
+                cancelled,
+                true,
+                vec![],
+            )
+            .with_stats(&self.stats);
             let theta = self.search.theta.clone();
             let (theta, evidence) = if theta.is_empty() {
                 (theta, None)
@@ -451,18 +462,16 @@ impl Estimator {
         Some(self.publish(&theta, None))
     }
 
-    /// Planets of the published map (none before the first publication).
-    fn published_planets(&self) -> Vec<crate::protocol::Planet> {
-        self.belief
-            .as_ref()
-            .map(|b| b.map.planets.clone())
-            .unwrap_or_default()
+    /// Planets of the maintained map (the search's, not the polished published one, so that a
+    /// polish cut by its wall ceiling cannot change any later noise or search).
+    fn maintained_planets(&self) -> Vec<crate::protocol::Planet> {
+        self.search.theta.iter().map(|t| planet_at(*t)).collect()
     }
 
     /// The noise of an operation starting now: the current model-error estimate, shaped by the
-    /// published map and every path.
+    /// maintained map and every path.
     fn noise(&self) -> Noise {
-        Noise::new(self.model, &self.published_planets(), &self.shots)
+        Noise::new(self.model, &self.maintained_planets(), &self.shots)
     }
 
     /// Forget the map epoch's evidence. Player positions survive: the server announces a

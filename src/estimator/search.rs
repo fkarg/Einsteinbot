@@ -349,28 +349,6 @@ pub(super) struct Search {
     /// At the planet cap a death trial has run since the last path or adoption (a successful one
     /// frees a slot, so the next birth makes it a swap).
     cap_trial_done: bool,
-    /// Every adopted birth and death, with its evidence gain split.
-    pub adoptions: Vec<Adoption>,
-}
-
-/// An adopted birth or death of the live search: its evidence gain split into the chi-square and
-/// the log-determinant parts (`-0.5` times each change; the log-determinant part is 0 while every
-/// compared map shares one noise). A gain mainly from the log-determinant would be a map adopted
-/// for shrinking its own noise rather than for explaining the data.
-#[derive(Clone, Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
-pub(super) struct Adoption {
-    pub paths: usize,
-    pub birth: bool,
-    pub chi2_gain: f64,
-    pub log_det_gain: f64,
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-impl Adoption {
-    pub fn from_log_det(&self) -> bool {
-        self.log_det_gain > self.chi2_gain
-    }
 }
 
 impl Search {
@@ -679,18 +657,6 @@ impl Search {
                     if evidence > parent && (deaths || theta.len() <= slice.max_planets) =>
                 {
                     let theta = theta.clone();
-                    // Bookkeeping only: no stats, so the slice's evaluation count is unchanged.
-                    let record = Fit::new(&shots, world, cancelled, true, vec![]);
-                    if let (Some(before), Some(after)) =
-                        (record.chi2(&self.theta), record.chi2(&theta))
-                    {
-                        self.adoptions.push(Adoption {
-                            paths: self.paths.len(),
-                            birth: !deaths,
-                            chi2_gain: -0.5 * (after - before),
-                            log_det_gain: 0.0,
-                        });
-                    }
                     self.deaths_due = !deaths;
                     if !deaths {
                         // The candidates stay as warm starts (re-scored next round); the one just
