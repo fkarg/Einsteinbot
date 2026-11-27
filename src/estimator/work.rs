@@ -1,12 +1,12 @@
 //! Work counters, per-part timings and wall-clock ceilings of one estimator update (a path's local
 //! refit and the search slices that follow it).
 //!
-//! Two independent kinds of limit exist. The *work limit* (`Estimator::max_evaluations`) counts
-//! residual and Jacobian evaluations and is deterministic: the same data and limit give the same
-//! belief whatever the machine load. *Wall-clock* limits (`Estimator::time_budget`, an overall bound
-//! that stops the search and publishes the best belief so far, and the per-part `PartCeilings`)
-//! depend on the machine. A ceiling that is exceeded is never silent: it is recorded in the
-//! `UpdateReport` (and `UpdateReport::assert_within_ceilings` panics naming the part).
+//! Two independent kinds of limit exist. The *work limit* (`Settings::slice_evaluations` per
+//! slice) counts residual and Jacobian evaluations and is deterministic: the same data and limit
+//! give the same belief whatever the machine load. *Wall-clock* limits (`Settings::slice_ceiling`,
+//! which cuts a slice and keeps the best map so far, and the per-part `PartCeilings`) depend on
+//! the machine. A ceiling that is exceeded is never silent: it is recorded in the `UpdateReport`
+//! (and `UpdateReport::assert_within_ceilings` panics naming the part).
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};

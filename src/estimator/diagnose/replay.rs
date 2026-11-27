@@ -68,7 +68,7 @@ fn replay_deterministic(case: &Case, settings: Settings) {
         if audit {
             let before = belief_theta(&estimator);
             let started = Instant::now();
-            let adopted = estimator.finish_audit(&never).is_some();
+            let adopted = estimator.finish_audit().is_some();
             estimator.settle(&never);
             if started.elapsed() > Duration::from_millis(50) || adopted {
                 println!(

@@ -14,6 +14,8 @@ use crate::estimator::work::cores;
 /// The default estimator, path by path; returns (planets, evaluations, wall s, slowest update s).
 fn production(case: &Case) -> (Vec<[f64; 3]>, u64, f64, f64) {
     let mut estimator = Estimator::default();
+    // Deterministic: no slice is cut by the wall clock.
+    estimator.settings.slice_ceiling = None;
     let never = AtomicBool::new(false);
     let (mut total, mut slowest) = (0, 0.0_f64);
     let started = Instant::now();

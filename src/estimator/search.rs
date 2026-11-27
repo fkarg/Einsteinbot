@@ -376,12 +376,12 @@ impl Search {
         self.clear_pending();
     }
 
-    /// Replace the map by an audit's (built from fewer paths than are known now): every planet is
-    /// refit on all paths, pending work is dropped and the search starts over from the first level.
-    pub(super) fn adopt(&mut self, theta: Vec<[f64; 3]>, slice: &Slice) {
+    /// Replace the map by an audit's (refit on the paths of a few seconds ago): pending work is
+    /// dropped and the search starts over from the first level.
+    pub(super) fn adopt(&mut self, theta: Vec<[f64; 3]>) {
         self.theta = theta;
         self.clear_pending();
-        self.refit_near_newest(slice, false);
+        self.level = 0;
     }
 
     /// A new path: refit the planets within `LOCAL_RADIUS` of its rows (the others are fixed
@@ -392,12 +392,6 @@ impl Search {
         for (level, relative) in LEVELS.iter().enumerate() {
             self.paths[level].push(shot.at_relative_level(WorldParameters::default(), *relative));
         }
-        self.refit_near_newest(slice, true);
-    }
-
-    /// Refit the planets near the newest path (all planets when `local` is false) and make every
-    /// pending piece of work stale.
-    fn refit_near_newest(&mut self, slice: &Slice, local: bool) {
         let world = WorldParameters::default();
         for level in 0..LEVELS.len() {
             if self.theta.is_empty() || slice.cancelled.load(Ordering::Relaxed) {
@@ -406,13 +400,12 @@ impl Search {
             let shots = self.thin(level);
             let newest = self.paths[level].last().and_then(|s| s.path.as_ref());
             let near = |t: &[f64; 3]| {
-                !local
-                    || newest.is_some_and(|p| {
-                        (0..p.row_count()).any(|r| {
-                            let c = p.center(r);
-                            (t[0] - c[0]).hypot(t[1] - c[1]) < LOCAL_RADIUS
-                        })
+                newest.is_some_and(|p| {
+                    (0..p.row_count()).any(|r| {
+                        let c = p.center(r);
+                        (t[0] - c[0]).hypot(t[1] - c[1]) < LOCAL_RADIUS
                     })
+                })
             };
             let (free, fixed): (Vec<[f64; 3]>, Vec<[f64; 3]>) =
                 self.theta.iter().partition(|t| near(t));

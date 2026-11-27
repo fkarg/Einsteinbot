@@ -77,7 +77,7 @@ impl Replay {
                 self.estimator.observe(event, &never);
                 self.estimator.settle(&never);
                 if self.estimator.settings.audit_enabled {
-                    self.estimator.finish_audit(&never);
+                    self.estimator.finish_audit();
                     self.estimator.settle(&never);
                 }
                 self.update_micros = start.elapsed().as_micros();

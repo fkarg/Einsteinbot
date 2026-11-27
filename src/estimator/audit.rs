@@ -1,9 +1,10 @@
 //! Background audit of the maintained map: a from-scratch map (`rebuild::from_scratch`) on a
-//! snapshot of the paths, adopted only if its evidence beats the maintained map's on every row.
-//! It runs on its own thread, so it never delays the publication of a map; the estimator adopts a
-//! finished audit between slices.
+//! snapshot of the paths, adopted only if its evidence beats the maintained map's on all the rows
+//! known when the rebuild is done. Both halves (the rebuild, then the comparison) run on their
+//! own threads, so an audit never delays the publication of a map; the estimator collects a
+//! finished half between slices.
 use super::Shot;
-use super::fit::{Budget, Fit};
+use super::fit::{Budget, Fit, theta_of};
 use super::rebuild::from_scratch;
 use super::search::{LEVELS, refit};
 use crate::simulation::WorldParameters;
@@ -11,8 +12,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 
-/// Evaluations of the maintained map's refit on all rows before the comparison.
-const MAINTAINED_REFIT_EVALUATIONS: u64 = 1500;
+/// Evaluations of each map's refit on all rows before the comparison.
+const REFIT_EVALUATIONS: u64 = 1500;
 /// The first audit runs at this many paths, then every `AUDIT_EVERY`.
 const FIRST_AUDIT: usize = 8;
 const AUDIT_EVERY: usize = 16;
@@ -22,26 +23,42 @@ pub(super) fn due(paths: usize) -> bool {
     paths >= FIRST_AUDIT && (paths - FIRST_AUDIT) % AUDIT_EVERY == 0
 }
 
+/// Which half of the audit a thread runs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Stage {
+    /// The from-scratch map (minutes).
+    Rebuild,
+    /// The comparison with the maintained map on the paths known now (seconds).
+    Compare,
+}
+
 pub(super) struct Audit {
+    pub stage: Stage,
     thread: Option<JoinHandle<Option<Vec<[f64; 3]>>>>,
     cancel: Arc<AtomicBool>,
 }
 
 impl Audit {
-    /// Start auditing `maintained` on the paths `shots` (exact, full rows).
-    pub(super) fn spawn(
+    /// Start building a map from scratch on the paths `shots` (exact, full rows). The result is
+    /// compared with the maintained map by `compare`, on the paths known when it is done: a map
+    /// built from the paths of minutes ago must not be compared (or adopted) on those.
+    pub(super) fn rebuild(shots: Vec<Shot>, max_planets: usize, threads: usize) -> Self {
+        Self::spawn(Stage::Rebuild, move |cancelled| {
+            from_scratch(&shots, max_planets, threads, cancelled)
+        })
+    }
+
+    /// Start comparing `candidate` with `maintained` on all of `shots`: both refit on all rows at
+    /// the finest relative level, the maintained one is what the candidate has to beat there (the
+    /// candidate's polish already ran at that level). The result is the refit candidate if its
+    /// evidence is higher.
+    pub(super) fn compare(
         shots: Vec<Shot>,
         maintained: Vec<[f64; 3]>,
-        max_planets: usize,
+        candidate: Vec<[f64; 3]>,
         threads: usize,
     ) -> Self {
-        let cancel = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&cancel);
-        let thread = std::thread::spawn(move || {
-            let cancelled = &*flag;
-            let candidate = from_scratch(&shots, max_planets, threads, cancelled)?;
-            // Both maps on all rows at the finest relative level, the maintained one refit there
-            // first (the candidate's polish already ran at that level).
+        Self::spawn(Stage::Compare, move |cancelled| {
             let world = WorldParameters::default();
             let level = LEVELS[LEVELS.len() - 1];
             let rows: Vec<Shot> = shots
@@ -50,13 +67,16 @@ impl Audit {
                 .collect();
             let joint = Fit::new(&rows, world, cancelled, true, vec![]);
             let budget = Budget {
-                evaluations: MAINTAINED_REFIT_EVALUATIONS,
+                evaluations: REFIT_EVALUATIONS,
                 deadline: None,
                 threads,
             };
-            let maintained = refit(&joint, &maintained, &budget)
-                .map(|mode| mode.planets.iter().map(super::fit::theta_of).collect())
-                .unwrap_or(maintained);
+            let refit_of = |start: Vec<[f64; 3]>| {
+                refit(&joint, &start, &budget)
+                    .map(|mode| mode.planets.iter().map(theta_of).collect())
+                    .unwrap_or(start)
+            };
+            let (maintained, candidate) = (refit_of(maintained), refit_of(candidate));
             let evidence = |theta: &[[f64; 3]]| joint.evidence(theta).map(|e| e.log_evidence);
             let better = match (evidence(&maintained), evidence(&candidate)) {
                 (Some(old), Some(new)) => new > old,
@@ -64,9 +84,18 @@ impl Audit {
                 _ => false,
             };
             (better && !cancelled.load(Ordering::Relaxed)).then_some(candidate)
-        });
+        })
+    }
+
+    fn spawn(
+        stage: Stage,
+        work: impl FnOnce(&AtomicBool) -> Option<Vec<[f64; 3]>> + Send + 'static,
+    ) -> Self {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancel);
         Self {
-            thread: Some(thread),
+            stage,
+            thread: Some(std::thread::spawn(move || work(&flag))),
             cancel,
         }
     }

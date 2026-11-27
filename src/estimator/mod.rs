@@ -35,7 +35,7 @@ use crate::map::PlanetMap;
 use crate::protocol::{Point, ServerEvent};
 use crate::simulation::{ShotObservation, WorldParameters};
 use crate::strategy::MapBelief;
-use audit::Audit;
+use audit::{Audit, Stage};
 use fit::{CONTACT_FULL, Evidence, Fit, planet_at};
 use search::{Search, Slice};
 use std::collections::BTreeMap;
@@ -275,11 +275,10 @@ impl Estimator {
             && self.settings.audit_enabled
             && (first + 1..=self.shots.len()).any(audit::due)
         {
-            self.audit = Some(Audit::spawn(
+            self.audit = Some(Audit::rebuild(
                 self.shots.clone(),
-                self.search.theta.clone(),
                 self.settings.max_planets,
-                (self.settings.threads / 2).max(1),
+                self.audit_threads(),
             ));
         }
         let theta = self.search.theta.clone();
@@ -312,7 +311,7 @@ impl Estimator {
     /// refit of the published map. Returns the belief when the published map changed.
     pub fn step(&mut self, cancelled: &AtomicBool) -> Option<MapBelief> {
         if self.audit.as_ref().is_some_and(Audit::finished) {
-            if let Some(belief) = self.finish_audit(cancelled) {
+            if let Some(belief) = self.collect_audit() {
                 return Some(belief);
             }
         }
@@ -371,12 +370,38 @@ impl Estimator {
         latest
     }
 
-    /// Wait for the running audit and adopt its map if it is better. Returns the belief when it
-    /// was adopted.
-    pub fn finish_audit(&mut self, cancelled: &AtomicBool) -> Option<MapBelief> {
-        let theta = self.audit.take()?.join()?;
-        let slice = self.settings.slice(cancelled, &self.stats);
-        self.search.adopt(theta, &slice);
+    /// Wait for the running audit to end and adopt its map if it is better. Returns the belief
+    /// when it was adopted. For replays, where time does not pass between paths.
+    pub fn finish_audit(&mut self) -> Option<MapBelief> {
+        while self.audit.is_some() {
+            if let Some(belief) = self.collect_audit() {
+                return Some(belief);
+            }
+        }
+        None
+    }
+
+    fn audit_threads(&self) -> usize {
+        (self.settings.threads / 2).max(1)
+    }
+
+    /// Take the result of the audit thread (waiting if it still runs). A rebuilt map goes on to
+    /// its comparison on the paths known now; a map that won the comparison replaces the
+    /// maintained one (it was refit on the paths known when the comparison started).
+    fn collect_audit(&mut self) -> Option<MapBelief> {
+        let audit = self.audit.take()?;
+        let stage = audit.stage;
+        let found = audit.join()?;
+        if stage == Stage::Rebuild {
+            self.audit = Some(Audit::compare(
+                self.shots.clone(),
+                self.search.theta.clone(),
+                found,
+                self.audit_threads(),
+            ));
+            return None;
+        }
+        self.search.adopt(found);
         self.slices_left = self.settings.slices_per_path;
         self.polish_due = true;
         let theta = self.search.theta.clone();
