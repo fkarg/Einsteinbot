@@ -62,6 +62,14 @@ pub struct MapBelief {
     /// Whether the planet cap is likely below the true count (P23); `None`: not assessed (the
     /// belief did not come from the estimator).
     pub count_limit: Option<crate::estimator::CountLimit>,
+    /// Fog of war (P26, `estimator::Fog`): where unseen planets could be. `None`: not computed
+    /// (the belief did not come from the estimator).
+    pub fog: Option<std::sync::Arc<crate::estimator::Fog>>,
+    /// What `fog` was built with; with `map` and the first `paths_fitted` paths of the epoch it
+    /// rebuilds it (`estimator::unseen_fog`).
+    pub fog_model: Option<crate::estimator::FogModel>,
+    /// Paths of the map epoch the estimator had fitted when it published this belief.
+    pub paths_fitted: Option<usize>,
 }
 
 impl MapBelief {
@@ -83,7 +91,29 @@ impl MapBelief {
             residual_correction_unavailable_reason: Some(ResidualGate::NotComputed),
             residual_model: None,
             count_limit: None,
+            fog: None,
+            fog_model: None,
+            paths_fitted: None,
         }
+    }
+
+    /// Attach the fog of war of the paths the belief had fitted.
+    pub fn set_fog(&mut self, fog: crate::estimator::Fog, paths_fitted: usize) {
+        self.fog_model = Some(fog.model);
+        self.paths_fitted = Some(paths_fitted);
+        self.fog = Some(std::sync::Arc::new(fog));
+    }
+
+    /// Probability that an unseen planet's centre lies within 100 units of `position`; `None`
+    /// when no fog was computed.
+    pub fn unseen_risk_at(&self, position: Vec2) -> Option<f64> {
+        self.fog.as_ref().map(|fog| fog.risk_at(position))
+    }
+
+    /// Root mean square pull of the unseen planets at `position` (acceleration units); `None`
+    /// when no fog was computed.
+    pub fn unseen_pull_at(&self, position: Vec2) -> Option<f64> {
+        self.fog.as_ref().map(|fog| fog.pull_at(position))
     }
 
     /// The residual correction at `position` (acceleration units); `None` when unavailable
@@ -122,6 +152,9 @@ impl MapBelief {
             "residual_correction_unavailable_reason": self.residual_correction_unavailable_reason,
             "residual_model": self.residual_model,
             "count_limit": self.count_limit,
+            "fog_model": self.fog_model,
+            "paths_fitted": self.paths_fitted,
+            "fog": self.fog.as_ref().map(|fog| fog.summary()),
         })
     }
 

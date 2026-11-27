@@ -69,6 +69,7 @@ pub fn run(config: &AppConfig) -> ClientResult<()> {
         Settings {
             planets: config.planets,
             learn_planets: config.learn_planets,
+            carry_planets: config.carry_planets,
             ..Settings::default()
         },
     );
@@ -1366,6 +1367,7 @@ mod tests {
             db_path: "unused.sqlite".into(),
             planets: None,
             learn_planets: false,
+            carry_planets: true,
             tui: false,
         };
         let names = (0..config.clients)
