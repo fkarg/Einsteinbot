@@ -100,7 +100,7 @@ fn cache_dir() -> String {
     std::env::var("CACHE").unwrap_or_else(|_| "/tmp/p6-cache".into())
 }
 
-fn world_id(case: &Case) -> String {
+pub(super) fn world_id(case: &Case) -> String {
     // Without the path count, so the id is the same whatever PATHS was.
     let name = case.name.split(" paths=").next().unwrap();
     name.chars()
@@ -149,8 +149,8 @@ fn limits<'a>(max: Option<u64>, ceilings: &'a PartCeilings, seconds: u64) -> Lim
     }
 }
 
-struct Metrics {
-    text: String,
+pub(super) struct Metrics {
+    pub(super) text: String,
     k: usize,
     rec2: usize,
     spur: usize,
@@ -159,7 +159,7 @@ struct Metrics {
 }
 
 /// Quality of `theta` against the exact likelihood and the truth on the first `n` paths.
-fn quality(case: &Case, n: usize, theta: &[[f64; 3]]) -> Metrics {
+pub(super) fn quality(case: &Case, n: usize, theta: &[[f64; 3]]) -> Metrics {
     let never = AtomicBool::new(false);
     let world = WorldParameters::default();
     let shots = &case.shots[..n];
@@ -187,16 +187,16 @@ fn quality(case: &Case, n: usize, theta: &[[f64; 3]]) -> Metrics {
     }
 }
 
-struct Rebuilt {
-    theta: Vec<[f64; 3]>,
-    evals: u64,
-    equiv: f64,
-    wall: f64,
+pub(super) struct Rebuilt {
+    pub(super) theta: Vec<[f64; 3]>,
+    pub(super) evals: u64,
+    pub(super) equiv: f64,
+    pub(super) wall: f64,
 }
 
 /// From scratch on the first `n` paths: the E9 cascade (cap 28000 evaluations) and the E9c
 /// program `0.005gd+0.001gd+0` with the guarded exact refit (`G3C1.5`). Cached on disk.
-fn rebuild(case: &Case, n: usize, noise: f64) -> Rebuilt {
+pub(super) fn rebuild(case: &Case, n: usize, noise: f64) -> Rebuilt {
     let path = format!("{}/{}_{n}.txt", cache_dir(), world_id(case));
     if let Ok(text) = std::fs::read_to_string(&path) {
         let mut lines = text.lines();
