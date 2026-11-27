@@ -204,7 +204,7 @@ fn resolve(cli: CliOptions, env: EnvOptions, file: FileOptions) -> Result<AppCon
         } else if let Some(value) = env.targeting {
             parse_bool(&value, "EINSTEINBOT_TARGETING")?
         } else {
-            file.targeting.unwrap_or(false)
+            file.targeting.unwrap_or(true)
         },
         oracle_map_for_policy: if let Some(oracle_map) = cli.oracle_map_for_policy {
             oracle_map
@@ -320,8 +320,8 @@ fn help_text() -> &'static str {
        --no-record         Disable SQLite recording\n\
        --dummy             Fire low-energy random shots\n\
        --no-dummy          Disable dummy actions\n\
-       --target            Target known players using trajectory search\n\
-       --no-target         Disable targeting\n\
+       --target            Target players using trajectory search (default)\n\
+       --no-target         Disable targeting (observe only)\n\
        --oracle-map        Allow local Planets events to drive targeting\n\
        --no-oracle-map     Ignore Planets events for targeting (default)\n\
        --clients N         Run N local bot connections (default: 1, max: 16)\n\
@@ -464,15 +464,22 @@ mod tests {
     }
 
     #[test]
-    fn targeting_is_opt_in_and_oracle_map_requires_an_explicit_flag() {
+    fn targeting_is_on_by_default_and_oracle_map_requires_an_explicit_flag() {
         let passive = resolve(
             CliOptions::default(),
             EnvOptions::default(),
             FileOptions::default(),
         )
         .unwrap();
-        assert!(!passive.targeting);
+        assert!(passive.targeting);
         assert!(!passive.oracle_map_for_policy);
+
+        let ParsedCli::Options(cli) = parse_args(["--no-target"].map(str::to_owned)).unwrap()
+        else {
+            panic!("expected parsed options");
+        };
+        let observer = resolve(cli, EnvOptions::default(), FileOptions::default()).unwrap();
+        assert!(!observer.targeting);
 
         let ParsedCli::Options(cli) =
             parse_args(["--target", "--oracle-map"].map(str::to_owned)).unwrap()

@@ -19,14 +19,14 @@ You need a Rust toolchain and the NewtonWars source checked out next to this rep
 
    `sendplanets 1` makes the server disclose the true planets. The bot never uses them to fit its map; the tools use them to score it.
 
-2. **Run the bot** with targeting on:
+2. **Run the bot** (it aims by default):
 
    ```sh
-   cargo run -- --target                 # one bot
-   cargo run -- --clients 3 --target     # three bots on one local server
+   cargo run                     # one bot
+   cargo run -- --clients 3      # three bots on one local server
    ```
 
-   Without `--target` the bot only watches. It records everything it sees to `einsteinbot.sqlite3`. Press Ctrl+C once to stop and print a per-map report.
+   With `--no-target` the bot only watches. It records everything it sees to `einsteinbot.sqlite3`. Press Ctrl+C once to stop and print a per-map report.
 
 3. **Inspect what it believed**:
 

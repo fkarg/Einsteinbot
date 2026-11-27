@@ -27,23 +27,23 @@ cd ../NewtonWars
 
 - `sendplanets 1` is required if the server should disclose planet positions.
 - If a local server is already running, connect to it; do not start another copy.
-- Local NewtonWars connections may run side by side. `cargo run -- --clients 3 --target` launches three parameter variants under one manager.
+- Local NewtonWars connections may run side by side. `cargo run -- --clients 3` launches three parameter variants under one manager.
 
 ## Running the client
 
 Each bot session opens one TCP connection. It reads the server's text welcome prompt, enters bot protocol 8, prints parsed game events, and requests energy once per second.
 
 ```sh
-cargo run -- --name Einstein     # passive: watches and records
-cargo run -- --target            # aims with the targeting policy
+cargo run                        # aims with the targeting policy (default)
+cargo run -- --no-target         # passive: watches and records
 cargo run -- --dummy             # small random shots
-cargo run -- --clients 3 --target
+cargo run -- --clients 3
 ```
 
 | Mode | Flag | Behaviour |
 |---|---|---|
-| passive | (default) | watches and records, never shoots |
-| targeting | `--target` | aims by simulating candidate shots on the estimated map |
+| targeting | (default; `--target`) | aims by simulating candidate shots on the estimated map |
+| passive | `--no-target` | watches and records, never shoots |
 | dummy | `--dummy` | an integer velocity between 2 and `min(8, floor(energy))` and an integer angle from -180 through 180, at most one shot per energy response, once energy is at least 2; takes precedence over `--target` |
 | oracle | `--oracle-map` | uses the server's disclosed planets for local target simulation (explicit opt-in, for diagnosis) |
 
@@ -88,7 +88,7 @@ cargo run -- --config einsteinbot.toml
 | recording | `--no-record` | `EINSTEINBOT_RECORD` | on |
 | database | `--db-path PATH` | `EINSTEINBOT_DB_PATH` | `einsteinbot.sqlite3` |
 | dummy | `--dummy`, `--no-dummy` | `EINSTEINBOT_DUMMY` | off |
-| targeting | `--target`, `--no-target` | `EINSTEINBOT_TARGETING` | off |
+| targeting | `--target`, `--no-target` | `EINSTEINBOT_TARGETING` | on |
 | oracle map | `--oracle-map`, `--no-oracle-map` | `EINSTEINBOT_ORACLE_MAP` | off |
 | clients | `--clients N` | `EINSTEINBOT_CLIENTS` | 1 |
 | planet count | `--planets N` | `EINSTEINBOT_PLANETS` | estimated |
@@ -263,7 +263,7 @@ sequenceDiagram
 
 ### Targeting
 
-Targeting is opt-in with `--target` or `targeting = true`.
+Targeting is on by default; `--no-target` (`targeting = false`) makes the bot passive.
 
 **Candidate search.**
 
