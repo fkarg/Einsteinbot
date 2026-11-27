@@ -9,12 +9,12 @@ Einsteinbot is a Rust bot for [NewtonWars](https://github.com/Draradech/NewtonWa
 
 You need a Rust toolchain and the NewtonWars source checked out next to this repository at `../NewtonWars`.
 
-1. **Start a local server** (macOS build; skip this if one is already running on port 3490):
+1. **Start a local server** (build then start, skip this if one is already running on port 3490):
 
    ```sh
    cd ../NewtonWars
-   ./build-mac.sh
-   ./nw fullscreen 0 sendplanets 1 throttle 16
+   ./build-<system>.sh
+   ./nw <optional parameters>
    ```
 
    `sendplanets 1` makes the server disclose the true planets. The bot never uses them to fit its map; the tools use them to score it.
@@ -26,7 +26,7 @@ You need a Rust toolchain and the NewtonWars source checked out next to this rep
    cargo run -- --clients 3      # three bots on one local server
    ```
 
-   Targeting (`--target`) is the default; with `--no-target` the bot only watches. It records everything it sees to `einsteinbot.sqlite3`. Press Ctrl+C once to stop and print a per-map report.
+   Default newtonwars instance target is `localhost:3490`, others can be configured via `--host` and `--port`. See usage with `-- --help`. It records everything it sees to `einsteinbot.sqlite3`. Press Ctrl+C once to stop and print a per-map report.
 
 3. **Inspect what it believed**:
 
@@ -76,8 +76,6 @@ Each item says what the bot does, why it helps, and what it measured. The math b
 | **Aims with what it can't explain yet** | Adds the still-unexplained pull seen along observed paths to its shot simulation; switches off once the map is complete. | Early in a map, paths near earlier shots are bent by planets the map lacks. | +5 to +32 true hits per replayed game, almost all early in the map. |
 | **Prefers short shots** | Ranks predicted hits by flight time first, miss distance second. | Map errors grow along a path; long shots rarely hit. | The ranking alone: true hits 15 → 23, 49 → 61, 22 → 46 on replayed games. |
 | **Doesn't shoot the doomed** | Simulates every shot in flight (all players, its own included) and skips targets that will die before its shot lands, unless its shot wins the race. | In busy games many shots hit where a player *was*. | Capture 58: true hits 252 → 315, wasted hits 112 → 62. |
-| **Saves energy** | Without a predicted hit it waits for 15 energy instead of firing weak shots; during a round's end card it stops shooting. | Weak shots almost never hit (5 of 58); end-card shots vanish. | Part of the P15 gain above. |
-| **Notices new maps by itself** | Detects a new map when every player is moved at once, even when the server does not send planets. | Competitive servers never announce maps; mixing maps would ruin the fit. | 294 of 294 map changes found in recorded games, no false alarms. |
 
 ### The math, step by step
 
@@ -118,7 +116,7 @@ Each such equation is one row. The bot evaluates the right side on the model fie
 
 #### 3. Likelihood: what the residuals really are
 
-A row residual has three parts, and the bot models each one ([`src/estimator/noise.rs`](src/estimator/noise.rs)).
+A row residual has three (?) parts, and the bot models each one ([`src/estimator/noise.rs`](src/estimator/noise.rs)).
 
 | Part | Cause | Model |
 |---|---|---|
