@@ -8,10 +8,11 @@
 //! the path is a cubic Hermite interpolant with 4th-order central-difference tangents (the exact
 //! launch velocity at tick 0).
 //!
-//! Noise: the f32 rounding of the observed tick positions (uniform, sd `ulp / sqrt(12)`; its
-//! exact covariance, including the correlation between neighbouring rows, is whitened by a
-//! banded Cholesky factor) plus an interpolation-error variance per row estimated from the
-//! observed ticks alone (`interpolation_error`). The interpolation error dominates near planets:
+//! Noise: the measurement floor is the f32 rounding of the observed tick positions (uniform, sd
+//! `ulp / sqrt(12)`; neighbouring rows share ticks, so it is correlated) plus an
+//! interpolation-error variance per row estimated from the observed ticks alone
+//! (`interpolation_error`). On top of it a model-error process for unseen planets can be set
+//! (`set_noise`); `noise.rs` whitens both exactly. The interpolation error dominates near planets:
 //! without it the true map has a chi-square 10^3 to 10^5 times its degrees of freedom on a near
 //! pass. Rows are one tick wide, which keeps the most information; the variance term, not a
 //! longer window, handles near passes (`docs/estimator-evaluation.md`).
@@ -19,6 +20,7 @@
 //! There is deliberately no launch row. The engine starts a debris shot with a stale
 //! acceleration, which corrupts the first tick's relation to the launch velocity but no row built
 //! from observed ticks only.
+use super::noise::{Floor, Gains, Noise};
 use crate::protocol::Point;
 use crate::simulation::WorldParameters;
 
@@ -50,14 +52,6 @@ fn f32_sd(x: f64) -> f64 {
     (2f64.powi(a.log2().floor() as i32 - 23) / 12f64.sqrt()).max(1e-7)
 }
 
-/// Lower-triangular Cholesky factor of a pentadiagonal matrix, by diagonals.
-#[derive(Clone, Debug)]
-struct Whitener {
-    diagonal: Vec<f64>,
-    first: Vec<f64>,
-    second: Vec<f64>,
-}
-
 /// One path's observations prepared for the windowed comparison.
 #[derive(Clone, Debug)]
 pub(super) struct PathData {
@@ -70,8 +64,12 @@ pub(super) struct PathData {
     substeps: usize,
     /// Observed second difference per axis and row.
     y: [Vec<f64>; 2],
-    /// Per axis.
-    whitener: [Whitener; 2],
+    /// Measurement floor of the rows.
+    floor: Floor,
+    /// Model-error process (sd, length) per row (`noise.rs`); sd 0 without one.
+    shape: Vec<(f64, f64)>,
+    /// Whitening of each axis under the floor and `shape`.
+    whitener: [Gains; 2],
     /// First node of each row of a thinned path (`thinned`): kept rows that are neighbours on
     /// the path share nodes. `None` for a full path (row `r` starts at node `r * n + 1`).
     row_node: Option<Vec<usize>>,
@@ -85,17 +83,13 @@ pub(super) struct PathData {
 }
 
 impl PathData {
-    /// `None` when the path has fewer than `MIN_TICKS` regular ticks. `relative` times the
-    /// observed acceleration magnitude of each row is added to that row's noise standard deviation
-    /// (in quadrature, both axes), on top of the f32 rounding noise; 0 is the exact noise model.
-    /// The relative term widens the likelihood for the search stages (E9 in
-    /// `docs/estimator-experiments.md`).
+    /// `None` when the path has fewer than `MIN_TICKS` regular ticks. The noise is the
+    /// measurement floor alone until `set_noise`.
     pub fn new(
         points: &[Point],
         angle_degrees: f64,
         velocity: f64,
         world: WorldParameters,
-        relative: f64,
     ) -> Option<Self> {
         // The engine records a debris shot's first dot without stepping it when the shot was
         // created after its slot was simulated that tick: the launch dot is then duplicated.
@@ -162,50 +156,28 @@ impl PathData {
                 error * error
             })
             .collect();
-        let whitener = [0, 1].map(|axis| {
-            // Row `r` has noise coefficients (1, -2, 1) on ticks r, r + 1, r + 2.
-            let var = |tick: usize| f32_sd(ticks[tick][axis]).powi(2);
-            let mut factor = Whitener {
-                diagonal: Vec::with_capacity(rows),
-                first: Vec::with_capacity(rows),
-                second: Vec::with_capacity(rows),
-            };
-            for i in 0..rows {
-                let relative_sd = relative * y[0][i].hypot(y[1][i]);
-                let c0 = var(i)
-                    + 4.0 * var(i + 1)
-                    + var(i + 2)
-                    + interpolation_variance[i]
-                    + relative_sd * relative_sd;
-                let c1 = if i >= 1 {
-                    -2.0 * (var(i) + var(i + 1))
-                } else {
-                    0.0
-                };
-                let c2 = if i >= 2 { var(i) } else { 0.0 };
-                // Cholesky by diagonals: L[i][i-2], L[i][i-1], L[i][i].
-                let l2 = if i >= 2 {
-                    c2 / factor.diagonal[i - 2]
-                } else {
-                    0.0
-                };
-                let l1 = if i >= 1 {
-                    (c1 - l2 * factor.first[i - 1]) / factor.diagonal[i - 1]
-                } else {
-                    0.0
-                };
-                factor.second.push(l2);
-                factor.first.push(l1);
-                factor.diagonal.push((c0 - l1 * l1 - l2 * l2).sqrt());
-            }
-            factor
-        });
+        let mut arc = Vec::with_capacity(rows);
+        let mut length = 0.0;
+        for r in 0..rows {
+            let (a, b) = (ticks[r], ticks[r + 1]);
+            length += (b[0] - a[0]).hypot(b[1] - a[1]);
+            arc.push(length);
+        }
+        let floor = Floor {
+            ticks: Some([0, 1].map(|axis| ticks.iter().map(|t| f32_sd(t[axis]).powi(2)).collect())),
+            white: [interpolation_variance.clone(), interpolation_variance],
+            arc,
+        };
+        let shape = vec![(0.0, f64::INFINITY); rows];
+        let whitener = [0, 1].map(|axis| Gains::new(&floor, axis, &shape));
         Some(Self {
             nodes,
             ticks,
             kernel,
             substeps: n,
             y,
+            floor,
+            shape,
             whitener,
             row_node: None,
             centers: None,
@@ -221,9 +193,9 @@ impl PathData {
     }
 
     /// A path of only the rows `keep` (ascending), each with its own `2n - 1` nodes. The row
-    /// noise is the original's marginal variance (correlation between neighbouring rows is
-    /// dropped), so this is an approximate objective for the search stage only.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// floor is the original's marginal variance (its correlation between neighbouring rows is
+    /// dropped, an approximation); the model-error process is the original's at the kept rows,
+    /// stepped by arc length.
     pub fn thinned(&self, keep: &[usize]) -> Option<Self> {
         if keep.is_empty() || self.row_node.is_some() {
             return None;
@@ -247,25 +219,21 @@ impl PathData {
             }
             previous = Some(r);
         }
-        let whitener = [0, 1].map(|axis| {
-            let w = &self.whitener[axis];
-            Whitener {
-                diagonal: keep
-                    .iter()
-                    .map(|&r| {
-                        (w.diagonal[r].powi(2) + w.first[r].powi(2) + w.second[r].powi(2)).sqrt()
-                    })
-                    .collect(),
-                first: vec![0.0; keep.len()],
-                second: vec![0.0; keep.len()],
-            }
-        });
+        let floor = Floor {
+            ticks: None,
+            white: [0, 1].map(|axis| keep.iter().map(|&r| self.floor.marginal(axis, r)).collect()),
+            arc: keep.iter().map(|&r| self.floor.arc[r]).collect(),
+        };
+        let shape: Vec<(f64, f64)> = keep.iter().map(|&r| self.shape[r]).collect();
+        let whitener = [0, 1].map(|axis| Gains::new(&floor, axis, &shape));
         Some(Self {
             nodes,
             ticks: self.ticks.clone(),
             kernel: self.kernel.clone(),
             substeps: n,
             y: [0, 1].map(|axis| keep.iter().map(|&r| self.y[axis][r]).collect()),
+            floor,
+            shape,
             whitener,
             row_node: Some(row_node),
             centers: Some(keep.iter().map(|&r| self.ticks[r + 1]).collect()),
@@ -284,12 +252,22 @@ impl PathData {
         self.y[0].len()
     }
 
-    /// Marginal measurement-noise variance (f32 rounding, interpolation and any relative term) of
-    /// row `r` on `axis`.
+    /// Marginal measurement-floor variance (f32 rounding and interpolation) of row `r` on `axis`.
     #[cfg(test)]
     pub fn floor_variance(&self, axis: usize, r: usize) -> f64 {
-        let w = &self.whitener[axis];
-        w.diagonal[r].powi(2) + w.first[r].powi(2) + w.second[r].powi(2)
+        self.floor.marginal(axis, r)
+    }
+
+    pub fn floor(&self) -> &Floor {
+        &self.floor
+    }
+
+    /// Use `noise`'s model-error process on top of the floor.
+    pub fn set_noise(&mut self, noise: &Noise) {
+        self.shape = (0..self.row_count())
+            .map(|r| noise.shape(self.center(r)))
+            .collect();
+        self.whitener = [0, 1].map(|axis| Gains::new(&self.floor, axis, &self.shape));
     }
 
     /// Position on the path at the centre of row `r`.
@@ -390,10 +368,11 @@ impl PathData {
         }
     }
 
-    /// Whitened residual `L^-1 (y - prediction)` of one axis, from per-row predictions.
+    /// Whitened residual (normalized innovations of `y - prediction`) of one axis, from per-row
+    /// predictions.
     pub fn residual(&self, axis: usize, prediction: &[f64], out: &mut [f64]) {
         self.raw_residual(axis, prediction, out);
-        self.whiten(axis, out, 0);
+        self.whiten(axis, out);
     }
 
     /// Unwhitened `y - prediction` of one axis.
@@ -403,19 +382,9 @@ impl PathData {
         }
     }
 
-    /// Replace `v` by `L^-1 v`, where `v` is zero before row `start`.
-    pub fn whiten(&self, axis: usize, v: &mut [f64], start: usize) {
-        let w = &self.whitener[axis];
-        for i in start..v.len() {
-            let mut s = v[i];
-            if i >= 1 {
-                s -= w.first[i] * v[i - 1];
-            }
-            if i >= 2 {
-                s -= w.second[i] * v[i - 2];
-            }
-            v[i] = s / w.diagonal[i];
-        }
+    /// Replace one axis's per-row values `v` by their normalized innovations (linear in `v`).
+    pub fn whiten(&self, axis: usize, v: &mut [f64]) {
+        self.whitener[axis].whiten(v);
     }
 }
 
@@ -524,7 +493,7 @@ mod tests {
             })
             .collect();
         let world = WorldParameters::default();
-        let full = PathData::new(&points, 0.0, 3.0, world, 0.0).unwrap();
+        let full = PathData::new(&points, 0.0, 3.0, world).unwrap();
         let keep = [0, 1, 2, 7, 12, 13, 30];
         let thin = full.thinned(&keep).unwrap();
         assert_eq!(thin.row_count(), keep.len());
@@ -586,7 +555,7 @@ mod tests {
                     points: vec![Point { x: 900.0, y: 650.0 }],
                 };
                 let path = simulate_shot(&map, &shot, world, 400).unwrap();
-                let Some(data) = PathData::new(&path.points, angle, velocity, world, 0.0) else {
+                let Some(data) = PathData::new(&path.points, angle, velocity, world) else {
                     continue;
                 };
                 let rows = data.row_count();
@@ -657,51 +626,5 @@ mod tests {
         }
         assert!(far > 1000 && near > 10, "far {far} near {near}");
         assert!(worst < 0.05, "worst error {worst} rounding sd");
-    }
-
-    /// The pentadiagonal factor reproduces the rounding-noise covariance of the rows computed
-    /// independently (the interpolation variance is negligible on this smooth path).
-    #[test]
-    fn whitening_factor_reproduces_the_noise_covariance() {
-        let points: Vec<Point> = (0..30)
-            .map(|i| Point {
-                x: 1000.0 + 3.0 * i as f32 + 0.001 * (i * i) as f32,
-                y: 20.0 - 5.0 * i as f32,
-            })
-            .collect();
-        let path = PathData::new(&points, 0.0, 3.0, WorldParameters::default(), 0.0).unwrap();
-        let sd = |tick: usize, axis: usize| {
-            let p = &points[tick];
-            f32_sd(f64::from(if axis == 0 { p.x } else { p.y }))
-        };
-        let coefs = |row: usize| [(row, 1.0), (row + 1, -2.0), (row + 2, 1.0)];
-        for axis in 0..2 {
-            let w = &path.whitener[axis];
-            let l = |row: usize, col: usize| match row - col {
-                0 => w.diagonal[row],
-                1 => w.first[row],
-                _ => w.second[row],
-            };
-            for i in 0..path.row_count() {
-                for j in i.saturating_sub(2)..=i {
-                    let mut expected = 0.0;
-                    for (ti, ci) in coefs(i) {
-                        for (tj, cj) in coefs(j) {
-                            if ti == tj {
-                                expected += ci * cj * sd(ti, axis).powi(2);
-                            }
-                        }
-                    }
-                    let got: f64 = (i.saturating_sub(2)..=j)
-                        .filter(|k| i - k <= 2 && j - k <= 2)
-                        .map(|k| l(i, k) * l(j, k))
-                        .sum();
-                    assert!(
-                        (got - expected).abs() <= 1e-4 * expected.abs() + 1e-14,
-                        "axis {axis} rows {i},{j}: {got} vs {expected}"
-                    );
-                }
-            }
-        }
     }
 }

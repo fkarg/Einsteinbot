@@ -2,18 +2,19 @@
 //! admitted only when trajectory evidence supports it.
 //!
 //! Estimation compares the model's gravity field with the field implied by the observed paths
-//! (`window`: windowed velocity-change comparison with the engine's exact discrete kernel and the
-//! f32 rounding covariance, plus a relative-noise term while searching); no dynamics are simulated
-//! in the fit. `fit` jointly fits K planets `(x, y, radius)` to the rows of every path.
+//! (`window`: windowed velocity-change comparison with the engine's exact discrete kernel); no
+//! dynamics are simulated in the fit. The likelihood (`noise`) is the exact measurement floor
+//! plus a model-error process for the field of planets not found yet, whose two scalars are
+//! estimated from prequential residuals and frozen within each operation. `fit` jointly fits K
+//! planets `(x, y, radius)` to the rows of every path.
 //!
 //! The live map is maintained incrementally (`search`): each new path first gets a local refit of
 //! the planets near it, and that map is published at once; bounded slices of birth work then
-//! continue the planet search on a thinned, relative-noise row set, with state that survives
-//! across slices and new paths. The published belief carries one map and no alternatives. The
-//! map the search keeps is polished for publication by a guarded exact refit (`rebuild`), which
-//! also gives the covariance. A background audit (`audit`) rebuilds the map from scratch
-//! (`rebuild`: the E9 cascade and the E9c polish) and replaces the maintained map only when its
-//! evidence on all rows is higher.
+//! continue the planet search on a thinned row set, with state that survives across slices and
+//! new paths. The published belief carries one map and no alternatives. The map the search keeps
+//! is refit on all rows for publication, which also gives the covariance. A background audit
+//! (`audit`) rebuilds the map from scratch (`rebuild`) and replaces the maintained map only when
+//! its evidence on all rows is higher.
 //!
 //! Surface contacts (`contacts`) are extra evidence only: a gated surface constraint on the
 //! joint fit that never creates a planet. Contact terms enter only planet-bearing models; the
@@ -22,6 +23,7 @@ mod audit;
 mod contacts;
 mod eval;
 mod fit;
+mod noise;
 mod rebuild;
 mod rows;
 mod search;
@@ -37,6 +39,7 @@ use crate::simulation::{ShotObservation, WorldParameters};
 use crate::strategy::MapBelief;
 use audit::{Audit, Stage};
 use fit::{CONTACT_FULL, Evidence, Fit, planet_at};
+use noise::{ModelError, Noise};
 use search::{Search, Slice};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -52,6 +55,8 @@ pub const DEFAULT_SLICE_EVALUATIONS: u64 = 300;
 pub const DEFAULT_SLICE_CEILING: Duration = Duration::from_millis(250);
 /// Default search slices owed after each new path.
 pub const DEFAULT_SLICES_PER_PATH: usize = 6;
+/// Evaluations of the full-row refit of the published map.
+const POLISH_EVALUATIONS: u64 = 600;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -88,26 +93,14 @@ struct Shot {
 }
 
 impl Shot {
-    /// `relative` times the observed acceleration of each row is added to the row's noise; 0 is
-    /// the exact noise model.
+    /// The noise of the path is the measurement floor alone (`noise::apply` adds a model error).
     fn new(
         obs: ShotObservation,
         contact: Option<contacts::Contact>,
         world: WorldParameters,
-        relative: f64,
     ) -> Self {
-        let path = PathData::new(
-            &obs.points,
-            obs.angle_degrees,
-            obs.velocity,
-            world,
-            relative,
-        );
+        let path = PathData::new(&obs.points, obs.angle_degrees, obs.velocity, world);
         Self { obs, contact, path }
-    }
-
-    fn at_relative_level(&self, world: WorldParameters, relative: f64) -> Self {
-        Self::new(self.obs.clone(), self.contact.clone(), world, relative)
     }
 }
 
@@ -148,8 +141,14 @@ impl Default for Settings {
 }
 
 impl Settings {
-    fn slice<'a>(&'a self, cancelled: &'a AtomicBool, stats: &'a Stats) -> Slice<'a> {
+    fn slice<'a>(
+        &'a self,
+        cancelled: &'a AtomicBool,
+        stats: &'a Stats,
+        noise: &'a Noise,
+    ) -> Slice<'a> {
         Slice {
+            noise,
             evaluations: self.slice_evaluations,
             deadline: Instant::now() + self.slice_ceiling.unwrap_or(Duration::from_secs(24 * 3600)),
             threads: self.threads,
@@ -162,8 +161,12 @@ impl Settings {
 
 pub struct Estimator {
     players: BTreeMap<u32, Point>,
-    /// Every path of the map epoch, at the exact noise model.
+    /// Every path of the map epoch, with the measurement floor as their noise.
     shots: Vec<Shot>,
+    /// Prequential residuals of the latest paths (at most `noise::WINDOW`).
+    series: Vec<noise::Series>,
+    /// The model-error scalars estimated from `series`.
+    model: ModelError,
     search: Search,
     /// Paths already given to the search (the rest were ingested when an update was cancelled).
     searched: usize,
@@ -188,6 +191,8 @@ impl Default for Estimator {
         Self {
             players: BTreeMap::new(),
             shots: Vec::new(),
+            series: Vec::new(),
+            model: ModelError::PRIOR,
             search: Search::new(),
             searched: 0,
             audit: None,
@@ -248,7 +253,7 @@ impl Estimator {
                     self.pending_timings
                         .push((Part::Contacts, started.elapsed()));
                     let started = Instant::now();
-                    self.shots.push(Shot::new(obs, contact, world, 0.0));
+                    self.shots.push(Shot::new(obs, contact, world));
                     self.pending_timings
                         .push((Part::WindowBuild, started.elapsed()));
                 }
@@ -263,9 +268,24 @@ impl Estimator {
         for (part, elapsed) in self.pending_timings.drain(..) {
             self.stats.add(part, elapsed);
         }
-        for shot in &self.shots[self.searched..] {
-            let slice = self.settings.slice(cancelled, &self.stats);
-            self.search.add_path(shot, &slice);
+        while self.searched < self.shots.len() {
+            // Prequential residuals of the new path against the published map, then the
+            // model-error estimate and the local refit under it.
+            let started = Instant::now();
+            let published = self.published_planets();
+            let mut noise = Noise::new(self.model, &published, &self.shots[..=self.searched]);
+            if let Some(path) = &self.shots[self.searched].path {
+                self.series
+                    .push(noise::Series::new(path, &published, &noise.admissible));
+                if self.series.len() > noise::WINDOW {
+                    self.series.remove(0);
+                }
+                self.model = noise::estimate(&self.series);
+                noise.model = self.model;
+            }
+            self.stats.add(Part::Noise, started.elapsed());
+            let slice = self.settings.slice(cancelled, &self.stats, &noise);
+            self.search.add_path(&self.shots[self.searched], &slice);
             self.searched += 1;
             if cancelled.load(Ordering::SeqCst) {
                 return None;
@@ -280,6 +300,7 @@ impl Estimator {
         {
             self.audit = Some(Audit::rebuild(
                 self.shots.clone(),
+                self.noise(),
                 self.settings.max_planets,
                 self.audit_threads(),
             ));
@@ -325,7 +346,8 @@ impl Estimator {
         }
         if !self.search.idle() && self.slices_left > 0 {
             self.slices_left -= 1;
-            let slice = self.settings.slice(cancelled, &self.stats);
+            let noise = self.noise();
+            let slice = self.settings.slice(cancelled, &self.stats, &noise);
             let before = self.stats.evaluations();
             let changed = self.search.step(&slice);
             let spent = self.stats.evaluations() - before;
@@ -346,27 +368,25 @@ impl Estimator {
         if self.polish_due {
             self.polish_due = false;
             let started = Instant::now();
-            let exact = Fit::new(
-                &self.shots,
-                WorldParameters::default(),
-                cancelled,
-                true,
-                vec![],
-            )
-            .with_stats(&self.stats);
+            let shots = noise::with_noise(&self.shots, &self.noise());
+            let full = Fit::new(&shots, WorldParameters::default(), cancelled, true, vec![])
+                .with_stats(&self.stats);
             let theta = self.search.theta.clone();
             let (theta, evidence) = if theta.is_empty() {
                 (theta, None)
             } else {
-                let rows = rebuild::residual_rows(&self.shots);
                 let deadline = self.settings.slice_ceiling.map(|ceiling| started + ceiling);
-                let theta =
-                    rebuild::exact_refit(&exact, rows, &theta, self.settings.threads, deadline);
+                let budget = fit::Budget {
+                    evaluations: POLISH_EVALUATIONS,
+                    deadline,
+                    threads: self.settings.threads,
+                };
+                let theta = full.refine(&theta, &budget).map_or(theta, |(t, _)| t);
                 // The covariance needs a Jacobian of all rows; a refit that used up its time
                 // leaves it out (`not_computed`) rather than run over the ceiling.
                 let evidence = deadline
                     .is_none_or(|deadline| Instant::now() < deadline)
-                    .then(|| exact.evidence(&theta))
+                    .then(|| full.evidence(&theta))
                     .flatten();
                 (theta, evidence)
             };
@@ -410,6 +430,7 @@ impl Estimator {
         if stage == Stage::Rebuild {
             self.audit = Some(Audit::compare(
                 self.shots.clone(),
+                self.noise(),
                 self.search.theta.clone(),
                 found,
                 self.audit_threads(),
@@ -422,6 +443,20 @@ impl Estimator {
         self.limit = Some(SearchLimit::WorkBudget);
         let theta = self.search.theta.clone();
         Some(self.publish(&theta, None))
+    }
+
+    /// Planets of the published map (none before the first publication).
+    fn published_planets(&self) -> Vec<crate::protocol::Planet> {
+        self.belief
+            .as_ref()
+            .map(|b| b.map.planets.clone())
+            .unwrap_or_default()
+    }
+
+    /// The noise of an operation starting now: the current model-error estimate, shaped by the
+    /// published map and every path.
+    fn noise(&self) -> Noise {
+        Noise::new(self.model, &self.published_planets(), &self.shots)
     }
 
     /// Forget the map epoch's evidence. Player positions survive: the server announces a

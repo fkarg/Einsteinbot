@@ -190,7 +190,7 @@ fn one_planet_world_beats_flat_on_a_held_out_shot() {
 fn shot_with_contact(event: &ServerEvent, players: &[Point]) -> Shot {
     let obs = shot_of(event);
     let contact = contacts::classify(&obs.points, players, WorldParameters::default());
-    Shot::new(obs, contact, WorldParameters::default(), 0.0)
+    Shot::new(obs, contact, WorldParameters::default())
 }
 
 fn center_error(theta: &[f64; 3]) -> f64 {
@@ -254,8 +254,12 @@ fn trajectory_alone_recovers_a_hit_and_the_contact_refines_it() {
     );
 }
 
+/// After one path the model-error scale is the prequential estimate against the flat map, which
+/// counts the planet's own field as error of a map with unseen planets (P13): the planet is found
+/// near its true place, and the covariance is wider than the floor alone would give and covers
+/// the error.
 #[test]
-fn a_hit_is_recovered_tightly_from_one_path_through_the_estimator() {
+fn a_hit_is_recovered_from_one_path_through_the_estimator() {
     let (mut estimator, cancelled) = estimator();
     let event = contact_event();
     let belief = estimator
@@ -264,15 +268,14 @@ fn a_hit_is_recovered_tightly_from_one_path_through_the_estimator() {
     assert_eq!(belief.map.planets.len(), 1);
     let planet = &belief.map.planets[0];
     assert!((planet.mass - planet.radius.powi(3) / 10.0).abs() < 1e-9);
-    assert!(
-        (planet.x - 500.0).hypot(planet.y - 500.0) < 1.0,
-        "{planet:?}"
-    );
-    assert!((planet.radius - 30.0).abs() < 0.5, "{planet:?}");
+    let error = (planet.x - 500.0).hypot(planet.y - 500.0);
+    assert!(error < 2.0, "{planet:?}");
+    assert!((planet.radius - 30.0).abs() < 1.0, "{planet:?}");
     assert_eq!(belief.unmatched_contacts, 0);
     assert_eq!(belief.contact_points.len(), 1);
     let covariance = belief.parameter_covariance.as_ref().expect("identified");
-    assert!(covariance[(0, 0)].sqrt() < 1.0 && covariance[(1, 1)].sqrt() < 1.0);
+    let sd = covariance[(0, 0)].sqrt().max(covariance[(1, 1)].sqrt());
+    assert!(sd < 10.0 && error < 3.0 * sd, "error {error} sd {sd}");
     let learned = rmse(&belief.map, &event);
     let flat = rmse(&world_of(vec![]), &event);
     assert!(learned < flat / 10.0, "learned={learned} flat={flat}");
@@ -568,7 +571,7 @@ fn a_mode_at_a_bound_reports_no_covariance() {
             shot_in(&truth, (500.0, 380.0), 0.0, 10.0),
             shot_in(&truth, (900.0, 150.0), 90.0, 8.0),
         ]
-        .map(|event| Shot::new(shot_of(&event), None, WorldParameters::default(), 0.0));
+        .map(|event| Shot::new(shot_of(&event), None, WorldParameters::default()));
         Fit::new(
             &shots,
             WorldParameters::default(),

@@ -84,7 +84,7 @@ fn measure_residual_scale_on_live_captures() {
                     }
                     seen.push(obs.clone());
                     all.extend(chi_square_per_coordinate(
-                        &Shot::new(obs, None, world, 0.0),
+                        &Shot::new(obs, None, world),
                         planets,
                     ));
                 }
@@ -136,7 +136,7 @@ fn measure_residual_scale_on_synthetic_paths() {
                 ..shot
             };
             values.extend(chi_square_per_coordinate(
-                &Shot::new(obs, None, world, 0.0),
+                &Shot::new(obs, None, world),
                 &planets,
             ));
         }

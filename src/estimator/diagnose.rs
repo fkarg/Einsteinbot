@@ -36,7 +36,7 @@ fn uniform(state: &mut u64) -> f64 {
 }
 
 fn exact_shot(obs: ShotObservation) -> Shot {
-    Shot::new(obs, None, WorldParameters::default(), 0.0)
+    Shot::new(obs, None, WorldParameters::default())
 }
 
 fn synthetic(seed: u64, k: usize, paths: usize) -> Case {
@@ -223,7 +223,7 @@ fn field_rmse(shots: &[Shot], theta: &[[f64; 3]], truth: &[[f64; 3]]) -> (f64, f
 fn quality(case: &Case, n: usize, theta: &[[f64; 3]]) -> String {
     let never = AtomicBool::new(false);
     let shots = &case.shots[..n];
-    let rows = rebuild::residual_rows(shots);
+    let rows = residual_rows(shots);
     let truth = theta_of_planets(&case.truth);
     let exact = Fit::new(shots, WorldParameters::default(), &never, false, vec![]);
     let chi2_per_row = |t: &[[f64; 3]]| exact.chi2(t).unwrap() / rows as f64;
@@ -263,291 +263,41 @@ fn belief_theta(estimator: &Estimator) -> Vec<[f64; 3]> {
         .unwrap_or_default()
 }
 
-/// Lag-1 autocorrelation of the whitened residuals along each path and chi2 per row, for the true
-/// map and the true map minus `DROP` planets, at the search's relative levels. Tests whether the
-/// row-independent relative noise over-counts a smooth model error.
-#[test]
-#[ignore]
-fn diagnose_residual_correlation() {
-    let drop: usize = std::env::var("DROP")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(4);
-    let world = WorldParameters::default();
-    for case in cases() {
-        let truth = theta_of_planets(&case.truth);
-        // Drop the planets nearest the battlefield centre (a deterministic choice).
-        let mut order: Vec<usize> = (0..truth.len()).collect();
-        let c = [
-            world.battlefield_width / 2.0,
-            world.battlefield_height / 2.0,
-        ];
-        order.sort_by(|&a, &b| {
-            (truth[a][0] - c[0])
-                .hypot(truth[a][1] - c[1])
-                .total_cmp(&(truth[b][0] - c[0]).hypot(truth[b][1] - c[1]))
-        });
-        let partial: Vec<[f64; 3]> = order[drop..].iter().map(|&i| truth[i]).collect();
-        for relative in [0.0, 0.02, 0.005] {
-            let shots: Vec<Shot> = case
-                .shots
-                .iter()
-                .map(|s| s.at_relative_level(world, relative))
-                .collect();
-            let cancelled = AtomicBool::new(false);
-            let fit = Fit::new(&shots, world, &cancelled, false, Vec::new());
-            for (label, theta) in [("true", &truth), ("missing", &partial)] {
-                let (mut num, mut den, mut chi2, mut rows) = (0.0, 0.0, 0.0, 0usize);
-                for (i, shot) in shots.iter().enumerate() {
-                    let Some(path) = &shot.path else { continue };
-                    let field = fit.field(i, path, theta);
-                    for axis in 0..2 {
-                        let mut r = vec![0.0; path.row_count()];
-                        path.residual(axis, &field[axis], &mut r);
-                        for w in r.windows(2) {
-                            num += w[0] * w[1];
-                        }
-                        den += r.iter().map(|v| v * v).sum::<f64>();
-                        chi2 += r.iter().map(|v| v * v).sum::<f64>();
-                        rows += r.len();
-                    }
-                }
-                println!(
-                    "RESCORR case={:?} relative={relative} map={label} rows={rows} chi2_per_row={:.3e} lag1={:.3}",
-                    case.name,
-                    chi2 / rows as f64,
-                    num / den
-                );
-            }
-        }
-    }
+/// Residual rows (both axes) of the shots.
+fn residual_rows(shots: &[Shot]) -> usize {
+    shots
+        .iter()
+        .filter_map(|shot| shot.path.as_ref())
+        .map(|path| 2 * path.row_count())
+        .sum()
 }
 
-/// Falsification test of a physics-derived model-error term (review F1, tier A): the field of
-/// the unfound planets as an Ornstein-Uhlenbeck process along each path, its variance from
-/// Campbell's theorem for `N_u` unseen planets uniform on the admissible region U (outside found
-/// planets' exclusion disks and the 20-unit no-hit tube around observed ticks) and its length
-/// the distance to U. Prints chi2/row and lag-1 autocorrelation of the Kalman innovations for the
-/// true map (N_u = 0) and the true map minus `DROP` central planets (N_u = DROP).
-#[test]
-#[ignore]
-fn diagnose_campbell_model_error() {
-    let drop: usize = std::env::var("DROP")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(4);
-    let world = WorldParameters::default();
-    // E[m^2] for r ~ U[20, 40], m = r^3 / 10.
-    let e_m2 = (40f64.powi(7) - 20f64.powi(7)) / (7.0 * 20.0) / 100.0;
-    let (w, h) = (world.battlefield_width, world.battlefield_height);
-    let diagonal = w.hypot(h);
-    for case in cases() {
-        let truth = theta_of_planets(&case.truth);
-        let c = [w / 2.0, h / 2.0];
-        let mut order: Vec<usize> = (0..truth.len()).collect();
-        order.sort_by(|&a, &b| {
-            (truth[a][0] - c[0])
-                .hypot(truth[a][1] - c[1])
-                .total_cmp(&(truth[b][0] - c[0]).hypot(truth[b][1] - c[1]))
-        });
-        let partial: Vec<[f64; 3]> = order[drop..].iter().map(|&i| truth[i]).collect();
-        let ticks: Vec<[f64; 2]> = case
-            .shots
-            .iter()
-            .filter_map(|s| s.path.as_ref())
-            .flat_map(|p| p.ticks.iter().copied())
-            .collect();
-        let cancelled = AtomicBool::new(false);
-        let fit = Fit::new(&case.shots, world, &cancelled, false, Vec::new());
-        for (label, theta, unseen) in [("true", &truth, 0usize), ("missing", &partial, drop)] {
-            // Admissible centres of an unseen planet on a 10-unit raster.
-            let found: Vec<Planet> = theta.iter().map(|t| planet_at(*t)).collect();
-            let mut admissible: Vec<[f64; 2]> = Vec::new();
-            let mut y = 25.0;
-            while y < h - 20.0 {
-                let mut x = 25.0;
-                while x < w - 20.0 {
-                    let free = found
-                        .iter()
-                        .all(|p| (p.x - x).hypot(p.y - y) > p.radius + 20.0)
-                        && ticks.iter().all(|t| (t[0] - x).hypot(t[1] - y) > 20.0);
-                    if free {
-                        admissible.push([x, y]);
-                    }
-                    x += 10.0;
-                }
-                y += 10.0;
-            }
-            let area = admissible.len() as f64 * 100.0;
-            let lambda = if area > 0.0 {
-                unseen as f64 / area
-            } else {
-                0.0
-            };
-            let (mut chi2, mut rows, mut num, mut den) = (0.0, 0usize, 0.0, 0.0);
-            for (i, shot) in case.shots.iter().enumerate() {
-                let Some(path) = &shot.path else { continue };
-                let n = path.row_count();
-                let field = fit.field(i, path, theta);
-                let ones = vec![1.0; path.nodes.len()];
-                let mut scale = vec![0.0; n];
-                path.apply(&ones, &mut scale, 0..n);
-                let centers: Vec<[f64; 2]> = (0..n).map(|r| path.center(r)).collect();
-                let distance: Vec<f64> = centers
-                    .iter()
-                    .map(|p| {
-                        admissible
-                            .iter()
-                            .map(|a| (a[0] - p[0]).hypot(a[1] - p[1]))
-                            .fold(f64::INFINITY, f64::min)
-                            .max(20.0)
-                    })
-                    .collect();
-                let sigma2: Vec<f64> = (0..n)
-                    .map(|r| {
-                        let d = distance[r];
-                        let v = lambda
-                            * e_m2
-                            * std::f64::consts::FRAC_PI_2
-                            * (1.0 / (d * d) - 1.0 / (diagonal * diagonal));
-                        scale[r] * scale[r] * v.max(0.0)
-                    })
-                    .collect();
-                for axis in 0..2 {
-                    let mut raw = vec![0.0; n];
-                    path.raw_residual(axis, &field[axis], &mut raw);
-                    let (mut u, mut p) = (0.0, sigma2[0]);
-                    let mut innovations = Vec::with_capacity(n);
-                    for r in 0..n {
-                        if r > 0 {
-                            let s = (centers[r][0] - centers[r - 1][0])
-                                .hypot(centers[r][1] - centers[r - 1][1]);
-                            let phi = (-s / distance[r]).exp();
-                            let a = if sigma2[r - 1] > 0.0 {
-                                phi * (sigma2[r] / sigma2[r - 1]).sqrt()
-                            } else {
-                                0.0
-                            };
-                            u *= a;
-                            p = a * a * p + (1.0 - phi * phi) * sigma2[r];
-                        }
-                        let s = p + path.floor_variance(axis, r);
-                        let nu = raw[r] - u;
-                        innovations.push(nu / s.sqrt());
-                        let k = p / s;
-                        u += k * nu;
-                        p *= 1.0 - k;
-                    }
-                    for pair in innovations.windows(2) {
-                        num += pair[0] * pair[1];
-                    }
-                    let ss: f64 = innovations.iter().map(|v| v * v).sum();
-                    den += ss;
-                    chi2 += ss;
-                    rows += n;
-                }
-            }
-            println!(
-                "CAMPBELL case={:?} map={label} unseen={unseen} admissible_area={area:.0} rows={rows} chi2_per_row={:.3e} lag1={:.3}",
-                case.name,
-                chi2 / rows as f64,
-                num / den
-            );
-        }
-    }
-}
-
-/// P13 falsifier: a stationary Matern-3/2 model-error process in arc length along each path
-/// (scale `s`, length `l`, one pair per map, estimated by maximizing the Kalman marginal
-/// likelihood on a grid) on top of the measurement floor. For the true map and the true map
-/// minus `DROP` central planets, prints the estimate and the innovations' chi2/row and lag-1
-/// autocorrelation. Pass: chi2/row near 1 and lag-1 below about 0.3 for both maps.
+/// P13 check of the production likelihood (`noise.rs`): for the true map and the true map minus
+/// `DROP` central planets (maps not fitted, so the residuals are honest), the model-error
+/// scalars estimated by `noise::estimate` from every path's residuals, and the production
+/// innovations' chi2/row and lag-1 autocorrelation along each path. Pass (from the prototype):
+/// chi2/row near 1 and |lag-1| below 0.1 for both maps. `MODEL=off` uses the floor alone.
 #[test]
 #[ignore]
 fn diagnose_matern_model_error() {
+    use super::noise::{ModelError, Noise, Series, estimate, with_noise};
     let drop: usize = std::env::var("DROP")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(4);
+    let off = std::env::var("MODEL").is_ok_and(|v| v == "off");
+    let white = std::env::var("FLOOR").is_ok_and(|v| v == "white");
     let world = WorldParameters::default();
-    // Innovations of one axis of one path: (whitened innovations, log-likelihood).
-    // `shape[t]` multiplies the scale `s` and the length `l` at row `t` (1 when stationary).
-    let filter = |raw: &[f64],
-                  floor: &[f64],
-                  step: &[f64],
-                  shape: &[(f64, f64)],
-                  s: f64,
-                  l: f64|
-     -> (Vec<f64>, f64) {
-        let (mut m, mut p) = ([0.0, 0.0], [[0.0, 0.0], [0.0, 0.0]]);
-        let mut out = Vec::with_capacity(raw.len());
-        let mut loglik = 0.0;
-        for t in 0..raw.len() {
-            let (ss, ll) = (s * shape[t].0, l * shape[t].1);
-            let lam = 3f64.sqrt() / ll;
-            let pinf = [ss * ss, lam * lam * ss * ss];
-            if t == 0 {
-                p = [[pinf[0], 0.0], [0.0, pinf[1]]];
-            } else if ss > 0.0 {
-                // Rescale the state to this row's scale, then step the stationary process.
-                let ratio = if shape[t - 1].0 > 0.0 {
-                    shape[t].0 / shape[t - 1].0
-                } else {
-                    0.0
-                };
-                m = [m[0] * ratio, m[1] * ratio];
-                for row in p.iter_mut() {
-                    for v in row.iter_mut() {
-                        *v *= ratio * ratio;
-                    }
-                }
-                let d = step[t];
-                let e = (-lam * d).exp();
-                let f = [
-                    [e * (1.0 + lam * d), e * d],
-                    [-e * lam * lam * d, e * (1.0 - lam * d)],
-                ];
-                let mm = [
-                    f[0][0] * m[0] + f[0][1] * m[1],
-                    f[1][0] * m[0] + f[1][1] * m[1],
-                ];
-                // P = F P F' + (Pinf - F Pinf F').
-                let mul = |a: [[f64; 2]; 2], b: [[f64; 2]; 2]| {
-                    let mut c = [[0.0; 2]; 2];
-                    for i in 0..2 {
-                        for j in 0..2 {
-                            c[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j];
-                        }
-                    }
-                    c
-                };
-                let ft = [[f[0][0], f[1][0]], [f[0][1], f[1][1]]];
-                let fpf = mul(mul(f, p), ft);
-                let pi = [[pinf[0], 0.0], [0.0, pinf[1]]];
-                let fif = mul(mul(f, pi), ft);
-                for i in 0..2 {
-                    for j in 0..2 {
-                        p[i][j] = fpf[i][j] + pi[i][j] - fif[i][j];
-                    }
-                }
-                m = mm;
+    for mut case in cases() {
+        if white {
+            // Every row kept, its floor treated as white (the prototype's approximation).
+            for shot in &mut case.shots {
+                shot.path = shot
+                    .path
+                    .as_ref()
+                    .and_then(|p| p.thinned(&(0..p.row_count()).collect::<Vec<_>>()));
             }
-            let sv = p[0][0] + floor[t];
-            let nu = raw[t] - m[0];
-            out.push(nu / sv.sqrt());
-            loglik += -0.5 * (nu * nu / sv + sv.ln());
-            let k = [p[0][0] / sv, p[1][0] / sv];
-            m = [m[0] + k[0] * nu, m[1] + k[1] * nu];
-            let p00 = p[0][0];
-            let p01 = p[0][1];
-            p = [
-                [p[0][0] - k[0] * p00, p[0][1] - k[0] * p01],
-                [p[1][0] - k[1] * p00, p[1][1] - k[1] * p01],
-            ];
         }
-        (out, loglik)
-    };
-    for case in cases() {
         let truth = theta_of_planets(&case.truth);
         let c = [
             world.battlefield_width / 2.0,
@@ -561,107 +311,70 @@ fn diagnose_matern_model_error() {
         });
         let partial: Vec<[f64; 3]> = order[drop..].iter().map(|&i| truth[i]).collect();
         let cancelled = AtomicBool::new(false);
-        let fit = Fit::new(&case.shots, world, &cancelled, false, Vec::new());
         for (label, theta) in [("true", &truth), ("missing", &partial)] {
-            let campbell = std::env::var("SHAPE").is_ok_and(|v| v == "campbell");
-            // Admissible centres of an unseen planet on a 10-unit raster (for the Campbell shape:
-            // scale 1 / d_U, length d_U, d_U the distance to the admissible region).
-            let mut admissible: Vec<[f64; 2]> = Vec::new();
-            if campbell {
-                let found: Vec<Planet> = theta.iter().map(|t| planet_at(*t)).collect();
-                let ticks: Vec<[f64; 2]> = case
-                    .shots
-                    .iter()
-                    .filter_map(|s| s.path.as_ref())
-                    .flat_map(|p| p.ticks.iter().copied())
-                    .collect();
-                let (w, h) = (world.battlefield_width, world.battlefield_height);
-                let mut y = 25.0;
-                while y < h - 20.0 {
-                    let mut x = 25.0;
-                    while x < w - 20.0 {
-                        if found
-                            .iter()
-                            .all(|p| (p.x - x).hypot(p.y - y) > p.radius + 20.0)
-                            && ticks.iter().all(|t| (t[0] - x).hypot(t[1] - y) > 20.0)
-                        {
-                            admissible.push([x, y]);
-                        }
-                        x += 10.0;
-                    }
-                    y += 10.0;
+            let planets: Vec<Planet> = theta.iter().map(|t| planet_at(*t)).collect();
+            let started = Instant::now();
+            let mut noise = Noise::new(ModelError::PRIOR, &planets, &case.shots);
+            let raster_ms = started.elapsed().as_secs_f64() * 1e3;
+            let series: Vec<Series> = case
+                .shots
+                .iter()
+                .filter_map(|s| s.path.as_ref())
+                .map(|p| Series::new(p, &planets, &noise.admissible))
+                .collect();
+            let started = Instant::now();
+            noise.model = if off {
+                ModelError {
+                    scale: 0.0,
+                    ..ModelError::PRIOR
                 }
-            }
-            // (raw residual, floor variance, step, shape) per path and axis.
-            let mut series: Vec<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<(f64, f64)>)> = Vec::new();
-            for (i, shot) in case.shots.iter().enumerate() {
-                let Some(path) = &shot.path else { continue };
-                let n = path.row_count();
-                let field = fit.field(i, path, theta);
-                let step: Vec<f64> = (0..n)
-                    .map(|r| {
-                        if r == 0 {
-                            0.0
-                        } else {
-                            let (a, b) = (path.center(r - 1), path.center(r));
-                            (a[0] - b[0]).hypot(a[1] - b[1])
-                        }
-                    })
-                    .collect();
-                let shape: Vec<(f64, f64)> = (0..n)
-                    .map(|r| {
-                        if !campbell {
-                            return (1.0, 1.0);
-                        }
-                        let c = path.center(r);
-                        let d = admissible
-                            .iter()
-                            .map(|a| (a[0] - c[0]).hypot(a[1] - c[1]))
-                            .fold(f64::INFINITY, f64::min)
-                            .max(20.0);
-                        (100.0 / d, d / 100.0)
-                    })
-                    .collect();
-                for axis in 0..2 {
-                    let mut raw = vec![0.0; n];
-                    path.raw_residual(axis, &field[axis], &mut raw);
-                    let floor = (0..n).map(|r| path.floor_variance(axis, r)).collect();
-                    series.push((raw, floor, step.clone(), shape.clone()));
-                }
-            }
-            let total = |s: f64, l: f64| -> f64 {
-                series
-                    .iter()
-                    .map(|(raw, floor, step, shape)| filter(raw, floor, step, shape, s, l).1)
-                    .sum()
+            } else {
+                estimate(&series)
             };
-            let mut best = (total(0.0, 1.0), 0.0, 1.0);
-            for si in 0..33 {
-                let s = 1e-6 * 10f64.powf(si as f64 / 4.0);
-                for li in 0..13 {
-                    let l = 5.0 * 10f64.powf(li as f64 / 4.0);
-                    let v = total(s, l);
-                    if v > best.0 {
-                        best = (v, s, l);
-                    }
+            let estimate_ms = started.elapsed().as_secs_f64() * 1e3;
+            if std::env::var("GRID").is_ok() {
+                for si in 0..9 {
+                    let scale = 0.01 * 2f64.powf(si as f64 * 0.5);
+                    let line: Vec<String> = (0..9)
+                        .map(|li| {
+                            let length = 50.0 * 2f64.powf(li as f64 * 0.5);
+                            let model = ModelError { scale, length };
+                            format!(
+                                "{:.0}",
+                                series.iter().map(|s| s.log_likelihood(model)).sum::<f64>()
+                            )
+                        })
+                        .collect();
+                    println!(
+                        "GRID map={label} s100={:.2} ll(l=50..800)={}",
+                        scale * 100.0,
+                        line.join(" ")
+                    );
                 }
             }
-            let (_, s, l) = best;
+            let shots = with_noise(&case.shots, &noise);
+            let fit = Fit::new(&shots, world, &cancelled, false, Vec::new());
             let (mut chi2, mut rows, mut num, mut den) = (0.0, 0usize, 0.0, 0.0);
-            for (raw, floor, step, shape) in &series {
-                let (w, _) = filter(raw, floor, step, shape, s, l);
-                for pair in w.windows(2) {
-                    num += pair[0] * pair[1];
+            for (i, shot) in shots.iter().enumerate() {
+                let Some(path) = &shot.path else { continue };
+                let field = fit.field(i, path, theta);
+                for axis in 0..2 {
+                    let mut r = vec![0.0; path.row_count()];
+                    path.residual(axis, &field[axis], &mut r);
+                    for w in r.windows(2) {
+                        num += w[0] * w[1];
+                    }
+                    let ss: f64 = r.iter().map(|v| v * v).sum();
+                    den += ss;
+                    chi2 += ss;
+                    rows += r.len();
                 }
-                let ss: f64 = w.iter().map(|v| v * v).sum();
-                den += ss;
-                chi2 += ss;
-                rows += w.len();
             }
             println!(
-                "MATERN case={:?} shape={} map={label} s={s:.3e} l={l:.1} rows={rows} chi2_per_row={:.3} lag1={:.3}",
+                "MATERN case={:?} shape=prod map={label} s100={:.3} l={:.1} rows={rows} chi2_per_row={:.3} lag1={:.3} raster_ms={raster_ms:.1} estimate_ms={estimate_ms:.0}",
                 case.name,
-                if campbell { "campbell" } else { "stationary" },
+                noise.model.scale * 100.0,
+                noise.model.length,
                 chi2 / rows as f64,
                 num / den
             );

@@ -76,7 +76,7 @@ mod tests {
             velocity: 4.0,
             points,
         };
-        let shots = vec![Shot::new(obs, None, WorldParameters::default(), 0.005)];
+        let shots = vec![Shot::new(obs, None, WorldParameters::default())];
         let thin = thin_rows(&shots, 30);
         let path = thin[0].path.as_ref().unwrap();
         assert!(path.row_count() <= 30 && path.row_count() > 0);

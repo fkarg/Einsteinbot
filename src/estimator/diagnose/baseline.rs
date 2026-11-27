@@ -54,8 +54,13 @@ fn diagnose_baseline() {
                 "rebuild" => {
                     let never = AtomicBool::new(false);
                     let started = Instant::now();
-                    let theta =
-                        from_scratch(&case.shots, 32, cores(), &never).expect("not cancelled");
+                    let noise = crate::estimator::noise::Noise::new(
+                        crate::estimator::noise::ModelError::PRIOR,
+                        &[],
+                        &case.shots,
+                    );
+                    let theta = from_scratch(&case.shots, &noise, 32, cores(), &never)
+                        .expect("not cancelled");
                     println!(
                         "QUAL world={id} cfg=rebuild n={n} {} wall={:.1}",
                         quality(&case, n, &theta),

@@ -7,8 +7,9 @@
 //! gated surface-contact term per contact. Jacobians are analytic. The fit is a continuous
 //! Levenberg-Marquardt refinement in logistic coordinates; no grid is searched.
 //!
-//! Evidence is `-chi2/2 - Occam(Laplace) - K ln 20`. The weights built from it are heuristic
-//! rankings, not calibrated probabilities.
+//! Evidence is `-chi2/2 - Occam(Laplace) - K ln 20`, under the noise the shots carry
+//! (`noise.rs`; the same for every map compared, so the log-determinant is left out). The
+//! weights built from it are heuristic rankings, not calibrated probabilities.
 use super::Shot;
 use super::window::PathData;
 use super::work::{Part, Stats, par_map};
@@ -44,7 +45,10 @@ const LM_PATIENCE: usize = 40;
 const PARALLEL_MIN_PLANET_NODES: usize = 40_000;
 /// More threads than this per evaluation do not help (measured: 8 and 16 threads are alike).
 const MAX_EVALUATION_THREADS: usize = 8;
-/// Prior odds against each additional planet.
+/// Prior odds against each additional planet. Not a count prior: a Poisson(24) count prior with
+/// the `K!` label factor adds `+ln 24` per planet, which makes a planet the data do not constrain
+/// (Occam term near 0) free, and the flat-world test grows five such planets in a corner
+/// (P13, `docs/estimator-experiments.md`); a planet must be born from trajectory evidence.
 const PLANET_PRIOR_ODDS: f64 = 20.0;
 
 pub(super) fn planet_at(theta: [f64; 3]) -> Planet {
@@ -90,7 +94,8 @@ pub(super) fn contact_residual(signed: f64, allowance: f64) -> f64 {
 pub(super) struct Unexplained {
     pub position: [f64; 2],
     pub acceleration: [f64; 2],
-    /// Whitened residual magnitude (about 1.25 on average, 1.4 rms, for a correct model and noise).
+    /// Whitened residual (innovation) magnitude (about 1.25 on average, 1.4 rms, for a correct
+    /// model and noise).
     pub significance: f64,
 }
 
@@ -248,7 +253,6 @@ impl<'a> Fit<'a> {
             let mut scratch = vec![0.0; r];
             for j in planets.clone() {
                 let th = &theta[j];
-                let rows = 0..r;
                 let mass = MASS_PER_RADIUS_CUBED * th[2].powi(3);
                 let dmass = 3.0 * MASS_PER_RADIUS_CUBED * th[2].powi(2);
                 let mut derivative: [Vec<f64>; 6] = std::array::from_fn(|_| vec![0.0; r]);
@@ -257,8 +261,8 @@ impl<'a> Fit<'a> {
                     let column = (3 * (j - planets.start) + param) * total;
                     for axis in 0..2 {
                         scratch.copy_from_slice(&derivative[param * 2 + axis]);
-                        path.whiten(axis, &mut scratch, rows.start);
-                        for (i, v) in scratch.iter().enumerate().skip(rows.start) {
+                        path.whiten(axis, &mut scratch);
+                        for (i, v) in scratch.iter().enumerate() {
                             block[column + row + axis * r + i] = -v;
                         }
                     }
@@ -552,7 +556,7 @@ impl<'a> Fit<'a> {
             for axis in 0..2 {
                 path.raw_residual(axis, &field[axis], &mut raw[axis]);
                 white[axis].copy_from_slice(&raw[axis]);
-                path.whiten(axis, &mut white[axis], 0);
+                path.whiten(axis, &mut white[axis]);
             }
             for i in 0..r {
                 out.push(Unexplained {

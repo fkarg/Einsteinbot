@@ -1,11 +1,11 @@
 //! Search over the number of planets K.
 //!
 //! Two pieces share the birth machinery:
-//! - `Search`, the live map. It keeps the current planets, the accumulated paths at two relative
-//!   noise levels and the pending birth work (candidate planets and partial joint refits). A new
-//!   path gets a cheap local refit (`Search::add_path`); `Search::step` does a bounded slice of
-//!   birth work and can be called at any time. A path that arrives between slices does not restart
-//!   the pending work.
+//! - `Search`, the live map. It keeps the current planets, the accumulated paths and the pending
+//!   birth work (candidate planets and partial joint refits). A new path gets a cheap local refit
+//!   (`Search::add_path`); `Search::step` does a bounded slice of birth work and can be called at
+//!   any time. A path that arrives between slices does not restart the pending work. Both work on
+//!   the thinned rows (`rows.rs`) under the noise frozen for the operation (`Slice::noise`).
 //! - `grow` and `prune`, the greedy birth and death descents of the from-scratch cascade
 //!   (`rebuild.rs`).
 //!
@@ -18,6 +18,7 @@
 //! surface constraints.
 use super::Shot;
 use super::fit::{Budget, Evidence, Fit, planet_at, theta_of};
+use super::noise::{Noise, apply};
 use super::rows::thin_rows;
 use super::work::{Part, PartCeilings, Stats, par_map};
 use crate::protocol::Planet;
@@ -41,10 +42,7 @@ pub(super) const DEATH_DEPTH: usize = 6;
 /// Modes closer than this in centre and radius are the same planet.
 const SAME_PLANET: (f64, f64) = (10.0, 3.0);
 
-/// Relative noise levels (times the observed acceleration of a row) the live search goes through,
-/// coarse to fine; the last is the level of the evidence that ranks maps.
-pub(super) const LEVELS: [f64; 2] = [0.02, 0.005];
-/// Rows kept by the live search per level (see `rows.rs`).
+/// Rows kept by the live search (see `rows.rs`).
 const ROW_CAP: usize = 1000;
 /// A new path's local refit frees the planets within this distance of its rows.
 const LOCAL_RADIUS: f64 = 100.0;
@@ -329,17 +327,19 @@ pub(super) struct Slice<'a> {
     pub max_planets: usize,
     pub cancelled: &'a AtomicBool,
     pub stats: &'a Stats,
+    /// The noise of every fit of the slice.
+    pub noise: &'a Noise,
 }
 
 /// The live map and its pending birth work.
 #[derive(Default)]
 pub(super) struct Search {
-    /// Full-row relative shots of every path so far, per level of `LEVELS`.
-    paths: [Vec<Shot>; LEVELS.len()],
+    /// Every path so far (full rows, floor noise).
+    paths: Vec<Shot>,
     /// The current best-estimate planets.
     pub theta: Vec<[f64; 3]>,
-    /// Level the births are searched at; `LEVELS.len()` when nothing is pending.
-    level: usize,
+    /// Birth (or death) work is pending.
+    pending: bool,
     seeded: bool,
     candidates: Vec<Candidate>,
     partials: Vec<Partial>,
@@ -353,18 +353,18 @@ pub(super) struct Search {
 
 impl Search {
     pub(super) fn new() -> Self {
-        Self {
-            level: LEVELS.len(),
-            ..Self::default()
-        }
+        Self::default()
     }
 
     pub(super) fn idle(&self) -> bool {
-        self.level >= LEVELS.len()
+        !self.pending
     }
 
-    fn thin(&self, level: usize) -> Vec<Shot> {
-        thin_rows(&self.paths[level], ROW_CAP)
+    /// The thinned rows of every path under `noise`.
+    fn thin(&self, noise: &Noise) -> Vec<Shot> {
+        let mut shots = thin_rows(&self.paths, ROW_CAP);
+        apply(&mut shots, noise);
+        shots
     }
 
     fn clear_pending(&mut self) {
@@ -374,51 +374,41 @@ impl Search {
         self.deaths_due = false;
     }
 
-    fn next_level(&mut self) {
-        self.level += 1;
+    fn finish(&mut self) {
+        self.pending = false;
         self.clear_pending();
     }
 
     /// Replace the map by an audit's (refit on the paths of a few seconds ago): pending work is
-    /// dropped and the search starts over from the first level.
+    /// dropped and the search starts over.
     pub(super) fn adopt(&mut self, theta: Vec<[f64; 3]>) {
         self.theta = theta;
         self.clear_pending();
-        self.level = 0;
+        self.pending = true;
         self.cap_trial_done = false;
     }
 
     /// A new path: refit the planets within `LOCAL_RADIUS` of its rows (the others are fixed
-    /// field) on the thinned rows of each level, and mark the pending work stale: candidates keep
-    /// their alone fits (re-scored when the next round ranks them) and the joint partials resume
-    /// from where they were.
+    /// field) on the thinned rows, and mark the pending work stale: candidates keep their alone
+    /// fits (re-scored when the next round ranks them) and the joint partials resume from where
+    /// they were.
     pub(super) fn add_path(&mut self, shot: &Shot, slice: &Slice) {
-        for (level, relative) in LEVELS.iter().enumerate() {
-            self.paths[level].push(shot.at_relative_level(WorldParameters::default(), *relative));
-        }
-        let world = WorldParameters::default();
-        for level in 0..LEVELS.len() {
-            if self.theta.is_empty() || slice.cancelled.load(Ordering::Relaxed) {
-                break;
-            }
-            let shots = self.thin(level);
-            let newest = self.paths[level].last().and_then(|s| s.path.as_ref());
-            let near = |t: &[f64; 3]| {
-                newest.is_some_and(|p| {
-                    (0..p.row_count()).any(|r| {
-                        let c = p.center(r);
-                        (t[0] - c[0]).hypot(t[1] - c[1]) < LOCAL_RADIUS
-                    })
+        self.paths.push(shot.clone());
+        let near = |t: &[f64; 3]| {
+            shot.path.as_ref().is_some_and(|p| {
+                (0..p.row_count()).any(|r| {
+                    let c = p.center(r);
+                    (t[0] - c[0]).hypot(t[1] - c[1]) < LOCAL_RADIUS
                 })
-            };
-            let (free, fixed): (Vec<[f64; 3]>, Vec<[f64; 3]>) =
-                self.theta.iter().partition(|t| near(t));
-            if free.is_empty() {
-                continue;
-            }
+            })
+        };
+        let (free, fixed): (Vec<[f64; 3]>, Vec<[f64; 3]>) =
+            self.theta.iter().partition(|t| near(t));
+        if !free.is_empty() && !slice.cancelled.load(Ordering::Relaxed) {
+            let shots = self.thin(slice.noise);
             let local = Fit::new(
                 &shots,
-                world,
+                WorldParameters::default(),
                 slice.cancelled,
                 false,
                 fixed.iter().map(|t| planet_at(*t)).collect(),
@@ -435,7 +425,7 @@ impl Search {
             self.theta = fixed;
             self.theta.extend(refitted.map_or(free, |(t, _)| t));
         }
-        self.level = 0;
+        self.pending = true;
         self.seeded = false;
         self.cap_trial_done = false;
         for partial in &mut self.partials {
@@ -451,6 +441,8 @@ impl Search {
         let (stats, cancelled) = (slice.stats, slice.cancelled);
         let first = stats.evaluations();
         let mut changed = false;
+        // The paths and the noise do not change within a slice.
+        let shots = self.thin(slice.noise);
         while !self.idle()
             && stats.evaluations() - first < slice.evaluations
             && Instant::now() < slice.deadline
@@ -461,14 +453,13 @@ impl Search {
                 // At the cap no birth is attempted, but a map holding a spurious planet must not
                 // freeze there: one death trial per path, whose success frees a slot.
                 if self.cap_trial_done {
-                    self.level = LEVELS.len();
+                    self.pending = false;
                     break;
                 }
                 self.cap_trial_done = true;
                 self.deaths_due = true;
                 continue;
             }
-            let shots = self.thin(self.level);
             let joint = Fit::new(&shots, world, cancelled, true, vec![])
                 .with_deadline(slice.deadline)
                 .with_stats(stats);
@@ -526,7 +517,7 @@ impl Search {
                 self.candidates.truncate(MAX_CANDIDATES);
                 self.seeded = true;
                 if self.candidates.is_empty() {
-                    self.next_level();
+                    self.finish();
                 }
                 continue;
             }
@@ -609,7 +600,7 @@ impl Search {
                     })
                     .collect();
                 if self.partials.is_empty() {
-                    self.next_level();
+                    self.finish();
                     continue;
                 }
             }
@@ -679,7 +670,7 @@ impl Search {
                     self.seeded = false;
                 }
                 _ if deaths => self.partials.clear(),
-                _ => self.next_level(),
+                _ => self.finish(),
             }
         }
         changed
@@ -689,6 +680,7 @@ impl Search {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::estimator::noise::ModelError;
     use crate::map::PlanetMap;
     use crate::protocol::Point;
     use crate::simulation::{ShotObservation, simulate_shot};
@@ -733,13 +725,17 @@ mod tests {
                 },
                 None,
                 world,
-                0.0,
             )
         })
         .collect()
     }
 
-    fn slice<'a>(cancelled: &'a AtomicBool, stats: &'a Stats, evaluations: u64) -> Slice<'a> {
+    fn slice<'a>(
+        cancelled: &'a AtomicBool,
+        stats: &'a Stats,
+        noise: &'a Noise,
+        evaluations: u64,
+    ) -> Slice<'a> {
         Slice {
             evaluations,
             deadline: Instant::now() + Duration::from_secs(60),
@@ -747,25 +743,27 @@ mod tests {
             max_planets: 24,
             cancelled,
             stats,
+            noise,
         }
     }
 
     /// A path that arrives mid-search is absorbed: the pending candidates survive it and the
-    /// search starts over from the first level.
+    /// search has work again.
     #[test]
     fn a_new_path_keeps_pending_work() {
         let (cancelled, stats) = (AtomicBool::new(false), Stats::default());
+        let noise = Noise::new(ModelError::PRIOR, &[], &shots());
         let shots = shots();
         let mut search = Search::new();
-        search.add_path(&shots[0], &slice(&cancelled, &stats, 20));
-        search.add_path(&shots[1], &slice(&cancelled, &stats, 20));
+        search.add_path(&shots[0], &slice(&cancelled, &stats, &noise, 20));
+        search.add_path(&shots[1], &slice(&cancelled, &stats, &noise, 20));
         // Enough work for seeds and alone fits, not for a joint refit to settle.
-        search.step(&slice(&cancelled, &stats, 20));
+        search.step(&slice(&cancelled, &stats, &noise, 20));
         assert!(!search.candidates.is_empty() && !search.idle());
         let pending = search.candidates.len();
-        search.add_path(&shots[2], &slice(&cancelled, &stats, 20));
+        search.add_path(&shots[2], &slice(&cancelled, &stats, &noise, 20));
         assert_eq!(search.candidates.len(), pending);
-        assert_eq!(search.level, 0);
+        assert!(search.pending);
     }
 
     /// Slices make progress and the search ends idle with planets found; at the planet cap no
@@ -773,13 +771,14 @@ mod tests {
     #[test]
     fn slices_grow_the_map_until_idle() {
         let (cancelled, stats) = (AtomicBool::new(false), Stats::default());
+        let noise = Noise::new(ModelError::PRIOR, &[], &shots());
         let mut search = Search::new();
         for shot in &shots() {
-            search.add_path(shot, &slice(&cancelled, &stats, 300));
+            search.add_path(shot, &slice(&cancelled, &stats, &noise, 300));
         }
         let mut rounds = 0;
         while !search.idle() && rounds < 200 {
-            search.step(&slice(&cancelled, &stats, 300));
+            search.step(&slice(&cancelled, &stats, &noise, 300));
             rounds += 1;
         }
         assert!(search.idle(), "not idle after {rounds} slices");
@@ -787,9 +786,9 @@ mod tests {
 
         let mut capped = Search::new();
         for shot in &shots() {
-            capped.add_path(shot, &slice(&cancelled, &stats, 300));
+            capped.add_path(shot, &slice(&cancelled, &stats, &noise, 300));
         }
-        let mut limited = slice(&cancelled, &stats, 300);
+        let mut limited = slice(&cancelled, &stats, &noise, 300);
         limited.max_planets = 0;
         capped.step(&limited);
         assert!(capped.idle() && capped.theta.is_empty());

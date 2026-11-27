@@ -1,12 +1,13 @@
 //! Background audit of the maintained map: a from-scratch map (`rebuild::from_scratch`) on a
 //! snapshot of the paths, adopted only if its evidence beats the maintained map's on all the rows
-//! known when the rebuild is done. Both halves (the rebuild, then the comparison) run on their
+//! known when the rebuild is done, under the noise of that moment. Both halves (the rebuild, then the comparison) run on their
 //! own threads, so an audit never delays the publication of a map; the estimator collects a
 //! finished half between slices.
 use super::Shot;
 use super::fit::{Budget, Fit, theta_of};
+use super::noise::{Noise, with_noise};
 use super::rebuild::from_scratch;
-use super::search::{LEVELS, refit};
+use super::search::refit;
 use crate::simulation::WorldParameters;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,32 +40,34 @@ pub(super) struct Audit {
 }
 
 impl Audit {
-    /// Start building a map from scratch on the paths `shots` (exact, full rows). The result is
-    /// compared with the maintained map by `compare`, on the paths known when it is done: a map
-    /// built from the paths of minutes ago must not be compared (or adopted) on those.
-    pub(super) fn rebuild(shots: Vec<Shot>, max_planets: usize, threads: usize) -> Self {
+    /// Start building a map from scratch on the paths `shots` (floor noise, full rows) under
+    /// `noise`. The result is compared with the maintained map by `compare`, on the paths known
+    /// when it is done: a map built from the paths of minutes ago must not be compared (or
+    /// adopted) on those.
+    pub(super) fn rebuild(
+        shots: Vec<Shot>,
+        noise: Noise,
+        max_planets: usize,
+        threads: usize,
+    ) -> Self {
         Self::spawn(Stage::Rebuild, move |cancelled| {
-            from_scratch(&shots, max_planets, threads, cancelled)
+            from_scratch(&shots, &noise, max_planets, threads, cancelled)
         })
     }
 
-    /// Start comparing `candidate` with `maintained` on all of `shots`: both refit on all rows at
-    /// the finest relative level, the maintained one is what the candidate has to beat there (the
-    /// candidate's polish already ran at that level). The result is the refit candidate if its
+    /// Start comparing `candidate` with `maintained` on all of `shots` under `noise` (both maps
+    /// see the same noise): both refit on all rows, and the result is the refit candidate if its
     /// evidence is higher.
     pub(super) fn compare(
         shots: Vec<Shot>,
+        noise: Noise,
         maintained: Vec<[f64; 3]>,
         candidate: Vec<[f64; 3]>,
         threads: usize,
     ) -> Self {
         Self::spawn(Stage::Compare, move |cancelled| {
             let world = WorldParameters::default();
-            let level = LEVELS[LEVELS.len() - 1];
-            let rows: Vec<Shot> = shots
-                .iter()
-                .map(|shot| shot.at_relative_level(world, level))
-                .collect();
+            let rows = with_noise(&shots, &noise);
             let joint = Fit::new(&rows, world, cancelled, true, vec![]);
             let budget = Budget {
                 evaluations: REFIT_EVALUATIONS,
