@@ -18,6 +18,8 @@
 //! correction is below `GATE_ACCELERATION`, nothing is built or applied (`ResidualGate`).
 use super::Shot;
 use super::noise::{ModelError, Noise};
+use super::window::PathData;
+use super::work::par_map;
 use crate::map::Vec2;
 use crate::protocol::Planet;
 use crate::simulation::WorldParameters;
@@ -134,11 +136,12 @@ struct Row {
 }
 
 /// The correction for the map `planets` from the paths of `shots` under `noise` (built from the
-/// same map and paths).
+/// same map and paths), on up to `threads` threads (the result does not depend on them).
 pub(super) fn build(
     planets: &[Planet],
     shots: &[Shot],
     noise: &Noise,
+    threads: usize,
 ) -> Result<ResidualCorrection, ResidualGate> {
     if peak_sd(noise) < GATE_ACCELERATION {
         return Err(if noise.rho0 > 0.0 {
@@ -148,8 +151,9 @@ pub(super) fn build(
         });
     }
     let excess = noise.model.white * noise.model.white;
-    let mut rows = Vec::new();
-    for path in shots.iter().filter_map(|shot| shot.path.as_ref()) {
+    let paths: Vec<&PathData> = shots.iter().filter_map(|shot| shot.path.as_ref()).collect();
+    // Paths are smoothed independently, so in parallel; the rows keep the path order.
+    let rows: Vec<Row> = par_map(&paths, threads, |path| {
         let n = path.row_count();
         let mut prediction = [vec![0.0; n], vec![0.0; n]];
         for p in planets {
@@ -165,7 +169,7 @@ pub(super) fn build(
             })
             .collect();
         if missing.iter().all(|m| *m) {
-            continue;
+            return Vec::new();
         }
         let shape: Vec<(f64, f64)> = centers.iter().map(|c| noise.shape(*c)).collect();
         let means = [0, 1].map(|axis| {
@@ -183,14 +187,18 @@ pub(super) fn build(
                 .collect();
             smooth(&path.floor().arc, &shape, &ticks, &white, &missing, &raw)
         });
-        for r in (0..n).filter(|r| !missing[*r]) {
-            rows.push(Row {
+        (0..n)
+            .filter(|r| !missing[*r])
+            .map(|r| Row {
                 center: centers[r],
                 mean: [means[0][r], means[1][r]],
                 length: shape[r].1,
-            });
-        }
-    }
+            })
+            .collect()
+    })
+    .into_iter()
+    .flatten()
+    .collect();
     if rows.is_empty() {
         return Err(ResidualGate::NoEvidence);
     }

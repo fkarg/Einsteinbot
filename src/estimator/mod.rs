@@ -42,7 +42,7 @@ use crate::simulation::{ShotObservation, WorldParameters};
 use crate::strategy::MapBelief;
 use audit::{Audit, Stage};
 use fit::{CONTACT_FULL, Evidence, Fit, planet_at};
-use noise::{ModelError, Noise};
+use noise::{ModelError, Noise, TickMask};
 use search::{Search, Slice};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -169,6 +169,9 @@ pub struct Estimator {
     /// Every path of the map epoch. Their noise is whatever the last polish set; every user sets
     /// the noise it needs (`noise::apply`, `with_noise`).
     shots: Vec<Shot>,
+    /// The ticks of the first paths of `shots` stamped on the candidate-centre raster (extended
+    /// path by path; every noise of the epoch starts from it).
+    mask: TickMask,
     /// Prequential residuals of the latest paths (at most `noise::WINDOW`).
     series: Vec<noise::Series>,
     /// The model-error scalars of the current fits: estimated from `series` without the latest
@@ -198,6 +201,7 @@ impl Default for Estimator {
         Self {
             players: BTreeMap::new(),
             shots: Vec::new(),
+            mask: TickMask::new(WorldParameters::default()),
             series: Vec::new(),
             model: ModelError::PRIOR,
             search: Search::new(),
@@ -282,7 +286,8 @@ impl Estimator {
             // seen it; its residuals join the window for the next path.
             let started = Instant::now();
             let maintained = self.maintained_planets();
-            let mut noise = Noise::new(self.model, &maintained, &self.shots[..=self.searched]);
+            self.mask.cover(&self.shots[..=self.searched]);
+            let mut noise = Noise::with_mask(self.model, &maintained, &self.mask);
             let current = self.shots[self.searched]
                 .path
                 .as_ref()
@@ -473,8 +478,9 @@ impl Estimator {
 
     /// The noise of an operation starting now: the current model-error estimate, shaped by the
     /// maintained map and every path.
-    fn noise(&self) -> Noise {
-        Noise::new(self.model, &self.maintained_planets(), &self.shots)
+    fn noise(&mut self) -> Noise {
+        self.mask.cover(&self.shots);
+        Noise::with_mask(self.model, &self.maintained_planets(), &self.mask)
     }
 
     /// Forget the map epoch's evidence. Player positions survive: the server announces a
@@ -490,7 +496,6 @@ impl Estimator {
     /// The belief of the map `theta`; `evidence` is its exact evidence when that was computed.
     fn publish(&mut self, theta: &[[f64; 3]], evidence: Option<Evidence>) -> MapBelief {
         let started = Instant::now();
-        let world = WorldParameters::default();
         let planets: Vec<_> = theta.iter().map(|th| planet_at(*th)).collect();
         let mut belief = MapBelief::new(PlanetMap { planets }, None);
         belief.covariance_unavailable_reason = match (theta.is_empty(), evidence) {
@@ -519,12 +524,6 @@ impl Estimator {
         } else {
             self.limit
         };
-        let observations = self
-            .shots
-            .iter()
-            .map(|shot| shot.obs.clone())
-            .collect::<Vec<_>>();
-        belief.model_position_rmse = position_rmse(&belief.map, &observations, world).ok();
         for contact in self.shots.iter().filter_map(|shot| shot.contact.as_ref()) {
             if !belief.contact_points.contains(&contact.point) {
                 belief.contact_points.push(contact.point.clone());
@@ -547,9 +546,15 @@ impl Estimator {
         self.stats.add(Part::Diagnostics, started.elapsed());
         // The correction must match the published map (a birth explains part of the residual).
         let started = Instant::now();
-        let noise = Noise::new(self.model, &belief.map.planets, &self.shots);
+        self.mask.cover(&self.shots);
+        let noise = Noise::with_mask(self.model, &belief.map.planets, &self.mask);
         belief.residual_model = Some(self.model.into());
-        match residual::build(&belief.map.planets, &self.shots, &noise) {
+        match residual::build(
+            &belief.map.planets,
+            &self.shots,
+            &noise,
+            self.settings.threads,
+        ) {
             Ok(correction) => {
                 belief.residual_correction = Some(correction);
                 belief.residual_correction_unavailable_reason = None;
@@ -589,7 +594,10 @@ pub fn residual_correction(
         noise::estimate(&series, None)
     });
     let noise = Noise::new(model, &map.planets, &shots);
-    (model.into(), residual::build(&map.planets, &shots, &noise))
+    (
+        model.into(),
+        residual::build(&map.planets, &shots, &noise, cores()),
+    )
 }
 
 #[cfg(test)]

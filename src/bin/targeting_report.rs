@@ -238,6 +238,9 @@ struct PlanetReplay {
     total_fits: usize,
     shots: usize,
     errors: Vec<f64>,
+    /// Position RMSE of the last fit over the epoch's paths (computed here: the live estimator
+    /// no longer publishes it).
+    last_rmse: Option<f64>,
     last_map: Option<einsteinbot::map::PlanetMap>,
     future_errors: Vec<f64>,
     future_flat_errors: Vec<f64>,
@@ -256,7 +259,13 @@ impl PlanetReplay {
         let belief = self.estimator.settle(&never).unwrap_or(local);
         self.fits += 1;
         self.total_fits += 1;
-        if let Some(error) = belief.model_position_rmse {
+        self.last_rmse = einsteinbot::estimator::position_rmse(
+            &belief.map,
+            &self.seen,
+            einsteinbot::simulation::WorldParameters::default(),
+        )
+        .ok();
+        if let Some(error) = self.last_rmse {
             self.errors.push(error);
         }
         self.last_map = Some(belief.map.clone());
@@ -351,8 +360,7 @@ impl PlanetReplay {
                 .map_weight
                 .map(|x| format!("{x:.3}"))
                 .unwrap_or_else(|| "unavailable".to_owned()),
-            belief
-                .model_position_rmse
+            self.last_rmse
                 .map(|x| format!("{x:.6}"))
                 .unwrap_or_else(|| "unavailable".to_owned()),
             belief.parameter_covariance.is_some(),

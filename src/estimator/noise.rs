@@ -26,6 +26,8 @@ use super::Shot;
 use super::window::PathData;
 use crate::protocol::Planet;
 use crate::simulation::WorldParameters;
+use std::cell::RefCell;
+use std::collections::HashMap;
 
 /// Prior (and starting) model-error scalars; `diagnose_matern_model_error` estimated
 /// `scale` 0.056-0.10 and `length` 500-900, and the Campbell prior for 4 unseen planets gives
@@ -71,10 +73,117 @@ impl ModelError {
     }
 }
 
+/// The raster of candidate centres with the battlefield inside `CLEARANCE` free and every
+/// observed tick's `CLEARANCE` disk stamped out. Ticks only accumulate within a map epoch, so the
+/// estimator extends one mask path by path (`cover`) instead of stamping every tick of every path
+/// for each operation; stamping is order-independent, so the result is the same.
+#[derive(Clone, Debug)]
+pub(super) struct TickMask {
+    nx: usize,
+    ny: usize,
+    /// Raster nodes before the first battlefield node, per axis.
+    offset: [usize; 2],
+    free: Vec<bool>,
+    /// Paths whose ticks are stamped (the first ones of the slice given to `cover`).
+    paths: usize,
+}
+
+impl TickMask {
+    pub fn new(world: WorldParameters) -> Self {
+        // Battlefield nodes `ORIGIN + SPACING * k` below `extent - CLEARANCE`, plus the margin.
+        let count =
+            |extent: f64| ((extent - CLEARANCE - ORIGIN) / SPACING).ceil().max(0.0) as usize;
+        let inside = [
+            count(world.battlefield_width),
+            count(world.battlefield_height),
+        ];
+        let pad = ((world.margin + ORIGIN) / SPACING).ceil() as usize;
+        let (nx, ny) = (inside[0] + 2 * pad, inside[1] + 2 * pad);
+        let mut free = vec![false; nx * ny];
+        for j in pad..pad + inside[1] {
+            free[j * nx + pad..j * nx + pad + inside[0]].fill(true);
+        }
+        Self {
+            nx,
+            ny,
+            offset: [pad, pad],
+            free,
+            paths: 0,
+        }
+    }
+
+    /// The mask of the ticks of the paths `shots`.
+    pub fn of(shots: &[Shot]) -> Self {
+        let mut mask = Self::new(WorldParameters::default());
+        mask.cover(shots);
+        mask
+    }
+
+    /// Make the mask that of the paths `shots`: stamp the ticks of the paths not stamped yet (a
+    /// mask that already covers more paths than `shots` is rebuilt).
+    pub fn cover(&mut self, shots: &[Shot]) {
+        if self.paths > shots.len() {
+            *self = Self::of(shots);
+            return;
+        }
+        for path in shots[self.paths..]
+            .iter()
+            .filter_map(|shot| shot.path.as_ref())
+        {
+            for t in &path.ticks {
+                stamp(
+                    &mut self.free,
+                    self.nx,
+                    self.ny,
+                    self.offset,
+                    t[0],
+                    t[1],
+                    CLEARANCE,
+                );
+            }
+        }
+        self.paths = shots.len();
+    }
+
+    #[cfg(test)]
+    fn stamp_ticks<'a>(&mut self, ticks: impl Iterator<Item = &'a [f64; 2]>) {
+        for t in ticks {
+            stamp(
+                &mut self.free,
+                self.nx,
+                self.ny,
+                self.offset,
+                t[0],
+                t[1],
+                CLEARANCE,
+            );
+        }
+    }
+}
+
+/// Mark the raster nodes within `radius` of `(x, y)` as not free.
+fn stamp(free: &mut [bool], nx: usize, ny: usize, offset: [usize; 2], x: f64, y: f64, radius: f64) {
+    let position = |k: usize, axis: usize| ORIGIN + SPACING * (k as f64 - offset[axis] as f64);
+    let range = |c: f64, axis: usize, n: usize| {
+        let node = |v: f64| (v - ORIGIN) / SPACING + offset[axis] as f64;
+        let lo = node(c - radius).ceil().clamp(0.0, n as f64) as usize;
+        let hi = (node(c + radius).floor() + 1.0).clamp(0.0, n as f64) as usize;
+        (lo, hi)
+    };
+    let ((i0, i1), (j0, j1)) = (range(x, 0, nx), range(y, 1, ny));
+    for j in j0..j1 {
+        for i in i0..i1 {
+            if (position(i, 0) - x).hypot(position(j, 1) - y) <= radius {
+                free[j * nx + i] = false;
+            }
+        }
+    }
+}
+
 /// The admissible region `U` of unseen planet centres on a `SPACING` raster: inside the
 /// battlefield by `CLEARANCE`, farther than `radius + CLEARANCE` from every found planet and
-/// farther than `CLEARANCE` from every observed tick. Distances come from an exact Euclidean
-/// distance transform with nearest-node tracking.
+/// farther than `CLEARANCE` from every observed tick (`TickMask`). Distances come from an exact
+/// Euclidean distance transform with nearest-node tracking.
 #[derive(Clone, Debug)]
 pub(super) struct Admissible {
     nx: usize,
@@ -88,47 +197,11 @@ pub(super) struct Admissible {
 }
 
 impl Admissible {
-    pub fn new<'a>(
-        planets: &[Planet],
-        ticks: impl Iterator<Item = &'a [f64; 2]>,
-        world: WorldParameters,
-    ) -> Self {
-        // Battlefield nodes `ORIGIN + SPACING * k` below `extent - CLEARANCE`, plus the margin.
-        let count =
-            |extent: f64| ((extent - CLEARANCE - ORIGIN) / SPACING).ceil().max(0.0) as usize;
-        let inside = [
-            count(world.battlefield_width),
-            count(world.battlefield_height),
-        ];
-        let pad = ((world.margin + ORIGIN) / SPACING).ceil() as usize;
-        let offset = [pad, pad];
-        let (nx, ny) = (inside[0] + 2 * pad, inside[1] + 2 * pad);
-        let mut free = vec![false; nx * ny];
-        for j in pad..pad + inside[1] {
-            free[j * nx + pad..j * nx + pad + inside[0]].fill(true);
-        }
-        let position = |k: usize, axis: usize| ORIGIN + SPACING * (k as f64 - offset[axis] as f64);
-        let mut stamp = |x: f64, y: f64, radius: f64| {
-            let range = |c: f64, axis: usize, n: usize| {
-                let node = |v: f64| (v - ORIGIN) / SPACING + offset[axis] as f64;
-                let lo = node(c - radius).ceil().clamp(0.0, n as f64) as usize;
-                let hi = (node(c + radius).floor() + 1.0).clamp(0.0, n as f64) as usize;
-                (lo, hi)
-            };
-            let ((i0, i1), (j0, j1)) = (range(x, 0, nx), range(y, 1, ny));
-            for j in j0..j1 {
-                for i in i0..i1 {
-                    if (position(i, 0) - x).hypot(position(j, 1) - y) <= radius {
-                        free[j * nx + i] = false;
-                    }
-                }
-            }
-        };
+    pub fn new(planets: &[Planet], mask: &TickMask) -> Self {
+        let (nx, ny, offset) = (mask.nx, mask.ny, mask.offset);
+        let mut free = mask.free.clone();
         for p in planets {
-            stamp(p.x, p.y, p.radius + CLEARANCE);
-        }
-        for t in ticks {
-            stamp(t[0], t[1], CLEARANCE);
+            stamp(&mut free, nx, ny, offset, p.x, p.y, p.radius + CLEARANCE);
         }
         Self {
             nx,
@@ -265,11 +338,12 @@ pub(super) struct Noise {
 impl Noise {
     /// The noise for the map `planets` (the maintained one) and the paths `shots`.
     pub fn new(model: ModelError, planets: &[Planet], shots: &[Shot]) -> Self {
-        let ticks = shots
-            .iter()
-            .filter_map(|shot| shot.path.as_ref())
-            .flat_map(|path| path.ticks.iter());
-        let admissible = Admissible::new(planets, ticks, WorldParameters::default());
+        Self::with_mask(model, planets, &TickMask::of(shots))
+    }
+
+    /// As `new`, with the paths' ticks already stamped in `mask`.
+    pub fn with_mask(model: ModelError, planets: &[Planet], mask: &TickMask) -> Self {
+        let admissible = Admissible::new(planets, mask);
         let unseen = (PLANETS_EXPECTED - planets.len() as f64).max(MIN_UNSEEN);
         // An empty `U` (every candidate centre excluded) gives `rho0 = 0` and an infinite distance
         // everywhere: no process (sd 0, infinite length), so the gains carry the floor alone.
@@ -485,6 +559,10 @@ pub(super) struct Series {
     /// that planet's parameter error (or by a wrong planet), not by the field of unseen planets,
     /// so the estimate treats them as missing.
     missing: Vec<bool>,
+    /// `log_likelihood` by the bits of the model it was evaluated at. A series stays in the
+    /// window for several paths, and every estimate's pattern search starts from the prior with
+    /// the same steps, so it revisits many models; the cached value is the same computation.
+    cache: RefCell<HashMap<[u64; 3], f64>>,
 }
 
 impl Series {
@@ -512,15 +590,23 @@ impl Series {
             distance: (0..rows).map(|r| noise.distance(path.center(r))).collect(),
             raw,
             missing,
+            cache: Default::default(),
         }
     }
 
     /// Gaussian log-likelihood of the residuals under `model` (without the `2 pi` constant).
     pub fn log_likelihood(&self, model: ModelError) -> f64 {
-        self.innovations(model)
+        let key = [model.scale, model.length, model.white].map(f64::to_bits);
+        if let Some(value) = self.cache.borrow().get(&key) {
+            return *value;
+        }
+        let value = self
+            .innovations(model)
             .into_iter()
             .map(|(v, log_det)| -0.5 * (v.iter().map(|x| x * x).sum::<f64>() + log_det))
-            .sum()
+            .sum();
+        self.cache.borrow_mut().insert(key, value);
+        value
     }
 
     /// Normalized innovations of each axis under `model` (0 at missing rows) and their
@@ -547,6 +633,7 @@ impl Series {
         for (m, extra) in self.missing.iter_mut().zip(missing) {
             *m |= *extra;
         }
+        self.cache.borrow_mut().clear();
     }
 
     #[cfg(test)]
@@ -812,6 +899,7 @@ mod tests {
             distance: vec![f64::INFINITY; n],
             raw,
             missing: vec![false; n],
+            cache: Default::default(),
         };
         let injected = 2e-3;
         let noisy = series([0, 1].map(|_| (0..n).map(|_| injected * gaussian()).collect()));
@@ -921,6 +1009,36 @@ mod tests {
         }
     }
 
+    /// Extending the tick mask path by path gives the mask of all the paths at once, and a mask
+    /// that covers more paths than asked for is rebuilt.
+    #[test]
+    fn tick_mask_extended_path_by_path_equals_the_mask_of_all_paths() {
+        let shot = |dx: f32, dy: f32| {
+            let points: Vec<Point> = (0..60)
+                .map(|i| Point {
+                    x: 300.0 + dx * i as f32,
+                    y: 400.0 + dy * i as f32 + 0.01 * (i * i) as f32,
+                })
+                .collect();
+            let obs = crate::simulation::ShotObservation {
+                player_id: 1,
+                angle_degrees: 0.0,
+                velocity: 3.0,
+                points,
+            };
+            Shot::new(obs, None, WorldParameters::default())
+        };
+        let shots = [shot(4.0, 1.0), shot(-2.0, 5.0), shot(6.0, -3.0)];
+        let mut mask = TickMask::new(WorldParameters::default());
+        for n in 1..=shots.len() {
+            mask.cover(&shots[..n]);
+        }
+        assert_eq!(mask.free, TickMask::of(&shots).free);
+        assert!(mask.free != TickMask::of(&shots[..1]).free);
+        mask.cover(&shots[..1]);
+        assert_eq!(mask.free, TickMask::of(&shots[..1]).free);
+    }
+
     /// The distance transform gives the brute-force distance to the nearest admissible node.
     #[test]
     fn admissible_distance_matches_brute_force() {
@@ -938,7 +1056,9 @@ mod tests {
             })
             .chain((0..300).map(|i| [-200.0 + 3.0 * i as f64, 1300.0 - 2.5 * i as f64]))
             .collect();
-        let admissible = Admissible::new(&planets, ticks.iter(), world);
+        let mut mask = TickMask::new(world);
+        mask.stamp_ticks(ticks.iter());
+        let admissible = Admissible::new(&planets, &mask);
         let mut nodes = Vec::new();
         let mut y = ORIGIN;
         while y < world.battlefield_height - CLEARANCE {
@@ -986,12 +1106,11 @@ mod tests {
         assert!(worst < 1e-9, "worst difference {worst}");
         let empty = Admissible::new(
             &[],
-            std::iter::empty(),
-            WorldParameters {
+            &TickMask::new(WorldParameters {
                 battlefield_width: 30.0,
                 battlefield_height: 30.0,
                 ..world
-            },
+            }),
         );
         assert_eq!(empty.distance([10.0, 10.0]), f64::INFINITY);
     }

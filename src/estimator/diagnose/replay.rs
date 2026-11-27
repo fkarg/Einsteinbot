@@ -143,7 +143,10 @@ fn replay_schedule(case: &Case, settings: Settings, period: u64) {
             theta.len()
         );
     };
-    let mut worst_lag = 0.0_f64;
+    let mut lags = Vec::with_capacity(total);
+    let mut max_queued = 0;
+    // Serial per-path phases of `observe` (ms) once the epoch has many paths (n > total / 2).
+    let mut late: BTreeMap<Part, Vec<f64>> = BTreeMap::new();
     for n in 1..=total {
         let arrival = t0 + period * (n as u32 - 1);
         while Instant::now() < arrival {
@@ -157,10 +160,27 @@ fn replay_schedule(case: &Case, settings: Settings, period: u64) {
             }
         }
         let started = Instant::now();
+        let queued = (n..total)
+            .take_while(|k| t0 + period * *k as u32 <= started)
+            .count();
+        max_queued = max_queued.max(queued);
         estimator.observe(&event_of(&case.shots[n - 1]), &never);
         slow_step(&estimator, started, &id, n);
-        let lag = arrival.elapsed().as_secs_f64() * 1e3;
-        worst_lag = worst_lag.max(lag);
+        lags.push(arrival.elapsed().as_secs_f64() * 1e3);
+        if 2 * n > total {
+            for part in [
+                Part::Noise,
+                Part::Diagnostics,
+                Part::ResidualCorrection,
+                Part::WarmRefit,
+            ] {
+                let ms = estimator
+                    .last_report()
+                    .and_then(|r| r.part(part))
+                    .map_or(0.0, |p| p.total_ms);
+                late.entry(part).or_default().push(ms);
+            }
+        }
         timeline(&estimator, n, "path");
     }
     // The tail: one more period of slices after the last path.
@@ -169,10 +189,29 @@ fn replay_schedule(case: &Case, settings: Settings, period: u64) {
         estimator.step(&never);
         timeline(&estimator, total, "slice");
     }
+    let quantile = |values: &mut Vec<f64>, q: f64| {
+        values.sort_by(f64::total_cmp);
+        values
+            .get(((values.len() as f64 * q).ceil() as usize).saturating_sub(1))
+            .copied()
+            .unwrap_or(0.0)
+    };
+    let worst_lag = quantile(&mut lags, 1.0);
     println!(
-        "TLEND world={id} cfg={name} period_ms={} worst_publish_lag_ms={worst_lag:.0}",
-        period.as_millis()
+        "TLEND world={id} cfg={name} period_ms={} worst_publish_lag_ms={worst_lag:.0} p90_lag_ms={:.0} median_lag_ms={:.0} max_queued={max_queued}",
+        period.as_millis(),
+        quantile(&mut lags, 0.9),
+        quantile(&mut lags, 0.5),
     );
+    for (part, mut ms) in late {
+        println!(
+            "LATE world={id} cfg={name} part={} median_ms={:.1} p90_ms={:.1} max_ms={:.1}",
+            part.name(),
+            quantile(&mut ms, 0.5),
+            quantile(&mut ms, 0.9),
+            quantile(&mut ms, 1.0)
+        );
+    }
     println!(
         "QUAL world={id} cfg={name} n={total} {}",
         quality(case, total, &belief_theta(&estimator))

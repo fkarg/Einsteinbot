@@ -562,7 +562,8 @@ fn non_finite_shots_are_ignored_without_panicking() {
     assert!(estimator.shots.is_empty());
     let belief = estimator.observe_settled(&good_shot(), &cancelled).unwrap();
     assert!(belief.map.planets.is_empty());
-    assert!(belief.model_position_rmse.is_some_and(f64::is_finite));
+    // Not computed live (P18): absent means unavailable.
+    assert!(belief.model_position_rmse.is_none());
 }
 
 // A mode at the radius bound has no trustworthy Gaussian approximation: no covariance, never a
