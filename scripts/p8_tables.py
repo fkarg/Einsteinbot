@@ -2,7 +2,7 @@
 """Tables for docs/estimator-experiments.md "P8 results" from the QUAL lines of the diagnose_baseline
 and diagnose_incremental harnesses (src/estimator/diagnose/baseline.rs, incremental.rs).
 
-usage: p8_tables.py {rows,summary,csv} OUTPUT_FILE...
+usage: p8_tables.py {rows,summary,csv} OUTPUT_FILE... [--min-paths N] [--max-paths N]
 
 Methods (cfg): flat, prod (default Estimator, per-update evaluation limit), rebuild (E9 cascade +
 E9c guarded polish), and optionally B* (a cfg starting with "lv=": raw) and its guarded exact
@@ -129,7 +129,17 @@ def summary(worlds):
             n = sum(c.values())
             cells.append(f"{c['better']} / {c['equal']} / {c['worse']} (n={n})" if n else "n/a")
         print(f"| {label[a]} vs {label[b]} | " + " | ".join(cells) + " |")
-    print("\nCaptures where the first method is worse:\n")
+    print("\nCaptures where the first method is worse on at least one of recall(2), recall(15), chi2 ratio, field explored, unexplored, whole (spurious planets excluded: flat has none by construction):\n")
+    core = [m for m in METRICS if m[0] != "spur"]
+    for a, b in pairs:
+        bad, both = [], 0
+        for w, ms in worlds.items():
+            if a in ms and b in ms:
+                both += 1
+                if any(compare(k, metrics(ms[a])[k], metrics(ms[b])[k], h) == "worse" for k, _, h in core):
+                    bad.append(w.split("_")[1])
+        print(f"- {label[a]} vs {label[b]}: worse somewhere in {len(bad)} of {both} captures ({', '.join(sorted(bad, key=int))})")
+    print("\nCaptures where the first method is worse, by metric:\n")
     for (a, b, key), caps in sorted(notbetter.items()):
         print(f"- {label[a]} vs {label[b]}, {key}: {', '.join(sorted(caps, key=int))}")
 
@@ -147,5 +157,13 @@ def write_csv(worlds):
 if __name__ == "__main__":
     if len(sys.argv) < 3 or sys.argv[1] not in ("rows", "summary", "csv"):
         sys.exit(__doc__)
-    w = load(sys.argv[2:])
+    args = sys.argv[2:]
+    lo, hi = 0, 10**9
+    for flag in ("--min-paths", "--max-paths"):
+        if flag in args:
+            i = args.index(flag)
+            v = int(args[i + 1])
+            lo, hi = (v, hi) if flag == "--min-paths" else (lo, v)
+            del args[i : i + 2]
+    w = {k: v for k, v in load(args).items() if lo <= int(next(iter(v.values()))["n"]) <= hi}
     {"rows": rows, "summary": summary, "csv": write_csv}[sys.argv[1]](w)

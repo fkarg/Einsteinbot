@@ -588,3 +588,242 @@ Setup. Every capture: the first map epoch, at most 61 paths (`PATHS=60`, as in P
 Sanity checks (observed). The cascade reproduces the E9c C numbers where they overlap: capture 40 recall(2) 20 with chi2 ratio 460 (E9c: 20, 460), capture 45 recall(2) 16 (E9c: 16), capture 33 recall(2) 18 (E9c: 18); B* at 61 paths matches P6's live dev picture (21-22 of 24 on 33 and 45). The cascade is better than flat in the explored area on all three (0.17, 1e-4, 0.2 of the flat error). It is not better than flat in the unexplored area (1.26-2.5x flat) or whole field on 45: a published map with a few wrong or missing planets is worse than flat away from the data, as found in P6. The production search is worse than flat even in the explored area on capture 33 (2.75x flat, 17 spurious planets, recall(2) 2 of 24) although it spent 122k evaluations.
 
 Stage-2 estimate (written before the launch). Pilot cost per capture with all 61 paths: (a)-(c) 530-1390 s at 8 threads (prod 460-1270 s dominates, the cascade 70-120 s), (d) 1-5 minutes at 2 threads. The production search is mostly single-threaded (it used about 2.4 cores of 8). Stage 2 is 29 captures (14 with 61 paths, the others fewer); run as a queue of 8 captures at a time at 4 threads each (32 threads on jolly, P7 using up to 16 more); expected about 29 x 15 min / 8 = 1 to 1.5 hours wall, longer if jolly stays loaded. Launched 11:50 UTC.
+
+#### Stage 2: all usable captures (observed, 2026-11-27)
+
+Launched 11:50 UTC after the pilot looked sane, finished 12:57 UTC (about 67 minutes against the 60-90 minute estimate). 29 further captures as a queue of 8 at a time at 4 threads each (B* at 2 threads), on jolly; all 32 runs (pilot 3 + stage 2 29) exited 0. Same settings as the pilot, except 4 threads for (a)-(c). Raw outputs on jolly in `/tmp/P8/out` (`pilot_*`, `s2_*`), the cascade cache in `/tmp/P8/cache`; the parsed rows are in `docs/p8/p8_results.csv`.
+
+Captures. 32 with an oracle map and at least one first-epoch path were run (7, 8, 10, 11, 13, 14, 15, 16, 17, 21, 22, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 39, 40, 41, 42, 43, 45, 47, 48). Of them 23 have 37-61 paths; 9 have too little data to expect a map (34: 2 paths, 21: 3, 10: 4, 11, 13 and 36: 5, 26: 12, 7: 18, 27: 28) and are shown separately below. Skipped:
+- Reserved (not run, not inspected): captures 12, 18, 44, 49, 52. I read "scorecard cases 12/18/44/49" as capture ids as well; 12 and 18 would have had no first-epoch path anyway.
+- No `planets` message at all (no oracle): 1, 2, 3, 4, 5, 6, 19.
+- Oracle but no completed path in the first map epoch (nothing to fit): 9, 20, 23, 24, 38, 46, 50, 51.
+(This survey counted distinct `shot_fin` events per capture in SQL, before the runs; the harness' own path counts are in the table.)
+
+Per-capture rows (K, recall(2) and recall(15) of the true planets, spurious = fitted planets with no true planet within 15 units, chi2 ratio = exact chi2/row over the true map's, field errors relative to the flat map on the 20-unit grid with explored = within 30 units of a path row, evals and wall seconds for prod and the cascade; B* is the maintained map at the last path, `+x` = after one guarded exact refit; flat's chi2 ratio, 1e11-1e13, is kept for reference). One run per cell:
+
+| capture | paths | method | K | rec2 | rec15 | spur | chi2 ratio | field expl/flat | unexpl/flat | whole/flat | evals | wall s |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 7 | 18 | flat | 0 | 0/24 | 0/24 | 0 | 3.44e+12 | 1 | 1 | 1 |  |  |
+| 7 | 18 | prod | 15 | 0/24 | 2/24 | 13 | 9.01e+10 | 1.86 | 16.9 | 14.7 | 36278 | 84.6 |
+| 7 | 18 | cascade | 22 | 20/24 | 21/24 | 1 | 3.94e+05 | 4.82e-03 | 2.67 | 2.31 | 36511 | 66.6 |
+| 7 | 18 | B* | 23 | 18/24 | 21/24 | 2 | 3.65e+06 | 3.58e-03 | 14.4 | 12.4 |  |  |
+| 7 | 18 | B*+x | 23 | 18/24 | 21/24 | 2 | 3.65e+06 | 3.58e-03 | 14.4 | 12.4 |  |  |
+| 8 | 37 | flat | 0 | 0/24 | 0/24 | 0 | 5.06e+13 | 1 | 1 | 1 |  |  |
+| 8 | 37 | prod | 23 | 8/24 | 12/24 | 11 | 5.94e+08 | 0.374 | 10.6 | 8.85 | 74655 | 261.1 |
+| 8 | 37 | cascade | 22 | 15/24 | 18/24 | 4 | 9.10e+05 | 7.65e-04 | 15.9 | 13.3 | 34707 | 122.3 |
+| 8 | 37 | B* | 20 | 14/24 | 17/24 | 3 | 2.18e+08 | 3.51e-03 | 17.3 | 14.5 |  |  |
+| 8 | 37 | B*+x | 20 | 14/24 | 17/24 | 3 | 2.18e+08 | 3.51e-03 | 17.3 | 14.5 |  |  |
+| 10 | 4 | flat | 0 | 0/24 | 0/24 | 0 | 5.84e+11 | 1 | 1 | 1 |  |  |
+| 10 | 4 | prod | 7 | 0/24 | 0/24 | 7 | 2.85e+11 | 4.86 | 6.56 | 6.43 | 8028 | 0.4 |
+| 10 | 4 | cascade | 18 | 11/24 | 14/24 | 4 | 7.16e+05 | 9.73e-03 | 65.8 | 62.9 | 36437 | 14.8 |
+| 10 | 4 | B* | 13 | 1/24 | 5/24 | 8 | 8.66e+09 | 0.208 | 2.71 | 2.59 |  |  |
+| 10 | 4 | B*+x | 13 | 1/24 | 5/24 | 8 | 8.66e+09 | 0.208 | 2.71 | 2.59 |  |  |
+| 11 | 5 | flat | 0 | 0/24 | 0/24 | 0 | 9.80e+11 | 1 | 1 | 1 |  |  |
+| 11 | 5 | prod | 7 | 0/24 | 0/24 | 7 | 2.48e+11 | 1.17 | 7.06 | 6.75 | 8615 | 1.3 |
+| 11 | 5 | cascade | 19 | 8/24 | 15/24 | 4 | 3.50e+06 | 0.0806 | 3.6 | 3.44 | 36850 | 19.9 |
+| 11 | 5 | B* | 12 | 0/24 | 6/24 | 6 | 9.47e+09 | 0.589 | 2.83 | 2.71 |  |  |
+| 11 | 5 | B*+x | 12 | 0/24 | 6/24 | 6 | 9.47e+09 | 0.589 | 2.83 | 2.71 |  |  |
+| 13 | 5 | flat | 0 | 0/24 | 0/24 | 0 | 8.03e+11 | 1 | 1 | 1 |  |  |
+| 13 | 5 | prod | 8 | 0/24 | 2/24 | 6 | 1.50e+09 | 0.392 | 16.8 | 16.2 | 9934 | 1.3 |
+| 13 | 5 | cascade | 16 | 6/24 | 10/24 | 6 | 2.33e+05 | 0.0308 | 7.05 | 6.78 | 36578 | 18.4 |
+| 13 | 5 | B* | 11 | 1/24 | 6/24 | 5 | 3.18e+07 | 0.102 | 62.8 | 60.4 |  |  |
+| 13 | 5 | B*+x | 11 | 1/24 | 6/24 | 5 | 3.18e+07 | 0.102 | 62.8 | 60.4 |  |  |
+| 14 | 61 | flat | 0 | 0/24 | 0/24 | 0 | 2.62e+12 | 1 | 1 | 1 |  |  |
+| 14 | 61 | prod | 23 | 20/24 | 22/24 | 1 | 290 | 3.42e-03 | 10 | 7.65 | 119904 | 1135.2 |
+| 14 | 61 | cascade | 23 | 20/24 | 22/24 | 1 | 2.56e+03 | 9.43e-04 | 2.89 | 2.21 | 40120 | 394.2 |
+| 14 | 61 | B* | 22 | 18/24 | 19/24 | 3 | 2.67e+06 | 1.59e-03 | 5.2 | 3.97 |  |  |
+| 14 | 61 | B*+x | 22 | 18/24 | 19/24 | 3 | 2.67e+06 | 1.59e-03 | 5.2 | 3.97 |  |  |
+| 15 | 43 | flat | 0 | 0/24 | 0/24 | 0 | 5.83e+12 | 1 | 1 | 1 |  |  |
+| 15 | 43 | prod | 24 | 10/24 | 17/24 | 7 | 1.88e+09 | 0.308 | 3.41 | 2.08 | 85707 | 586.8 |
+| 15 | 43 | cascade | 24 | 24/24 | 24/24 | 0 | 0.995 | 8.28e-06 | 1.24e-05 | 9.99e-06 | 32458 | 65.4 |
+| 15 | 43 | B* | 24 | 23/24 | 24/24 | 0 | 5.16e+07 | 1.13e-03 | 0.0349 | 0.0212 |  |  |
+| 15 | 43 | B*+x | 24 | 24/24 | 24/24 | 0 | 0.995 | 8.28e-06 | 1.24e-05 | 9.99e-06 |  |  |
+| 16 | 61 | flat | 0 | 0/24 | 0/24 | 0 | 2.68e+12 | 1 | 1 | 1 |  |  |
+| 16 | 61 | prod | 24 | 1/24 | 8/24 | 16 | 5.92e+09 | 0.719 | 20.4 | 14.8 | 122755 | 1088.9 |
+| 16 | 61 | cascade | 24 | 24/24 | 24/24 | 0 | 0.996 | 1.20e-05 | 6.52e-05 | 4.81e-05 | 31095 | 89.7 |
+| 16 | 61 | B* | 24 | 24/24 | 24/24 | 0 | 1.21e+04 | 2.52e-04 | 0.0122 | 8.90e-03 |  |  |
+| 16 | 61 | B*+x | 24 | 24/24 | 24/24 | 0 | 0.996 | 1.20e-05 | 6.52e-05 | 4.81e-05 |  |  |
+| 17 | 61 | flat | 0 | 0/24 | 0/24 | 0 | 2.88e+12 | 1 | 1 | 1 |  |  |
+| 17 | 61 | prod | 19 | 4/24 | 12/24 | 6 | 5.69e+09 | 0.898 | 9.75 | 6.98 | 121747 | 902.4 |
+| 17 | 61 | cascade | 24 | 24/24 | 24/24 | 0 | 0.995 | 1.58e-05 | 2.82e-05 | 2.30e-05 | 40698 | 123.5 |
+| 17 | 61 | B* | 24 | 24/24 | 24/24 | 0 | 6.38e+04 | 2.01e-04 | 6.77e-03 | 4.83e-03 |  |  |
+| 17 | 61 | B*+x | 24 | 24/24 | 24/24 | 0 | 0.995 | 1.58e-05 | 2.82e-05 | 2.30e-05 |  |  |
+| 21 | 3 | flat | 0 | 0/24 | 0/24 | 0 | 2.15e+12 | 1 | 1 | 1 |  |  |
+| 21 | 3 | prod | 7 | 1/24 | 2/24 | 5 | 6.54e+09 | 0.608 | 4.1 | 4.02 | 6070 | 0.2 |
+| 21 | 3 | cascade | 13 | 4/24 | 5/24 | 8 | 1.69e+05 | 4.71e-03 | 65.7 | 64.5 | 36522 | 9.0 |
+| 21 | 3 | B* | 9 | 2/24 | 3/24 | 6 | 8.57e+09 | 0.157 | 4.74 | 4.65 |  |  |
+| 21 | 3 | B*+x | 9 | 2/24 | 3/24 | 6 | 8.57e+09 | 0.157 | 4.74 | 4.65 |  |  |
+| 22 | 61 | flat | 0 | 0/24 | 0/24 | 0 | 2.08e+12 | 1 | 1 | 1 |  |  |
+| 22 | 61 | prod | 24 | 0/24 | 8/24 | 16 | 3.28e+10 | 15.1 | 24.2 | 19.2 | 121301 | 1409.4 |
+| 22 | 61 | cascade | 24 | 24/24 | 24/24 | 0 | 0.992 | 9.38e-06 | 1.92e-03 | 1.21e-03 | 38526 | 433.6 |
+| 22 | 61 | B* | 22 | 19/24 | 20/24 | 2 | 8.88e+09 | 3.01e-03 | 4.29 | 2.71 |  |  |
+| 22 | 61 | B*+x | 22 | 19/24 | 20/24 | 2 | 8.88e+09 | 3.01e-03 | 4.29 | 2.71 |  |  |
+| 25 | 42 | flat | 0 | 0/24 | 0/24 | 0 | 3.95e+13 | 1 | 1 | 1 |  |  |
+| 25 | 42 | prod | 21 | 0/24 | 3/24 | 18 | 5.84e+11 | 4.52 | 15.7 | 10.8 | 83355 | 563.1 |
+| 25 | 42 | cascade | 24 | 24/24 | 24/24 | 0 | 0.994 | 1.71e-05 | 4.90e-05 | 3.45e-05 | 27566 | 35.8 |
+| 25 | 42 | B* | 24 | 24/24 | 24/24 | 0 | 2.24e+03 | 1.54e-04 | 1.65e-03 | 1.08e-03 |  |  |
+| 25 | 42 | B*+x | 24 | 24/24 | 24/24 | 0 | 0.994 | 1.71e-05 | 4.90e-05 | 3.45e-05 |  |  |
+| 26 | 12 | flat | 0 | 0/24 | 0/24 | 0 | 7.91e+12 | 1 | 1 | 1 |  |  |
+| 26 | 12 | prod | 13 | 0/24 | 4/24 | 9 | 1.68e+09 | 0.534 | 20.9 | 19 | 21114 | 5.3 |
+| 26 | 12 | cascade | 20 | 8/24 | 15/24 | 5 | 2.00e+08 | 0.175 | 1.9 | 1.73 | 36794 | 19.9 |
+| 26 | 12 | B* | 21 | 12/24 | 17/24 | 4 | 1.70e+08 | 0.0427 | 2.52 | 2.29 |  |  |
+| 26 | 12 | B*+x | 21 | 12/24 | 17/24 | 4 | 1.70e+08 | 0.0427 | 2.52 | 2.29 |  |  |
+| 27 | 28 | flat | 0 | 0/24 | 0/24 | 0 | 5.19e+12 | 1 | 1 | 1 |  |  |
+| 27 | 28 | prod | 19 | 0/24 | 3/24 | 16 | 4.69e+11 | 16.2 | 6.24 | 10.7 | 55126 | 283.9 |
+| 27 | 28 | cascade | 23 | 19/24 | 21/24 | 2 | 2.42e+04 | 3.92e-04 | 23.8 | 19.3 | 35507 | 170.5 |
+| 27 | 28 | B* | 22 | 19/24 | 19/24 | 3 | 3.23e+07 | 2.01e-03 | 5.1 | 4.13 |  |  |
+| 27 | 28 | B*+x | 22 | 19/24 | 19/24 | 3 | 3.23e+07 | 2.01e-03 | 5.1 | 4.13 |  |  |
+| 28 | 61 | flat | 0 | 0/24 | 0/24 | 0 | 6.61e+12 | 1 | 1 | 1 |  |  |
+| 28 | 61 | prod | 24 | 24/24 | 24/24 | 0 | 21.4 | 4.60e-05 | 2.03e-04 | 1.45e-04 | 112661 | 1182.5 |
+| 28 | 61 | cascade | 24 | 24/24 | 24/24 | 0 | 0.994 | 5.90e-06 | 1.18e-05 | 9.25e-06 | 27152 | 71.9 |
+| 28 | 61 | B* | 24 | 24/24 | 24/24 | 0 | 1.87e+04 | 1.09e-04 | 2.42e-03 | 1.68e-03 |  |  |
+| 28 | 61 | B*+x | 24 | 24/24 | 24/24 | 0 | 0.994 | 5.90e-06 | 1.18e-05 | 9.25e-06 |  |  |
+| 29 | 61 | flat | 0 | 0/24 | 0/24 | 0 | 1.12e+13 | 1 | 1 | 1 |  |  |
+| 29 | 61 | prod | 24 | 12/24 | 18/24 | 6 | 5.86e+07 | 0.383 | 3.32 | 2.28 | 122398 | 1487.6 |
+| 29 | 61 | cascade | 25 | 16/24 | 20/24 | 5 | 1.26e+09 | 0.0208 | 41 | 27.9 | 41096 | 303.9 |
+| 29 | 61 | B* | 23 | 19/24 | 19/24 | 3 | 8.21e+09 | 2.73e-03 | 4.86 | 3.31 |  |  |
+| 29 | 61 | B*+x | 23 | 19/24 | 19/24 | 3 | 8.21e+09 | 2.73e-03 | 4.86 | 3.31 |  |  |
+| 30 | 61 | flat | 0 | 0/24 | 0/24 | 0 | 2.55e+13 | 1 | 1 | 1 |  |  |
+| 30 | 61 | prod | 15 | 0/24 | 6/24 | 8 | 1.72e+10 | 0.497 | 16.4 | 11.4 | 122417 | 1252.3 |
+| 30 | 61 | cascade | 24 | 24/24 | 24/24 | 0 | 0.992 | 5.59e-06 | 3.65e-05 | 2.56e-05 | 28735 | 146.1 |
+| 30 | 61 | B* | 25 | 18/24 | 22/24 | 1 | 2.57e+09 | 5.95e-03 | 0.216 | 0.15 |  |  |
+| 30 | 61 | B*+x | 25 | 18/24 | 22/24 | 1 | 2.57e+09 | 5.95e-03 | 0.216 | 0.15 |  |  |
+| 31 | 61 | flat | 0 | 0/24 | 0/24 | 0 | 3.05e+12 | 1 | 1 | 1 |  |  |
+| 31 | 61 | prod | 23 | 1/24 | 7/24 | 15 | 1.47e+10 | 1.33 | 743 | 538 | 114792 | 1305.6 |
+| 31 | 61 | cascade | 22 | 19/24 | 19/24 | 3 | 1.59e+05 | 7.76e-04 | 11 | 7.93 | 23249 | 58.6 |
+| 31 | 61 | B* | 22 | 19/24 | 19/24 | 2 | 7.66e+09 | 3.42e-03 | 27.3 | 19.8 |  |  |
+| 31 | 61 | B*+x | 22 | 19/24 | 19/24 | 2 | 7.66e+09 | 3.42e-03 | 27.3 | 19.8 |  |  |
+| 32 | 61 | flat | 0 | 0/24 | 0/24 | 0 | 6.87e+12 | 1 | 1 | 1 |  |  |
+| 32 | 61 | prod | 21 | 0/24 | 4/24 | 17 | 5.94e+10 | 2.79 | 7.29 | 5.5 | 118555 | 1605.2 |
+| 32 | 61 | cascade | 23 | 21/24 | 23/24 | 0 | 1.90e+05 | 2.31e-04 | 0.209 | 0.147 | 29665 | 93.8 |
+| 32 | 61 | B* | 23 | 22/24 | 22/24 | 1 | 1.00e+07 | 5.36e-04 | 0.477 | 0.336 |  |  |
+| 32 | 61 | B*+x | 23 | 22/24 | 22/24 | 1 | 1.00e+07 | 5.36e-04 | 0.477 | 0.336 |  |  |
+| 33 | 61 | flat | 0 | 0/24 | 0/24 | 0 | 9.83e+11 | 1 | 1 | 1 |  |  |
+| 33 | 61 | prod | 24 | 2/24 | 7/24 | 17 | 5.02e+10 | 2.75 | 29.2 | 18.9 | 122609 | 1273.8 |
+| 33 | 61 | cascade | 26 | 18/24 | 20/24 | 6 | 3.75e+07 | 0.17 | 1.28 | 0.834 | 41162 | 118.4 |
+| 33 | 61 | B* | 23 | 22/24 | 22/24 | 1 | 4.67e+07 | 1.62e-03 | 2.94 | 1.9 |  |  |
+| 33 | 61 | B*+x | 23 | 22/24 | 22/24 | 1 | 4.67e+07 | 1.62e-03 | 2.94 | 1.9 |  |  |
+| 34 | 2 | flat | 0 | 0/24 | 0/24 | 0 | 1.93e+11 | 1 | 1 | 1 |  |  |
+| 34 | 2 | prod | 3 | 0/24 | 0/24 | 3 | 7.75e+09 | 1.33 | 3.68 | 3.57 | 2227 | 0.0 |
+| 34 | 2 | cascade | 18 | 2/24 | 7/24 | 11 | 1.51 | 0.0328 | 10.5 | 10.2 | 28437 | 6.8 |
+| 34 | 2 | B* | 5 | 0/24 | 2/24 | 3 | 2.97e+09 | 0.454 | 2.88 | 2.79 |  |  |
+| 34 | 2 | B*+x | 5 | 0/24 | 2/24 | 3 | 2.97e+09 | 0.454 | 2.88 | 2.79 |  |  |
+| 35 | 61 | flat | 0 | 0/24 | 0/24 | 0 | 7.44e+12 | 1 | 1 | 1 |  |  |
+| 35 | 61 | prod | 24 | 12/24 | 15/24 | 9 | 4.70e+08 | 0.661 | 4.16 | 2.79 | 117013 | 1362.5 |
+| 35 | 61 | cascade | 24 | 24/24 | 24/24 | 0 | 0.995 | 5.53e-06 | 3.54e-05 | 2.37e-05 | 28834 | 69.2 |
+| 35 | 61 | B* | 24 | 24/24 | 24/24 | 0 | 3.02e+05 | 2.02e-04 | 5.36e-03 | 3.54e-03 |  |  |
+| 35 | 61 | B*+x | 24 | 24/24 | 24/24 | 0 | 0.995 | 5.53e-06 | 3.54e-05 | 2.37e-05 |  |  |
+| 36 | 5 | flat | 0 | 0/24 | 0/24 | 0 | 8.72e+10 | 1 | 1 | 1 |  |  |
+| 36 | 5 | prod | 8 | 0/24 | 0/24 | 8 | 5.78e+10 | 2.25 | 13 | 12.4 | 10184 | 0.9 |
+| 36 | 5 | cascade | 15 | 3/24 | 11/24 | 4 | 1.37e+08 | 0.117 | 2.55 | 2.42 | 36619 | 7.1 |
+| 36 | 5 | B* | 13 | 1/24 | 6/24 | 7 | 5.17e+08 | 0.263 | 3.53 | 3.35 |  |  |
+| 36 | 5 | B*+x | 13 | 1/24 | 6/24 | 7 | 5.17e+08 | 0.263 | 3.53 | 3.35 |  |  |
+| 37 | 61 | flat | 0 | 0/24 | 0/24 | 0 | 8.89e+11 | 1 | 1 | 1 |  |  |
+| 37 | 61 | prod | 24 | 21/24 | 22/24 | 1 | 6.07e+04 | 0.0181 | 1.27 | 0.935 | 118594 | 893.6 |
+| 37 | 61 | cascade | 25 | 21/24 | 22/24 | 3 | 1.33e+06 | 5.81e-03 | 2.17 | 1.6 | 40943 | 329.5 |
+| 37 | 61 | B* | 25 | 22/24 | 24/24 | 0 | 4.48e+04 | 1.64e-04 | 0.0816 | 0.0602 |  |  |
+| 37 | 61 | B*+x | 25 | 22/24 | 24/24 | 0 | 0.992 | 3.21e-05 | 0.0811 | 0.0599 |  |  |
+| 39 | 61 | flat | 0 | 0/24 | 0/24 | 0 | 4.93e+12 | 1 | 1 | 1 |  |  |
+| 39 | 61 | prod | 18 | 1/24 | 7/24 | 11 | 1.90e+10 | 12.1 | 5.97 | 9.92 | 122037 | 1693.3 |
+| 39 | 61 | cascade | 23 | 22/24 | 22/24 | 1 | 3.19e+04 | 9.92e-04 | 3.62 | 2.38 | 27336 | 116.9 |
+| 39 | 61 | B* | 23 | 21/24 | 22/24 | 1 | 3.01e+07 | 7.14e-04 | 4.71 | 3.09 |  |  |
+| 39 | 61 | B*+x | 23 | 21/24 | 22/24 | 1 | 3.01e+07 | 7.14e-04 | 4.71 | 3.09 |  |  |
+| 40 | 61 | flat | 0 | 0/24 | 0/24 | 0 | 1.42e+12 | 1 | 1 | 1 |  |  |
+| 40 | 61 | prod | 22 | 19/24 | 21/24 | 1 | 3.70e+03 | 7.96e-03 | 2.42 | 1.76 | 120366 | 698.9 |
+| 40 | 61 | cascade | 23 | 20/24 | 22/24 | 1 | 459 | 1.18e-04 | 1.26 | 0.913 | 28456 | 95.4 |
+| 40 | 61 | B* | 22 | 19/24 | 21/24 | 1 | 2.06e+06 | 2.53e-03 | 34.7 | 25.2 |  |  |
+| 40 | 61 | B*+x | 22 | 19/24 | 21/24 | 1 | 2.06e+06 | 2.53e-03 | 34.7 | 25.2 |  |  |
+| 41 | 61 | flat | 0 | 0/24 | 0/24 | 0 | 9.81e+12 | 1 | 1 | 1 |  |  |
+| 41 | 61 | prod | 23 | 0/24 | 2/24 | 19 | 8.58e+11 | 25.8 | 10.6 | 20.2 | 120719 | 1929.8 |
+| 41 | 61 | cascade | 22 | 20/24 | 20/24 | 2 | 1.69e+08 | 0.105 | 134 | 90.9 | 44796 | 304.1 |
+| 41 | 61 | B* | 23 | 22/24 | 22/24 | 1 | 6.63e+07 | 1.57e-03 | 111 | 75.4 |  |  |
+| 41 | 61 | B*+x | 23 | 22/24 | 22/24 | 1 | 6.63e+07 | 1.57e-03 | 111 | 75.4 |  |  |
+| 42 | 61 | flat | 0 | 0/24 | 0/24 | 0 | 1.32e+13 | 1 | 1 | 1 |  |  |
+| 42 | 61 | prod | 23 | 15/24 | 20/24 | 3 | 5.87e+07 | 0.137 | 0.761 | 0.531 | 122696 | 413.9 |
+| 42 | 61 | cascade | 23 | 21/24 | 21/24 | 2 | 1.65e+07 | 1.58e-03 | 0.329 | 0.226 | 38664 | 375.8 |
+| 42 | 61 | B* | 22 | 20/24 | 21/24 | 1 | 2.64e+07 | 1.56e-03 | 0.324 | 0.222 |  |  |
+| 42 | 61 | B*+x | 22 | 20/24 | 21/24 | 1 | 2.64e+07 | 1.56e-03 | 0.324 | 0.222 |  |  |
+| 43 | 41 | flat | 0 | 0/24 | 0/24 | 0 | 1.25e+14 | 1 | 1 | 1 |  |  |
+| 43 | 41 | prod | 23 | 0/24 | 0/24 | 23 | 7.13e+12 | 83.9 | 27 | 62 | 82122 | 696.0 |
+| 43 | 41 | cascade | 24 | 24/24 | 24/24 | 0 | 0.993 | 8.31e-06 | 3.72e-06 | 6.41e-06 | 28786 | 37.7 |
+| 43 | 41 | B* | 25 | 24/24 | 24/24 | 0 | 4.02e+04 | 7.74e-05 | 1.70e-04 | 1.32e-04 |  |  |
+| 43 | 41 | B*+x | 25 | 24/24 | 24/24 | 0 | 0.993 | 7.99e-06 | 3.67e-06 | 6.19e-06 |  |  |
+| 45 | 61 | flat | 0 | 0/24 | 0/24 | 0 | 8.33e+11 | 1 | 1 | 1 |  |  |
+| 45 | 61 | prod | 22 | 14/24 | 18/24 | 3 | 1.44e+07 | 0.0353 | 5.51 | 4 | 111391 | 459.2 |
+| 45 | 61 | cascade | 22 | 16/24 | 19/24 | 2 | 1.48e+07 | 0.199 | 2.48 | 1.81 | 40519 | 71.6 |
+| 45 | 61 | B* | 22 | 21/24 | 21/24 | 1 | 8.52e+06 | 2.40e-03 | 3.61 | 2.62 |  |  |
+| 45 | 61 | B*+x | 22 | 21/24 | 21/24 | 1 | 8.52e+06 | 2.40e-03 | 3.61 | 2.62 |  |  |
+| 47 | 38 | flat | 0 | 0/24 | 0/24 | 0 | 4.63e+12 | 1 | 1 | 1 |  |  |
+| 47 | 38 | prod | 22 | 19/24 | 20/24 | 2 | 1.29e+04 | 7.52e-03 | 2.28 | 1.85 | 74382 | 253.4 |
+| 47 | 38 | cascade | 23 | 19/24 | 20/24 | 3 | 1.52e+04 | 2.32e-03 | 1.78 | 1.44 | 36208 | 109.1 |
+| 47 | 38 | B* | 22 | 19/24 | 20/24 | 2 | 1.66e+07 | 6.52e-03 | 1.79 | 1.45 |  |  |
+| 47 | 38 | B*+x | 22 | 19/24 | 20/24 | 2 | 1.66e+07 | 6.52e-03 | 1.79 | 1.45 |  |  |
+| 48 | 48 | flat | 0 | 0/24 | 0/24 | 0 | 1.66e+13 | 1 | 1 | 1 |  |  |
+| 48 | 48 | prod | 24 | 12/24 | 17/24 | 7 | 5.80e+08 | 0.127 | 9.66 | 6.91 | 94065 | 714.4 |
+| 48 | 48 | cascade | 24 | 24/24 | 24/24 | 0 | 0.992 | 9.48e-06 | 5.88e-04 | 4.20e-04 | 24962 | 72.0 |
+| 48 | 48 | B* | 23 | 20/24 | 22/24 | 1 | 8.89e+08 | 5.78e-04 | 3.55 | 2.54 |  |  |
+| 48 | 48 | B*+x | 23 | 20/24 | 22/24 | 1 | 8.89e+08 | 5.78e-04 | 3.55 | 2.54 |  |  |
+
+Comparison counts, all 32 captures. "better / equal / worse" is the first method against the second per metric: recall higher is better, spurious, chi2 ratio and field error lower is better; discrete metrics equal only when identical, continuous within 1%. Spurious against flat is "worse or equal" by construction (flat has none); read that column only for cascade against prod and for B*+x against the cascade.
+
+Counts over captures (better / equal / worse of the first method against the second; n = captures where both are defined).
+
+| comparison | recall(2) | recall(15) | spurious | chi2 ratio | field explored/flat | field unexplored/flat | field whole/flat |
+|---|---|---|---|---|---|---|---|
+| prod vs flat | 18 / 14 / 0 (n=32) | 27 / 5 / 0 (n=32) | 0 / 1 / 31 (n=32) | 32 / 0 / 0 (n=32) | 18 / 0 / 14 (n=32) | 2 / 0 / 30 (n=32) | 3 / 0 / 29 (n=32) |
+| cascade vs flat | 32 / 0 / 0 (n=32) | 32 / 0 / 0 (n=32) | 0 / 11 / 21 (n=32) | 32 / 0 / 0 (n=32) | 32 / 0 / 0 (n=32) | 12 / 0 / 20 (n=32) | 14 / 0 / 18 (n=32) |
+| cascade vs prod | 28 / 4 / 0 (n=32) | 28 / 4 / 0 (n=32) | 24 / 4 / 4 (n=32) | 27 / 0 / 5 (n=32) | 31 / 0 / 1 (n=32) | 24 / 0 / 8 (n=32) | 24 / 0 / 8 (n=32) |
+| B*+x vs flat | 30 / 2 / 0 (n=32) | 32 / 0 / 0 (n=32) | 0 / 8 / 24 (n=32) | 32 / 0 / 0 (n=32) | 32 / 0 / 0 (n=32) | 11 / 0 / 21 (n=32) | 11 / 0 / 21 (n=32) |
+| B*+x vs cascade | 7 / 10 / 15 (n=32) | 5 / 12 / 15 (n=32) | 13 / 9 / 10 (n=32) | 4 / 7 / 21 (n=32) | 10 / 6 / 16 (n=32) | 10 / 7 / 15 (n=32) | 10 / 7 / 15 (n=32) |
+
+Only the 23 captures with 37-61 paths:
+
+Counts over captures (better / equal / worse of the first method against the second; n = captures where both are defined).
+
+| comparison | recall(2) | recall(15) | spurious | chi2 ratio | field explored/flat | field unexplored/flat | field whole/flat |
+|---|---|---|---|---|---|---|---|
+| prod vs flat | 17 / 6 / 0 (n=23) | 22 / 1 / 0 (n=23) | 0 / 1 / 22 (n=23) | 23 / 0 / 0 (n=23) | 15 / 0 / 8 (n=23) | 2 / 0 / 21 (n=23) | 3 / 0 / 20 (n=23) |
+| cascade vs flat | 23 / 0 / 0 (n=23) | 23 / 0 / 0 (n=23) | 0 / 11 / 12 (n=23) | 23 / 0 / 0 (n=23) | 23 / 0 / 0 (n=23) | 12 / 0 / 11 (n=23) | 14 / 0 / 9 (n=23) |
+| cascade vs prod | 19 / 4 / 0 (n=23) | 19 / 4 / 0 (n=23) | 18 / 3 / 2 (n=23) | 18 / 0 / 5 (n=23) | 22 / 0 / 1 (n=23) | 19 / 0 / 4 (n=23) | 19 / 0 / 4 (n=23) |
+| B*+x vs flat | 23 / 0 / 0 (n=23) | 23 / 0 / 0 (n=23) | 0 / 8 / 15 (n=23) | 23 / 0 / 0 (n=23) | 23 / 0 / 0 (n=23) | 11 / 0 / 12 (n=23) | 11 / 0 / 12 (n=23) |
+| B*+x vs cascade | 6 / 9 / 8 (n=23) | 4 / 11 / 8 (n=23) | 9 / 9 / 5 (n=23) | 3 / 7 / 13 (n=23) | 8 / 6 / 9 (n=23) | 5 / 7 / 11 (n=23) | 5 / 7 / 11 (n=23) |
+
+Only the 9 captures with 2-28 paths:
+
+Counts over captures (better / equal / worse of the first method against the second; n = captures where both are defined).
+
+| comparison | recall(2) | recall(15) | spurious | chi2 ratio | field explored/flat | field unexplored/flat | field whole/flat |
+|---|---|---|---|---|---|---|---|
+| prod vs flat | 1 / 8 / 0 (n=9) | 5 / 4 / 0 (n=9) | 0 / 0 / 9 (n=9) | 9 / 0 / 0 (n=9) | 3 / 0 / 6 (n=9) | 0 / 0 / 9 (n=9) | 0 / 0 / 9 (n=9) |
+| cascade vs flat | 9 / 0 / 0 (n=9) | 9 / 0 / 0 (n=9) | 0 / 0 / 9 (n=9) | 9 / 0 / 0 (n=9) | 9 / 0 / 0 (n=9) | 0 / 0 / 9 (n=9) | 0 / 0 / 9 (n=9) |
+| cascade vs prod | 9 / 0 / 0 (n=9) | 9 / 0 / 0 (n=9) | 6 / 1 / 2 (n=9) | 9 / 0 / 0 (n=9) | 9 / 0 / 0 (n=9) | 5 / 0 / 4 (n=9) | 5 / 0 / 4 (n=9) |
+| B*+x vs flat | 7 / 2 / 0 (n=9) | 9 / 0 / 0 (n=9) | 0 / 0 / 9 (n=9) | 9 / 0 / 0 (n=9) | 9 / 0 / 0 (n=9) | 0 / 0 / 9 (n=9) | 0 / 0 / 9 (n=9) |
+| B*+x vs cascade | 1 / 1 / 7 (n=9) | 1 / 1 / 7 (n=9) | 4 / 0 / 5 (n=9) | 1 / 0 / 8 (n=9) | 2 / 0 / 7 (n=9) | 5 / 0 / 4 (n=9) | 5 / 0 / 4 (n=9) |
+
+Captures where a method is worse than the one it is compared with, on any of recall(2), recall(15), chi2 ratio, explored, unexplored or whole field (ex spurious): cascade against flat 20 of 32 (all 9 small ones plus 8, 14, 29, 31, 33, 37, 39, 40, 41, 45, 47); production against flat 30 of 32; cascade against production 11 of 32 (8, 10, 14, 21, 27, 29, 34, 37, 41, 45, 47). The by-metric lists come from `python3 -I scripts/p8_tables.py summary ...`.
+
+#### What the numbers say (observed unless marked)
+
+- The user's ideal, "the new implementation is better in all cases", holds for the from-scratch cascade only in the explored area and in recall: against flat it has higher recall(2) and recall(15) in 32 of 32 captures, lower chi2 ratio in 32 of 32 and lower explored-area field error in 32 of 32 (explored error 1e-6 to 0.2 of flat). It does not hold for the unexplored area and the whole field: unexplored error is above flat in 20 of 32 captures (whole field above flat in 18), and the cascade has spurious planets in 21 of 32 (flat has none, by definition). Against the production search the cascade has the higher recall(2) in 28, equal in 4 (14, 28, 37, 47), never lower; it is worse than production on the explored field in 1 capture (45), on the unexplored field in 8, on the chi2 ratio in 5, on spurious count in 4.
+- Production (default `Estimator`, 2000 evaluations per update, about 120k per capture at 61 paths) is much worse than the cascade and often worse than flat: mean recall(2) 6.1 of 24 against 17.8 (cascade), on the 23 larger captures 8.5 against 21.2; it is worse than flat in the explored area in 14 of 32 captures (e.g. 41: 26x flat, 43: 84x flat, with 19-23 spurious planets) and worse in the unexplored area in 30 of 32. It reaches 24/24 on one capture (28) only. Every update used the evaluation limit; the slowest single update took 82 s at 4 threads, so 2000 is far above what the live budget (5 s, about 250-440 evaluations at K = 24 in P6) allows; production at its real live budget would be worse, not better (inferred).
+- Cascade (from scratch, on all paths, 23-45k raw evaluations, 7-433 s at 4 threads): complete map (24/24) and chi2 ratio 0.99 on 10 of the 23 larger captures (15, 16, 17, 22, 25, 28, 30, 35, 43, 48; 15 and 25 and 43 have 41-43 paths); with ratio above 1.2 elsewhere (live truth is degenerate and an incomplete map is punished by the exact likelihood). Mean recall(2) 21.2 of 24 on the larger captures.
+- B* (incremental, last path): mean recall(2) 21.0 on the larger captures against 21.2 for the cascade; complete on 6 (7 after the guarded exact refit, ratio <= 1.2 on 8 after it). It is equal or better than the cascade in recall(2) in 17 of 32 captures (7 better, 10 equal) and worse in 15: better on 33 (22 against 18), 41 (22 against 20), 45 (21 against 16), 29 (19 against 16) and 37 (22 against 21), worse on 22 (19 against 24), 30 (18 against 24), 48 (20 against 24), 14 (18 against 20) and on most small captures (e.g. 10, 11, 13: 0-1 against 6-11 of 24). That matches P6 (B behind the cascade at few paths, at least equal from about 16 paths on the synthetic worlds; live results mixed).
+
+Where the new implementation is NOT better than flat (cascade; the reasons are partly inferred):
+- Spurious planets exist at all: flat has none. Count against flat is a property of the metric, not a regression in the field.
+- Unexplored-area and whole-field error above flat (20 captures in unexplored: 7, 8, 10, 11, 13, 14, 21, 26, 27, 29, 31, 33, 34, 36, 37, 39, 40, 41, 45, 47). Two causes seen in the data: (i) small data: all nine captures with at most 28 paths (the maps are 3-19 of 24 planets) are worse than flat there, as in P6's synthetic data at 4-16 paths; (ii) on the 23 larger captures, every one of the 11 that is worse than flat somewhere (8, 14, 29, 31, 33, 37, 39, 40, 41, 45, 47) has an incomplete map: recall(2) 15-22 of 24, and 1-6 spurious planets (a misplaced planet adds a false pull in unexplored space, e.g. capture 41: two fitted planets 46 and 59 units from any true planet, error 134x flat in the unexplored area; capture 29: five spurious planets, two of them 399 and 557 units from any true planet, 41x flat; capture 31: 11x flat), and 1-4 true planets with no fitted planet within 44-200 units (checked against the cached maps; that these sit in parts of the field the paths hardly visit is inferred, not measured). The whole-field error is still below flat on 33 and 40 (0.83, 0.91) although their unexplored error is 1.3x flat. The 10 complete maps have unexplored error 4e-6 to 2e-3 of flat.
+- The explored area itself is never worse than flat for the cascade; B*+x is also never worse than flat there (32 of 32), production is (14 of 32).
+
+Hypothesis, not tested here: publishing a full map is only worth it past the point where the map is nearly complete; before that a gate (publish a planet only with support, or publish the flat field away from the data) would avoid the unexplored-area loss, but P6 showed that the removal chi2 is not a usable support statistic (Q4), so this stays open.
+
+#### Caveats and limits
+
+- One run per cell, no repeats; evaluation-count budgets make (b) and (c) deterministic, but the (b) result depends on the per-update limit I chose (2000); a larger or smaller limit was not tried, and the live production update has a 5 s wall budget instead. Production here is fed without contacts and without player positions (as in the other diagnosis harnesses), and not as the background thread of the real client; its warm starts are the estimator's own.
+- The cascade was run once on all paths (from scratch), (b) incrementally path by path: they do the same work only loosely (cascade 25-45k evaluations total against about 120k for production). B* was run with the P6 settings that were chosen on dev worlds 33, 39, 40, 41, 45, 48, so its numbers on those are not independent; the cascade parameters were tuned on synthetic data and checked on live dev 33/39/40/41/45/48 in E9c, so captures 33-48 are not unseen for it either. The other 26 captures were never used for tuning (E9 held-out live captures 34, 35, 37, 42, 43 were looked at once); the cascade is better than flat in all explored-area metrics there too.
+- "Equal" for continuous metrics is a 1% band. Captures are taken in recording order (spatially correlated), truth is degenerate on live data, so chi2 ratios of 1e3-1e9 for incomplete maps are not informative about how close the map is.
+- Paths: at most 61 per capture (first map epoch); 9 captures have 2-28. Oracle truth only scores (also the diagnosis of misplaced planets above, which I did against the cached maps after the runs).
+- The wall times are indicative (shared machine, load up to 27 from other jobs, 4 threads). Evaluation counts are exact. No run exceeded a runaway ceiling (slowest single production update 82 s).
+
+Reproduction. Build once: `cargo test --release --lib --no-run` in the worktree; with `einsteinbot.sqlite3` in the working directory and `SEEDS=-` (no synthetic worlds) run, per capture `C`:
+`LIVE=C SEEDS=- PATHS=60 THREADS=4 CACHE=/tmp/P8/cache PROD_EVALS=2000 cargo test --release --lib diagnose_baseline -- --ignored --nocapture --test-threads=1` (flat, prod, cascade; `METHODS=flat,prod,rebuild` default) and
+`LIVE=C SEEDS=- PATHS=60 THREADS=2 CACHE=/tmp/P8/cache CHECKPOINTS=1000 CONFIGS=lv=0.02/0.005:cap=1000:rf=300:ev=1500:lr=100:dl=30:dn=4 cargo test --release --lib diagnose_incremental -- --ignored --nocapture --test-threads=1` (B*; `CHECKPOINTS=1000` keeps only the last path count). Tables: `python3 -I scripts/p8_tables.py {rows,summary,csv} OUTPUT_FILES... [--min-paths N] [--max-paths N]`.
