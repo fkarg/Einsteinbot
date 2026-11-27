@@ -84,16 +84,18 @@ Each item says what the bot does, why it helps, and what it measured. The math b
 
 The bot assumes the NewtonWars physics, taken from the source; the server does not disclose it. Planet $j$ has centre $c_j$, radius $r_j$ and mass $m_j = r_j^3/10$. A shot at position $p$ accelerates with
 
-$$a(p) = \sum_j m_j \frac{c_j - p}{\lVert c_j - p\rVert^3}.$$
-
+```math
+a(p) = \sum_j m_j \frac{c_j - p}{\lVert c_j - p\rVert^3}.
+```
 The engine integrates with velocity Verlet at $n = 25$ substeps of length $h$ per tick. The protocol reports positions once per tick, as f32. So the unknowns are the planet parameters $\theta = (x_j, y_j, r_j)_{j=1..K}$ and their number $K$; everything else is fixed.
 
 #### 2. Rows: compare fields, not simulated paths
 
 Velocity Verlet has the exact identity $x_{m+1} - 2x_m + x_{m-1} = h^2 a(x_m)$ for substep positions. Summing it over one tick gives, for the observed tick positions $X_s$,
 
-$$X_{s+1} - 2X_s + X_{s-1} = h^2 \sum_{|i|<n} (n - |i|)\, a\big(x_{ns+i}\big).$$
-
+```math
+X_{s+1} - 2X_s + X_{s-1} = h^2 \sum_{\lvert i\rvert < n} \bigl(n - \lvert i\rvert\bigr)\, a\bigl(x_{ns+i}\bigr).
+```
 In words: the observed second difference of a tick equals a triangle-weighted sum of the field at the substep positions around it.
 
 ```text
@@ -128,14 +130,16 @@ Without the interpolation term, the *true* map has a chi-square $10^3$ to $10^5$
 
 **Why unseen planets need a correlated model.** The field of unseen planets is smooth along a path, so its residuals are strongly correlated. With the earlier relative-noise likelihood, a map missing 4 planets had whitened residuals with lag-1 autocorrelation 0.85-0.97 along each path, and chi-square per row of $10^3$ to $2.7\times10^4$ (brainstorm, observed). Treating such rows as independent counts $N$ rows as $N$ votes. An AR(1) series with correlation $\rho$ carries only about
 
-$$N_\text{eff} \approx N\,\frac{1-\rho}{1+\rho}$$
-
+```math
+N_\text{eff} \approx N\,\frac{1-\rho}{1+\rho}
+```
 independent ones, about $N/19$ at $\rho = 0.9$. The overconfident likelihood then pays for almost any extra planet that soaks up the correlated residual, and the search grows spurious planets.
 
 **The unseen-planet process.** Suppose the unseen planets form a Poisson field of point masses, with centres in the admissible region $U$: inside the battlefield, clear of the found planets and of every observed tick. Campbell's theorem then gives a field variance at distance $d$ from $U$ that falls as $1/d^2$, and by scaling the correlation length grows in proportion to $d$. So along each path, per axis, the model error is a Matérn-3/2 process in arc length with
 
-$$\mathrm{sd}(c) = s\,\frac{100}{\max(d_U(c), \rho_0)}, \qquad \ell(c) = l\,\frac{\max(d_U(c), \rho_0)}{100}, \qquad \rho_0 = \sqrt{\frac{|U|}{\pi N_u}}.$$
-
+```math
+\mathrm{sd}(c) = s\,\frac{100}{\max(d_U(c), \rho_0)}, \qquad \ell(c) = l\,\frac{\max(d_U(c), \rho_0)}{100}, \qquad \rho_0 = \sqrt{\frac{\lvert U\rvert}{\pi N_u}}.
+```
 ```text
  sd(c)                               ℓ(c)
    |________                           |                 /
@@ -164,8 +168,9 @@ Here $d_U(c)$ is the distance of row centre $c$ to $U$, and $N_u$ is the expecte
 
 A map with $K$ planets is scored by its Laplace-approximated evidence ([`src/estimator/fit.rs`](src/estimator/fit.rs)):
 
-$$\log Z_K \approx \underbrace{-\tfrac12 \chi^2(\hat\theta)}_{\text{fit}} \;\underbrace{-\;\tfrac12 \log\det\!\big(I + S^{1/2} J^\top J\, S^{1/2}\big)}_{\text{Occam factor}} \;\underbrace{-\;K \ln 20}_{\text{prior odds}}.$$
-
+```math
+\log Z_K \approx \underbrace{-\tfrac12 \chi^2(\hat\theta)}_{\text{fit}} \;\underbrace{-\;\tfrac12 \log\det\!\big(I + S^{1/2} J^\top J\, S^{1/2}\big)}_{\text{Occam factor}} \;\underbrace{-\;K \ln 20}_{\text{prior odds}}.
+```
 - $J$ is the whitened Jacobian at the fit.
 - $S$ is a Gaussian prior as wide as a uniform one over the battlefield and radii 20-40.
 - The Occam factor makes a planet pay for the prior volume it gives up: the more tightly the data pin a planet down, the more it costs.
@@ -215,8 +220,9 @@ sequenceDiagram
 
 **Shot search** ([`src/strategy.rs`](src/strategy.rs)). The bot simulates every legal integer velocity up to the available energy and the server limit, at angles in 8-12° steps refined to 1°. It checks planet and player collisions at substeps, for up to 180 ticks. Predicted hits rank by
 
-$$\text{score} = \text{flight ticks} + 5 \times \text{predicted miss distance},$$
-
+```math
+\text{score} = \text{flight ticks} + 5 \times \text{predicted miss distance},
+```
 then by lower velocity.
 
 **Why short flights win.** Map error grows along the path. On capture 55, the bot's shots replayed on the true map hit in:
