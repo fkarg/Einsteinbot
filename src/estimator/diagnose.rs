@@ -329,7 +329,7 @@ fn diagnose_matern_model_error() {
                     ..ModelError::PRIOR
                 }
             } else {
-                estimate(&series)
+                estimate(&series, None)
             };
             let estimate_ms = started.elapsed().as_secs_f64() * 1e3;
             if label == "missing" {
@@ -354,7 +354,7 @@ fn diagnose_matern_model_error() {
                     series.drop_rows(&near);
                     far_series.push(series);
                 }
-                let model = estimate(&far_series);
+                let model = estimate(&far_series, None);
                 let (mut chi2, mut used, mut total, mut num, mut den) =
                     (0.0, 0usize, 0usize, 0.0, 0.0);
                 for series in &far_series {
@@ -390,7 +390,11 @@ fn diagnose_matern_model_error() {
                     let line: Vec<String> = (0..9)
                         .map(|li| {
                             let length = 50.0 * 2f64.powf(li as f64 * 0.5);
-                            let model = ModelError { scale, length };
+                            let model = ModelError {
+                                scale,
+                                length,
+                                ..ModelError::PRIOR
+                            };
                             format!(
                                 "{:.0}",
                                 series.iter().map(|s| s.log_likelihood(model)).sum::<f64>()

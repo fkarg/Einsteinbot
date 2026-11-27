@@ -34,6 +34,10 @@ const PRIOR_SCALE: f64 = 0.07;
 const PRIOR_LENGTH: f64 = 600.0;
 /// Standard deviation of the log-normal hyperprior of each scalar (weak: a factor e).
 const HYPERPRIOR_LOG_SD: f64 = 1.0;
+/// Prior of the white excess sd: log-normal around 1e-6 (log-sd 2), far below the f32 floor of a
+/// row (about 3e-5 at coordinates near 1000), so exact captures are unaffected.
+const PRIOR_WHITE: f64 = 1e-6;
+const WHITE_LOG_SD: f64 = 2.0;
 /// Prequential series the estimate uses (the most recent paths).
 pub(super) const WINDOW: usize = 8;
 /// `d_U` below this is clamped (planet radii are at least 20).
@@ -49,12 +53,16 @@ const CLEARANCE: f64 = 20.0;
 pub(super) struct ModelError {
     pub scale: f64,
     pub length: f64,
+    /// Sd of a white excess noise added to every row on both axes (for position noise beyond the
+    /// f32 rounding, which exact captures do not have).
+    pub white: f64,
 }
 
 impl ModelError {
     pub const PRIOR: ModelError = ModelError {
         scale: PRIOR_SCALE,
         length: PRIOR_LENGTH,
+        white: PRIOR_WHITE,
     };
     /// (sd, length) of the process at distance `d` from `U` (infinite without a `U`: no process).
     fn shape(&self, d: f64) -> (f64, f64) {
@@ -335,13 +343,20 @@ const H: [f64; 5] = [1.0, 0.0, 1.0, -2.0, 1.0];
 
 impl Gains {
     /// Gains of `axis` of `floor` with the process `(sd, length)` per row.
-    pub fn new(floor: &Floor, axis: usize, shape: &[(f64, f64)]) -> Self {
-        Self::with_missing(floor, axis, shape, &[])
+    pub fn new(floor: &Floor, axis: usize, shape: &[(f64, f64)], excess: f64) -> Self {
+        Self::with_missing(floor, axis, shape, excess, &[])
     }
 
     /// As `new`, where the rows with `missing[t]` true are not observed (predicted only: their
     /// whitened value is 0 and they add nothing to the log-determinant).
-    fn with_missing(floor: &Floor, axis: usize, shape: &[(f64, f64)], missing: &[bool]) -> Self {
+    /// `excess` is a white variance added to every row.
+    fn with_missing(
+        floor: &Floor,
+        axis: usize,
+        shape: &[(f64, f64)],
+        excess: f64,
+        missing: &[bool],
+    ) -> Self {
         let n = floor.arc.len();
         let tick = |t: usize| floor.ticks.as_ref().map_or(0.0, |v| v[axis][t]);
         let mut out = Gains {
@@ -414,7 +429,7 @@ impl Gains {
                 continue;
             }
             let ph: [f64; 5] = std::array::from_fn(|i| (0..5).map(|j| p[i][j] * H[j]).sum());
-            let s = (0..5).map(|i| H[i] * ph[i]).sum::<f64>() + floor.white[axis][t];
+            let s = (0..5).map(|i| H[i] * ph[i]).sum::<f64>() + floor.white[axis][t] + excess;
             let gain = ph.map(|v| v / s);
             for i in 0..5 {
                 for j in 0..5 {
@@ -507,7 +522,13 @@ impl Series {
     pub fn innovations(&self, model: ModelError) -> [(Vec<f64>, f64); 2] {
         let shape: Vec<(f64, f64)> = self.distance.iter().map(|d| model.shape(*d)).collect();
         [0, 1].map(|axis| {
-            let gains = Gains::with_missing(&self.floor, axis, &shape, &self.missing);
+            let gains = Gains::with_missing(
+                &self.floor,
+                axis,
+                &shape,
+                model.white * model.white,
+                &self.missing,
+            );
             let mut v = self.raw[axis].clone();
             gains.whiten(&mut v);
             (v, gains.log_det)
@@ -528,46 +549,84 @@ impl Series {
     }
 }
 
-/// The type-II MAP scalars for `series` (the prior without any): a pattern search in log space
-/// from the prior, which keeps the estimate a function of the series alone.
-pub(super) fn estimate(series: &[Series]) -> ModelError {
-    if series.is_empty() {
-        return ModelError::PRIOR;
-    }
-    let centre = [PRIOR_SCALE.ln(), PRIOR_LENGTH.ln()];
+/// The type-II MAP scalars (the prior without any series). The background's `scale` and
+/// `length` come from the `earlier` paths' series only, so a path is never fitted under a
+/// background widened by its own signature; the white excess comes from a joint estimate on those
+/// and the `current` path's series (the background free there too, so a smooth planet signature
+/// is taken by it, not by the white term): white position noise is a property of the
+/// observations, not of the map. Pattern searches
+/// in log space from the prior, so the estimate is a function of the series alone.
+pub(super) fn estimate(earlier: &[Series], current: Option<&Series>) -> ModelError {
+    let centre = [PRIOR_SCALE.ln(), PRIOR_LENGTH.ln(), PRIOR_WHITE.ln()];
+    let sd = [HYPERPRIOR_LOG_SD, HYPERPRIOR_LOG_SD, WHITE_LOG_SD];
     // The scale stays below about six times the Campbell value for all 24 planets unseen.
-    let bounds = [(1e-6f64.ln(), 1f64.ln()), (20f64.ln(), 1e5f64.ln())];
-    let objective = |u: [f64; 2]| -> f64 {
-        let model = ModelError {
-            scale: u[0].exp(),
-            length: u[1].exp(),
-        };
-        let prior: f64 = (0..2)
-            .map(|i| -0.5 * ((u[i] - centre[i]) / HYPERPRIOR_LOG_SD).powi(2))
-            .sum();
-        series.iter().map(|s| s.log_likelihood(model)).sum::<f64>() + prior
-    };
-    let mut u = centre;
-    let mut best = objective(u);
-    let mut step = 1.0;
-    while step > 0.02 {
-        let mut moved = false;
-        for (axis, sign) in [(0, 1.0), (0, -1.0), (1, 1.0), (1, -1.0)] {
-            let mut trial = u;
-            trial[axis] = (trial[axis] + sign * step).clamp(bounds[axis].0, bounds[axis].1);
-            let value = objective(trial);
-            if value > best {
-                (u, best, moved) = (trial, value, true);
-            }
-        }
-        if !moved {
-            step /= 2.0;
-        }
-    }
-    ModelError {
+    let bounds = [
+        (1e-6f64.ln(), 1f64.ln()),
+        (20f64.ln(), 1e5f64.ln()),
+        (1e-9f64.ln(), 1f64.ln()),
+    ];
+    let model_of = |u: [f64; 3]| ModelError {
         scale: u[0].exp(),
         length: u[1].exp(),
+        white: u[2].exp(),
+    };
+    let search = |series: &[&Series], free: &[usize], start: [f64; 3]| -> [f64; 3] {
+        let objective = |u: [f64; 3]| -> f64 {
+            let prior: f64 = (0..3)
+                .map(|i| -0.5 * ((u[i] - centre[i]) / sd[i]).powi(2))
+                .sum();
+            series
+                .iter()
+                .map(|s| s.log_likelihood(model_of(u)))
+                .sum::<f64>()
+                + prior
+        };
+        let mut u = start;
+        let mut best = objective(u);
+        // The likelihood is flat in the white sd far below the floor, so a local search from
+        // the prior would never leave it: scan it by decades first.
+        if free.contains(&2) {
+            for k in 0..9 {
+                let mut trial = u;
+                trial[2] = (1e-9f64 * 10f64.powi(k)).ln();
+                let value = objective(trial);
+                if value > best {
+                    (u, best) = (trial, value);
+                }
+            }
+        }
+        let mut step = 1.0;
+        while step > 0.02 {
+            let mut moved = false;
+            for &axis in free {
+                for sign in [1.0, -1.0] {
+                    let mut trial = u;
+                    trial[axis] = (trial[axis] + sign * step).clamp(bounds[axis].0, bounds[axis].1);
+                    let value = objective(trial);
+                    if value > best {
+                        (u, best, moved) = (trial, value, true);
+                    }
+                }
+            }
+            if !moved {
+                step /= 2.0;
+            }
+        }
+        u
+    };
+    let earlier: Vec<&Series> = earlier.iter().collect();
+    let mut u = if earlier.is_empty() {
+        centre
+    } else {
+        search(&earlier, &[0, 1, 2], centre)
+    };
+    if let Some(current) = current {
+        // All three free here, so a smooth signature on the current path goes to the background
+        // in this estimate and only what is not smooth to the white term; only the latter is kept.
+        let all: Vec<&Series> = earlier.iter().copied().chain([current]).collect();
+        u[2] = search(&all, &[0, 1, 2], u)[2];
     }
+    model_of(u)
 }
 
 #[cfg(test)]
@@ -616,7 +675,7 @@ mod tests {
                 .l()
                 .solve_lower_triangular(&DMatrix::from_column_slice(n, 1, &v))
                 .unwrap();
-            let gains = Gains::new(floor, axis, &shape);
+            let gains = Gains::new(floor, axis, &shape, 0.0);
             let mut got = v.clone();
             gains.whiten(&mut got);
             for i in 0..n {
@@ -662,7 +721,7 @@ mod tests {
             .l()
             .solve_lower_triangular(&DMatrix::from_column_slice(n, 1, &v))
             .unwrap();
-        let gains = Gains::new(floor, axis, &shape);
+        let gains = Gains::new(floor, axis, &shape, 0.0);
         let mut got = v.clone();
         gains.whiten(&mut got);
         for i in 0..n {

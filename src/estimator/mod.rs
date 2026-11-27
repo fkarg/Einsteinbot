@@ -276,11 +276,15 @@ impl Estimator {
             // residuals against the published map join the window for the next path.
             let started = Instant::now();
             let published = self.published_planets();
-            self.model = noise::estimate(&self.series);
-            let noise = Noise::new(self.model, &published, &self.shots[..=self.searched]);
-            if let Some(path) = &self.shots[self.searched].path {
-                self.series
-                    .push(noise::Series::new(path, &published, &noise));
+            let mut noise = Noise::new(self.model, &published, &self.shots[..=self.searched]);
+            let current = self.shots[self.searched]
+                .path
+                .as_ref()
+                .map(|path| noise::Series::new(path, &published, &noise));
+            self.model = noise::estimate(&self.series, current.as_ref());
+            noise.model = self.model;
+            if let Some(series) = current {
+                self.series.push(series);
                 if self.series.len() > noise::WINDOW {
                     self.series.remove(0);
                 }

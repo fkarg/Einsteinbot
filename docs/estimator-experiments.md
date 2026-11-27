@@ -1216,3 +1216,13 @@ The held-out worlds repeat the dev pattern: far more recall at 8 paths, about th
 **Latency** (Mac, 10 threads, `SCHEDULE=500`, each in its live configuration: main with the audit, P13 without; binaries built before, sequential runs, Mac load average 2.4 rising to 3.4 from other sessions). Worst publish lag main -> P13: live 33 266 -> 243 ms, live 40 253 -> 72 ms, live 45 265 -> 265 ms. Scheduled final quality main -> P13: live 33 18/20/3 -> 24/24/0, live 40 16/18/3 -> 18/19/1, live 45 14/18/3 -> 21/21/1.
 
 **Compute this round:** jolly 604 + 592 + 466 + 796 s (about 0.7 CPU-h), Mac about 15 CPU-minutes.
+
+#### P13 white excess noise (main-session decision: keep `flat_world_with_small_position_noise_keeps_no_planet` unchanged; observed)
+
+A third scalar: the sd of a white excess noise added to every row on both axes (`ModelError::white`; added to the floor's white variance in the Kalman gains). Its prior is log-normal around 1e-6 (log-sd 2), far below the f32 floor of a row (about 3e-5 near coordinate 1000). The background `scale` and `length` still come from the earlier paths' series only. The white sd comes from a joint type-II estimate of all three on those series plus the current path's, and only the white sd is kept. With the background free there, the short hit's smooth signature goes to the background, not to the white term. The likelihood is flat in the white sd far below the floor, so a decade scan (1e-9 to 0.1) precedes the pattern search; without it the estimate never left the prior.
+
+Tried first: the white sd from earlier plus current with the background held fixed. That absorbed the 9-row hit and the `targeting_report` test failed again. A lower bound on the length in the white estimate turned out to be unnecessary once the scan was in.
+
+Result: all tests pass (`cargo test --no-fail-fast`: library 97 tests in 1.86 s, all binaries), including the flat-world test and `planet_replay_uses_paths_not_oracle_and_resets_physical_map`. Falsifier true-map chi2/row unchanged (0.830 / 0.842 / 0.824). Dev, no audit, 14 worlds, totals against `a5060f3`: 104/116/1, 179/194/1, 276/285/3 -> 283/290/3, 321/326/4 at 8/16/32/60 paths, CPU 592 -> 589 s. The largest white sd estimated on a live world is 3.9e-5.
+
+Mac latency spot check (live 33, 10 threads, `SCHEDULE=500`, no audit, load average 3.3-3.6): worst publish lag 325 ms (243 ms for `a5060f3` and 266 ms for main earlier, at load 2.4-3.4). The noise phase now takes up to 55 ms per path (two three-scalar searches) against 10-25 ms before. Evaluating the series in parallel did not reduce it (311 ms, 55 ms) and was reverted.

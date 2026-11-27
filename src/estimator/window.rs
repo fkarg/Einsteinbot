@@ -68,7 +68,9 @@ pub(super) struct PathData {
     floor: Floor,
     /// Model-error process (sd, length) per row (`noise.rs`); sd 0 without one.
     shape: Vec<(f64, f64)>,
-    /// Whitening of each axis under the floor and `shape`.
+    /// White excess variance per row (`noise.rs`); 0 without one.
+    excess: f64,
+    /// Whitening of each axis under the floor, `shape` and `excess`.
     whitener: [Gains; 2],
     /// First node of each row of a thinned path (`thinned`): kept rows that are neighbours on
     /// the path share nodes. `None` for a full path (row `r` starts at node `r * n + 1`).
@@ -169,7 +171,7 @@ impl PathData {
             arc,
         };
         let shape = vec![(0.0, f64::INFINITY); rows];
-        let whitener = [0, 1].map(|axis| Gains::new(&floor, axis, &shape));
+        let whitener = [0, 1].map(|axis| Gains::new(&floor, axis, &shape, 0.0));
         Some(Self {
             nodes,
             ticks,
@@ -178,6 +180,7 @@ impl PathData {
             y,
             floor,
             shape,
+            excess: 0.0,
             whitener,
             row_node: None,
             centers: None,
@@ -225,7 +228,7 @@ impl PathData {
             arc: keep.iter().map(|&r| self.floor.arc[r]).collect(),
         };
         let shape: Vec<(f64, f64)> = keep.iter().map(|&r| self.shape[r]).collect();
-        let whitener = [0, 1].map(|axis| Gains::new(&floor, axis, &shape));
+        let whitener = [0, 1].map(|axis| Gains::new(&floor, axis, &shape, self.excess));
         Some(Self {
             nodes,
             ticks: self.ticks.clone(),
@@ -234,6 +237,7 @@ impl PathData {
             y: [0, 1].map(|axis| keep.iter().map(|&r| self.y[axis][r]).collect()),
             floor,
             shape,
+            excess: self.excess,
             whitener,
             row_node: Some(row_node),
             centers: Some(keep.iter().map(|&r| self.ticks[r + 1]).collect()),
@@ -267,7 +271,8 @@ impl PathData {
         self.shape = (0..self.row_count())
             .map(|r| noise.shape(self.center(r)))
             .collect();
-        self.whitener = [0, 1].map(|axis| Gains::new(&self.floor, axis, &self.shape));
+        self.excess = noise.model.white * noise.model.white;
+        self.whitener = [0, 1].map(|axis| Gains::new(&self.floor, axis, &self.shape, self.excess));
     }
 
     /// Position on the path at the centre of row `r`.
