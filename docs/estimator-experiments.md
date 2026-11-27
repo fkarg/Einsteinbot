@@ -1300,3 +1300,43 @@ Per world, the maps agree to within one planet at every checkpoint, except live 
 **Mac deterministic CPU, capture 55 epoch 0, 128 paths, 10 threads (load 5-13, so CPU seconds are noisy there).** main 128.5 s CPU / 95.5 s wall -> P12b 61-78 s CPU / 18-21 s wall; the maps are identical across the P12b runs. After the change, a `sample` of that run puts the QR (`reflect` + `dot`) at 32% of busy samples, then the noise whitening (13%), the chord search (13%), `Folder::add` (7%, before its row filter was vectorized) and the field and derivative evaluation (10%).
 
 Reproduction: as for P13 (`diagnose_replay`; `PATHS=60 CEIL_MS=0 THREADS=2 AUDIT=0` per world; `SCHEDULE=110 THREADS=10 SEEDS=- LIVE=55 EPOCH=0 PATHS=545`; `SCHEDULE=500 THREADS=10 SEEDS=- LIVE=33 PATHS=60`). Compute: jolly about 1,060 CPU-s, Mac about 15 CPU-minutes.
+
+### P18 results (2026-11-27, branch `p18`; `noise.rs` (`TickMask`, `unseen`), `residual.rs`, `mod.rs`, `live_map.rs`, `game_stats.rs`; harness `diagnose/replay.rs` with `PLANETS`, `CAP` and lag quantiles)
+
+Three questions: does a known planet count help, what should happen without it, and can the per-path serial work keep up with 9 paths per second? Short answers (observed, one deterministic run per cell): a count that is too low costs exactly the missing planets (the cap); one that is too high costs little; the prior without a count behaves like the old constant 24 on 24-planet maps; and the serial work now fits the 110 ms period, so paths no longer queue, but the worst lag is still set by slices that are already running.
+
+**Planet count, capture 55 epoch 0 (truth 24; Mac, 10 threads, `CEIL_MS=0`, deterministic, 161 paths).** Cells: K / rec2 / rec15 / spurious, field RMSE explored at the end. `N` fixed means `--planets N`; "prior" is the default without the option.
+
+| config | n=16 | n=32 | n=64 | n=96 | n=128 | n=161 | fe end |
+|---|---|---|---|---|---|---|---|
+| N=24 fixed (the old constant) | 8/7/7/1 | 16/12/14/2 | 19/19/19/0 | 24/24/24/0 | 24/24/24/0 | 24/24/24/0 | 1.9e-4 |
+| N=22 fixed (wrong) | 8/7/7/1 | 16/13/14/2 | 19/19/19/0 | 22/21/22/0 | 22/22/22/0 | 22/22/22/0 | 3.6e-2 |
+| N=26 fixed (wrong) | 8/6/8/0 | 18/12/15/3 | 19/19/19/0 | 24/24/24/0 | 24/24/24/0 | 24/24/24/0 | 3.8e-5 |
+| prior, cap 24 (default) | 8/7/7/1 | 19/14/16/3 | 19/19/19/0 | 24/24/24/0 | 24/24/24/0 | 24/24/24/0 | 6.7e-5 |
+| prior, cap 32 | 8/7/7/1 | 19/14/16/3 | 19/19/19/0 | 26/24/24/0 | 26/24/24/0 | 26/24/24/0 | 4.2e-5 |
+
+With cap 32 the two extra planets are concentric with the true planet at (1347.6, 566.3), radius 36.1: the map holds three planets at that centre with radii 31.4, 20.05 and 20.0, whose masses add up to the true one (31.4^3 + 20.05^3 + 20^3 = 46,990 vs 47,006). The field cannot tell them apart, but the collision disk is 31.4 instead of 36.1. Concentric splits are a pre-existing weakness of the birth evidence that the cap of 24 hides; a birth concentric with an existing planet should be rejected or merged (follow-up).
+
+**Other worlds (deterministic).** Dev set (synthetic seeds 7001-7003 with 24 planets and live 40/36/33, 60 paths; summed rec2): N=24 fixed 21/37/61/97/114 at n = 4/8/16/32/60, the prior with cap 24 or 32 21/37/61/94/114 (the caps never bind within 60 paths; CPU 112-114 s each). Synthetic seed 7001 with 26 planets (96 paths): N=26 fixed reaches 26/26 at 96 paths (fe 8.3e-5); N=24 fixed and the prior with cap 24 stop at 24/24 (fe 9.6e-2); N=22 at 22 (fe 1.4e-1); the prior with cap 32 has 26/26 already at 64 paths (fe 7.0e-5, 1.1e-5 at 96). Seed 7002 with 26 planets: N=26 26/26 at 64 (fe 1.8e-5 at 96), prior cap 24 24/24 (fe 1.0e-1), prior cap 32 26/26 (fe 5.5e-6). Seed 7003 with 22 planets: N=22 and the prior (either cap) all 22/22 at 64 paths, no extras.
+
+Reading: the cap decides most of it. A known count is never worse than the prior here, and on 26-planet worlds it is what finds the last two planets (with cap 24). The prior's larger unseen allowance on a complete map (2.9 instead of 0.5 planets) changes little. The default cap stays 24 because of the concentric splits on the one long 24-planet replay; servers with more planets need `--planets`. Not tested: live play, counts other than 22-26, and whether the prior helps at all early in an epoch (it differs from the constant only near completion).
+
+**Throughput, real-time replay of capture 55 epoch 0 (Mac, 10 threads, a path every 110 ms, 545 paths, no audit; no NewtonWars listener on 3490 during these runs; other sessions kept the load average at 3-7).** "before" is main 6fed147 + the harness change; "after" is the final branch (with the prior, cap 24). Publish lag is from a path's scheduled arrival to the publication of the map that has seen it; queued is the most paths that had arrived but were not yet ingested when an update began; the phase times are per path over the second half of the epoch (n > 272).
+
+| run | lag median / p90 / max ms | max queued | noise median / p90 / max ms | diagnostics median ms | residual correction median / max ms | slices | final map |
+|---|---|---|---|---|---|---|---|
+| before 1 | 99 / 184 / 462 | 3 | 23 / 64 / 111 | 32 | 2.7 / 24 | 403 | 24/24/0 |
+| before 2 | 101 / 183 / 600 | 4 | 24 / 66 / 111 | 33 | 2.8 / 24 | 394 | 24/24/0 |
+| before 3 | 101 / 183 / 600 | 4 | 24 / 66 / 162 | 33 | 2.7 / 24 | 396 | 24/24/0 |
+| after 1 | 71 / 142 / 317 | 2 | 13 / 44 / 94 | 0 | 0.3 / 6.7 | 485 | 24/24/0 |
+| after 2 | 62 / 134 / 216 | 1 | 14 / 38 / 93 | 0 | 0.3 / 6.5 | 556 | 24/24/0 |
+
+The timeline (rec2 at n = 16/32/64/128) is 7/10-11/16/24 in both. Changes, all exact by construction; the deterministic harness gives identical output before and after them (every per-path map size, evaluation count and model scalar and every checkpoint score, synthetic seed 7001 and live 55 with 48 paths each, before the prior was added):
+- `model_position_rmse` is not computed on publish (it re-simulated every path; 32 ms per path late in the epoch). The belief field stays and is `null`; `targeting_report` computes it offline.
+- The noise of every operation needs the admissible region, whose raster stamped every observed tick of every path again for each path, slice, polish and publication. The estimator now keeps one tick mask per epoch and stamps each new path's ticks once (`TickMask::cover`); only the planets are stamped per operation.
+- The model-error estimate is a pattern search over 8 to 9 prequential series from the prior, so successive estimates revisit many of the same models; each series now caches its log-likelihood per model. Instrumented once: 1,100-9,200 likelihood calls per estimate, a third to two thirds of them now cache hits. Per call a series costs only microseconds, so parallelizing over series would not pay off.
+- The residual correction smooths the paths in parallel (`par_map`, results in path order).
+
+What is left: the noise estimate is still 13 ms median and up to about 95 ms (the search sometimes needs many steps); a warm start from the previous estimate would cut that but makes each estimate depend on the previous one, so it was not done. The p90 and worst lag now come from paths arriving while a slice or the full-row refit runs (each up to its 250 ms ceiling); preempting those when a path is queued would be the next step.
+
+Reproduction: `cargo test --release --lib diagnose_replay -- --ignored --nocapture --test-threads=1` with `THREADS=10 CEIL_MS=0 SEEDS=- LIVE=55 EPOCH=0 PATHS=160 CHECKPOINTS=8,16,32,64,96,128,160` plus `PLANETS=n` or `CAP=n`; `SEEDS=7001 KS=26 LIVE=- PATHS=96`; the dev set `SEEDS=7001,7002,7003 KS=24 LIVE=40,36,33 PATHS=60`; throughput `SCHEDULE=110 THREADS=10 SEEDS=- LIVE=55 EPOCH=0 PATHS=545`. Compute: Mac about 25 CPU-minutes.
