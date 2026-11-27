@@ -1514,3 +1514,39 @@ Every final map had the true count of planets except live 61 at 24 (23 found). R
 **Limits (inferred).** The likelihood treats each centre as reached or not, with a fixed reach; a planet within 200 of a path can be missed for a while (seen at 222 and 172 units), so the gates on the correction and the plateau carry part of the decision. The fitted `K` is not the number of true planets found: a completed-looking map with spurious planets can meet the gates (live 57 at M = 0.03). Not tested: real servers with counts other than 24, sessions over several maps (unit-tested), counts above 26 in the dynamic mode, live play.
 
 Reproduction: `cargo test --release --lib diagnose_replay -- --ignored --nocapture --test-threads=1` with `THREADS=2 CEIL_MS=0` and `SEEDS=<seed> KS=<k> LIVE=- PATHS=128 CHECKPOINTS=32,64,96,128 PLANETS=<n>` or `LEARN=<start>`, or `SEEDS= LIVE=<capture> EPOCH=<e> PATHS=160 CHECKPOINTS=32,64,96,128,160` with the same; `HID` lines carry `hid=` (f at 60/100/150/200/300) and `miss=`, `UPD` lines `count=`. Analysis scripts: `/tmp/P25scripts/{an,det,margin,dyn,raise,wcheck}.py` (jolly copies in `/tmp/P25w`, logs in `/tmp/P25w/out1` (design) and `/tmp/P25w/out` (held out and dynamic)). Compute: jolly 92 CPU-minutes (76 runs), Mac only unit tests.
+
+## Planet count (in the README until 2026-11-28)
+
+Does telling the bot the true count ($N = 24$ via `--planets 24`) help, compared with the default prior on the count (centre 24, sd 4, section 3)? The field error is the *explored-field RMSE*: the root mean square error of the estimated gravity vector against the truth, on the 20-unit grid cells that some earlier path crossed. An empty map (*flat*) scores about 0.63.
+
+On the 14 dev worlds the fixed count was better around 32 paths (explored-field RMSE 0.0046 vs 0.0202, geometric means over the worlds). On real games it makes no systematic difference: 69 recorded maps with disclosed planets (all with 24 planets, captures up to 58, duplicate games counted once, captures reserved for final tests excluded; built before P21 added the no-overlap rule, cap 24; one run each). Maps with fewer paths drop out of the later rows:
+
+| paths | maps | true planets | recall (prior / fixed) | explored-field RMSE (prior / fixed) |
+|---|---|---|---|---|
+| 8 | 69 | 1656 | 330 / 330 | 0.17 / 0.17 |
+| 16 | 69 | 1656 | 625 / 624 | 0.12 / 0.12 |
+| 32 | 42 | 1008 | 685 / 686 | 0.044 / 0.042 |
+| 64 | 33 | 792 | 715 / 713 | 6.1e-4 / 6.1e-4 |
+| 128 | 21 | 504 | 498 / 493 | 5.3e-5 / 7.2e-5 |
+| 256 | 8 | 192 | 189 / 189 | 2.1e-5 / 2.2e-5 |
+
+Spurious planets and the $\chi^2$ ratio against the true map are in the P18 section of [docs/estimator-experiments.md](estimator-experiments.md). A fixed count that is too low stops at that count: on 26-planet synthetic worlds only `--planets 26` found the last two planets under the old default cap of 24. Since overlapping planets are excluded (P21), the default cap is 32: the prior alone then finds all 26, and caps 24, 32 and 64 give the same maps on the 24-planet replays.
+
+**Detecting a cap below the truth (P23).** The count-limit warning is raised when the map is at its cap and its residual correction (the largest smoothed unexplained pull, section 6) exceeds 0.03 acceleration units on 3 of the last 5 maps after their full-row refit; once raised it stays for the rest of the map. Deterministic replays, one run each, 96 synthetic or 120 live paths:
+
+- Raised in all 26 runs whose cap was 1-4 planets below the truth (synthetic 25- to 28-planet worlds, live captures 53 and 55-58; 7 of the runs held out), a median of 2 paths after the map reached the cap, at most 46.
+- Never raised in the 20 runs with the right count at the cap.
+- The deciding value (third largest of the five) stayed at or below 0.015 with the right count and was at least 0.094 with planets left out. On real maps the margin to the 0.03 threshold is only a factor of two, measured on nine maps.
+- Two other signals also fired with the right count and were rejected. The full sets and rules are in the P23 section of [docs/estimator-experiments.md](estimator-experiments.md).
+
+**Detecting a count above the truth, and learning the count (P25, branch p25).** With the count fixed at $N$ and $K < N$ planets found, the $N - K$ others must hide where no path has been. Let $f$ be the fraction of possible planet centres farther than 200 units from every observed tick and not overlapping a found planet. For uniformly placed planets, "exactly $K$ within reach" has likelihood $\binom{N}{K}(1-f)^K f^{N-K}$, so $N - 1$ is more likely than $N$ when $N f / (N - K) < 1$. The *too-high signal* needs that, plus a residual correction below 0.01 on the last 8 polished maps and $K$ unchanged for 8. `--learn-planets` uses it to lower the count by one and the count-limit warning to raise it by one, never below the highest count a raise reached. Replays, one deterministic run each (jolly, 2 threads), 128 synthetic or 160 live paths, measured with a window of 5:
+
+| set | runs | signal fired | paths into the map |
+|---|---|---|---|
+| count 2-4 too high (synthetic 22/24-planet worlds with $N$ = 24/26; live 53, 55, 56, 57, 58 (four maps) with $N = 26$) | 18 | 15 | synthetic 32-51, live 43-102 |
+| right count (synthetic 22/24 with $N$ = 22/24; the same live maps with $N = 24$) | 16 | 0 | |
+| held out: started at 26 on 24-planet maps (live captures 59-64 and 66-71, one game each; synthetic 7101-7103) | 15 | 15 (24 reached in 14, 25 in one) | first step 45-123, median 65 |
+| held out: started at 24, right count (the same maps) | 15 | 1 (live 67; raised back 9 paths later) | 91 |
+
+The 3 design misses are maps the estimator never completed (live 57 with spurious planets, 58 map 0 with 32 paths, 58 map 2 with a spurious 25th planet). On completed maps with the count too high the ratio fell to 0.24 or less; with the right count and the other two conditions met it stayed at 3.3 or more (live 58 maps 2 and 3, planets 100-560 units from any path); without the ratio those two would have fired. The held-out false alarm came after 5 gated corrections in a row between corrections of 0.02-0.03; the final window of 8 would not have fired there and changes nothing else on either set (re-analysed offline, so this choice is not held out). Starting from 24: 22-planet worlds reached 22 (4 of 4, by path 58); 26-planet worlds reached 26 and stayed (6 of 7, by path 83); in one (7102) the count-limit warning fired at the right count (correction 0.030-0.037 just after the 26th planet was found) and the count stayed at 27.
+
