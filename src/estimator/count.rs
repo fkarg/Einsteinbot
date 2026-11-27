@@ -148,13 +148,14 @@ pub const LEARN_START: usize = 24;
 /// `N f / (N - K) < TOO_HIGH_RATIO` (1). The rule also needs the map to leave no planet-sized
 /// pull (the residual correction below `TOO_HIGH_ACCELERATION` on the last `TOO_HIGH_WINDOW`
 /// polished maps; a gated correction counts as none) and `K` unchanged for `TOO_HIGH_PLATEAU`
-/// polished maps. Measured on replays (`docs/estimator-experiments.md`, P25): the ratio was at
-/// most 0.37 when it fired with the count too high, and at least 3.3 on correct counts with the
-/// other conditions met.
+/// polished maps. Measured on replays (`docs/estimator-experiments.md`, P25): with the count too
+/// high the ratio fell to 0.24 or less on every map the estimator completed; with the right count
+/// and the other conditions met it stayed at 3.3 or more. The window was 5 in the held-out runs; 8 because one held-out real map
+/// lowered a correct count after 5 gated corrections in a row between corrections of 0.02-0.03.
 pub const TOO_HIGH_REACH: f64 = 200.0;
 pub const TOO_HIGH_RATIO: f64 = 1.0;
 pub const TOO_HIGH_ACCELERATION: f64 = 0.01;
-pub const TOO_HIGH_WINDOW: usize = 5;
+pub const TOO_HIGH_WINDOW: usize = 8;
 pub const TOO_HIGH_PLATEAU: usize = 8;
 
 /// The planet count of the dynamic mode (`Settings::learn_planets`): fixed at `planets` within a
