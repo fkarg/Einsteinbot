@@ -456,3 +456,215 @@ fn diagnose_campbell_model_error() {
         }
     }
 }
+
+/// P13 falsifier: a stationary Matern-3/2 model-error process in arc length along each path
+/// (scale `s`, length `l`, one pair per map, estimated by maximizing the Kalman marginal
+/// likelihood on a grid) on top of the measurement floor. For the true map and the true map
+/// minus `DROP` central planets, prints the estimate and the innovations' chi2/row and lag-1
+/// autocorrelation. Pass: chi2/row near 1 and lag-1 below about 0.3 for both maps.
+#[test]
+#[ignore]
+fn diagnose_matern_model_error() {
+    let drop: usize = std::env::var("DROP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
+    let world = WorldParameters::default();
+    // Innovations of one axis of one path: (whitened innovations, log-likelihood).
+    // `shape[t]` multiplies the scale `s` and the length `l` at row `t` (1 when stationary).
+    let filter = |raw: &[f64],
+                  floor: &[f64],
+                  step: &[f64],
+                  shape: &[(f64, f64)],
+                  s: f64,
+                  l: f64|
+     -> (Vec<f64>, f64) {
+        let (mut m, mut p) = ([0.0, 0.0], [[0.0, 0.0], [0.0, 0.0]]);
+        let mut out = Vec::with_capacity(raw.len());
+        let mut loglik = 0.0;
+        for t in 0..raw.len() {
+            let (ss, ll) = (s * shape[t].0, l * shape[t].1);
+            let lam = 3f64.sqrt() / ll;
+            let pinf = [ss * ss, lam * lam * ss * ss];
+            if t == 0 {
+                p = [[pinf[0], 0.0], [0.0, pinf[1]]];
+            } else if ss > 0.0 {
+                // Rescale the state to this row's scale, then step the stationary process.
+                let ratio = if shape[t - 1].0 > 0.0 {
+                    shape[t].0 / shape[t - 1].0
+                } else {
+                    0.0
+                };
+                m = [m[0] * ratio, m[1] * ratio];
+                for row in p.iter_mut() {
+                    for v in row.iter_mut() {
+                        *v *= ratio * ratio;
+                    }
+                }
+                let d = step[t];
+                let e = (-lam * d).exp();
+                let f = [
+                    [e * (1.0 + lam * d), e * d],
+                    [-e * lam * lam * d, e * (1.0 - lam * d)],
+                ];
+                let mm = [
+                    f[0][0] * m[0] + f[0][1] * m[1],
+                    f[1][0] * m[0] + f[1][1] * m[1],
+                ];
+                // P = F P F' + (Pinf - F Pinf F').
+                let mul = |a: [[f64; 2]; 2], b: [[f64; 2]; 2]| {
+                    let mut c = [[0.0; 2]; 2];
+                    for i in 0..2 {
+                        for j in 0..2 {
+                            c[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j];
+                        }
+                    }
+                    c
+                };
+                let ft = [[f[0][0], f[1][0]], [f[0][1], f[1][1]]];
+                let fpf = mul(mul(f, p), ft);
+                let pi = [[pinf[0], 0.0], [0.0, pinf[1]]];
+                let fif = mul(mul(f, pi), ft);
+                for i in 0..2 {
+                    for j in 0..2 {
+                        p[i][j] = fpf[i][j] + pi[i][j] - fif[i][j];
+                    }
+                }
+                m = mm;
+            }
+            let sv = p[0][0] + floor[t];
+            let nu = raw[t] - m[0];
+            out.push(nu / sv.sqrt());
+            loglik += -0.5 * (nu * nu / sv + sv.ln());
+            let k = [p[0][0] / sv, p[1][0] / sv];
+            m = [m[0] + k[0] * nu, m[1] + k[1] * nu];
+            let p00 = p[0][0];
+            let p01 = p[0][1];
+            p = [
+                [p[0][0] - k[0] * p00, p[0][1] - k[0] * p01],
+                [p[1][0] - k[1] * p00, p[1][1] - k[1] * p01],
+            ];
+        }
+        (out, loglik)
+    };
+    for case in cases() {
+        let truth = theta_of_planets(&case.truth);
+        let c = [
+            world.battlefield_width / 2.0,
+            world.battlefield_height / 2.0,
+        ];
+        let mut order: Vec<usize> = (0..truth.len()).collect();
+        order.sort_by(|&a, &b| {
+            (truth[a][0] - c[0])
+                .hypot(truth[a][1] - c[1])
+                .total_cmp(&(truth[b][0] - c[0]).hypot(truth[b][1] - c[1]))
+        });
+        let partial: Vec<[f64; 3]> = order[drop..].iter().map(|&i| truth[i]).collect();
+        let cancelled = AtomicBool::new(false);
+        let fit = Fit::new(&case.shots, world, &cancelled, false, Vec::new());
+        for (label, theta) in [("true", &truth), ("missing", &partial)] {
+            let campbell = std::env::var("SHAPE").is_ok_and(|v| v == "campbell");
+            // Admissible centres of an unseen planet on a 10-unit raster (for the Campbell shape:
+            // scale 1 / d_U, length d_U, d_U the distance to the admissible region).
+            let mut admissible: Vec<[f64; 2]> = Vec::new();
+            if campbell {
+                let found: Vec<Planet> = theta.iter().map(|t| planet_at(*t)).collect();
+                let ticks: Vec<[f64; 2]> = case
+                    .shots
+                    .iter()
+                    .filter_map(|s| s.path.as_ref())
+                    .flat_map(|p| p.ticks.iter().copied())
+                    .collect();
+                let (w, h) = (world.battlefield_width, world.battlefield_height);
+                let mut y = 25.0;
+                while y < h - 20.0 {
+                    let mut x = 25.0;
+                    while x < w - 20.0 {
+                        if found
+                            .iter()
+                            .all(|p| (p.x - x).hypot(p.y - y) > p.radius + 20.0)
+                            && ticks.iter().all(|t| (t[0] - x).hypot(t[1] - y) > 20.0)
+                        {
+                            admissible.push([x, y]);
+                        }
+                        x += 10.0;
+                    }
+                    y += 10.0;
+                }
+            }
+            // (raw residual, floor variance, step, shape) per path and axis.
+            let mut series: Vec<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<(f64, f64)>)> = Vec::new();
+            for (i, shot) in case.shots.iter().enumerate() {
+                let Some(path) = &shot.path else { continue };
+                let n = path.row_count();
+                let field = fit.field(i, path, theta);
+                let step: Vec<f64> = (0..n)
+                    .map(|r| {
+                        if r == 0 {
+                            0.0
+                        } else {
+                            let (a, b) = (path.center(r - 1), path.center(r));
+                            (a[0] - b[0]).hypot(a[1] - b[1])
+                        }
+                    })
+                    .collect();
+                let shape: Vec<(f64, f64)> = (0..n)
+                    .map(|r| {
+                        if !campbell {
+                            return (1.0, 1.0);
+                        }
+                        let c = path.center(r);
+                        let d = admissible
+                            .iter()
+                            .map(|a| (a[0] - c[0]).hypot(a[1] - c[1]))
+                            .fold(f64::INFINITY, f64::min)
+                            .max(20.0);
+                        (100.0 / d, d / 100.0)
+                    })
+                    .collect();
+                for axis in 0..2 {
+                    let mut raw = vec![0.0; n];
+                    path.raw_residual(axis, &field[axis], &mut raw);
+                    let floor = (0..n).map(|r| path.floor_variance(axis, r)).collect();
+                    series.push((raw, floor, step.clone(), shape.clone()));
+                }
+            }
+            let total = |s: f64, l: f64| -> f64 {
+                series
+                    .iter()
+                    .map(|(raw, floor, step, shape)| filter(raw, floor, step, shape, s, l).1)
+                    .sum()
+            };
+            let mut best = (total(0.0, 1.0), 0.0, 1.0);
+            for si in 0..33 {
+                let s = 1e-6 * 10f64.powf(si as f64 / 4.0);
+                for li in 0..13 {
+                    let l = 5.0 * 10f64.powf(li as f64 / 4.0);
+                    let v = total(s, l);
+                    if v > best.0 {
+                        best = (v, s, l);
+                    }
+                }
+            }
+            let (_, s, l) = best;
+            let (mut chi2, mut rows, mut num, mut den) = (0.0, 0usize, 0.0, 0.0);
+            for (raw, floor, step, shape) in &series {
+                let (w, _) = filter(raw, floor, step, shape, s, l);
+                for pair in w.windows(2) {
+                    num += pair[0] * pair[1];
+                }
+                let ss: f64 = w.iter().map(|v| v * v).sum();
+                den += ss;
+                chi2 += ss;
+                rows += w.len();
+            }
+            println!(
+                "MATERN case={:?} shape={} map={label} s={s:.3e} l={l:.1} rows={rows} chi2_per_row={:.3} lag1={:.3}",
+                case.name,
+                if campbell { "campbell" } else { "stationary" },
+                chi2 / rows as f64,
+                num / den
+            );
+        }
+    }
+}
