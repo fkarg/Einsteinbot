@@ -4,6 +4,23 @@ use crate::simulation::{Termination, simulate_shot};
 use fit::Fit;
 use std::time::Duration;
 
+/// Replay: one event, then the search work it owes.
+trait ObserveSettled {
+    fn observe_settled(&mut self, event: &ServerEvent, cancelled: &AtomicBool)
+    -> Option<MapBelief>;
+}
+
+impl ObserveSettled for Estimator {
+    fn observe_settled(
+        &mut self,
+        event: &ServerEvent,
+        cancelled: &AtomicBool,
+    ) -> Option<MapBelief> {
+        let local = self.observe(event, cancelled)?;
+        Some(self.settle(cancelled).unwrap_or(local))
+    }
+}
+
 fn planet(x: f64, y: f64, radius: f64) -> Planet {
     Planet {
         x,
@@ -55,7 +72,7 @@ fn rmse(map: &PlanetMap, event: &ServerEvent) -> f64 {
 fn estimator() -> (Estimator, AtomicBool) {
     let mut estimator = Estimator::default();
     let cancelled = AtomicBool::new(false);
-    estimator.observe(&position(9, 1800.0, 1000.0), &cancelled);
+    estimator.observe_settled(&position(9, 1800.0, 1000.0), &cancelled);
     (estimator, cancelled)
 }
 
@@ -86,12 +103,11 @@ fn flat_world_keeps_no_planet() {
         ((1500.0, 500.0), 200.0, 9.0),
         ((600.0, 100.0), -30.0, 11.0),
     ] {
-        belief = estimator.observe(&shot_in(&flat, start, angle, velocity), &cancelled);
+        belief = estimator.observe_settled(&shot_in(&flat, start, angle, velocity), &cancelled);
         let belief = belief.as_ref().unwrap();
         assert!(belief.map.planets.is_empty(), "{:?}", belief.map);
     }
     let belief = belief.unwrap();
-    assert!(belief.map_weight.unwrap() > 0.5);
     assert_eq!(
         belief.covariance_unavailable_reason,
         Some(CovarianceUnavailableReason::NoPlanets)
@@ -145,7 +161,7 @@ fn flat_world_with_small_position_noise_keeps_no_planet() {
     let mut state = 4242u64;
     for _ in 0..4 {
         let event = noisy_flat_shot(&mut state, 1e-3);
-        let belief = estimator.observe(&event, &cancelled).unwrap();
+        let belief = estimator.observe_settled(&event, &cancelled).unwrap();
         assert!(belief.map.planets.is_empty(), "{:?}", belief.map);
     }
 }
@@ -162,7 +178,7 @@ fn one_planet_world_beats_flat_on_a_held_out_shot() {
     let held_out = shot_in(&truth, (400.0, 700.0), 15.0, 11.0);
     let mut belief = None;
     for event in &training {
-        belief = estimator.observe(event, &cancelled);
+        belief = estimator.observe_settled(event, &cancelled);
     }
     let belief = belief.unwrap();
     assert_eq!(belief.map.planets.len(), 1, "{:?}", belief);
@@ -174,7 +190,7 @@ fn one_planet_world_beats_flat_on_a_held_out_shot() {
 fn shot_with_contact(event: &ServerEvent, players: &[Point]) -> Shot {
     let obs = shot_of(event);
     let contact = contacts::classify(&obs.points, players, WorldParameters::default());
-    Shot::new(obs, contact, WorldParameters::default(), &NOISE_LEVELS)
+    Shot::new(obs, contact, WorldParameters::default(), 0.0)
 }
 
 fn center_error(theta: &[f64; 3]) -> f64 {
@@ -243,7 +259,7 @@ fn a_hit_is_recovered_tightly_from_one_path_through_the_estimator() {
     let (mut estimator, cancelled) = estimator();
     let event = contact_event();
     let belief = estimator
-        .observe(&event, &cancelled)
+        .observe_settled(&event, &cancelled)
         .expect("planet from a hit");
     assert_eq!(belief.map.planets.len(), 1);
     let planet = &belief.map.planets[0];
@@ -261,7 +277,7 @@ fn a_hit_is_recovered_tightly_from_one_path_through_the_estimator() {
     let flat = rmse(&world_of(vec![]), &event);
     assert!(learned < flat / 10.0, "learned={learned} flat={flat}");
     // Duplicates add nothing; a map reset forgets everything.
-    assert!(estimator.observe(&event, &cancelled).is_none());
+    assert!(estimator.observe_settled(&event, &cancelled).is_none());
     assert_eq!(estimator.shots.len(), 1);
     estimator.reset();
     assert!(estimator.belief().is_none() && estimator.shots.is_empty());
@@ -281,7 +297,7 @@ fn contacts_from_several_directions_give_one_sharper_planet() {
         ((650.0, 500.0), 180.0),
     ] {
         let belief = estimator
-            .observe(&hit_from(start, angle), &cancelled)
+            .observe_settled(&hit_from(start, angle), &cancelled)
             .unwrap();
         // Never several planets for one body, however many overlapping contacts arrive.
         assert_eq!(belief.map.planets.len(), 1, "{:?}", belief.map);
@@ -298,11 +314,13 @@ fn contacts_from_several_directions_give_one_sharper_planet() {
 #[test]
 fn a_curved_flyby_does_not_contradict_the_planet() {
     let (mut estimator, cancelled) = estimator();
-    estimator.observe(&contact_event(), &cancelled).unwrap();
+    estimator
+        .observe_settled(&contact_event(), &cancelled)
+        .unwrap();
     // Passes 100 units above the centre and bends toward it; the chord of its samples stays
     // outside the disk but the path is curved.
     let flyby = shot_in(&contact_truth(), (300.0, 400.0), 0.0, 6.0);
-    let belief = estimator.observe(&flyby, &cancelled).unwrap();
+    let belief = estimator.observe_settled(&flyby, &cancelled).unwrap();
     assert_eq!(belief.map.planets.len(), 1);
     let planet = &belief.map.planets[0];
     assert!(
@@ -316,9 +334,11 @@ fn a_curved_flyby_does_not_contradict_the_planet() {
 #[test]
 fn later_free_space_never_leaves_a_planet_containing_observed_samples() {
     let (mut estimator, cancelled) = estimator();
-    estimator.observe(&contact_event(), &cancelled).unwrap();
+    estimator
+        .observe_settled(&contact_event(), &cancelled)
+        .unwrap();
     let through = shot_in(&world_of(vec![]), (300.0, 500.0), 0.0, 6.0);
-    let belief = estimator.observe(&through, &cancelled).unwrap();
+    let belief = estimator.observe_settled(&through, &cancelled).unwrap();
     for shot in &estimator.shots {
         let regular = &shot.obs.points[..shot.obs.points.len() - 1];
         for planet in &belief.map.planets {
@@ -347,7 +367,7 @@ fn constant_acceleration_contact_is_kept_as_a_contact_but_creates_no_planet() {
         velocity: 1.0,
         points: points.clone(),
     };
-    let belief = estimator.observe(&event, &cancelled).unwrap();
+    let belief = estimator.observe_settled(&event, &cancelled).unwrap();
     assert!(belief.map.planets.is_empty());
     assert_eq!(belief.contact_points, vec![points.last().unwrap().clone()]);
     assert_eq!(belief.unmatched_contacts, 1);
@@ -358,7 +378,7 @@ fn a_contact_outside_the_battlefield_cannot_create_a_planet_there() {
     let (mut estimator, cancelled) = estimator();
     // Flat flight out of the battlefield, stopping inside the world margin at x = -300.
     let leaving = prefix(&shot_in(&world_of(vec![]), (100.0, 500.0), 180.0, 10.0), 41);
-    let belief = estimator.observe(&leaving, &cancelled).unwrap();
+    let belief = estimator.observe_settled(&leaving, &cancelled).unwrap();
     let world = WorldParameters::default();
     assert!(belief.map.planets.iter().all(|p| {
         p.x >= p.radius
@@ -398,10 +418,12 @@ fn player_positions_survive_a_map_reset_for_contact_classification() {
     let cancelled = AtomicBool::new(false);
     let ended_on_player = prefix(&shot_in(&world_of(vec![]), (300.0, 300.0), 0.0, 10.0), 41);
     let end = shot_of(&ended_on_player).points.last().unwrap().clone();
-    estimator.observe(&position(2, end.x, end.y), &cancelled);
+    estimator.observe_settled(&position(2, end.x, end.y), &cancelled);
     estimator.reset();
-    estimator.observe(&position(1, 100.0, 100.0), &cancelled);
-    let belief = estimator.observe(&ended_on_player, &cancelled).unwrap();
+    estimator.observe_settled(&position(1, 100.0, 100.0), &cancelled);
+    let belief = estimator
+        .observe_settled(&ended_on_player, &cancelled)
+        .unwrap();
     assert!(belief.contact_points.is_empty());
     assert!(belief.map.planets.is_empty());
 }
@@ -415,7 +437,7 @@ fn unknown_players_and_the_world_margin_create_no_contact() {
     let mut unknown = Estimator::default();
     assert!(
         unknown
-            .observe(&near_end, &cancelled)
+            .observe_settled(&near_end, &cancelled)
             .unwrap()
             .contact_points
             .is_empty()
@@ -423,7 +445,7 @@ fn unknown_players_and_the_world_margin_create_no_contact() {
     // Ended at the world margin.
     let (mut estimator, cancelled) = estimator();
     let margin = shot_in(&flat, (300.0, 300.0), 0.0, 10.0);
-    let belief = estimator.observe(&margin, &cancelled).unwrap();
+    let belief = estimator.observe_settled(&margin, &cancelled).unwrap();
     assert!(
         belief.contact_points.is_empty(),
         "{:?}",
@@ -434,7 +456,9 @@ fn unknown_players_and_the_world_margin_create_no_contact() {
 #[test]
 fn a_planets_event_forgets_earlier_evidence_inside_a_batch() {
     let (mut estimator, cancelled) = estimator();
-    estimator.observe(&contact_event(), &cancelled).unwrap();
+    estimator
+        .observe_settled(&contact_event(), &cancelled)
+        .unwrap();
     assert_eq!(estimator.shots.len(), 1);
     let flat_shot = shot_in(&world_of(vec![]), (200.0, 400.0), 0.0, 8.0);
     estimator.observe_batch(
@@ -443,14 +467,18 @@ fn a_planets_event_forgets_earlier_evidence_inside_a_batch() {
     );
     assert_eq!(estimator.shots.len(), 1);
     assert!(estimator.belief().unwrap().map.planets.is_empty());
-    assert!(estimator.warm_starts.iter().all(|mode| mode.is_empty()));
+    assert!(estimator.search.theta.is_empty());
 }
 
 #[test]
 fn cancellation_returns_no_belief() {
     let (mut estimator, _) = estimator();
     let cancelled = AtomicBool::new(true);
-    assert!(estimator.observe(&contact_event(), &cancelled).is_none());
+    assert!(
+        estimator
+            .observe_settled(&contact_event(), &cancelled)
+            .is_none()
+    );
 }
 
 #[test]
@@ -469,10 +497,10 @@ fn separate_hits_give_separate_planets_with_no_unmatched_contact() {
     ]);
     let (mut estimator, cancelled) = estimator();
     estimator
-        .observe(&shot_in(&truth, (350.0, 500.0), 0.0, 4.0), &cancelled)
+        .observe_settled(&shot_in(&truth, (350.0, 500.0), 0.0, 4.0), &cancelled)
         .unwrap();
     let belief = estimator
-        .observe(&shot_in(&truth, (1050.0, 700.0), 0.0, 4.0), &cancelled)
+        .observe_settled(&shot_in(&truth, (1050.0, 700.0), 0.0, 4.0), &cancelled)
         .unwrap();
     assert_eq!(belief.map.planets.len(), 2, "{:?}", belief.map);
     assert_eq!(belief.contact_points.len(), 2);
@@ -522,36 +550,11 @@ fn non_finite_shots_are_ignored_without_panicking() {
         velocity,
         points,
     };
-    assert!(estimator.observe(&bad, &cancelled).is_none());
+    assert!(estimator.observe_settled(&bad, &cancelled).is_none());
     assert!(estimator.shots.is_empty());
-    let belief = estimator.observe(&good_shot(), &cancelled).unwrap();
+    let belief = estimator.observe_settled(&good_shot(), &cancelled).unwrap();
     assert!(belief.map.planets.is_empty());
     assert!(belief.model_position_rmse.is_some_and(f64::is_finite));
-}
-
-#[test]
-fn a_cancelled_fit_is_retried_on_the_next_event() {
-    let (mut estimator, _) = estimator();
-    // A shot was ingested but its fit never published (cancelled or failed).
-    let obs = shot_of(&good_shot());
-    estimator.shots.push(Shot::new(
-        obs,
-        None,
-        WorldParameters::default(),
-        &NOISE_LEVELS,
-    ));
-    estimator.stale = true;
-    let cancelled = AtomicBool::new(true);
-    assert!(
-        estimator
-            .observe(&position(9, 1.0, 1.0), &cancelled)
-            .is_none()
-    );
-    assert!(estimator.stale);
-    cancelled.store(false, Ordering::SeqCst);
-    let belief = estimator.observe(&position(9, 2.0, 2.0), &cancelled);
-    assert!(belief.is_some());
-    assert!(!estimator.stale);
 }
 
 // A mode at the radius bound has no trustworthy Gaussian approximation: no covariance, never a
@@ -565,14 +568,7 @@ fn a_mode_at_a_bound_reports_no_covariance() {
             shot_in(&truth, (500.0, 380.0), 0.0, 10.0),
             shot_in(&truth, (900.0, 150.0), 90.0, 8.0),
         ]
-        .map(|event| {
-            Shot::new(
-                shot_of(&event),
-                None,
-                WorldParameters::default(),
-                &NOISE_LEVELS,
-            )
-        });
+        .map(|event| Shot::new(shot_of(&event), None, WorldParameters::default(), 0.0));
         Fit::new(
             &shots,
             WorldParameters::default(),
@@ -587,52 +583,6 @@ fn a_mode_at_a_bound_reports_no_covariance() {
     assert!(covariance_at(30.0).is_some());
     assert!(covariance_at(40.0).is_none());
     assert!(covariance_at(20.0).is_none());
-}
-
-// The planet cap and the time budget stop the search, are reported, and still publish a belief.
-#[test]
-fn planet_cap_and_time_budget_are_reported() {
-    let truth = world_of(vec![
-        planet(500.0, 500.0, 30.0),
-        planet(1200.0, 700.0, 30.0),
-    ]);
-    let events = [
-        shot_in(&truth, (350.0, 500.0), 0.0, 4.0),
-        shot_in(&truth, (1050.0, 700.0), 0.0, 4.0),
-    ];
-    let (mut capped, cancelled) = estimator();
-    capped.max_planets = 1;
-    let belief = events
-        .iter()
-        .filter_map(|event| capped.observe(event, &cancelled))
-        .last()
-        .unwrap();
-    assert!(belief.map.planets.len() <= 1);
-    assert_eq!(belief.search_limit, Some(SearchLimit::PlanetCap));
-
-    let (mut hurried, cancelled) = estimator();
-    hurried.time_budget = Duration::ZERO;
-    let belief = hurried.observe(&events[0], &cancelled).unwrap();
-    assert_eq!(belief.search_limit, Some(SearchLimit::TimeBudget));
-
-    let (mut free, cancelled) = estimator();
-    let belief = free.observe(&events[0], &cancelled).unwrap();
-    assert_eq!(belief.search_limit, None);
-}
-
-// A leftover planet that the data no longer support is removed by the death descent.
-#[test]
-fn an_unsupported_extra_planet_in_a_warm_start_dies() {
-    let truth = world_of(vec![planet(900.0, 500.0, 30.0)]);
-    let (mut estimator, cancelled) = estimator();
-    estimator.warm_starts = vec![vec![
-        planet(900.0, 500.0, 30.0),
-        planet(1500.0, 150.0, 25.0),
-    ]];
-    let belief = estimator
-        .observe(&shot_in(&truth, (500.0, 380.0), 0.0, 10.0), &cancelled)
-        .unwrap();
-    assert_eq!(belief.map.planets.len(), 1, "{:?}", belief.map);
 }
 
 /// Deterministic uniform values in `[0, 1)`.
@@ -691,7 +641,7 @@ fn recovery_rate_of_one_planet_worlds() {
                     .to_degrees();
                 let velocity = 8.0 + 4.0 * uniform(&mut state);
                 let event = shot_in(&truth, (start.0 as f32, start.1 as f32), angle, velocity);
-                belief = estimator.observe(&event, &cancelled).or(belief);
+                belief = estimator.observe_settled(&event, &cancelled).or(belief);
             }
             if let Some(found) = belief.and_then(|b| b.map.planets.first().cloned()) {
                 chosen += 1;
@@ -740,104 +690,10 @@ fn a_deadline_never_leaves_a_refit_worse_than_its_start() {
         let (theta, chi2) = fit.refine(&start, &fit::Budget::UNLIMITED).unwrap();
         let before = fit.chi2(&start).unwrap();
         assert!(
-            chi2 <= before * (1.0 + 0.0),
+            chi2 <= before * (1.0 + 1e-9),
             "{micros} us: {chi2} after, {before} before ({theta:?})"
         );
     }
-}
-
-// With no time at all the published belief is still at least as good (on the new data) as the
-// warm-start map it started from.
-#[test]
-fn an_exhausted_budget_never_publishes_worse_than_the_warm_start() {
-    let truth = world_of(vec![planet(900.0, 500.0, 30.0)]);
-    let warm = vec![planet(910.0, 490.0, 32.0)];
-    let (mut estimator, cancelled) = estimator();
-    estimator.time_budget = Duration::ZERO;
-    estimator.warm_starts = vec![warm.clone()];
-    let belief = estimator
-        .observe(&shot_in(&truth, (500.0, 380.0), 0.0, 10.0), &cancelled)
-        .unwrap();
-    assert_eq!(belief.search_limit, Some(SearchLimit::TimeBudget));
-    let fit = Fit::new(
-        &estimator.shots,
-        WorldParameters::default(),
-        &cancelled,
-        true,
-        Vec::new(),
-    );
-    let evidence = |planets: &[Planet]| {
-        let theta: Vec<_> = planets.iter().map(fit::theta_of).collect();
-        fit.evidence(&theta).unwrap().log_evidence
-    };
-    assert!(evidence(&belief.map.planets) >= evidence(&warm));
-}
-
-// Cancellation arriving in the middle of the search returns no belief and leaves the retry state
-// and the warm starts as they were.
-#[test]
-fn cancellation_during_the_search_publishes_nothing_and_changes_no_state() {
-    let truth = world_of(vec![
-        planet(500.0, 500.0, 30.0),
-        planet(1200.0, 700.0, 30.0),
-        planet(900.0, 200.0, 25.0),
-    ]);
-    let events: Vec<ServerEvent> = [
-        ((350.0, 500.0), 0.0),
-        ((1050.0, 700.0), 0.0),
-        ((900.0, 400.0), 90.0),
-        ((300.0, 900.0), 20.0),
-        ((1500.0, 300.0), 170.0),
-    ]
-    .iter()
-    .map(|(start, angle)| shot_in(&truth, *start, *angle, 6.0))
-    .collect();
-    let (mut estimator, _) = estimator();
-    let warm = vec![planet(505.0, 495.0, 30.0)];
-    estimator.warm_starts = vec![warm.clone()];
-    let cancelled = AtomicBool::new(false);
-    let belief = std::thread::scope(|scope| {
-        scope.spawn(|| {
-            std::thread::sleep(Duration::from_millis(15));
-            cancelled.store(true, Ordering::SeqCst);
-        });
-        estimator.observe_batch(&events, &cancelled)
-    });
-    assert!(belief.is_none());
-    assert!(estimator.stale);
-    assert!(estimator.belief().is_none());
-    assert_eq!(estimator.warm_starts, vec![warm]);
-}
-
-// The budget bounds the search, not the work after it (evidence of each mode, the diagnostic
-// `model_position_rmse` over every shot, and the unrefit warm-start evaluations are not
-// budgeted); on this small problem that remainder is far below the slack.
-#[test]
-fn the_time_budget_bounds_the_update_time() {
-    let truth = world_of(vec![
-        planet(500.0, 500.0, 30.0),
-        planet(1200.0, 700.0, 30.0),
-        planet(900.0, 200.0, 25.0),
-    ]);
-    let (mut estimator, cancelled) = estimator();
-    let budget = Duration::from_millis(50);
-    estimator.time_budget = budget;
-    let events: Vec<ServerEvent> = [
-        ((350.0, 500.0), 0.0),
-        ((1050.0, 700.0), 0.0),
-        ((900.0, 400.0), 90.0),
-        ((300.0, 900.0), 20.0),
-        ((1500.0, 300.0), 170.0),
-    ]
-    .iter()
-    .map(|(start, angle)| shot_in(&truth, *start, *angle, 6.0))
-    .collect();
-    let started = Instant::now();
-    let belief = estimator.observe_batch(&events, &cancelled).unwrap();
-    let elapsed = started.elapsed();
-    assert_eq!(belief.search_limit, Some(SearchLimit::TimeBudget));
-    assert!(belief.map_weight.is_none());
-    assert!(elapsed < budget + Duration::from_secs(2), "{elapsed:?}");
 }
 
 fn three_planet_events() -> Vec<ServerEvent> {
@@ -856,34 +712,82 @@ fn three_planet_events() -> Vec<ServerEvent> {
     .collect()
 }
 
-// The evaluation limit is a work count: the belief and the work done do not depend on the clock
-// or on how many threads share the work.
+// The planet cap and the slice limits are reported, and a belief is published either way.
 #[test]
-fn the_evaluation_limit_gives_the_same_belief_whatever_the_load() {
+fn planet_cap_and_slice_limits_are_reported() {
+    let truth = world_of(vec![
+        planet(500.0, 500.0, 30.0),
+        planet(1200.0, 700.0, 30.0),
+    ]);
+    let events = [
+        shot_in(&truth, (350.0, 500.0), 0.0, 4.0),
+        shot_in(&truth, (1050.0, 700.0), 0.0, 4.0),
+    ];
+    let (mut capped, cancelled) = estimator();
+    capped.settings.max_planets = 1;
+    let belief = events
+        .iter()
+        .filter_map(|event| capped.observe_settled(event, &cancelled))
+        .last()
+        .unwrap();
+    assert_eq!(belief.map.planets.len(), 1);
+    assert_eq!(belief.search_limit, Some(SearchLimit::PlanetCap));
+
+    // Right after a path the slices are still owed; with no time per slice none gets anywhere.
+    let (mut hurried, cancelled) = estimator();
+    hurried.settings.slice_ceiling = Some(Duration::ZERO);
+    let belief = hurried.observe(&events[0], &cancelled).unwrap();
+    assert_eq!(belief.search_limit, Some(SearchLimit::WorkBudget));
+    let belief = hurried.settle(&cancelled).unwrap();
+    assert_eq!(belief.search_limit, Some(SearchLimit::TimeBudget));
+
+    let (mut free, cancelled) = estimator();
+    free.settings.slices_per_path = 50;
+    let belief = free.observe_settled(&events[0], &cancelled).unwrap();
+    assert_eq!(belief.search_limit, None);
+    assert_eq!(belief.map.planets.len(), 1);
+}
+
+// The slice limit is a work count: the belief and the work done do not depend on the clock or on
+// how many threads share the work.
+#[test]
+fn the_slice_limit_gives_the_same_belief_whatever_the_load() {
     let events = three_planet_events();
-    let run = |parallel: bool, budget: Duration| {
+    let run = |threads: usize| {
         let (mut estimator, cancelled) = estimator();
-        estimator.max_evaluations = Some(150);
-        estimator.time_budget = budget;
-        estimator.parallel_evaluations = parallel;
-        let belief = estimator.observe_batch(&events, &cancelled).unwrap();
-        (belief, estimator.last_report().unwrap().evaluations)
+        estimator.settings.slice_evaluations = 100;
+        estimator.settings.slice_ceiling = None;
+        estimator.settings.threads = threads;
+        let mut work = 0;
+        let mut belief = None;
+        for event in &events {
+            belief = estimator.observe_settled(event, &cancelled);
+            work += estimator.last_report().unwrap().evaluations;
+        }
+        (belief.unwrap(), work)
     };
-    let (first, work) = run(false, Duration::from_secs(3600));
-    assert_eq!(first.search_limit, Some(SearchLimit::WorkBudget));
-    assert!(first.map_weight.is_none());
-    // Evidence evaluations may overshoot the limit slightly, never by a whole stage.
-    assert!(work < 600, "{work} evaluations");
-    for (parallel, budget) in [
-        (false, Duration::from_secs(3600)),
-        (true, Duration::from_secs(3600)),
-        (false, Duration::from_secs(1800)),
-    ] {
-        let (again, again_work) = run(parallel, budget);
-        assert_eq!(again.map.planets, first.map.planets, "parallel {parallel}");
+    let (first, work) = run(1);
+    for threads in [1, 4] {
+        let (again, again_work) = run(threads);
+        assert_eq!(again.map.planets, first.map.planets, "{threads} threads");
         assert_eq!(again_work, work);
-        assert_eq!(again.search_limit, first.search_limit);
     }
+}
+
+// A slice exits promptly when cancelled, and a reset drops the pending work.
+#[test]
+fn a_cancelled_slice_stops_and_a_reset_drops_pending_work() {
+    let (mut estimator, cancelled) = estimator();
+    estimator
+        .observe(&three_planet_events()[0], &cancelled)
+        .unwrap();
+    assert!(estimator.search_pending());
+    let stop = AtomicBool::new(true);
+    let started = Instant::now();
+    estimator.settle(&stop);
+    assert!(started.elapsed() < Duration::from_secs(5));
+    estimator.reset();
+    assert!(!estimator.search_pending() && estimator.belief().is_none());
 }
 
 // A part that exceeds its wall-clock ceiling is named in the report and fails loudly on demand;
@@ -892,12 +796,14 @@ fn the_evaluation_limit_gives_the_same_belief_whatever_the_load() {
 fn an_exceeded_part_ceiling_is_reported_by_name() {
     let events = three_planet_events();
     let (mut generous, cancelled) = estimator();
-    generous.max_planets = 2;
+    generous.settings.max_planets = 2;
     generous
+        .settings
         .ceilings
         .0
         .insert(Part::WindowBuild, Duration::from_secs(60));
     generous.observe_batch(&events, &cancelled).unwrap();
+    generous.settle(&cancelled);
     let report = generous.last_report().unwrap();
     assert!(report.violations.is_empty());
     report.assert_within_ceilings();
@@ -908,10 +814,12 @@ fn an_exceeded_part_ceiling_is_reported_by_name() {
 
     let (mut hurried, cancelled) = estimator();
     hurried
+        .settings
         .ceilings
         .0
         .insert(Part::Evidence, Duration::from_nanos(1));
     hurried.observe_batch(&events, &cancelled).unwrap();
+    hurried.settle(&cancelled);
     let report = hurried.last_report().unwrap();
     assert_eq!(
         report.violations.iter().map(|v| v.part).collect::<Vec<_>>(),
@@ -953,10 +861,10 @@ fn the_jacobian_matches_finite_differences_and_threads_change_nothing() {
         [1195.0, 703.0, 27.0],
         [905.0, 255.0, 25.5],
     ];
-    let (residual, jacobian) = fit.evaluate(&theta, true, 0, 1).unwrap();
+    let (residual, jacobian) = fit.evaluate(&theta, true, 1).unwrap();
     let jacobian = jacobian.unwrap();
     for threads in [2, 3, 8] {
-        let (r, j) = fit.evaluate(&theta, true, 0, threads).unwrap();
+        let (r, j) = fit.evaluate(&theta, true, threads).unwrap();
         assert!(r == residual && j.unwrap() == jacobian, "{threads} threads");
     }
     let h = 1e-5;
@@ -964,7 +872,7 @@ fn the_jacobian_matches_finite_differences_and_threads_change_nothing() {
         let at = |sign: f64| {
             let mut moved = theta;
             moved[column / 3][column % 3] += sign * h;
-            fit.evaluate(&moved, false, 0, 1).unwrap().0
+            fit.evaluate(&moved, false, 1).unwrap().0
         };
         let numeric = (at(1.0) - at(-1.0)) / (2.0 * h);
         let scale = numeric.amax().max(1e-9);

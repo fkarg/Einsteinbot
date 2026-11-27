@@ -63,8 +63,8 @@ pub(super) struct PathData {
     substeps: usize,
     /// Observed second difference per axis and row.
     y: [Vec<f64>; 2],
-    /// Per noise level (see `new`) and axis.
-    whiteners: Vec<[Whitener; 2]>,
+    /// Per axis.
+    whitener: [Whitener; 2],
     /// First node of each row of a thinned path (`thinned`): kept rows that are neighbours on
     /// the path share nodes. `None` for a full path (row `r` starts at node `r * n + 1`).
     row_node: Option<Vec<usize>>,
@@ -73,33 +73,20 @@ pub(super) struct PathData {
 }
 
 impl PathData {
-    /// `None` when the path has fewer than `MIN_TICKS` regular ticks. `extra_sd` lists position
-    /// noise allowances in world units added to the f32 rounding noise, one whitener per entry
-    /// (the estimator fits coarse-to-fine; the last level is the one that is scored).
+    /// `None` when the path has fewer than `MIN_TICKS` regular ticks. `relative` times the
+    /// observed acceleration magnitude of each row is added to that row's noise standard deviation
+    /// (in quadrature, both axes), on top of the f32 rounding noise; 0 is the exact noise model.
+    /// The relative term widens the likelihood for the search stages (E9 in
+    /// `docs/estimator-experiments.md`).
     pub fn new(
         points: &[Point],
         angle_degrees: f64,
         velocity: f64,
         world: WorldParameters,
-        extra_sd: &[f64],
-    ) -> Option<Self> {
-        Self::new_relative(points, angle_degrees, velocity, world, extra_sd, 0.0)
-    }
-
-    /// As `new`, with `relative` times the observed acceleration magnitude of each row added to
-    /// that row's noise standard deviation (in quadrature, both axes). Experimental, for the
-    /// search stage only (`diagnose/thinning.rs`); 0 is the exact noise model.
-    pub fn new_relative(
-        points: &[Point],
-        angle_degrees: f64,
-        velocity: f64,
-        world: WorldParameters,
-        extra_sd: &[f64],
         relative: f64,
     ) -> Option<Self> {
         // The engine records a debris shot's first dot without stepping it when the shot was
         // created after its slot was simulated that tick: the launch dot is then duplicated.
-        assert!(!extra_sd.is_empty(), "at least one noise level is needed");
         let points = match points {
             [first, second, ..] if first == second => &points[1..],
             _ => points,
@@ -136,56 +123,51 @@ impl PathData {
                 error * error
             })
             .collect();
-        let whiteners = extra_sd
-            .iter()
-            .map(|extra| {
-                [0, 1].map(|axis| {
-                    // Row `r` has noise coefficients (1, -2, 1) on ticks r, r + 1, r + 2.
-                    let var = |tick: usize| f32_sd(ticks[tick][axis]).powi(2) + extra * extra;
-                    let mut factor = Whitener {
-                        diagonal: Vec::with_capacity(rows),
-                        first: Vec::with_capacity(rows),
-                        second: Vec::with_capacity(rows),
-                    };
-                    for i in 0..rows {
-                        let relative_sd = relative * y[0][i].hypot(y[1][i]);
-                        let c0 = var(i)
-                            + 4.0 * var(i + 1)
-                            + var(i + 2)
-                            + interpolation_variance[i]
-                            + relative_sd * relative_sd;
-                        let c1 = if i >= 1 {
-                            -2.0 * (var(i) + var(i + 1))
-                        } else {
-                            0.0
-                        };
-                        let c2 = if i >= 2 { var(i) } else { 0.0 };
-                        // Cholesky by diagonals: L[i][i-2], L[i][i-1], L[i][i].
-                        let l2 = if i >= 2 {
-                            c2 / factor.diagonal[i - 2]
-                        } else {
-                            0.0
-                        };
-                        let l1 = if i >= 1 {
-                            (c1 - l2 * factor.first[i - 1]) / factor.diagonal[i - 1]
-                        } else {
-                            0.0
-                        };
-                        factor.second.push(l2);
-                        factor.first.push(l1);
-                        factor.diagonal.push((c0 - l1 * l1 - l2 * l2).sqrt());
-                    }
-                    factor
-                })
-            })
-            .collect();
+        let whitener = [0, 1].map(|axis| {
+            // Row `r` has noise coefficients (1, -2, 1) on ticks r, r + 1, r + 2.
+            let var = |tick: usize| f32_sd(ticks[tick][axis]).powi(2);
+            let mut factor = Whitener {
+                diagonal: Vec::with_capacity(rows),
+                first: Vec::with_capacity(rows),
+                second: Vec::with_capacity(rows),
+            };
+            for i in 0..rows {
+                let relative_sd = relative * y[0][i].hypot(y[1][i]);
+                let c0 = var(i)
+                    + 4.0 * var(i + 1)
+                    + var(i + 2)
+                    + interpolation_variance[i]
+                    + relative_sd * relative_sd;
+                let c1 = if i >= 1 {
+                    -2.0 * (var(i) + var(i + 1))
+                } else {
+                    0.0
+                };
+                let c2 = if i >= 2 { var(i) } else { 0.0 };
+                // Cholesky by diagonals: L[i][i-2], L[i][i-1], L[i][i].
+                let l2 = if i >= 2 {
+                    c2 / factor.diagonal[i - 2]
+                } else {
+                    0.0
+                };
+                let l1 = if i >= 1 {
+                    (c1 - l2 * factor.first[i - 1]) / factor.diagonal[i - 1]
+                } else {
+                    0.0
+                };
+                factor.second.push(l2);
+                factor.first.push(l1);
+                factor.diagonal.push((c0 - l1 * l1 - l2 * l2).sqrt());
+            }
+            factor
+        });
         Some(Self {
             nodes,
             ticks,
             kernel,
             substeps: n,
             y,
-            whiteners,
+            whitener,
             row_node: None,
             centers: None,
         })
@@ -224,33 +206,26 @@ impl PathData {
             }
             previous = Some(r);
         }
-        let whiteners = self
-            .whiteners
-            .iter()
-            .map(|level| {
-                [0, 1].map(|axis| {
-                    let w = &level[axis];
-                    Whitener {
-                        diagonal: keep
-                            .iter()
-                            .map(|&r| {
-                                (w.diagonal[r].powi(2) + w.first[r].powi(2) + w.second[r].powi(2))
-                                    .sqrt()
-                            })
-                            .collect(),
-                        first: vec![0.0; keep.len()],
-                        second: vec![0.0; keep.len()],
-                    }
-                })
-            })
-            .collect();
+        let whitener = [0, 1].map(|axis| {
+            let w = &self.whitener[axis];
+            Whitener {
+                diagonal: keep
+                    .iter()
+                    .map(|&r| {
+                        (w.diagonal[r].powi(2) + w.first[r].powi(2) + w.second[r].powi(2)).sqrt()
+                    })
+                    .collect(),
+                first: vec![0.0; keep.len()],
+                second: vec![0.0; keep.len()],
+            }
+        });
         Some(Self {
             nodes,
             ticks: self.ticks.clone(),
             kernel: self.kernel.clone(),
             substeps: n,
             y: [0, 1].map(|axis| keep.iter().map(|&r| self.y[axis][r]).collect()),
-            whiteners,
+            whitener,
             row_node: Some(row_node),
             centers: Some(keep.iter().map(|&r| self.ticks[r + 1]).collect()),
         })
@@ -269,11 +244,6 @@ impl PathData {
         self.row_node
             .as_ref()
             .map_or(r * self.substeps + 1, |v| v[r])
-    }
-
-    /// Number of noise levels.
-    pub fn levels(&self) -> usize {
-        self.whiteners.len()
     }
 
     pub fn row_count(&self) -> usize {
@@ -299,10 +269,10 @@ impl PathData {
         }
     }
 
-    /// Whitened residual `L^-1 (y - W field)` of one axis at a noise level.
-    pub fn residual(&self, axis: usize, level: usize, field: &[f64], out: &mut [f64]) {
+    /// Whitened residual `L^-1 (y - W field)` of one axis.
+    pub fn residual(&self, axis: usize, field: &[f64], out: &mut [f64]) {
         self.raw_residual(axis, field, out);
-        self.whiten(axis, level, out, 0);
+        self.whiten(axis, out, 0);
     }
 
     /// Unwhitened `y - W field` of one axis.
@@ -313,9 +283,9 @@ impl PathData {
         }
     }
 
-    /// Replace `v` by `L^-1 v` at a noise level, where `v` is zero before row `start`.
-    pub fn whiten(&self, axis: usize, level: usize, v: &mut [f64], start: usize) {
-        let w = &self.whiteners[level.min(self.whiteners.len() - 1)][axis];
+    /// Replace `v` by `L^-1 v`, where `v` is zero before row `start`.
+    pub fn whiten(&self, axis: usize, v: &mut [f64], start: usize) {
+        let w = &self.whitener[axis];
         for i in start..v.len() {
             let mut s = v[i];
             if i >= 1 {
@@ -430,7 +400,7 @@ mod tests {
             })
             .collect();
         let world = WorldParameters::default();
-        let full = PathData::new(&points, 0.0, 3.0, world, &[0.0]).unwrap();
+        let full = PathData::new(&points, 0.0, 3.0, world, 0.0).unwrap();
         let keep = [0, 1, 2, 7, 12, 13, 30];
         let thin = full.thinned(&keep).unwrap();
         assert_eq!(thin.row_count(), keep.len());
@@ -468,14 +438,14 @@ mod tests {
                 y: 20.0 - 5.0 * i as f32,
             })
             .collect();
-        let path = PathData::new(&points, 0.0, 3.0, WorldParameters::default(), &[0.0]).unwrap();
+        let path = PathData::new(&points, 0.0, 3.0, WorldParameters::default(), 0.0).unwrap();
         let sd = |tick: usize, axis: usize| {
             let p = &points[tick];
             f32_sd(f64::from(if axis == 0 { p.x } else { p.y }))
         };
         let coefs = |row: usize| [(row, 1.0), (row + 1, -2.0), (row + 2, 1.0)];
         for axis in 0..2 {
-            let w = &path.whiteners[0][axis];
+            let w = &path.whitener[axis];
             let l = |row: usize, col: usize| match row - col {
                 0 => w.diagonal[row],
                 1 => w.first[row],

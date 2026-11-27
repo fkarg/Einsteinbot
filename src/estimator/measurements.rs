@@ -84,7 +84,7 @@ fn measure_residual_scale_on_live_captures() {
                     }
                     seen.push(obs.clone());
                     all.extend(chi_square_per_coordinate(
-                        &Shot::new(obs, None, world, &NOISE_LEVELS),
+                        &Shot::new(obs, None, world, 0.0),
                         planets,
                     ));
                 }
@@ -136,7 +136,7 @@ fn measure_residual_scale_on_synthetic_paths() {
                 ..shot
             };
             values.extend(chi_square_per_coordinate(
-                &Shot::new(obs, None, world, &NOISE_LEVELS),
+                &Shot::new(obs, None, world, 0.0),
                 &planets,
             ));
         }
@@ -252,10 +252,10 @@ fn measure_update_cost() {
     let never = AtomicBool::new(false);
     let mut estimator = Estimator::default();
     if let Ok(v) = std::env::var("MAX_PLANETS") {
-        estimator.max_planets = v.parse().unwrap();
+        estimator.settings.max_planets = v.parse().unwrap();
     }
-    if let Ok(v) = std::env::var("BUDGET_MS") {
-        estimator.time_budget = Duration::from_millis(v.parse().unwrap());
+    if let Ok(v) = std::env::var("SLICE_CEILING_MS") {
+        estimator.settings.slice_ceiling = Some(Duration::from_millis(v.parse().unwrap()));
     }
     let mut completed = 0;
     let mut truth: Vec<Planet> = Vec::new();
@@ -268,7 +268,8 @@ fn measure_update_cost() {
         }
         let is_shot = matches!(event, ServerEvent::ShotFin { .. });
         let start = Instant::now();
-        let belief = estimator.observe(&event, &never);
+        let local = estimator.observe(&event, &never);
+        let belief = estimator.settle(&never).or(local);
         if let (true, Some(belief)) = (is_shot, belief) {
             completed += 1;
             let elapsed = start.elapsed();

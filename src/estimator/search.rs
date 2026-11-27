@@ -1,22 +1,27 @@
 //! Search over the number of planets K.
 //!
-//! Every update refits the previous update's retained modes jointly on all paths, then tries to
-//! grow and shrink the best one on the evidence of the windowed comparison:
-//! - Birth: seed one extra planet where the observed windows' unexplained mean acceleration is
-//!   most significant (the residual points toward the missing mass, whose distance follows from
-//!   `|a| = mass / d^2` for a few radii; several diverse seeds, no grid). Each seed is first
-//!   fitted alone against the field the current planets leave over (cheap), then the best few
-//!   are refitted jointly with every planet on every path.
-//! - Death: drop each of the weakest planets, refit the rest jointly and compare evidence.
+//! Two pieces share the birth machinery:
+//! - `Search`, the live map. It keeps the current planets, the accumulated paths at two relative
+//!   noise levels and the pending birth work (candidate planets and partial joint refits). A new
+//!   path gets a cheap local refit (`Search::add_path`); `Search::step` does a bounded slice of
+//!   birth work and can be called at any time. A path that arrives between slices does not restart
+//!   the pending work.
+//! - `grow` and `prune`, the greedy birth and death descents of the from-scratch cascade
+//!   (`rebuild.rs`).
 //!
-//! Contacts never create planets: they enter the joint fit only as gated surface constraints.
-use super::SearchLimit;
+//! Birth: seed one extra planet where the observed windows' unexplained mean acceleration is
+//! most significant (the residual points toward the missing mass, whose distance follows from
+//! `|a| = mass / d^2` for a few radii; several diverse seeds, no grid). Each seed is first fitted
+//! alone against the field the current planets leave over (cheap), then the best few are refitted
+//! jointly with every planet. Death: drop each of the weakest planets, refit the rest jointly and
+//! compare evidence. Contacts never create planets: they enter the joint fits only as gated
+//! surface constraints.
 use super::Shot;
 use super::fit::{Budget, Evidence, Fit, planet_at, theta_of};
-use super::work::{Part, PartCeilings, Stats, cores, par_map};
+use super::rows::thin_rows;
+use super::work::{Part, PartCeilings, Stats, par_map};
 use crate::protocol::Planet;
 use crate::simulation::WorldParameters;
-use nalgebra::DMatrix;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
@@ -31,30 +36,44 @@ const SEED_RADII: [f64; 3] = [20.0, 30.0, 40.0];
 const JOINT_REFITS: usize = 3;
 /// Weakest planets tried as deaths per level.
 const DEATH_TRIALS: usize = 2;
-/// Levels of the death descent (planets removed one by one from the best mode).
-const DEATH_DEPTH: usize = 6;
+/// Levels of the death descent of the cascade (planets removed one by one from the best mode).
+pub(super) const DEATH_DEPTH: usize = 6;
 /// Modes closer than this in centre and radius are the same planet.
 const SAME_PLANET: (f64, f64) = (10.0, 3.0);
+
+/// Relative noise levels (times the observed acceleration of a row) the live search goes through,
+/// coarse to fine; the last is the level of the evidence that ranks maps.
+pub(super) const LEVELS: [f64; 2] = [0.02, 0.005];
+/// Rows kept by the live search per level (see `rows.rs`).
+const ROW_CAP: usize = 1000;
+/// A new path's local refit frees the planets within this distance of its rows.
+const LOCAL_RADIUS: f64 = 100.0;
+/// Evaluations of a local refit.
+const LOCAL_EVALUATIONS: u64 = 300;
+/// Alone fits per batch (a batch is the unit between wall-clock checks).
+const BATCH: usize = 8;
+/// A joint partial that is still improving after this many slices of work counts as finished.
+const MAX_ROUNDS: usize = 6;
+/// Candidates closer than this (xy) are one hypothesis; the list is bounded.
+const DUPLICATE: f64 = 30.0;
+const MAX_CANDIDATES: usize = 24;
 
 #[derive(Clone, Debug)]
 pub(super) struct Mode {
     pub planets: Vec<Planet>,
     /// Approximate log evidence including the planet prior; the flat model's is `-0.5 * chi2`.
     pub log_evidence: f64,
-    /// `[x, y, radius]` covariance, `None` when under-identified or saturated at a bound.
-    pub covariance: Option<DMatrix<f64>>,
 }
 
+/// Limits of a from-scratch run (the cascade).
 pub(super) struct Limits<'a> {
     pub max_planets: usize,
-    /// Wall-clock bound on the whole search (machine dependent).
-    pub deadline: Instant,
     /// Deterministic bound on residual plus Jacobian evaluations. It is checked between search
     /// stages and shared out equally among the refits of a stage, so the result does not depend
     /// on timing or thread scheduling; a stage may overshoot it by the evidence evaluations.
     pub max_evaluations: Option<u64>,
-    /// Let a refit use the cores that the other refits of its stage leave idle.
-    pub parallel_evaluations: bool,
+    /// Threads of the run.
+    pub threads: usize,
     pub ceilings: &'a PartCeilings,
 }
 
@@ -62,10 +81,11 @@ pub(super) struct Limits<'a> {
 pub(super) struct Run<'a> {
     pub limits: &'a Limits<'a>,
     pub stats: &'a Stats,
+    pub cancelled: &'a AtomicBool,
 }
 
 impl Run<'_> {
-    fn work_exhausted(&self) -> bool {
+    pub(super) fn work_exhausted(&self) -> bool {
         self.limits
             .max_evaluations
             .is_some_and(|max| self.stats.evaluations() >= max)
@@ -80,11 +100,7 @@ impl Run<'_> {
             .max_evaluations
             .map(|max| max.saturating_sub(self.stats.evaluations()));
         Budget {
-            threads: if self.limits.parallel_evaluations {
-                (cores() / tasks.max(1)).max(1)
-            } else {
-                1
-            },
+            threads: (self.limits.threads / tasks.max(1)).max(1),
             evaluations: left.map_or(u64::MAX, |left| left.div_ceil(tasks.max(1) as u64)),
             deadline: self
                 .limits
@@ -100,28 +116,15 @@ fn same_planet(a: &Planet, b: &Planet) -> bool {
     (a.x - b.x).hypot(a.y - b.y) < SAME_PLANET.0 && (a.radius - b.radius).abs() < SAME_PLANET.1
 }
 
-/// Whether two maps are the same mode: the same number of planets, each matching one of the other.
-pub(super) fn same_map(a: &[Planet], b: &[Planet]) -> bool {
-    a.len() == b.len() && {
-        let mut free: Vec<&Planet> = b.iter().collect();
-        a.iter().all(|planet| {
-            free.iter()
-                .position(|other| same_planet(planet, other))
-                .map(|i| free.swap_remove(i))
-                .is_some()
-        })
-    }
+fn distance(a: &[f64; 3], b: &[f64; 3]) -> f64 {
+    (a[0] - b[0]).hypot(a[1] - b[1])
 }
 
 pub(super) fn mode_at(joint: &Fit, theta: &[[f64; 3]]) -> Option<Mode> {
-    let Evidence {
-        log_evidence,
-        covariance,
-    } = joint.evidence(theta)?;
+    let Evidence { log_evidence, .. } = joint.evidence(theta)?;
     Some(Mode {
         planets: theta.iter().map(|th| planet_at(*th)).collect(),
         log_evidence,
-        covariance,
     })
 }
 
@@ -131,7 +134,7 @@ pub(super) fn refit(joint: &Fit, start: &[[f64; 3]], budget: &Budget) -> Option<
 }
 
 /// Seed planets from the largest unexplained windows of the paths under `theta`.
-pub(super) fn seeds(joint: &Fit, theta: &[[f64; 3]], world: WorldParameters) -> Vec<[f64; 3]> {
+fn seeds(joint: &Fit, theta: &[[f64; 3]], world: WorldParameters) -> Vec<[f64; 3]> {
     let mut chosen: Vec<[f64; 2]> = Vec::new();
     let mut seeds = Vec::new();
     for window in joint.unexplained(theta) {
@@ -162,28 +165,27 @@ pub(super) fn seeds(joint: &Fit, theta: &[[f64; 3]], world: WorldParameters) -> 
 }
 
 /// Joint refits of `parent` plus one more planet, best evidence first.
-pub(super) fn births(
+fn births(
     shots: &[Shot],
     joint: &Fit,
     parent: &Mode,
     world: WorldParameters,
-    cancelled: &AtomicBool,
     run: &Run,
 ) -> Vec<Mode> {
     let stats = run.stats;
+    let threads = run.limits.threads;
     let theta: Vec<[f64; 3]> = parent.planets.iter().map(theta_of).collect();
     let seeds = stats.time(Part::Seeding, || seeds(joint, &theta, world));
     if seeds.is_empty() {
         return Vec::new();
     }
     // Stage 1: the new planet alone against the field the parent leaves over.
-    let alone = Fit::new(shots, world, cancelled, false, parent.planets.clone())
-        .with_deadline(run.limits.deadline)
-        .with_stats(stats);
+    let alone =
+        Fit::new(shots, world, run.cancelled, false, parent.planets.clone()).with_stats(stats);
     let budget = run.budget(seeds.len(), Part::BirthAlone);
     let mut fitted: Vec<([f64; 3], f64)> = stats
         .time(Part::BirthAlone, || {
-            par_map(&seeds, cores(), |seed| alone.refine(&[*seed], &budget))
+            par_map(&seeds, threads, |seed| alone.refine(&[*seed], &budget))
         })
         .into_iter()
         .flatten()
@@ -204,7 +206,7 @@ pub(super) fn births(
     let budget = run.budget(distinct.len(), Part::BirthJoint);
     let mut modes: Vec<Mode> = stats
         .time(Part::BirthJoint, || {
-            par_map(&distinct, cores(), |planet| {
+            par_map(&distinct, threads, |planet| {
                 let mut start = theta.clone();
                 start.push(*planet);
                 refit(joint, &start, &budget)
@@ -218,7 +220,7 @@ pub(super) fn births(
 }
 
 /// Joint refits of `parent` without each of its weakest planets, best evidence first.
-pub(super) fn deaths(joint: &Fit, parent: &Mode, run: &Run) -> Vec<Mode> {
+fn deaths(joint: &Fit, parent: &Mode, run: &Run) -> Vec<Mode> {
     let theta: Vec<[f64; 3]> = parent.planets.iter().map(theta_of).collect();
     let Some(full) = joint.chi2(&theta) else {
         return Vec::new();
@@ -234,12 +236,16 @@ pub(super) fn deaths(joint: &Fit, parent: &Mode, run: &Run) -> Vec<Mode> {
     weakest.sort_by(|a, b| a.1.total_cmp(&b.1));
     weakest.truncate(DEATH_TRIALS);
     let budget = run.budget(weakest.len(), Part::Deaths);
-    let mut modes: Vec<Mode> = par_map(&weakest, cores(), |(i, _)| {
-        refit(joint, &without(*i), &budget)
-    })
-    .into_iter()
-    .flatten()
-    .collect();
+    let mut modes: Vec<Mode> = run
+        .stats
+        .time(Part::Deaths, || {
+            par_map(&weakest, run.limits.threads, |(i, _)| {
+                refit(joint, &without(*i), &budget)
+            })
+        })
+        .into_iter()
+        .flatten()
+        .collect();
     modes.sort_by(|a, b| b.log_evidence.total_cmp(&a.log_evidence));
     modes
 }
@@ -251,60 +257,24 @@ pub(super) fn best(modes: &[Mode]) -> &Mode {
         .expect("the flat mode is always present")
 }
 
-/// All modes evaluated this update (unsorted, possibly coinciding) and why the search stopped
-/// early, if it did. `None` when cancelled or when the flat model cannot be evaluated.
-pub(super) fn search(
+/// Greedy births from the best mode until no birth improves the evidence, the planet cap or the
+/// work limit is reached.
+pub(super) fn grow(
+    joint: &Fit,
     shots: &[Shot],
+    modes: &mut Vec<Mode>,
+    run: &Run,
     world: WorldParameters,
-    cancelled: &AtomicBool,
-    warm: &[Vec<Planet>],
-    limits: &Limits,
-    stats: &Stats,
-) -> Option<(Vec<Mode>, Option<SearchLimit>)> {
-    let run = Run { limits, stats };
-    let joint = Fit::new(shots, world, cancelled, true, Vec::new())
-        .with_deadline(limits.deadline)
-        .with_stats(stats);
-    let starts: Vec<Vec<[f64; 3]>> = warm
-        .iter()
-        .filter(|planets| !planets.is_empty())
-        .map(|planets| planets.iter().map(theta_of).collect())
-        .collect();
-    // The warm modes enter unrefit first, so a refit that is cut short (deadline) or fails can
-    // never lose them or leave the belief worse than the previous update's maps on the new data.
-    let mut modes = stats.time(Part::WarmStart, || {
-        let mut modes = vec![mode_at(&joint, &[])?];
-        modes.extend(starts.iter().filter_map(|start| mode_at(&joint, start)));
-        Some(modes)
-    })?;
-    let budget = run.budget(starts.len(), Part::WarmRefit);
-    modes.extend(
-        stats
-            .time(Part::WarmRefit, || {
-                par_map(&starts, cores(), |start| refit(&joint, start, &budget))
-            })
-            .into_iter()
-            .flatten(),
-    );
-    let mut limit = None;
+) {
     loop {
-        let parent = best(&modes).clone();
-        if cancelled.load(Ordering::Relaxed) {
-            return None;
-        }
-        if parent.planets.len() >= limits.max_planets {
-            limit = Some(SearchLimit::PlanetCap);
+        let parent = best(modes).clone();
+        if parent.planets.len() >= run.limits.max_planets
+            || run.work_exhausted()
+            || run.cancelled.load(Ordering::Relaxed)
+        {
             break;
         }
-        if Instant::now() >= limits.deadline {
-            limit = Some(SearchLimit::TimeBudget);
-            break;
-        }
-        if run.work_exhausted() {
-            limit = Some(SearchLimit::WorkBudget);
-            break;
-        }
-        let children = births(shots, &joint, &parent, world, cancelled, &run);
+        let children = births(shots, joint, &parent, world, run);
         let improved = children
             .first()
             .is_some_and(|child| child.log_evidence > parent.log_evidence);
@@ -313,31 +283,508 @@ pub(super) fn search(
             break;
         }
     }
-    // Deaths: descend from the best mode, always continuing from the best child even when it is
-    // worse, because planets that cancel each other (spurious leftovers of earlier, thinner
-    // data) only look useful one at a time.
-    let mut parent = best(&modes).clone();
-    for _ in 0..DEATH_DEPTH {
-        if cancelled.load(Ordering::Relaxed) {
-            return None;
-        }
-        if parent.planets.is_empty() {
+}
+
+/// Death descent from the best mode: always continuing from the best child even when it is worse,
+/// because planets that cancel each other (spurious leftovers of earlier, thinner data) only look
+/// useful one at a time.
+pub(super) fn prune(joint: &Fit, modes: &mut Vec<Mode>, run: &Run, depth: usize) {
+    let mut parent = best(modes).clone();
+    for _ in 0..depth {
+        if parent.planets.is_empty()
+            || run.work_exhausted()
+            || run.cancelled.load(Ordering::Relaxed)
+        {
             break;
         }
-        if Instant::now() >= limits.deadline {
-            limit = limit.or(Some(SearchLimit::TimeBudget));
-            break;
-        }
-        if run.work_exhausted() {
-            limit = limit.or(Some(SearchLimit::WorkBudget));
-            break;
-        }
-        let children = stats.time(Part::Deaths, || deaths(&joint, &parent, &run));
+        let children = deaths(joint, &parent, run);
         let Some(next) = children.first().cloned() else {
             break;
         };
         modes.extend(children);
         parent = next;
     }
-    (!cancelled.load(Ordering::Relaxed)).then_some((modes, limit))
+}
+
+struct Candidate {
+    theta: [f64; 3],
+    /// Chi2 of the map plus this planet when last scored; `None`: never fitted.
+    chi2: Option<f64>,
+}
+
+struct Partial {
+    /// The map plus the candidate planet (last), or the map minus a weak planet (deaths), refit
+    /// jointly.
+    theta: Vec<[f64; 3]>,
+    done: bool,
+    rounds: usize,
+}
+
+/// What a slice or a local refit may use.
+pub(super) struct Slice<'a> {
+    /// Evaluations (checked between batches, so a slice may exceed it by one batch).
+    pub evaluations: u64,
+    pub deadline: Instant,
+    pub threads: usize,
+    pub max_planets: usize,
+    pub cancelled: &'a AtomicBool,
+    pub stats: &'a Stats,
+}
+
+/// The live map and its pending birth work.
+#[derive(Default)]
+pub(super) struct Search {
+    /// Full-row relative shots of every path so far, per level of `LEVELS`.
+    paths: [Vec<Shot>; LEVELS.len()],
+    /// The current best-estimate planets.
+    pub theta: Vec<[f64; 3]>,
+    /// Level the births are searched at; `LEVELS.len()` when nothing is pending.
+    level: usize,
+    seeded: bool,
+    candidates: Vec<Candidate>,
+    partials: Vec<Partial>,
+    /// A death trial (the two planets whose removal costs least chi2, refit jointly, kept when
+    /// the evidence rises) follows every birth.
+    deaths_due: bool,
+}
+
+impl Search {
+    pub(super) fn new() -> Self {
+        Self {
+            level: LEVELS.len(),
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn idle(&self) -> bool {
+        self.level >= LEVELS.len()
+    }
+
+    fn thin(&self, level: usize) -> Vec<Shot> {
+        thin_rows(&self.paths[level], ROW_CAP)
+    }
+
+    fn clear_pending(&mut self) {
+        self.candidates.clear();
+        self.partials.clear();
+        self.seeded = false;
+        self.deaths_due = false;
+    }
+
+    fn next_level(&mut self) {
+        self.level += 1;
+        self.clear_pending();
+    }
+
+    /// Replace the map by an audit's (built from fewer paths than are known now): every planet is
+    /// refit on all paths, pending work is dropped and the search starts over from the first level.
+    pub(super) fn adopt(&mut self, theta: Vec<[f64; 3]>, slice: &Slice) {
+        self.theta = theta;
+        self.clear_pending();
+        self.refit_near_newest(slice, false);
+    }
+
+    /// A new path: refit the planets within `LOCAL_RADIUS` of its rows (the others are fixed
+    /// field) on the thinned rows of each level, and mark the pending work stale: candidates keep
+    /// their alone fits (re-scored when the next round ranks them) and the joint partials resume
+    /// from where they were.
+    pub(super) fn add_path(&mut self, shot: &Shot, slice: &Slice) {
+        for (level, relative) in LEVELS.iter().enumerate() {
+            self.paths[level].push(shot.at_relative_level(WorldParameters::default(), *relative));
+        }
+        self.refit_near_newest(slice, true);
+    }
+
+    /// Refit the planets near the newest path (all planets when `local` is false) and make every
+    /// pending piece of work stale.
+    fn refit_near_newest(&mut self, slice: &Slice, local: bool) {
+        let world = WorldParameters::default();
+        for level in 0..LEVELS.len() {
+            if self.theta.is_empty() || slice.cancelled.load(Ordering::Relaxed) {
+                break;
+            }
+            let shots = self.thin(level);
+            let newest = self.paths[level].last().and_then(|s| s.path.as_ref());
+            let near = |t: &[f64; 3]| {
+                !local
+                    || newest.is_some_and(|p| {
+                        (0..p.row_count()).any(|r| {
+                            let c = p.center(r);
+                            (t[0] - c[0]).hypot(t[1] - c[1]) < LOCAL_RADIUS
+                        })
+                    })
+            };
+            let (free, fixed): (Vec<[f64; 3]>, Vec<[f64; 3]>) =
+                self.theta.iter().partition(|t| near(t));
+            if free.is_empty() {
+                continue;
+            }
+            let local = Fit::new(
+                &shots,
+                world,
+                slice.cancelled,
+                false,
+                fixed.iter().map(|t| planet_at(*t)).collect(),
+            )
+            .with_stats(slice.stats);
+            let budget = Budget {
+                evaluations: LOCAL_EVALUATIONS,
+                deadline: None,
+                threads: slice.threads,
+            };
+            let refitted = slice
+                .stats
+                .time(Part::WarmRefit, || local.refine(&free, &budget));
+            self.theta = fixed;
+            self.theta.extend(refitted.map_or(free, |(t, _)| t));
+        }
+        self.level = 0;
+        self.seeded = false;
+        for partial in &mut self.partials {
+            partial.done = false;
+            partial.rounds = 0;
+        }
+    }
+
+    /// One slice of birth work, until `slice.evaluations` are spent (checked between batches) or
+    /// `slice.deadline`. Returns whether the map changed.
+    pub(super) fn step(&mut self, slice: &Slice) -> bool {
+        let world = WorldParameters::default();
+        let (stats, cancelled) = (slice.stats, slice.cancelled);
+        let first = stats.evaluations();
+        let mut changed = false;
+        while !self.idle()
+            && stats.evaluations() - first < slice.evaluations
+            && Instant::now() < slice.deadline
+            && !cancelled.load(Ordering::Relaxed)
+        {
+            if self.theta.len() >= slice.max_planets && !self.deaths_due && self.partials.is_empty()
+            {
+                // At the cap no birth is attempted.
+                self.level = LEVELS.len();
+                break;
+            }
+            let shots = self.thin(self.level);
+            let joint = Fit::new(&shots, world, cancelled, true, vec![])
+                .with_deadline(slice.deadline)
+                .with_stats(stats);
+            let left = slice.evaluations - (stats.evaluations() - first);
+            if self.deaths_due && self.partials.is_empty() {
+                let chi2 = joint.chi2(&self.theta);
+                let mut weakest: Vec<(usize, f64)> = (0..self.theta.len())
+                    .filter_map(|i| {
+                        let mut rest = self.theta.clone();
+                        rest.remove(i);
+                        Some((i, joint.chi2(&rest)? - chi2?))
+                    })
+                    .collect();
+                weakest.sort_by(|a, b| a.1.total_cmp(&b.1));
+                self.partials = weakest
+                    .iter()
+                    .take(DEATH_TRIALS)
+                    .map(|(i, _)| {
+                        let mut theta = self.theta.clone();
+                        theta.remove(*i);
+                        Partial {
+                            theta,
+                            done: false,
+                            rounds: 0,
+                        }
+                    })
+                    .collect();
+                if self.partials.is_empty() {
+                    self.deaths_due = false;
+                }
+                continue;
+            }
+            if !self.seeded && self.partials.is_empty() {
+                let new = stats.time(Part::Seeding, || seeds(&joint, &self.theta, world));
+                for seed in new {
+                    // A seed near a kept candidate is the same hypothesis.
+                    if !self
+                        .candidates
+                        .iter()
+                        .any(|c| distance(&c.theta, &seed) < DUPLICATE)
+                    {
+                        self.candidates.push(Candidate {
+                            theta: seed,
+                            chi2: None,
+                        });
+                    }
+                }
+                // Bounded list: fitted candidates by their last chi2, unfitted ones after.
+                self.candidates.sort_by(|a, b| {
+                    a.chi2
+                        .unwrap_or(f64::INFINITY)
+                        .total_cmp(&b.chi2.unwrap_or(f64::INFINITY))
+                });
+                self.candidates.truncate(MAX_CANDIDATES);
+                self.seeded = true;
+                if self.candidates.is_empty() {
+                    self.next_level();
+                }
+                continue;
+            }
+            let alone = || {
+                Fit::new(
+                    &shots,
+                    world,
+                    cancelled,
+                    false,
+                    self.theta.iter().map(|t| planet_at(*t)).collect(),
+                )
+                .with_deadline(slice.deadline)
+                .with_stats(stats)
+            };
+            // Candidates not fitted on the current rows and map: alone against the field of the map.
+            let todo: Vec<usize> = (0..self.candidates.len())
+                .filter(|&i| self.partials.is_empty() && self.candidates[i].chi2.is_none())
+                .take(BATCH)
+                .collect();
+            if !todo.is_empty() {
+                let budget = Budget {
+                    evaluations: (left / todo.len() as u64).clamp(15, 150),
+                    deadline: Some(slice.deadline),
+                    threads: (slice.threads / todo.len()).max(1),
+                };
+                let alone = alone();
+                let fitted = stats.time(Part::BirthAlone, || {
+                    par_map(&todo, slice.threads, |&i| {
+                        alone.refine(&[self.candidates[i].theta], &budget)
+                    })
+                });
+                for (&i, fit) in todo.iter().zip(fitted) {
+                    self.candidates[i] = match fit {
+                        Some((t, chi2)) => Candidate {
+                            theta: t[0],
+                            chi2: Some(chi2),
+                        },
+                        None => Candidate {
+                            theta: self.candidates[i].theta,
+                            chi2: Some(f64::INFINITY),
+                        },
+                    };
+                }
+                continue;
+            }
+            if self.partials.is_empty() {
+                // Re-score every fitted candidate against the current rows and map.
+                let alone = alone();
+                let rescored = par_map(&self.candidates, slice.threads, |c| alone.chi2(&[c.theta]));
+                for (c, chi2) in self.candidates.iter_mut().zip(rescored) {
+                    c.chi2 = Some(chi2.unwrap_or(f64::INFINITY));
+                }
+                let mut ranked: Vec<&Candidate> = self
+                    .candidates
+                    .iter()
+                    .filter(|c| c.chi2.is_some_and(f64::is_finite))
+                    .collect();
+                ranked.sort_by(|a, b| a.chi2.unwrap().total_cmp(&b.chi2.unwrap()));
+                let mut distinct: Vec<[f64; 3]> = Vec::new();
+                for c in ranked {
+                    if distinct.len() < JOINT_REFITS
+                        && !distinct.iter().any(|d| {
+                            distance(d, &c.theta) < SAME_PLANET.0
+                                && (d[2] - c.theta[2]).abs() < SAME_PLANET.1
+                        })
+                    {
+                        distinct.push(c.theta);
+                    }
+                }
+                self.partials = distinct
+                    .into_iter()
+                    .map(|c| {
+                        let mut theta = self.theta.clone();
+                        theta.push(c);
+                        Partial {
+                            theta,
+                            done: false,
+                            rounds: 0,
+                        }
+                    })
+                    .collect();
+                if self.partials.is_empty() {
+                    self.next_level();
+                    continue;
+                }
+            }
+            // Joint refits, resumed from where the last slice left them.
+            let todo: Vec<usize> = (0..self.partials.len())
+                .filter(|&i| !self.partials[i].done)
+                .collect();
+            if !todo.is_empty() {
+                let part = if self.deaths_due {
+                    Part::Deaths
+                } else {
+                    Part::BirthJoint
+                };
+                let each = (left / todo.len() as u64).max(30);
+                let budget = Budget {
+                    evaluations: each,
+                    deadline: Some(slice.deadline),
+                    threads: (slice.threads / todo.len()).max(1),
+                };
+                let fits = stats.time(part, || {
+                    par_map(&todo, slice.threads, |&i| {
+                        let counter = Stats::default();
+                        let out = Fit::new(&shots, world, cancelled, true, vec![])
+                            .with_deadline(slice.deadline)
+                            .with_stats(&counter)
+                            .refine(&self.partials[i].theta, &budget);
+                        (out, counter)
+                    })
+                });
+                for (&i, (out, counter)) in todo.iter().zip(fits) {
+                    let p = &mut self.partials[i];
+                    p.rounds += 1;
+                    if let Some((t, _)) = out {
+                        p.theta = t;
+                    }
+                    p.done = counter.evaluations() < each || p.rounds >= MAX_ROUNDS;
+                    stats.absorb(&counter);
+                }
+                continue;
+            }
+            // Every joint refit has settled: adopt the best if it beats the map's evidence.
+            let parent = mode_at(&joint, &self.theta).map_or(f64::NEG_INFINITY, |m| m.log_evidence);
+            let child = self
+                .partials
+                .iter()
+                .filter_map(|p| mode_at(&joint, &p.theta).map(|m| (m.log_evidence, &p.theta)))
+                .max_by(|a, b| a.0.total_cmp(&b.0));
+            let deaths = self.deaths_due;
+            self.deaths_due = false;
+            match child {
+                Some((evidence, theta))
+                    if evidence > parent && (deaths || theta.len() <= slice.max_planets) =>
+                {
+                    let theta = theta.clone();
+                    self.deaths_due = !deaths;
+                    if !deaths {
+                        // The candidates stay as warm starts (re-scored next round); the one just
+                        // born is spent.
+                        let born = *theta.last().unwrap();
+                        self.candidates.retain(|c| distance(&c.theta, &born) > 20.0);
+                    }
+                    self.theta = theta;
+                    changed = true;
+                    self.partials.clear();
+                    self.seeded = false;
+                }
+                _ if deaths => self.partials.clear(),
+                _ => self.next_level(),
+            }
+        }
+        changed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::map::PlanetMap;
+    use crate::protocol::Point;
+    use crate::simulation::{ShotObservation, simulate_shot};
+    use std::time::Duration;
+
+    fn shots() -> Vec<Shot> {
+        let truth = PlanetMap {
+            planets: vec![
+                Planet {
+                    x: 500.0,
+                    y: 500.0,
+                    radius: 30.0,
+                    mass: 2700.0,
+                },
+                Planet {
+                    x: 1200.0,
+                    y: 700.0,
+                    radius: 30.0,
+                    mass: 2700.0,
+                },
+            ],
+        };
+        let world = WorldParameters::default();
+        [
+            ((350.0, 500.0), 0.0),
+            ((1050.0, 700.0), 0.0),
+            ((900.0, 600.0), 150.0),
+        ]
+        .into_iter()
+        .map(|((x, y), angle)| {
+            let start = ShotObservation {
+                player_id: 1,
+                angle_degrees: angle,
+                velocity: 6.0,
+                points: vec![Point { x, y }],
+            };
+            let path = simulate_shot(&truth, &start, world, 400).unwrap();
+            Shot::new(
+                ShotObservation {
+                    points: path.points,
+                    ..start
+                },
+                None,
+                world,
+                0.0,
+            )
+        })
+        .collect()
+    }
+
+    fn slice<'a>(cancelled: &'a AtomicBool, stats: &'a Stats, evaluations: u64) -> Slice<'a> {
+        Slice {
+            evaluations,
+            deadline: Instant::now() + Duration::from_secs(60),
+            threads: 2,
+            max_planets: 24,
+            cancelled,
+            stats,
+        }
+    }
+
+    /// A path that arrives mid-search is absorbed: the pending candidates survive it and the
+    /// search starts over from the first level.
+    #[test]
+    fn a_new_path_keeps_pending_work() {
+        let (cancelled, stats) = (AtomicBool::new(false), Stats::default());
+        let shots = shots();
+        let mut search = Search::new();
+        search.add_path(&shots[0], &slice(&cancelled, &stats, 20));
+        search.add_path(&shots[1], &slice(&cancelled, &stats, 20));
+        // Enough work for seeds and alone fits, not for a joint refit to settle.
+        search.step(&slice(&cancelled, &stats, 20));
+        assert!(!search.candidates.is_empty() && !search.idle());
+        let pending = search.candidates.len();
+        search.add_path(&shots[2], &slice(&cancelled, &stats, 20));
+        assert_eq!(search.candidates.len(), pending);
+        assert_eq!(search.level, 0);
+    }
+
+    /// Slices make progress and the search ends idle with planets found; at the planet cap no
+    /// birth is attempted.
+    #[test]
+    fn slices_grow_the_map_until_idle() {
+        let (cancelled, stats) = (AtomicBool::new(false), Stats::default());
+        let mut search = Search::new();
+        for shot in &shots() {
+            search.add_path(shot, &slice(&cancelled, &stats, 300));
+        }
+        let mut rounds = 0;
+        while !search.idle() && rounds < 200 {
+            search.step(&slice(&cancelled, &stats, 300));
+            rounds += 1;
+        }
+        assert!(search.idle(), "not idle after {rounds} slices");
+        assert!(!search.theta.is_empty());
+
+        let mut capped = Search::new();
+        for shot in &shots() {
+            capped.add_path(shot, &slice(&cancelled, &stats, 300));
+        }
+        let mut limited = slice(&cancelled, &stats, 300);
+        limited.max_planets = 0;
+        capped.step(&limited);
+        assert!(capped.idle() && capped.theta.is_empty());
+    }
 }

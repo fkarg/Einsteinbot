@@ -225,7 +225,8 @@ fn learn_contact(state: &mut BotState) {
     }
     let event = planet_contact();
     state.observe(&event);
-    state.set_map_belief(estimator.observe(&event, &cancelled));
+    let local = estimator.observe(&event, &cancelled);
+    state.set_map_belief(estimator.settle(&cancelled).or(local));
 }
 
 #[test]
