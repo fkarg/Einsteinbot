@@ -57,8 +57,25 @@ flowchart LR
 2. **Read the curvature.** At each tick the bot measures how much the path bends. That bend is the gravity at that point, up to known factors. Each tick becomes one equation, called a *row*. The bot never has to simulate a whole shot to fit the map.
 3. **Say how wrong a row can be.** A row can be off for three reasons: the positions are rounded, the bot interpolates between ticks, and planets it has not found yet still pull on the shot. The bot models all three. The last one matters most: without it, the search invents planets to soak up the pull of distant ones.
 4. **Search for planets.** The bot adds a planet where the rows point to missing mass, removes one that no longer earns its place, and keeps a change only if it makes the data more probable after paying a penalty for every extra planet. The search runs in small resumable slices in the background, so a new map is published right after every new path.
-5. **Aim on the belief.** The bot simulates every legal shot on its current map, plus a correction for pull it can see along observed paths but has not explained yet. It prefers short flights, because map errors grow along a path.
+5. **Aim on the belief.** The bot simulates every legal shot on its current map, plus a correction for pull it can see along observed paths but has not explained yet. It prefers short flights, because map errors grow along a path, and it skips targets that someone else's shot already in flight will kill first.
 6. **Notice new maps.** The server starts a new map without saying so. The bot recognises the moment when every player is moved at once, and starts a fresh map.
+
+### The smart parts, in brief
+
+Each item says what the bot does, why it helps, and what it measured. The math behind each is in the next section.
+
+| | What it does | Why it helps | Measured |
+|---|---|---|---|
+| **Reads gravity from curvature** | Turns each tick of every observed shot (anyone's) into an exact equation for the local gravity, instead of simulating whole shots. | Exact, cheap, and every shot in the game becomes data. | True map fits the rows to rounding noise ($\chi^2$/row ≈ 0.9 on 5,886 live paths). |
+| **Knows what it doesn't know** | Treats the pull of planets it has not found yet as a smooth, correlated error along each path, sized by how far away an unseen planet could be. | Without it, the fit counts one systematic error as thousands of independent clues and invents phantom planets. | Phantom planets at 8 paths: 79 → 1 (14 worlds). |
+| **Learns its own noise level honestly** | Sizes that error from how badly the current map *predicts* each new path before fitting it. | Fitted residuals understate the error; predictions don't. The error shrinks by itself as the map completes. | Residuals look like noise again ($\chi^2$/row ≈ 1, neighbour correlation ≈ 0 instead of 0.85-0.97). |
+| **Never stops to think** | Searches for planets in small resumable slices between shots and publishes a fresh map after every path. | Targeting always has a current map, even at 9 new paths per second. | Median publish lag 62-71 ms at 9 paths/s; all 24 planets after 128 paths (14 s) of a real game. |
+| **Pays for every extra planet** | Adds or removes a planet only when the data become more probable after an Occam penalty. | Planets come from evidence, not from the search's appetite. | Same recall as before at the end of a map, with fewer phantoms. |
+| **Aims with what it can't explain yet** | Adds the still-unexplained pull seen along observed paths to its shot simulation; switches off once the map is complete. | Early in a map, paths near earlier shots are bent by planets the map lacks. | +5 to +32 true hits per replayed game, almost all early in the map. |
+| **Prefers short shots** | Ranks predicted hits by flight time first, miss distance second. | Map errors grow along a path; long shots rarely hit. | The ranking alone: true hits 15 → 23, 49 → 61, 22 → 46 on replayed games. |
+| **Doesn't shoot the doomed** | Simulates every shot in flight (all players, its own included) and skips targets that will die before its shot lands, unless its shot wins the race. | In busy games many shots hit where a player *was*. | Capture 58: true hits 252 → 315, wasted hits 112 → 62. |
+| **Saves energy** | Without a predicted hit it waits for 15 energy instead of firing weak shots; during a round's end card it stops shooting. | Weak shots almost never hit (5 of 58); end-card shots vanish. | Part of the P15 gain above. |
+| **Notices new maps by itself** | Detects a new map when every player is moved at once, even when the server does not send planets. | Competitive servers never announce maps; mixing maps would ruin the fit. | 294 of 294 map changes found in recorded games, no false alarms. |
 
 ### The math, step by step
 
@@ -207,6 +224,8 @@ then by lower velocity.
 | 30-60 | 9 of 17 |
 | 60-100 | 3 of 20 |
 | 100 or more | 1 of 32 |
+
+**Doomed targets** ([`src/in_flight.rs`](src/in_flight.rs)). Every shot in flight, from every player, is simulated on the current map to predict who dies and when. A predicted hit is skipped if its victim is predicted to die before our shot lands with probability at least 0.15 (kill chances by flight time: 0.75 under 60 ticks, 0.45, 0.3, 0.15 beyond; heuristic, overconfident on long flights). If our shot lands first, it still counts.
 
 **Waiting.** Without a predicted hit the bot waits until it has 15 energy rather than spend small shots that almost never hit. Before each decision it waits for the map to be quiet for 300 ms, at most 500 ms, and otherwise aims with the latest published belief.
 
