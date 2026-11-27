@@ -73,12 +73,33 @@ fn replay_deterministic(case: &Case, settings: Settings) {
                 .map(|p| p.total_ms)
                 .sum()
         });
+        let mismatch = estimator.last_mismatch;
+        let belief = estimator.belief();
+        let gate = belief.map_or("none".to_string(), |b| {
+            match (
+                &b.residual_correction,
+                b.residual_correction_unavailable_reason,
+            ) {
+                (Some(c), _) => format!("on:{:.1e}", c.max_magnitude),
+                (None, Some(r)) => format!("{r:?}"),
+                (None, None) => "none".into(),
+            }
+        });
         println!(
-            "UPD world={id} cfg={name} n={n} k={} evals={evals} publish_ms={publish_ms:.1} wall_ms={wall_ms:.1} noise_ms={noise_ms:.1} s100={:.3} l={:.0} white={:.1e}",
+            "UPD world={id} cfg={name} n={n} k={} evals={evals} publish_ms={publish_ms:.1} wall_ms={wall_ms:.1} noise_ms={noise_ms:.1} s100={:.3} l={:.0} white={:.1e} cap={} gain={} chi2r={:.3} lag1={:.3} mrows={} rho0={:.0} gate={gate}",
             belief_theta(&estimator).len(),
             estimator.model.scale * 100.0,
             estimator.model.length,
-            estimator.model.white
+            estimator.model.white,
+            estimator.search.theta.len() >= estimator.settings.cap(),
+            estimator
+                .search
+                .blocked_gain
+                .map_or("-".into(), |g| format!("{g:.1}")),
+            mismatch.map_or(0.0, |m| m.chi2_per_row),
+            mismatch.map_or(0.0, |m| m.lag1),
+            mismatch.map_or(0, |m| m.rows),
+            estimator.last_rho0.unwrap_or(0.0),
         );
         if audit {
             let before = belief_theta(&estimator);

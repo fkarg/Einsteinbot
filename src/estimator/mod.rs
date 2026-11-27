@@ -210,6 +210,8 @@ pub struct Estimator {
     pending_timings: Vec<(Part, Duration)>,
     /// `rho0` of the latest path's noise.
     last_rho0: Option<f64>,
+    /// Prequential mismatch of the latest path under the model it was fitted with.
+    last_mismatch: Option<noise::Mismatch>,
 }
 
 /// What the estimator holds about its map epoch, for status output (cheap: no fit).
@@ -257,6 +259,7 @@ impl Default for Estimator {
             last_report: None,
             pending_timings: Vec::new(),
             last_rho0: None,
+            last_mismatch: None,
         }
     }
 }
@@ -338,6 +341,7 @@ impl Estimator {
             self.model = noise::estimate(&self.series, current.as_ref());
             noise.model = self.model;
             self.last_rho0 = Some(noise.rho0);
+            self.last_mismatch = current.as_ref().map(|s| s.mismatch(self.model));
             if let Some(series) = current {
                 self.series.push(series);
                 if self.series.len() > noise::WINDOW {
