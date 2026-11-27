@@ -1163,3 +1163,56 @@ Follow-up checks (coordinator: check 1 above was the wrong criterion for this hy
 | **total** | 41/107/79 -> 103/114/2 | 229/248/50 -> 181/198/0 | 296/308/17 -> 273/281/6 | 313/320/8 -> 326/328/4 | | | 2726 -> 604 |
 
 Against the frozen P13 (v2) the totals are 62/111/9 -> 103/114/2 at 8 paths, 138/192/14 -> 181/198/0 at 16, 270/293/12 -> 273/281/6 at 32, 314/319/8 -> 326/328/4 at 60, CPU 837 -> 604 s. Unexplored error at the last path is lower than main's on all 6 live worlds. Recall at 16 paths is still below main's (181 vs 229), mostly on synthetic worlds where main is already complete; at 32 paths recall(15) is lower than both (281). During 12-22 paths the scale estimate often sits at its bound (`s * 100` = 100 on 7001), because the prequential series include near passes of missing planets. The adoption flag (`from_log_det`) marks 0-4 adoptions per world here: under frozen noise the log-det part is 0, so these are adoptions whose chi-square rose (deaths and Occam-driven moves), not variance shrink. One run each.
+
+#### P13 final round: robust scale, one-path test, held-out, audit, latency (observed; one run each)
+
+**(i) Scale pinned at its bound.** On 7001 (rho0 version) `s * 100` sits at the bound 100 for paths 12-22. Tried, data only:
+- Huber-distributed standardized innovations (quadratic within 3 sd, linear beyond) in the type-II objective: still pinned at the bound for paths 15-22; recall(2) 10/20/24/24 at 8/16/32/60.
+- Median over the window of each series' own MAP: still pinned for paths 15-18; 10/20/24/24.
+- Bound raised from 1 to 10: no longer pinned (`s * 100` 140-190 at paths 15-22), but recall drops to 18 at 16 paths and 22 at 32, and `a_curved_flyby_does_not_contradict_the_planet` fails.
+
+So the pin is not a few outliers: most series of an incomplete map want a larger scale. With `d >= rho0` (hundreds of units) the bound `s <= 1` caps the background sd at about 0.1-0.5, and that cap helps recall. All three were reverted; the bound stays, documented as binding.
+
+**(ii) One-path test (`planet_replay_uses_paths_not_oracle_and_resets_physical_map`).** The 12-point path (9 rows) from 90 units onto a planet of radius 30. The seed is found (significance 4.007 against the 4.0 threshold). Under the noise estimated from the path's own residual against the flat map (`s` at its bound, `l` 56):
+
+| map | chi2 | evidence |
+|---|---|---|
+| flat | 26.9 | -13.4 |
+| refit planet (499.6, 500.0, r 29.8) | 0.00 | -15.05 (Occam about 12 plus ln 20) |
+
+So the planet loses by 1.6 nats; under the floor alone it would win by about 3e9. That is self-absorption of the path's own signature. Fix: a path is fitted (its local refit and the slices after it) under the scale estimated from the earlier paths' series, and its own series joins the window for the next path. The test passes. `flat_world_with_small_position_noise_keeps_no_planet` (1e-3 white position noise, no planets) now fails: the first path is fitted under the prior scale, the smooth background cannot represent white noise (2.4e-3 per row, far above its innovation sd), and two radius-20 planets are fitted to it. Before, the path's own white residual widened its noise. Real captures have exact f32 positions (true-map chi2/row 0.82-0.84), and spurious planets did not rise on any dev or held-out world. Which of the two tests should change is left to the user.
+
+Dev, no audit, 14 worlds, `rec2/rec15/spur` totals at 8/16/32/60 paths:
+
+| version | n=8 | n=16 | n=32 | n=60 | CPU s |
+|---|---|---|---|---|---|
+| main | 41/107/79 | 229/248/50 | 296/308/17 | 313/320/8 | 2726 |
+| rho0, own series | 103/114/2 | 181/198/0 | 273/281/6 | 326/328/4 | 604 |
+| rho0, earlier series (final) | 104/116/1 | 179/194/1 | 276/285/3 | 321/326/4 | 592 |
+
+**Held-out, final configuration, once** (no audit, `THREADS=1`, 13 worlds, `/tmp/P13/prior_held`): main -> final
+
+| world | n=8 | n=16 | n=32 | n=60 | final fe | final fu | CPU s |
+|---|---|---|---|---|---|---|---|
+| live_34 (2 paths) | 0/2/2 -> 1/1/0 | | | | 4.3e-01 -> 8.6e-01 | 1.6e+00 -> 5.4e-01 | 0 -> 0 |
+| live_35 | 5/8/6 -> 7/8/0 | 6/11/8 -> 11/11/0 | 15/16/5 -> 16/16/0 | 20/21/2 -> 24/24/0 | 1.4e-01 -> 1.8e-04 | 9.8e-01 -> 4.4e-03 | 613 -> 50 |
+| live_37 | 2/8/4 -> 6/8/0 | 12/14/4 -> 10/10/0 | 17/19/2 -> 17/17/0 | 21/22/1 -> 22/22/1 | 1.0e-03 -> 8.0e-04 | 4.4e+00 -> 1.9e-01 | 121 -> 29 |
+| live_42 | 5/9/4 -> 4/6/0 | 15/16/3 -> 10/10/0 | 17/19/2 -> 17/18/0 | 20/21/1 -> 21/22/1 | 1.1e-03 -> 8.2e-04 | 1.6e-01 -> 2.3e-01 | 112 -> 79 |
+| live_43 | 0/6/7 -> 8/9/0 | 6/13/10 -> 11/12/0 | 24/24/0 -> 19/19/0 | 24/24/0 -> 23/23/0 | 4.4e-06 -> 3.0e-02 | 2.1e-06 -> 1.5e-01 | 182 -> 13 |
+| syn_7101 | 2/8/4 -> 10/11/0 | 19/20/3 -> 15/15/0 | 20/22/1 -> 16/19/0 | 24/24/0 -> 24/24/0 | 1.8e-06 -> 2.8e-06 | 2.8e-06 -> 5.0e-06 | 555 -> 45 |
+| syn_7102 | 0/5/5 -> 8/9/0 | 9/14/6 -> 14/15/0 | 18/19/4 -> 20/20/0 | 24/24/0 -> 24/24/0 | 1.7e-06 -> 3.6e-05 | 1.2e-06 -> 2.4e-04 | 260 -> 31 |
+| syn_7103 | 3/10/4 -> 8/9/0 | 15/20/4 -> 14/14/0 | 17/20/3 -> 22/22/0 | 24/24/0 -> 24/24/0 | 1.5e-06 -> 3.7e-06 | 9.1e-07 -> 5.6e-06 | 308 -> 38 |
+| syn_7104 | 0/3/6 -> 12/13/0 | 16/19/3 -> 14/16/0 | 24/24/0 -> 23/23/0 | 24/24/0 -> 24/24/0 | 1.9e-06 -> 2.2e-06 | 4.3e-06 -> 3.6e-06 | 145 -> 41 |
+| syn_7105 | 1/4/8 -> 7/9/0 | 24/24/0 -> 16/18/0 | 24/24/0 -> 23/23/0 | 24/24/0 -> 24/24/0 | 1.1e-05 -> 1.3e-05 | 5.3e-06 -> 6.2e-06 | 130 -> 43 |
+| syn_7106 | 11/15/1 -> 12/12/0 | 24/24/0 -> 18/18/0 | 24/24/0 -> 24/24/0 | 24/24/0 -> 24/24/0 | 2.4e-06 -> 2.4e-06 | 3.3e-06 -> 3.3e-06 | 74 -> 42 |
+| syn_7107 | 1/7/6 -> 9/10/0 | 15/19/3 -> 13/14/0 | 24/24/0 -> 22/22/0 | 24/24/0 -> 24/24/0 | 2.1e-06 -> 3.8e-06 | 2.3e-06 -> 4.0e-06 | 126 -> 30 |
+| syn_7108 | 0/1/8 -> 5/7/1 | 12/16/3 -> 12/13/0 | 22/23/0 -> 18/18/0 | 19/22/1 -> 24/24/0 | 1.7e-01 -> 6.5e-06 | 1.7e-01 -> 9.1e-06 | 595 -> 26 |
+| **total** | 30/86/65 -> 97/112/1 | 173/212/49 -> 159/167/0 | 246/260/19 -> 238/242/0 | 272/280/7 -> 283/284/2 | | | 3221 -> 466 |
+
+The held-out worlds repeat the dev pattern: far more recall at 8 paths, about the same at the last path with fewer spurious planets, lower at 16-32 paths (mostly on synthetic worlds that main has already completed by then), at a seventh of the CPU. Live 43 is the one world that ends lower (24 -> 23).
+
+**Audit** (dev, 8 worlds, `AUDIT=1`, final configuration): identical to no audit through 32 paths (42/52/1, 79/90/1, 140/147/3); at the last path 177/179/4 against 177/182/4 without it; CPU 796 against 368 s. Against main with its audit: 175/179/6 -> 177/179/4 at the last path, CPU 3597 -> 796 s. The audit is dropped from the live map (`live_map.rs`; `Settings::audit_enabled` stays for replays and the scorecard, and the code stays until a later decision to delete it).
+
+**Latency** (Mac, 10 threads, `SCHEDULE=500`, each in its live configuration: main with the audit, P13 without; binaries built before, sequential runs, Mac load average 2.4 rising to 3.4 from other sessions). Worst publish lag main -> P13: live 33 266 -> 243 ms, live 40 253 -> 72 ms, live 45 265 -> 265 ms. Scheduled final quality main -> P13: live 33 18/20/3 -> 24/24/0, live 40 16/18/3 -> 18/19/1, live 45 14/18/3 -> 21/21/1.
+
+**Compute this round:** jolly 604 + 592 + 466 + 796 s (about 0.7 CPU-h), Mac about 15 CPU-minutes.

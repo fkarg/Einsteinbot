@@ -7,10 +7,10 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+/// The live map runs without the background audit: with the P13 likelihood it changed nothing on
+/// the dev worlds through 32 paths and cost 2.2 times the CPU (`docs/estimator-experiments.md`).
 fn live_estimator() -> Estimator {
-    let mut estimator = Estimator::default();
-    estimator.settings.audit_enabled = true;
-    estimator
+    Estimator::default()
 }
 
 pub(crate) struct WorkItem {
