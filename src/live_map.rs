@@ -5,6 +5,13 @@ use crate::strategy::MapBelief;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+fn live_estimator() -> Estimator {
+    let mut estimator = Estimator::default();
+    estimator.settings.audit_enabled = true;
+    estimator
+}
 
 pub(crate) struct WorkItem {
     epoch: u64,
@@ -62,15 +69,49 @@ impl LiveMap {
         let (sender, receiver) = mpsc::channel::<WorkItem>();
         let worker_state = Arc::clone(&published);
         let worker = thread::spawn(move || {
-            let mut estimator = Estimator::default();
+            let mut estimator = live_estimator();
             let mut estimator_epoch = 0;
-            while let Ok(WorkItem {
-                epoch,
-                watermark,
-                event,
-                ..
-            }) = receiver.recv()
-            {
+            loop {
+                // With search work left, events still go first; the work runs while none waits.
+                let item = if estimator.search_pending() {
+                    match receiver.try_recv() {
+                        Ok(item) => item,
+                        Err(mpsc::TryRecvError::Empty) => {
+                            let (epoch, cancelled) = {
+                                let state = worker_state.lock().unwrap();
+                                (state.epoch, Arc::clone(&state.fit_cancel))
+                            };
+                            if estimator_epoch != epoch {
+                                estimator = live_estimator();
+                                estimator_epoch = epoch;
+                                continue;
+                            }
+                            let belief = estimator.step(&cancelled);
+                            let mut state = worker_state.lock().unwrap();
+                            if let (true, Some(belief)) = (state.epoch == epoch, belief) {
+                                state.belief = Some(belief);
+                            }
+                            continue;
+                        }
+                        Err(mpsc::TryRecvError::Disconnected) => break,
+                    }
+                } else if estimator.audit_running() {
+                    // A finished audit is adopted even if no event comes.
+                    match receiver.recv_timeout(Duration::from_millis(200)) {
+                        Ok(item) => item,
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                } else if let Ok(item) = receiver.recv() {
+                    item
+                } else {
+                    break;
+                };
+                let WorkItem {
+                    epoch,
+                    watermark,
+                    event,
+                } = item;
                 let cancelled = {
                     let state = worker_state.lock().unwrap();
                     if state.epoch != epoch {
@@ -81,7 +122,7 @@ impl LiveMap {
                 if estimator_epoch != epoch {
                     // The canonical connection sends a complete player snapshot
                     // after reset; old queued leave events may have been discarded.
-                    estimator = Estimator::default();
+                    estimator = live_estimator();
                     estimator_epoch = epoch;
                 }
                 let belief = fit(&mut estimator, &event, &cancelled);

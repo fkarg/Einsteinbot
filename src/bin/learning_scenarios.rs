@@ -96,9 +96,11 @@ fn observe_launch(
     };
     state.observe(&event);
     let started = Instant::now();
-    let belief = estimator
-        .observe(&event, &AtomicBool::new(false))
+    let never = AtomicBool::new(false);
+    let local = estimator
+        .observe(&event, &never)
         .expect("new observation yields belief");
+    let belief = estimator.settle(&never).unwrap_or(local);
     if let Some(capture) = capture {
         capture.event(&event, Some("scenario"));
         capture.decision(

@@ -1,5 +1,5 @@
 //! Field evaluation of the physical-planet map from an ordered capture; truth is used only for scoring.
-use einsteinbot::estimator::{Estimator, Part};
+use einsteinbot::estimator::{Estimator, Part, Settings};
 use einsteinbot::event_store::EventLog;
 use einsteinbot::field_score::score_field;
 use einsteinbot::map::PlanetMap;
@@ -25,10 +25,9 @@ struct Replay {
 }
 
 impl Replay {
-    fn new(empty_is_flat: bool, max_planets: Option<usize>, time_budget: Option<Duration>) -> Self {
+    fn new(empty_is_flat: bool, settings: Settings) -> Self {
         let mut estimator = Estimator::default();
-        estimator.max_planets = max_planets.unwrap_or(estimator.max_planets);
-        estimator.time_budget = time_budget.unwrap_or(estimator.time_budget);
+        estimator.settings = settings;
         Self {
             ceiling_violations: 0,
             estimator,
@@ -74,7 +73,13 @@ impl Replay {
                     return None;
                 }
                 let start = Instant::now();
-                self.estimator.observe(event, &AtomicBool::new(false));
+                let never = AtomicBool::new(false);
+                self.estimator.observe(event, &never);
+                self.estimator.settle(&never);
+                if self.estimator.settings.audit_enabled {
+                    self.estimator.finish_audit();
+                    self.estimator.settle(&never);
+                }
                 self.update_micros = start.elapsed().as_micros();
                 self.fit_micros += self.update_micros;
                 if let Some(report) = self.estimator.last_report() {
@@ -145,12 +150,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut capture: Option<i64> = None;
     let mut empty_is_flat = false;
     let mut max_completed = None;
-    let mut max_planets = None;
-    let mut time_budget = None;
-    let mut max_evaluations = None;
-    let mut noise_sd = None;
-    let mut parallel_evaluations = true;
-    let mut ceilings = einsteinbot::estimator::PartCeilings::default();
+    let mut settings = Settings::default();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--db-path" => db = args.next().ok_or("--db-path requires a value")?,
@@ -170,34 +170,34 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 )
             }
             "--max-planets" => {
-                max_planets = Some(
-                    args.next()
-                        .ok_or("--max-planets requires a value")?
-                        .parse::<usize>()?,
-                )
+                settings.max_planets = args
+                    .next()
+                    .ok_or("--max-planets requires a value")?
+                    .parse()?
             }
-            "--time-budget-ms" => {
-                time_budget = Some(Duration::from_millis(
-                    args.next()
-                        .ok_or("--time-budget-ms requires a value")?
-                        .parse()?,
-                ))
+            "--slice-evaluations" => {
+                settings.slice_evaluations = args
+                    .next()
+                    .ok_or("--slice-evaluations requires a value")?
+                    .parse()?
             }
-            "--max-evaluations" => {
-                max_evaluations = Some(
-                    args.next()
-                        .ok_or("--max-evaluations requires a value")?
-                        .parse::<u64>()?,
-                )
+            "--slice-ceiling-ms" => {
+                let ms: u64 = args
+                    .next()
+                    .ok_or("--slice-ceiling-ms requires a value")?
+                    .parse()?;
+                settings.slice_ceiling = (ms > 0).then(|| Duration::from_millis(ms));
             }
-            "--serial-evaluations" => parallel_evaluations = false,
-            "--noise-sd" => {
-                noise_sd = Some(
-                    args.next()
-                        .ok_or("--noise-sd requires a value")?
-                        .parse::<f64>()?,
-                )
+            "--slices-per-path" => {
+                settings.slices_per_path = args
+                    .next()
+                    .ok_or("--slices-per-path requires a value")?
+                    .parse()?
             }
+            "--threads" => {
+                settings.threads = args.next().ok_or("--threads requires a value")?.parse()?
+            }
+            "--audit" => settings.audit_enabled = true,
             "--ceiling-ms" => {
                 let value = args.next().ok_or("--ceiling-ms requires PART=MS")?;
                 let (name, ms) = value.split_once('=').ok_or("--ceiling-ms needs PART=MS")?;
@@ -207,13 +207,14 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         Part::ALL.map(Part::name).join(", ")
                     )
                 })?;
-                ceilings
+                settings
+                    .ceilings
                     .0
                     .insert(part, Duration::from_secs_f64(ms.parse::<f64>()? / 1e3));
             }
             "--help" | "-h" => {
                 println!(
-                    "Usage: field_scorecard --capture-id ID [--db-path PATH] [--empty-is-flat] [--max-completed N] [--max-planets N] [--time-budget-ms MS] [--max-evaluations N] [--noise-sd SD] [--serial-evaluations] [--ceiling-ms PART=MS]...\n--max-evaluations is a deterministic work limit (residual plus Jacobian evaluations per update; results do not depend on load) and, unless --time-budget-ms is given, removes the wall-clock budget. --ceiling-ms fails the run (exit 2, naming the part) when a part of an update exceeds the wall-clock ceiling.\nJSON lines report causal pre-launch and post-completion physical-map field scores. Empty planet messages are unknown unless --empty-is-flat is explicitly set."
+                    "Usage: field_scorecard --capture-id ID [--db-path PATH] [--empty-is-flat] [--max-completed N] [--max-planets N] [--slice-evaluations N] [--slice-ceiling-ms MS] [--slices-per-path N] [--threads N] [--audit] [--ceiling-ms PART=MS]...\nThe estimator keeps its map incrementally: each path gets a local refit, then --slices-per-path search slices of --slice-evaluations evaluations (a deterministic work limit; results do not depend on load unless --slice-ceiling-ms, the wall-clock ceiling per slice, 0 for none, cuts a slice). --audit runs the from-scratch audit to completion after every path that is due (slow). --ceiling-ms fails the run (exit 2, naming the part) when a part of an update exceeds the wall-clock ceiling.\nJSON lines report causal pre-launch and post-completion physical-map field scores. Empty planet messages are unknown unless --empty-is-flat is explicitly set."
                 );
                 return Ok(());
             }
@@ -231,18 +232,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if events.is_empty() {
         return Err(format!("capture {capture} is missing or has no recorded events").into());
     }
-    // The deterministic mode must not be cut by the wall clock unless that is requested.
-    let time_budget = match (time_budget, max_evaluations) {
-        (None, Some(_)) => Some(Duration::from_secs(24 * 3600)),
-        (budget, _) => budget,
-    };
-    let mut replay = Replay::new(empty_is_flat, max_planets, time_budget);
-    replay.estimator.max_evaluations = max_evaluations;
-    replay.estimator.parallel_evaluations = parallel_evaluations;
-    if let Some(noise_sd) = noise_sd {
-        replay.estimator.noise_levels = vec![noise_sd];
-    }
-    replay.estimator.ceilings = ceilings;
+    let mut replay = Replay::new(empty_is_flat, settings);
     println!(
         "{}",
         json!({"type":"field_scorecard", "capture_id":capture, "db_path":db,
@@ -297,7 +287,7 @@ mod tests {
 
     #[test]
     fn launch_snapshot_excludes_shots_that_finish_after_launch_and_resets_per_epoch() {
-        let mut replay = Replay::new(true, None, None);
+        let mut replay = Replay::new(true, Settings::default());
         replay.ingest(1, &ServerEvent::Planets { planets: vec![] });
         let initial = replay.ingest(2, &begin(0.0)).unwrap();
         assert_eq!(initial["completed_paths"], 0);
@@ -319,7 +309,7 @@ mod tests {
 
     #[test]
     fn empty_planets_are_not_implicitly_a_disclosed_flat_world() {
-        let mut replay = Replay::new(false, None, None);
+        let mut replay = Replay::new(false, Settings::default());
         replay.ingest(1, &ServerEvent::Planets { planets: vec![] });
         let row = replay.ingest(2, &begin(0.0)).unwrap();
         assert_eq!(row["truth_status"], "unavailable");

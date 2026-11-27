@@ -1,11 +1,12 @@
-//! Work counters, per-part timings and wall-clock ceilings of one estimator update.
+//! Work counters, per-part timings and wall-clock ceilings of one estimator update (a path's local
+//! refit and the search slices that follow it).
 //!
-//! Two independent kinds of limit exist. The *work limit* (`Estimator::max_evaluations`) counts
-//! residual and Jacobian evaluations and is deterministic: the same data and limit give the same
-//! belief whatever the machine load. *Wall-clock* limits (`Estimator::time_budget`, an overall bound
-//! that stops the search and publishes the best belief so far, and the per-part `PartCeilings`)
-//! depend on the machine. A ceiling that is exceeded is never silent: it is recorded in the
-//! `UpdateReport` (and `UpdateReport::assert_within_ceilings` panics naming the part).
+//! Two independent kinds of limit exist. The *work limit* (`Settings::slice_evaluations` per
+//! slice) counts residual and Jacobian evaluations and is deterministic: the same data and limit
+//! give the same belief whatever the machine load. *Wall-clock* limits (`Settings::slice_ceiling`,
+//! which cuts a slice and keeps the best map so far, and the per-part `PartCeilings`) depend on
+//! the machine. A ceiling that is exceeded is never silent: it is recorded in the `UpdateReport`
+//! (and `UpdateReport::assert_within_ceilings` panics naming the part).
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -31,9 +32,7 @@ pub enum Part {
     Evidence,
     /// The covariance and conditioning part of an evidence evaluation (leaf).
     Covariance,
-    /// Flat and unrefit warm-start evidence (phase).
-    WarmStart,
-    /// Refit of the warm-start modes (phase).
+    /// Local refit of the planets near a new path (phase).
     WarmRefit,
     /// Finding birth seeds from the unexplained windows (phase).
     Seeding,
@@ -43,7 +42,9 @@ pub enum Part {
     BirthJoint,
     /// Death trials and refits (phase).
     Deaths,
-    /// Diagnostics after the search (position RMSE, contact bookkeeping; phase).
+    /// Exact refit and covariance of the published map (phase).
+    Polish,
+    /// Diagnostics of a published belief (position RMSE, contact bookkeeping; phase).
     Diagnostics,
 }
 
@@ -55,12 +56,12 @@ const PARTS: [Part; 14] = [
     Part::LmSolve,
     Part::Evidence,
     Part::Covariance,
-    Part::WarmStart,
     Part::WarmRefit,
     Part::Seeding,
     Part::BirthAlone,
     Part::BirthJoint,
     Part::Deaths,
+    Part::Polish,
     Part::Diagnostics,
 ];
 
@@ -70,12 +71,12 @@ impl Part {
     fn is_leaf(self) -> bool {
         !matches!(
             self,
-            Part::WarmStart
-                | Part::WarmRefit
+            Part::WarmRefit
                 | Part::Seeding
                 | Part::BirthAlone
                 | Part::BirthJoint
                 | Part::Deaths
+                | Part::Polish
                 | Part::Diagnostics
         )
     }
@@ -89,12 +90,12 @@ impl Part {
             Part::LmSolve => "lm_solve",
             Part::Evidence => "evidence",
             Part::Covariance => "covariance",
-            Part::WarmStart => "warm_start",
             Part::WarmRefit => "warm_refit",
             Part::Seeding => "seeding",
             Part::BirthAlone => "birth_alone",
             Part::BirthJoint => "birth_joint",
             Part::Deaths => "deaths",
+            Part::Polish => "polish",
             Part::Diagnostics => "diagnostics",
         }
     }
@@ -128,6 +129,18 @@ impl Stats {
         stat.calls.fetch_add(1, Ordering::Relaxed);
         stat.nanos.fetch_add(nanos, Ordering::Relaxed);
         stat.max_nanos.fetch_max(nanos, Ordering::Relaxed);
+    }
+
+    /// Add everything `other` has counted.
+    pub fn absorb(&self, other: &Stats) {
+        for (mine, theirs) in self.parts.iter().zip(&other.parts) {
+            mine.calls
+                .fetch_add(theirs.calls.load(Ordering::Relaxed), Ordering::Relaxed);
+            mine.nanos
+                .fetch_add(theirs.nanos.load(Ordering::Relaxed), Ordering::Relaxed);
+            mine.max_nanos
+                .fetch_max(theirs.max_nanos.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
     }
 
     pub fn time<R>(&self, part: Part, f: impl FnOnce() -> R) -> R {
@@ -234,8 +247,16 @@ impl UpdateReport {
     }
 }
 
+/// Test-only thread limit (0: none), so the diagnosis harness can measure at 1, 4 and 8 threads.
+#[cfg(test)]
+pub(super) static TEST_THREADS: AtomicUsize = AtomicUsize::new(0);
+
 /// Logical cores available to the process.
 pub(super) fn cores() -> usize {
+    #[cfg(test)]
+    if TEST_THREADS.load(Ordering::Relaxed) > 0 {
+        return TEST_THREADS.load(Ordering::Relaxed);
+    }
     std::thread::available_parallelism().map_or(1, usize::from)
 }
 

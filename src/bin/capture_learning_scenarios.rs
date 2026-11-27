@@ -149,6 +149,7 @@ fn replay(
                 if checkpoints.iter().any(|prefix| *prefix >= count) {
                     let started = Instant::now();
                     estimator.observe(event, &cancelled);
+                    estimator.settle(&cancelled);
                     fit_ms += started.elapsed().as_millis();
                 }
                 if checkpoints.contains(&count) {

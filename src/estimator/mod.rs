@@ -3,20 +3,27 @@
 //!
 //! Estimation compares the model's gravity field with the field implied by the observed paths
 //! (`window`: windowed velocity-change comparison with the engine's exact discrete kernel and the
-//! f32 rounding covariance); no dynamics are simulated in the fit. `fit` jointly fits K planets
-//! to every path, and `search` grows and shrinks K on the approximate evidence (Laplace/Occam
-//! with a prior of 20:1 against each extra planet, so K=0 is favoured). Distinct supported modes
-//! are kept (at most `MAX_MODES`) with normalized evidence weights. **These weights are heuristic
-//! rankings, not calibrated probabilities**, and the published `map_weight` is absent when the search
-//! stopped early (`search_limit`). The published `map` is the maximum-weight mode.
+//! f32 rounding covariance, plus a relative-noise term while searching); no dynamics are simulated
+//! in the fit. `fit` jointly fits K planets `(x, y, radius)` to the rows of every path.
+//!
+//! The live map is maintained incrementally (`search`): each new path first gets a local refit of
+//! the planets near it, and that map is published at once; bounded slices of birth work then
+//! continue the planet search on a thinned, relative-noise row set, with state that survives
+//! across slices and new paths. The published belief carries one map and no alternatives. The
+//! map the search keeps is polished for publication by a guarded exact refit (`rebuild`), which
+//! also gives the covariance. A background audit (`audit`) rebuilds the map from scratch
+//! (`rebuild`: the E9 cascade and the E9c polish) and replaces the maintained map only when its
+//! evidence on all rows is higher.
 //!
 //! Surface contacts (`contacts`) are extra evidence only: a gated surface constraint on the
 //! joint fit that never creates a planet. Contact terms enter only planet-bearing models; the
-//! flat model has none. A hit can therefore lower a planet's evidence relative to flat but never
-//! raise it. Oracle planets are never an input.
+//! flat model has none. Oracle planets are never an input.
+mod audit;
 mod contacts;
 mod eval;
 mod fit;
+mod rebuild;
+mod rows;
 mod search;
 mod window;
 mod work;
@@ -27,30 +34,24 @@ pub use work::{CeilingViolation, Part, PartCeilings, PartReport, UpdateReport};
 use crate::map::PlanetMap;
 use crate::protocol::{Point, ServerEvent};
 use crate::simulation::{ShotObservation, WorldParameters};
-use crate::strategy::{MapBelief, WeightedMap};
-use fit::CONTACT_FULL;
-use search::{Limits, Mode, same_map};
+use crate::strategy::MapBelief;
+use audit::{Audit, Stage};
+use fit::{CONTACT_FULL, Evidence, Fit, planet_at};
+use search::{Search, Slice};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use window::PathData;
-use work::Stats;
+use work::{Stats, cores};
 
-/// At most this many modes (including the flat one) are retained.
-const MAX_MODES: usize = 4;
-/// Modes whose log evidence trails the best by more than this are dropped (relative weight
-/// below about 1e-3).
-const RETAIN_NATS: f64 = 7.0;
-/// Position-noise levels (world units, on top of f32 rounding) the fit goes through, coarse to
-/// fine; the last is the scored likelihood. PROVISIONAL, NOT MEASURED: the measured residual
-/// scale against the disclosed truth (`measure_residual_scale_on_live_captures`) is f32 rounding
-/// only, i.e. 0, but with 0 (or an annealed 0.3 -> 0.03 -> 0) the multi-planet scorecard cases are
-/// far worse than with a single 0.1 level (docs/estimator-evaluation.md). Needs a decision.
-const NOISE_LEVELS: [f64; 1] = [0.1];
 /// Default cap on the number of planets in a map.
 pub const DEFAULT_MAX_PLANETS: usize = 24;
-/// Default wall-clock budget per update for growing and shrinking K.
-pub const DEFAULT_TIME_BUDGET: Duration = Duration::from_secs(5);
+/// Default evaluations of one search slice.
+pub const DEFAULT_SLICE_EVALUATIONS: u64 = 300;
+/// Default wall-clock ceiling of one search slice.
+pub const DEFAULT_SLICE_CEILING: Duration = Duration::from_millis(250);
+/// Default search slices owed after each new path.
+pub const DEFAULT_SLICES_PER_PATH: usize = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -63,16 +64,17 @@ pub enum CovarianceUnavailableReason {
     UnderIdentified,
 }
 
-/// Why the search for more (or fewer) planets stopped before it ran out of proposals.
+/// Why the planet search has work left in the published belief.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchLimit {
-    /// The best map has the maximum number of planets, so growing it was not attempted (a
-    /// supported extra planet may or may not exist).
+    /// The map has the maximum number of planets, so growing it is not attempted (a supported
+    /// extra planet may or may not exist).
     PlanetCap,
-    /// The per-update time budget ran out.
+    /// A search slice was cut by its wall-clock ceiling.
     TimeBudget,
-    /// The deterministic evaluation limit (`Estimator::max_evaluations`) was reached.
+    /// The search has work left: a slice reached its evaluation limit, or the slices owed after
+    /// the latest path have not all run.
     WorkBudget,
 }
 
@@ -86,54 +88,96 @@ struct Shot {
 }
 
 impl Shot {
+    /// `relative` times the observed acceleration of each row is added to the row's noise; 0 is
+    /// the exact noise model.
     fn new(
         obs: ShotObservation,
         contact: Option<contacts::Contact>,
         world: WorldParameters,
-        noise_levels: &[f64],
+        relative: f64,
     ) -> Self {
         let path = PathData::new(
             &obs.points,
             obs.angle_degrees,
             obs.velocity,
             world,
-            noise_levels,
+            relative,
         );
         Self { obs, contact, path }
     }
+
+    fn at_relative_level(&self, world: WorldParameters, relative: f64) -> Self {
+        Self::new(self.obs.clone(), self.contact.clone(), world, relative)
+    }
 }
 
-#[derive(Clone)]
-pub struct Estimator {
-    players: BTreeMap<u32, Point>,
-    shots: Vec<Shot>,
-    /// Planets of the previous update's retained modes; warm starts for the next update.
-    warm_starts: Vec<Vec<crate::protocol::Planet>>,
-    belief: Option<MapBelief>,
-    /// Shots were added since the last published belief: the next event retries the fit even if it
-    /// brings nothing new (a cancelled or failed fit must not stall the estimator).
-    stale: bool,
+/// Limits and switches of an estimator.
+#[derive(Clone, Debug)]
+pub struct Settings {
     /// Maximum number of planets in a map.
     pub max_planets: usize,
-    /// Wall-clock budget per update for growing and shrinking K; the best belief found so far is
-    /// published when it runs out.
-    /// The budget bounds the search (checked between iterations and inside each fit evaluation).
-    /// Not budgeted, so an update can overrun: the unrefit warm-start and flat evidence at the
-    /// start of the search, the evidence (Jacobian) of each mode, and `model_position_rmse`, which
-    /// simulates every shot of the epoch and is only a diagnostic.
-    pub time_budget: Duration,
-    /// Deterministic bound on residual plus Jacobian evaluations per update (`None`: unbounded).
-    /// Independent of `time_budget`; see `work.rs`.
-    pub max_evaluations: Option<u64>,
-    /// Whether a refit's own evaluations use the cores that the other refits of its stage leave
-    /// idle (results are identical either way; see `diagnose.rs` for the measurement).
-    pub parallel_evaluations: bool,
-    /// Position-noise levels of the likelihood, coarse to fine (default `NOISE_LEVELS`). Set
-    /// before the first shot: paths are prepared with it when they arrive.
-    pub noise_levels: Vec<f64>,
+    /// Evaluations of one search slice (checked between batches of refits, so a slice may exceed
+    /// it a little). Deterministic: the same paths and limits give the same belief whatever the
+    /// load, as long as `slice_ceiling` does not cut a slice and no audit is adopted.
+    pub slice_evaluations: u64,
+    /// Wall-clock ceiling of a slice (`None`: no ceiling); the best map so far is kept when it is hit.
+    pub slice_ceiling: Option<Duration>,
+    /// Slices owed after each new path.
+    pub slices_per_path: usize,
+    /// Threads of the live search; the audit uses half of them.
+    pub threads: usize,
+    /// Run the background audit. Off by default, because an adopted audit depends on timing; the
+    /// live map turns it on.
+    pub audit_enabled: bool,
     /// Wall-clock ceilings per part of the update; exceeded ones are listed in `last_report`.
     pub ceilings: PartCeilings,
-    /// Work and timing of the most recent update that ran the search.
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            max_planets: DEFAULT_MAX_PLANETS,
+            slice_evaluations: DEFAULT_SLICE_EVALUATIONS,
+            slice_ceiling: Some(DEFAULT_SLICE_CEILING),
+            slices_per_path: DEFAULT_SLICES_PER_PATH,
+            threads: cores(),
+            audit_enabled: false,
+            ceilings: PartCeilings::default(),
+        }
+    }
+}
+
+impl Settings {
+    fn slice<'a>(&'a self, cancelled: &'a AtomicBool, stats: &'a Stats) -> Slice<'a> {
+        Slice {
+            evaluations: self.slice_evaluations,
+            deadline: Instant::now() + self.slice_ceiling.unwrap_or(Duration::from_secs(24 * 3600)),
+            threads: self.threads,
+            max_planets: self.max_planets,
+            cancelled,
+            stats,
+        }
+    }
+}
+
+pub struct Estimator {
+    players: BTreeMap<u32, Point>,
+    /// Every path of the map epoch, at the exact noise model.
+    shots: Vec<Shot>,
+    search: Search,
+    /// Paths already given to the search (the rest were ingested when an update was cancelled).
+    searched: usize,
+    audit: Option<Audit>,
+    belief: Option<MapBelief>,
+    /// Search slices still owed for the latest path.
+    slices_left: usize,
+    /// The published map has not been polished since the latest search change.
+    polish_due: bool,
+    /// Why the search has work left, if it has.
+    limit: Option<SearchLimit>,
+    pub settings: Settings,
+    stats: Stats,
+    /// Work and timing of the most recent update (a path's local refit and the slices since).
     last_report: Option<UpdateReport>,
     /// Window-build and contact-classification times of shots ingested since the last update.
     pending_timings: Vec<(Part, Duration)>,
@@ -144,15 +188,15 @@ impl Default for Estimator {
         Self {
             players: BTreeMap::new(),
             shots: Vec::new(),
-            warm_starts: Vec::new(),
+            search: Search::new(),
+            searched: 0,
+            audit: None,
             belief: None,
-            stale: false,
-            max_planets: DEFAULT_MAX_PLANETS,
-            time_budget: DEFAULT_TIME_BUDGET,
-            max_evaluations: None,
-            parallel_evaluations: true,
-            noise_levels: NOISE_LEVELS.to_vec(),
-            ceilings: PartCeilings::default(),
+            slices_left: 0,
+            polish_due: false,
+            limit: None,
+            settings: Settings::default(),
+            stats: Stats::default(),
             last_report: None,
             pending_timings: Vec::new(),
         }
@@ -160,9 +204,9 @@ impl Default for Estimator {
 }
 
 impl Estimator {
-    /// Ingest an ordered group of events, then fit once if there are unpublished trajectories.
-    /// Returns `None` when nothing changed or the fit was cancelled or failed; the fit is then
-    /// retried on the next event.
+    /// Ingest an ordered group of events. When there are new trajectories, the planets near each
+    /// get a local refit and the resulting map is published (returned). The rest of the search is
+    /// `step`. `None` when nothing changed or the update was cancelled.
     pub fn observe_batch(
         &mut self,
         events: &[ServerEvent],
@@ -174,7 +218,9 @@ impl Estimator {
                 return None;
             }
             match event {
-                ServerEvent::Planets { .. } => self.reset(),
+                ServerEvent::Planets { .. } => {
+                    self.reset();
+                }
                 ServerEvent::PlayerPosition { player_id, x, y } => {
                     self.players.insert(*player_id, Point { x: *x, y: *y });
                 }
@@ -202,41 +248,180 @@ impl Estimator {
                     self.pending_timings
                         .push((Part::Contacts, started.elapsed()));
                     let started = Instant::now();
-                    self.shots
-                        .push(Shot::new(obs, contact, world, &self.noise_levels));
+                    self.shots.push(Shot::new(obs, contact, world, 0.0));
                     self.pending_timings
                         .push((Part::WindowBuild, started.elapsed()));
-                    self.stale = true;
                 }
                 _ => {}
             }
         }
-        if !self.stale {
+        if self.searched == self.shots.len() {
             return None;
         }
-        let Some(belief) = self.infer(world, cancelled) else {
-            if !cancelled.load(Ordering::SeqCst) {
-                eprintln!("estimator: the fit failed; it will be retried on the next event");
+        let before = self.searched;
+        self.stats = Stats::default();
+        for (part, elapsed) in self.pending_timings.drain(..) {
+            self.stats.add(part, elapsed);
+        }
+        for shot in &self.shots[self.searched..] {
+            let slice = self.settings.slice(cancelled, &self.stats);
+            self.search.add_path(shot, &slice);
+            self.searched += 1;
+            if cancelled.load(Ordering::SeqCst) {
+                return None;
             }
-            return None;
-        };
-        self.stale = false;
-        self.belief = Some(belief.clone());
-        Some(belief)
+        }
+        self.slices_left = self.settings.slices_per_path;
+        self.polish_due = true;
+        self.limit = (!self.search.idle()).then_some(SearchLimit::WorkBudget);
+        if self.audit.is_none()
+            && self.settings.audit_enabled
+            && (before + 1..=self.searched).any(audit::due)
+        {
+            self.audit = Some(Audit::rebuild(
+                self.shots.clone(),
+                self.settings.max_planets,
+                self.audit_threads(),
+            ));
+        }
+        let theta = self.search.theta.clone();
+        Some(self.publish(&theta, None))
     }
 
-    /// Sequential replay fits after each event.
+    /// Sequential replay: one event.
     pub fn observe(&mut self, event: &ServerEvent, cancelled: &AtomicBool) -> Option<MapBelief> {
         self.observe_batch(std::slice::from_ref(event), cancelled)
     }
 
+    /// The most recently published belief.
     pub fn belief(&self) -> Option<&MapBelief> {
         self.belief.as_ref()
     }
 
-    /// Work counts and per-part timings of the most recent update that ran the search.
+    /// Work counts and per-part timings of the most recent update.
     pub fn last_report(&self) -> Option<&UpdateReport> {
         self.last_report.as_ref()
+    }
+
+    /// Whether an audit is running, so that `step` will have a map to adopt at some point.
+    pub fn audit_running(&self) -> bool {
+        self.audit.is_some()
+    }
+
+    /// Whether `step` has work: a finished audit to adopt, search slices owed, or a map to polish.
+    pub fn search_pending(&self) -> bool {
+        self.audit.as_ref().is_some_and(Audit::finished)
+            || (!self.search.idle() && self.slices_left > 0)
+            || self.polish_due
+    }
+
+    /// One unit of background work: adopt a finished audit, else one search slice, else the exact
+    /// refit of the published map. Returns the belief when the published map changed.
+    pub fn step(&mut self, cancelled: &AtomicBool) -> Option<MapBelief> {
+        if self.audit.as_ref().is_some_and(Audit::finished) {
+            if let Some(belief) = self.collect_audit() {
+                return Some(belief);
+            }
+        }
+        if !self.search.idle() && self.slices_left > 0 {
+            self.slices_left -= 1;
+            let slice = self.settings.slice(cancelled, &self.stats);
+            let before = self.stats.evaluations();
+            let changed = self.search.step(&slice);
+            let spent = self.stats.evaluations() - before;
+            self.limit = if self.search.idle() {
+                None
+            } else if spent >= self.settings.slice_evaluations {
+                Some(SearchLimit::WorkBudget)
+            } else {
+                Some(SearchLimit::TimeBudget)
+            };
+            self.polish_due |= changed;
+            if changed {
+                let theta = self.search.theta.clone();
+                return Some(self.publish(&theta, None));
+            }
+            return None;
+        }
+        if self.polish_due {
+            self.polish_due = false;
+            let started = Instant::now();
+            let exact = Fit::new(
+                &self.shots,
+                WorldParameters::default(),
+                cancelled,
+                true,
+                vec![],
+            )
+            .with_stats(&self.stats);
+            let theta = self.search.theta.clone();
+            let (theta, evidence) = if theta.is_empty() {
+                (theta, None)
+            } else {
+                let rows = rebuild::residual_rows(&self.shots);
+                let deadline = self.settings.slice_ceiling.map(|ceiling| started + ceiling);
+                let theta =
+                    rebuild::exact_refit(&exact, rows, &theta, self.settings.threads, deadline);
+                // The covariance needs a Jacobian of all rows; a refit that used up its time
+                // leaves it out (`not_computed`) rather than run over the ceiling.
+                let evidence = deadline
+                    .is_none_or(|deadline| Instant::now() < deadline)
+                    .then(|| exact.evidence(&theta))
+                    .flatten();
+                (theta, evidence)
+            };
+            self.stats.add(Part::Polish, started.elapsed());
+            return Some(self.publish(&theta, evidence));
+        }
+        None
+    }
+
+    /// Run `step` until nothing is pending; the latest published belief if any was.
+    pub fn settle(&mut self, cancelled: &AtomicBool) -> Option<MapBelief> {
+        let mut latest = None;
+        while self.search_pending() && !cancelled.load(Ordering::SeqCst) {
+            latest = self.step(cancelled).or(latest);
+        }
+        latest
+    }
+
+    /// Wait for the running audit to end and adopt its map if it is better. Returns the belief
+    /// when it was adopted. For replays, where time does not pass between paths.
+    pub fn finish_audit(&mut self) -> Option<MapBelief> {
+        while self.audit.is_some() {
+            if let Some(belief) = self.collect_audit() {
+                return Some(belief);
+            }
+        }
+        None
+    }
+
+    fn audit_threads(&self) -> usize {
+        (self.settings.threads / 2).max(1)
+    }
+
+    /// Take the result of the audit thread (waiting if it still runs). A rebuilt map goes on to
+    /// its comparison on the paths known now; a map that won the comparison replaces the
+    /// maintained one (it was refit on the paths known when the comparison started).
+    fn collect_audit(&mut self) -> Option<MapBelief> {
+        let audit = self.audit.take()?;
+        let stage = audit.stage;
+        let found = audit.join()?;
+        if stage == Stage::Rebuild {
+            self.audit = Some(Audit::compare(
+                self.shots.clone(),
+                self.search.theta.clone(),
+                found,
+                self.audit_threads(),
+            ));
+            return None;
+        }
+        self.search.adopt(found);
+        self.slices_left = self.settings.slices_per_path;
+        self.polish_due = true;
+        self.limit = Some(SearchLimit::WorkBudget);
+        let theta = self.search.theta.clone();
+        Some(self.publish(&theta, None))
     }
 
     /// Forget the map epoch's evidence. Player positions survive: the server announces a
@@ -244,82 +429,43 @@ impl Estimator {
     pub fn reset(&mut self) {
         *self = Self {
             players: std::mem::take(&mut self.players),
-            max_planets: self.max_planets,
-            time_budget: self.time_budget,
-            max_evaluations: self.max_evaluations,
-            parallel_evaluations: self.parallel_evaluations,
-            noise_levels: std::mem::take(&mut self.noise_levels),
-            ceilings: std::mem::take(&mut self.ceilings),
+            settings: self.settings.clone(),
             ..Self::default()
         };
     }
 
-    /// Search K, rank the modes and build the belief. `None` when cancelled or when the flat model
-    /// cannot be evaluated.
-    fn infer(&mut self, world: WorldParameters, cancelled: &AtomicBool) -> Option<MapBelief> {
-        let limits = Limits {
-            max_planets: self.max_planets,
-            deadline: Instant::now() + self.time_budget,
-            max_evaluations: self.max_evaluations,
-            parallel_evaluations: self.parallel_evaluations,
-            ceilings: &self.ceilings,
-        };
-        let stats = Stats::default();
-        for (part, elapsed) in self.pending_timings.drain(..) {
-            stats.add(part, elapsed);
-        }
-        let (mut modes, limit) = search::search(
-            &self.shots,
-            world,
-            cancelled,
-            &self.warm_starts,
-            &limits,
-            &stats,
-        )?;
-        let diagnostics_started = Instant::now();
-        // One ranking pass: best first, coinciding modes merged, weak ones dropped.
-        modes.sort_by(|a, b| b.log_evidence.total_cmp(&a.log_evidence));
-        let best = modes[0].log_evidence;
-        let mut kept: Vec<Mode> = Vec::new();
-        for mode in modes {
-            let duplicate = kept
-                .iter()
-                .any(|other| same_map(&other.planets, &mode.planets));
-            if !duplicate && mode.log_evidence >= best - RETAIN_NATS && kept.len() < MAX_MODES {
-                kept.push(mode);
-            }
-        }
-        let total: f64 = kept
-            .iter()
-            .map(|mode| (mode.log_evidence - best).exp())
-            .sum();
-        let weight = |mode: &Mode| (mode.log_evidence - best).exp() / total;
-        let map_of = |mode: &Mode| PlanetMap {
-            planets: mode.planets.clone(),
-        };
-
-        let top = &kept[0];
-        let mut belief = MapBelief::new(map_of(top), None);
-        // The weights are normalized over the modes that were kept; a truncated search has not
-        // seen the modes it would be compared with, so no weight is reported then.
-        belief.map_weight = limit.is_none().then(|| weight(top));
-        belief.alternatives = kept[1..]
-            .iter()
-            .map(|mode| WeightedMap {
-                map: map_of(mode),
-                weight: weight(mode),
-            })
-            .collect();
-        belief.covariance_unavailable_reason = match (top.planets.is_empty(), &top.covariance) {
+    /// The belief of the map `theta`; `evidence` is its exact evidence when that was computed.
+    fn publish(&mut self, theta: &[[f64; 3]], evidence: Option<Evidence>) -> MapBelief {
+        let started = Instant::now();
+        let world = WorldParameters::default();
+        let planets: Vec<_> = theta.iter().map(|th| planet_at(*th)).collect();
+        let mut belief = MapBelief::new(PlanetMap { planets }, None);
+        belief.covariance_unavailable_reason = match (theta.is_empty(), evidence) {
             (true, _) => Some(CovarianceUnavailableReason::NoPlanets),
-            (false, None) => Some(CovarianceUnavailableReason::UnderIdentified),
-            (false, Some(covariance)) => {
-                belief.parameter_covariance = Some(fit::covariance_xym(covariance, &top.planets));
+            (false, None) => Some(CovarianceUnavailableReason::NotComputed),
+            (
+                false,
+                Some(Evidence {
+                    covariance: None, ..
+                }),
+            ) => Some(CovarianceUnavailableReason::UnderIdentified),
+            (
+                false,
+                Some(Evidence {
+                    covariance: Some(covariance),
+                    ..
+                }),
+            ) => {
+                belief.parameter_covariance =
+                    Some(fit::covariance_xym(&covariance, &belief.map.planets));
                 None
             }
         };
-        belief.search_limit = limit;
-
+        belief.search_limit = if theta.len() >= self.settings.max_planets {
+            Some(SearchLimit::PlanetCap)
+        } else {
+            self.limit
+        };
         let observations = self
             .shots
             .iter()
@@ -345,10 +491,10 @@ impl Estimator {
                 })
             })
             .count();
-        self.warm_starts = kept.into_iter().map(|mode| mode.planets).collect();
-        stats.add(Part::Diagnostics, diagnostics_started.elapsed());
-        self.last_report = Some(stats.report(&self.ceilings));
-        Some(belief)
+        self.stats.add(Part::Diagnostics, started.elapsed());
+        self.last_report = Some(self.stats.report(&self.settings.ceilings));
+        self.belief = Some(belief.clone());
+        belief
     }
 }
 

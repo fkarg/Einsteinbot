@@ -251,9 +251,9 @@ impl PlanetReplay {
     fn flush(&mut self) -> Option<einsteinbot::strategy::MapBelief> {
         let events = std::mem::take(&mut self.pending);
         self.pending_distinct = 0;
-        let belief = self
-            .estimator
-            .observe_batch(&events, &std::sync::atomic::AtomicBool::new(false))?;
+        let never = std::sync::atomic::AtomicBool::new(false);
+        let local = self.estimator.observe_batch(&events, &never)?;
+        let belief = self.estimator.settle(&never).unwrap_or(local);
         self.fits += 1;
         self.total_fits += 1;
         if let Some(error) = belief.model_position_rmse {

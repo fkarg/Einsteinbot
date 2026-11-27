@@ -20,9 +20,6 @@ use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-/// Noise level index that selects every path's finest (scored) level.
-const FINEST: usize = usize::MAX;
-
 /// Scale of the interior-sample penalty residual, in world units.
 const PENALTY_SIGMA: f64 = 0.5;
 const MIN_CONTACT_SIGMA: f64 = 0.25;
@@ -140,27 +137,12 @@ pub(super) struct Fit<'a> {
     cancelled: &'a AtomicBool,
     /// `refine` stops improving (keeping its best point so far) at this instant.
     deadline: Option<Instant>,
-    /// Number of noise levels of the paths; `refine` fits coarse to fine.
-    levels: usize,
     use_contacts: bool,
     /// Planets held fixed; the fitted planets add to their field. Evidence needs this empty.
     fixed: Vec<Planet>,
     /// Field of the fixed planets at each shot's nodes (empty arrays without a path or planets).
     base: Vec<[Vec<f64>; 2]>,
     stats: Option<&'a Stats>,
-    /// Measured and rejected variants (see `diagnose.rs`); they exist only in test builds.
-    #[cfg(test)]
-    experiments: Experiments,
-}
-
-/// Jacobian entries of a planet only for rows within `jacobian_radius` of it; the optimizer's
-/// relative stopping tolerance; the normal-equations optimizer instead of the QR-based one.
-#[cfg(test)]
-#[derive(Default)]
-struct Experiments {
-    jacobian_radius: Option<f64>,
-    tolerance: Option<f64>,
-    normal_equations: bool,
 }
 
 impl<'a> Fit<'a> {
@@ -189,35 +171,11 @@ impl<'a> Fit<'a> {
             world,
             cancelled,
             deadline: None,
-            levels: shots
-                .iter()
-                .find_map(|shot| shot.path.as_ref())
-                .map_or(1, |path| path.levels()),
             use_contacts,
             fixed,
             base,
             stats: None,
-            #[cfg(test)]
-            experiments: Experiments::default(),
         }
-    }
-
-    #[cfg(test)]
-    pub fn with_normal_equations(mut self) -> Self {
-        self.experiments.normal_equations = true;
-        self
-    }
-
-    #[cfg(test)]
-    pub fn with_tolerance(mut self, tolerance: f64) -> Self {
-        self.experiments.tolerance = Some(tolerance);
-        self
-    }
-
-    #[cfg(test)]
-    pub fn with_jacobian_radius(mut self, radius: f64) -> Self {
-        self.experiments.jacobian_radius = Some(radius);
-        self
     }
 
     pub fn with_stats(mut self, stats: &'a Stats) -> Self {
@@ -230,7 +188,7 @@ impl<'a> Fit<'a> {
         self
     }
 
-    fn field(&self, index: usize, path: &PathData, theta: &[[f64; 3]]) -> [Vec<f64>; 2] {
+    pub(super) fn field(&self, index: usize, path: &PathData, theta: &[[f64; 3]]) -> [Vec<f64>; 2] {
         let mut field = if self.base[index][0].is_empty() {
             [vec![0.0; path.nodes.len()], vec![0.0; path.nodes.len()]]
         } else {
@@ -256,11 +214,10 @@ impl<'a> Fit<'a> {
         &self,
         theta: &[[f64; 3]],
         want_jacobian: bool,
-        level: usize,
         threads: usize,
     ) -> Option<(DVector<f64>, Option<DMatrix<f64>>)> {
         let started = Instant::now();
-        let out = self.compute(theta, want_jacobian, level, threads);
+        let out = self.compute(theta, want_jacobian, threads);
         if let Some(stats) = self.stats {
             let part = if want_jacobian {
                 Part::JacobianEval
@@ -273,18 +230,13 @@ impl<'a> Fit<'a> {
     }
 
     /// The whitened window residuals of one path, axis by axis.
-    fn path_residual(&self, index: usize, theta: &[[f64; 3]], level: usize) -> Vec<f64> {
+    fn path_residual(&self, index: usize, theta: &[[f64; 3]]) -> Vec<f64> {
         let path = self.shots[index].path.as_ref().expect("a path");
         let r = path.row_count();
         let field = self.field(index, path, theta);
         let mut res = vec![0.0; 2 * r];
         for axis in 0..2 {
-            path.residual(
-                axis,
-                level,
-                &field[axis],
-                &mut res[axis * r..(axis + 1) * r],
-            );
+            path.residual(axis, &field[axis], &mut res[axis * r..(axis + 1) * r]);
         }
         res
     }
@@ -295,7 +247,6 @@ impl<'a> Fit<'a> {
         &self,
         theta: &[[f64; 3]],
         planets: std::ops::Range<usize>,
-        level: usize,
         total: usize,
         starts: &[(usize, usize)],
     ) -> Vec<f64> {
@@ -303,31 +254,15 @@ impl<'a> Fit<'a> {
         for &(index, row) in starts {
             let path = self.shots[index].path.as_ref().expect("a path");
             let r = path.row_count();
-            let n = path.substeps();
             let mut derivative = vec![vec![0.0; path.nodes.len()]; 6];
             let mut scratch = vec![0.0; r];
             for j in planets.clone() {
                 let th = &theta[j];
-                #[cfg(test)]
-                let rows = match self.experiments.jacobian_radius {
-                    None => 0..r,
-                    Some(radius) => {
-                        let near = |i: &usize| {
-                            let c = path.center(*i);
-                            (th[0] - c[0]).hypot(th[1] - c[1]) <= radius
-                        };
-                        match ((0..r).find(near), (0..r).rev().find(near)) {
-                            (Some(first), Some(last)) => first..last + 1,
-                            _ => continue,
-                        }
-                    }
-                };
-                #[cfg(not(test))]
                 let rows = 0..r;
                 let mass = MASS_PER_RADIUS_CUBED * th[2].powi(3);
                 let dmass = 3.0 * MASS_PER_RADIUS_CUBED * th[2].powi(2);
                 // Nodes read by the rows: row `i` uses nodes `i * n + 1 ..= i * n + 2n - 1`.
-                for i in rows.start * n + 1..(rows.end - 1) * n + 2 * n {
+                for i in path.node_range(rows.clone()) {
                     let p = path.nodes[i];
                     let (dx, dy) = (th[0] - p[0], th[1] - p[1]);
                     let d2 = (dx * dx + dy * dy).max(1e-18);
@@ -347,7 +282,7 @@ impl<'a> Fit<'a> {
                     for axis in 0..2 {
                         scratch.fill(0.0);
                         path.apply(&derivative[param * 2 + axis], &mut scratch, rows.clone());
-                        path.whiten(axis, level, &mut scratch, rows.start);
+                        path.whiten(axis, &mut scratch, rows.start);
                         for (i, v) in scratch.iter().enumerate().skip(rows.start) {
                             block[column + row + axis * r + i] = -v;
                         }
@@ -362,7 +297,6 @@ impl<'a> Fit<'a> {
         &self,
         theta: &[[f64; 3]],
         want_jacobian: bool,
-        level: usize,
         threads: usize,
     ) -> Option<(DVector<f64>, Option<DMatrix<f64>>)> {
         if self.cancelled.load(Ordering::Relaxed) {
@@ -403,7 +337,7 @@ impl<'a> Fit<'a> {
         }
         let mut res = Vec::with_capacity(total);
         for part in par_map(&starts, threads.min(paths).min(k.max(1)), |&(index, _)| {
-            self.path_residual(index, theta, level)
+            self.path_residual(index, theta)
         }) {
             res.extend(part);
         }
@@ -417,7 +351,7 @@ impl<'a> Fit<'a> {
                 .map(|first| first..(first + chunk).min(k))
                 .collect();
             let blocks = par_map(&chunks, threads, |planets| {
-                self.data_jacobian(theta, planets.clone(), level, total, &starts)
+                self.data_jacobian(theta, planets.clone(), total, &starts)
             });
             for (planets, block) in chunks.iter().zip(blocks) {
                 jacobian.as_mut_slice()[3 * planets.start * total..][..block.len()]
@@ -476,9 +410,9 @@ impl<'a> Fit<'a> {
             .then(|| (DVector::from_vec(res), jacobian))
     }
 
-    /// Chi-square at the finest noise level.
+    /// Chi-square.
     pub fn chi2(&self, theta: &[[f64; 3]]) -> Option<f64> {
-        self.evaluate(theta, false, FINEST, 1)
+        self.evaluate(theta, false, 1)
             .map(|(residuals, _)| residuals.norm_squared())
     }
 
@@ -530,53 +464,25 @@ impl<'a> Fit<'a> {
 
     /// Local minimum from `start`, or the best point reached when the deadline passes (never worse
     /// than `start`: `Lm` remembers the lowest-norm point it evaluated, because the optimizer
-    /// leaves its last, possibly worse, trial step as the parameters when it is interrupted). The fit
-    /// runs coarse to fine over the noise levels: the likelihood at exact noise is so sharp that a
-    /// start more than a few units off a planet is outside its basin, while the coarse levels
-    /// are wide enough to find it. `None` if cancelled or the model cannot be evaluated at the
-    /// result. Running out of patience is not a failure: the iterate is still a valid point and
-    /// is scored by its evidence like any other.
+    /// leaves its last, possibly worse, trial step as the parameters when it is interrupted).
+    /// `None` if cancelled or the model cannot be evaluated at the result. Running out of patience
+    /// is not a failure: the iterate is still a valid point and is scored by its evidence like any
+    /// other.
     pub fn refine(&self, start: &[[f64; 3]], budget: &Budget) -> Option<(Vec<[f64; 3]>, f64)> {
         let started = Instant::now();
         let used = Cell::new(0);
         let mut u = self.encode(start);
-        for level in 0..self.levels {
-            #[cfg(test)]
-            if self.experiments.normal_equations {
-                let mut lm = Lm {
-                    fit: self,
-                    u: u.clone(),
-                    level,
-                    best: RefCell::new(None),
-                    budget,
-                    used: &used,
-                };
-                normal_equations_lm(&mut lm);
-                if let Some((_, best)) = lm.best.into_inner() {
-                    u = best;
-                }
-                continue;
-            }
-            #[cfg_attr(not(test), allow(unused_mut))]
-            let mut optimizer = LevenbergMarquardt::new().with_patience(LM_PATIENCE);
-            #[cfg(test)]
-            if let Some(tolerance) = self.experiments.tolerance {
-                optimizer = optimizer
-                    .with_ftol(tolerance)
-                    .with_xtol(tolerance)
-                    .with_gtol(tolerance);
-            }
-            let (lm, _) = optimizer.minimize(Lm {
+        let (lm, _) = LevenbergMarquardt::new()
+            .with_patience(LM_PATIENCE)
+            .minimize(Lm {
                 fit: self,
                 u: u.clone(),
-                level,
                 best: RefCell::new(None),
                 budget,
                 used: &used,
             });
-            if let Some((_, best)) = lm.best.into_inner() {
-                u = best;
-            }
+        if let Some((_, best)) = lm.best.into_inner() {
+            u = best;
         }
         let theta = self.decode(&u);
         let chi2 = self.chi2(&theta)?;
@@ -599,7 +505,7 @@ impl<'a> Fit<'a> {
     fn laplace(&self, theta: &[[f64; 3]]) -> Option<Evidence> {
         debug_assert!(self.fixed.is_empty());
         let k = theta.len();
-        let (residuals, jacobian) = self.evaluate(theta, true, FINEST, 1)?;
+        let (residuals, jacobian) = self.evaluate(theta, true, 1)?;
         let chi2 = residuals.norm_squared();
         if k == 0 {
             return Some(Evidence {
@@ -660,7 +566,7 @@ impl<'a> Fit<'a> {
             for axis in 0..2 {
                 path.raw_residual(axis, &field[axis], &mut raw[axis]);
                 white[axis].copy_from_slice(&raw[axis]);
-                path.whiten(axis, FINEST, &mut white[axis], 0);
+                path.whiten(axis, &mut white[axis], 0);
             }
             for i in 0..r {
                 out.push(Unexplained {
@@ -675,92 +581,13 @@ impl<'a> Fit<'a> {
     }
 }
 
-#[cfg(test)]
-/// Levenberg-Marquardt on the normal equations `(J'J + mu diag(J'J)) step = -J'r` (Marquardt
-/// scaling, Nielsen's damping update): the `n x n` system costs a fraction of the QR
-/// factorization of the `m x n` Jacobian that the `levenberg_marquardt` crate computes per iteration.
-fn normal_equations_lm(lm: &mut Lm) {
-    let n = lm.u.len();
-    let max_evaluations = (LM_PATIENCE * (n + 1)) as u64;
-    let start_used = lm.used.get();
-    let Some(mut residuals) = lm.residuals() else {
-        return;
-    };
-    let mut cost = 0.5 * residuals.norm_squared();
-    let mut mu = 1e-3;
-    let mut nu = 2.0;
-    'outer: loop {
-        if lm.used.get() - start_used > max_evaluations {
-            return;
-        }
-        let Some(jacobian) = lm.jacobian() else {
-            return;
-        };
-        let information = jacobian.tr_mul(&jacobian);
-        let gradient = jacobian.tr_mul(&residuals);
-        if gradient.amax() == 0.0 {
-            return;
-        }
-        let scale = information.diagonal().map(|d| d.max(1e-12));
-        loop {
-            let mut damped = information.clone();
-            for i in 0..n {
-                damped[(i, i)] += mu * scale[i];
-            }
-            let step = damped.cholesky().map(|c| c.solve(&(-&gradient)));
-            let Some(step) = step.filter(|s| s.iter().all(|v| v.is_finite())) else {
-                mu *= nu;
-                nu *= 2.0;
-                if mu > 1e16 {
-                    return;
-                }
-                continue;
-            };
-            let current = lm.u.clone();
-            if step.norm() <= 1e-10 * (current.norm() + 1e-10) {
-                return;
-            }
-            lm.set_params(&(&current + &step));
-            let Some(trial) = lm.residuals() else {
-                return;
-            };
-            let trial_cost = 0.5 * trial.norm_squared();
-            let predicted = 0.5
-                * step
-                    .iter()
-                    .enumerate()
-                    .map(|(i, s)| s * (mu * scale[i] * s - gradient[i]))
-                    .sum::<f64>();
-            let rho = (cost - trial_cost) / predicted;
-            if rho > 0.0 && trial_cost.is_finite() {
-                let relative = (cost - trial_cost) / cost.max(1e-300);
-                residuals = trial;
-                cost = trial_cost;
-                mu *= (1.0 - (2.0 * rho - 1.0).powi(3)).max(1.0 / 3.0);
-                nu = 2.0;
-                if relative < 1e-10 {
-                    return;
-                }
-                continue 'outer;
-            }
-            lm.set_params(&current);
-            mu *= nu;
-            nu *= 2.0;
-            if mu > 1e16 {
-                return;
-            }
-        }
-    }
-}
-
 struct Lm<'a> {
     fit: &'a Fit<'a>,
     u: DVector<f64>,
-    level: usize,
     /// Lowest residual norm evaluated so far and its parameters.
     best: RefCell<Option<(f64, DVector<f64>)>>,
     budget: &'a Budget,
-    /// Evaluations of this refinement so far (shared across its noise levels).
+    /// Evaluations of this refinement so far.
     used: &'a Cell<u64>,
 }
 
@@ -795,12 +622,9 @@ impl LeastSquaresProblem<f64, Dyn, Dyn> for Lm<'_> {
         if !self.spend() {
             return None;
         }
-        let (residuals, _) = self.fit.evaluate(
-            &self.fit.decode(&self.u),
-            false,
-            self.level,
-            self.budget.threads,
-        )?;
+        let (residuals, _) =
+            self.fit
+                .evaluate(&self.fit.decode(&self.u), false, self.budget.threads)?;
         let norm = residuals.norm();
         let mut best = self.best.borrow_mut();
         if best.as_ref().is_none_or(|(lowest, _)| norm < *lowest) {
@@ -813,9 +637,7 @@ impl LeastSquaresProblem<f64, Dyn, Dyn> for Lm<'_> {
             return None;
         }
         let theta = self.fit.decode(&self.u);
-        let (_, jacobian) = self
-            .fit
-            .evaluate(&theta, true, self.level, self.budget.threads)?;
+        let (_, jacobian) = self.fit.evaluate(&theta, true, self.budget.threads)?;
         let mut jacobian = jacobian?;
         // Chain to the logistic coordinates: x and y depend on their own coordinate and, through
         // the bounds, on the radius coordinate.
