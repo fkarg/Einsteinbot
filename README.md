@@ -72,6 +72,19 @@ The server does not announce a new map unless it runs with `sendplanets 1`. At a
 
 Numbers as of 2026-11-27 (main at 58abdf9); each item names the change (P-number) it measured. Each comes from the experiment logs in [`docs/estimator-experiments.md`](docs/estimator-experiments.md) and the landing notes in [`docs/brainstorms/2026-11-13-newtonwars-bot.md`](docs/brainstorms/2026-11-13-newtonwars-bot.md). Unless stated otherwise each cell is **one run**; truth maps are used only for scoring. "Recall" counts true planets with an estimate within 2 units; "spurious" counts estimates with no true planet within 15 units. Captures 54 (second map) and 55 are the same game seen from two connections, so they count as one independent game.
 
+### What it looks like
+
+The map inspector on live capture 57 (four bots, 363 paths on one map; recorded by build fa9ffa1c, before the P15 targeting changes):
+
+![Gravity belief with all paths of the map coloured by outcome (red: hit a player, orange: planet surface, white: left the field) and the planet glyph row (fill: centre error, ring: radius error, dashed: missing, diamond: extra estimate)](docs/images/viewer-57-latest.jpg)
+*Gravity belief, every path of the map coloured by outcome, and one glyph per true planet: 19 found, 5 missing, 1 extra estimate at this point.*
+
+![Belief error layer: magnitude of the difference between the estimated and the true gravity field](docs/images/viewer-57-error.jpg)
+*Belief error: where the estimated field differs from the truth, dominated by the missing planets.*
+
+![One decision with its shot review: predicted versus observed path](docs/images/viewer-57-d937.jpg)
+*One decision: the predicted hit (dashed) diverges from the observed path near a missing planet, which is the "delta to reality" the inspector is built to show.*
+
 ### Estimator
 
 P13 (the likelihood above) against the previous estimator (main 16adc7f, relative noise), deterministic replays, no audit, totals over 14 dev worlds (8 synthetic, 6 live captures) and, once, over 13 held-out worlds (8 synthetic, 5 live). Cells are recall / spurious.
