@@ -233,6 +233,39 @@ fn infer_outcome(
     json!({"kind": "unexplained"})
 }
 
+/// The inferred outcome of every completed shot in `events`, keyed by its `ShotFin` sequence:
+/// `player` (hit a player), `planet` (ended on a planet surface: the truth map when disclosed,
+/// else the belief's planets), `left_field`, or `unknown` (anything else, including a sample
+/// limit). Shots without a matching `ShotBegin` are absent.
+pub fn path_outcomes(
+    events: &[(i64, Value)],
+    belief_planets: &[Planet],
+    actual: Option<&[Planet]>,
+) -> HashMap<i64, &'static str> {
+    let shot_events = events
+        .iter()
+        .filter(|(_, record)| {
+            matches!(
+                record["event"]["type"].as_str(),
+                Some("shot_begin" | "shot_fin" | "player_position" | "player_leave")
+            )
+        })
+        .cloned()
+        .collect();
+    observed_shots(shot_events)
+        .iter()
+        .map(|shot| {
+            let outcome = match infer_outcome(shot, belief_planets, actual)["kind"].as_str() {
+                Some("player") => "player",
+                Some("planet") => "planet",
+                Some("battlefield_margin") => "left_field",
+                _ => "unknown",
+            };
+            (shot.end_sequence, outcome)
+        })
+        .collect()
+}
+
 /// `GET /api/shot-review?id=&seq=[&repairs=1]` for a decision `seq`.
 pub fn shot_review(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Result<Value, String> {
     let capture_id = required_id(parameters, "id")?;
@@ -730,5 +763,41 @@ mod tests {
             infer_outcome(&shot(point(-480.0, 50.0)), &[], None)["kind"],
             "battlefield_margin"
         );
+    }
+
+    #[test]
+    fn path_outcomes_key_each_finished_shot_by_its_fin_sequence() {
+        let to_player = json!([{"x": 200.0, "y": 400.0}, {"x": 900.0, "y": 101.0}]);
+        let nowhere = json!([{"x": 900.0, "y": 100.0}, {"x": 700.0, "y": 300.0}]);
+        let events = vec![
+            event(
+                1,
+                json!({"type": "player_position", "player_id": 1, "x": 200.0, "y": 400.0}),
+            ),
+            event(
+                2,
+                json!({"type": "player_position", "player_id": 2, "x": 900.0, "y": 100.0}),
+            ),
+            event(
+                3,
+                json!({"type": "shot_begin", "player_id": 1, "angle": 0.0, "velocity": 8.0}),
+            ),
+            event(
+                4,
+                json!({"type": "shot_begin", "player_id": 2, "angle": 9.0, "velocity": 8.0}),
+            ),
+            event(
+                5,
+                json!({"type": "shot_fin", "player_id": 1, "angle": 0.0, "velocity": 8.0, "points": to_player}),
+            ),
+            event(
+                6,
+                json!({"type": "shot_fin", "player_id": 2, "angle": 9.0, "velocity": 8.0, "points": nowhere}),
+            ),
+        ];
+        let outcomes = path_outcomes(&events, &[], None);
+        assert_eq!(outcomes.get(&5), Some(&"player"));
+        assert_eq!(outcomes.get(&6), Some(&"unknown"));
+        assert_eq!(outcomes.len(), 2);
     }
 }
