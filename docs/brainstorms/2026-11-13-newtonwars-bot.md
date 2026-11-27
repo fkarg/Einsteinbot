@@ -1093,3 +1093,19 @@ Consequence: the model-error form for P13 is "Campbell spatial shape (1/d_U scal
 
 ### User acceptance (2026-11-27)
 **P12b accepted** ("solidly worth trying at least"): replace the levenberg_marquardt crate's per-iteration dense pivoted QR of the full Jacobian with a tall-skinny QR (per-path chunks in parallel, then QR of the stacked R factors) inside our own LM loop; keep QR accuracy (E8 rejected plain normal equations). Queued after P13 lands (P13 changes the whitening of Jacobian columns). Acceptance: same fitted maps within noise on dev replays, CPU and wall time measured before/after on the Mac (the `sample` profile showed ~68% of busy samples in the crate's QR).
+
+### P13 result (2026-11-27; branch `p13` 10cc418 + 732248c, NOT merged; details "P13 results" in docs/estimator-experiments.md on that branch)
+Worker observations (jolly deterministic replays, one run per world, ~3.7 CPU-h). recall(2) summed / spurious summed, main -> P13:
+- Dev no audit (14 worlds): n=8 41/79 -> 62/9; n=16 229/50 -> 138/14; n=32 296/17 -> 270/12; last path 313/8 -> 314/8; CPU 2726 s -> 837 s.
+- Dev with audit (8 worlds): n=8 60/48 -> 24/6; n=16 101/36 -> 60/10; last 175/6 -> 177/6; CPU 3597 -> 1015 s.
+- Held-out no audit (13): n=16 173/49 -> 104/13; last 272/7 -> 279/4.
+- Unexplored field error at the last path lower on 5/6 dev live and 4/5 held-out live. Mac worst publish lag 270/268/265 ms (was 331/259/269).
+- Production falsifier: missing-4 chi2/row ~1.0, lag-1 |<=0.04|; true map chi2/row ~0.83.
+- Problem (design tradeoff, worker stopped as briefed): mid-phase recall much lower (16-32 paths); mechanism (observed on 7001, inferred cause): with the noise frozen at the honest level for a map missing planets, the model-error process explains part of the missing planets' own signal, so births lack evidence (seed threshold not the limit). One-path hit no longer creates a planet (test `planet_replay_uses_paths_not_oracle_and_resets_physical_map` fails on p13; `a_hit_is_recovered...` loosened to a 2-unit tolerance with covering covariance).
+- Deviations: Poisson(24)+ln K! count prior made a flat noisy world grow 5 unconstrained corner planets, so 1/20 odds kept (contract: born only from trajectory evidence); prequential rows within r+20 of a published planet masked; s <= 1.
+- Deleted: relative levels, banded Whitener (replaced by noise.rs Kalman whitener with exact floor), guard/exact refit (full-row refit under new likelihood).
+
+### Round 54 (Q16: fix mid-phase absorption) session assessment BEFORE peer
+Options: (1) keep frozen noise, add a structured-residual birth test; (2) per-model noise: each compared map has its own exclusion zones and unseen count N_u = N - K scaling the process variance, compared by full Gaussian marginal likelihood including log-det (the principled marginal likelihood of model M_K; shared s, l); (3) in-sample scale estimate. Recommendation: (2), because the failure occurs exactly under frozen noise (so (1) is close to the status quo), and (2) is the user's stated model (uncertainty from unseen sources, shrinking as planets are found). Falsifier: replay synthetic 7001 (stalls at 20/24) and the one-path unit tests; then dev checkpoints 16/32; reject if spurious planets return or a map wins only by shrinking variance without lowering residuals.
+Peer (Codex; OpenCode failed): verdict insufficient_evidence; recommends testing (1) first as the smallest change, then (2) with full marginal likelihood if (1) fails; (3) risks circularity. Findings: candidate-specific noise could reward variance shrinkage unless the log-det/prior make that explicit; the short-path regression may need a separate route. Attempted falsifications: 4 (reasoning only).
+Impact: disagreement on order (peer: 1 first; session: 2 first, since 1 is near the status quo that failed). Added verification: check explicitly that adoptions under (2) lower residuals, not just variance; track the one-path case separately.
