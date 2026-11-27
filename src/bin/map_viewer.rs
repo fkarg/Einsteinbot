@@ -261,7 +261,7 @@ fn capture_overview(path: &PathBuf) -> Result<Value, String> {
                     "stage": data["scenario"]["stage"],
                     "planets": belief["planets"].as_array().map(Vec::len),
                     "fit_rmse": belief["model_position_rmse"],
-                    "fit_converged": belief["fit_converged"],
+                    "search_state": search_state(belief),
                     "accuracy": accuracy,
                 }))
             });
@@ -333,15 +333,12 @@ fn list_decisions(path: &PathBuf, capture_id: i64) -> Result<Value, String> {
                 "energy": data["energy"],
                 "choice": data["choice"],
                 "scenario": data["scenario"],
-                "map_updating": data["map_updating"],
+                "map_updating": map_updating(&data),
                 "map_planets": belief["planets"].as_array().map_or(0, Vec::len),
                 "fit_rmse": belief["model_position_rmse"],
-                "fit_converged": belief["fit_converged"],
                 "covariance": belief["covariance"].is_array(),
-                "approximate_covariance": belief["approximate_covariance"].is_array(),
-                "fit_approximate": belief["fit_approximate"],
                 "covariance_reason": belief["covariance_unavailable_reason"],
-                "field_evidence": belief["field_evidence"].is_object(),
+                "search_state": search_state(belief),
                 "map_epoch": epoch_starts
                     .partition_point(|start| *start <= sequence)
                     .checked_sub(1)
@@ -353,6 +350,26 @@ fn list_decisions(path: &PathBuf, capture_id: i64) -> Result<Value, String> {
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
     Ok(json!({"capture_id": capture_id, "decisions": decisions}))
+}
+
+/// Why the planet search stopped: `settled` when the belief records no limit, the recorded
+/// `search_limit` otherwise, and null for captures that predate the field (unknown, not settled).
+fn search_state(belief: &Value) -> Value {
+    match belief.get("search_limit") {
+        None => Value::Null,
+        Some(Value::Null) => json!("settled"),
+        Some(limit) => limit.clone(),
+    }
+}
+
+/// Whether observations were still queued for the estimator when the decision read its belief.
+/// Scenario captures record `map_updating`; live captures record `map_pending_events`.
+fn map_updating(data: &Value) -> Value {
+    match (&data["map_updating"], data["map_pending_events"].as_u64()) {
+        (Value::Bool(updating), _) => json!(updating),
+        (_, Some(pending)) => json!(pending > 0),
+        _ => Value::Null,
+    }
 }
 
 /// Every disclosed-planets message of a capture as `(sequence, planets)`, in sequence order.
@@ -846,8 +863,8 @@ fn decode_belief(value: &Value) -> Result<Option<MapBelief>, String> {
             .unwrap_or_else(|| json!([])),
     )
     .map_err(|error| error.to_string())?;
-    // Fit diagnostics, approximate covariance and field evidence are no longer recorded or
-    // decoded; the viewer layers that used them return null (unavailable) for every capture.
+    // Older captures may carry fit diagnostics, approximate covariance and field evidence; the
+    // estimator no longer records them and the viewer ignores them.
     Ok(Some(belief))
 }
 
@@ -890,8 +907,6 @@ fn make_field_grid(
                     Option::<f64>::None,
                     oracle.map(|v| v.x),
                     oracle.map(|v| v.y),
-                    Option::<f64>::None,
-                    Option::<f64>::None,
                     Option::<f64>::None
                 ]));
                 continue;
@@ -925,11 +940,7 @@ fn make_field_grid(
                 physical.map(|v| v.y),
                 actual_vector.map(|v| v.x),
                 actual_vector.map(|v| v.y),
-                sigma,
-                // Slots 11-12 (evidence availability, approximate sigma) are unavailable: the
-                // v2 estimator records neither.
-                Option::<f64>::None,
-                Option::<f64>::None
+                sigma
             ]));
         }
     }
@@ -943,7 +954,6 @@ fn make_field_grid(
         "columns": (end_x.saturating_sub(start_x) / grid_step) + 1,
         "rows": (end_y.saturating_sub(start_y) / grid_step) + 1,
         "has_covariance": covariance.is_some(),
-        "has_approximate_covariance": false,
         "has_belief": belief.is_some(),
     }))
 }
@@ -1491,12 +1501,11 @@ mod tests {
         )
         .unwrap();
         let sample = &grid["samples"][0];
-        assert_eq!(sample.as_array().unwrap().len(), 13);
+        assert_eq!(sample.as_array().unwrap().len(), 11);
         assert_eq!(sample[2], 0.0);
         assert_eq!(sample[3], 0.0);
-        // No recorded field evidence (older captures): availability is unavailable, not zero.
-        assert!(sample[11].is_null());
-        assert!(sample[12].is_null());
+        // No covariance: field sigma is unavailable, not zero.
+        assert!(sample[10].is_null());
     }
 
     #[test]
@@ -1512,5 +1521,79 @@ mod tests {
         });
         let belief = decode_belief(&data["map_belief"]).unwrap().unwrap();
         assert_eq!(belief.map.planets.len(), 1);
+    }
+
+    #[test]
+    fn decisions_report_search_state_and_covariance_for_current_and_old_beliefs() {
+        use einsteinbot::estimator::{CovarianceUnavailableReason, SearchLimit};
+        let path = std::env::temp_dir().join(format!(
+            "einsteinbot-viewer-decisions-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let metadata = einsteinbot::event_store::CaptureMetadata {
+            started_at_unix_ms: 1,
+            process_id: std::process::id(),
+            host: "localhost".into(),
+            port: 3490,
+            client_name: "viewer-test".into(),
+            protocol_version: 8,
+        };
+        let mut log = einsteinbot::event_store::EventLog::create(&path, &metadata).unwrap();
+        let planet = Planet {
+            x: 100.0,
+            y: 100.0,
+            radius: 20.0,
+            mass: 800.0,
+        };
+        // Right after a path: no covariance yet, search work pending.
+        let mut fresh = MapBelief::new(
+            PlanetMap {
+                planets: vec![planet.clone()],
+            },
+            None,
+        );
+        fresh.search_limit = Some(SearchLimit::WorkBudget);
+        // After the slices and the exact refit: covariance, search settled.
+        let polished = MapBelief::new(
+            PlanetMap {
+                planets: vec![planet],
+            },
+            Some(DMatrix::identity(3, 3)),
+        );
+        let mut empty = MapBelief::new(PlanetMap { planets: vec![] }, None);
+        empty.covariance_unavailable_reason = Some(CovarianceUnavailableReason::NoPlanets);
+        let live = |belief: &MapBelief, pending: u64| json!({"map_belief": belief.diagnostic_json(), "map_pending_events": pending});
+        for data in [
+            live(&fresh, 1),
+            live(&polished, 0),
+            live(&empty, 0),
+            // A capture from before the v2 estimator: removed keys, no search_limit.
+            json!({"map_belief": {"planets": [], "fit_converged": true,
+                "approximate_covariance": [[1.0]], "field_evidence": {}}}),
+        ] {
+            log.append_diagnostic(1, "bot", "target_decision", &data)
+                .unwrap();
+        }
+        let decisions = list_decisions(&path, 1).unwrap()["decisions"].clone();
+        let field = |index: usize, key: &str| decisions[index][key].clone();
+        assert_eq!(field(0, "search_state"), "work_budget");
+        assert_eq!(field(0, "covariance"), false);
+        assert_eq!(field(0, "covariance_reason"), "not_computed");
+        assert_eq!(field(0, "map_updating"), true);
+        assert_eq!(field(1, "search_state"), "settled");
+        assert_eq!(field(1, "covariance"), true);
+        assert!(field(1, "covariance_reason").is_null());
+        assert_eq!(field(1, "map_updating"), false);
+        assert_eq!(field(2, "covariance_reason"), "no_planets");
+        // Old capture: search state and staleness are unknown (null), not settled or fresh.
+        assert!(field(3, "search_state").is_null());
+        assert!(field(3, "map_updating").is_null());
+        assert_eq!(field(3, "covariance"), false);
+        assert!(field(3, "covariance_reason").is_null());
+        let removed = ["fit_converged", "approximate_covariance", "field_evidence"];
+        assert!(removed.iter().all(|key| decisions[3].get(key).is_none()));
+        drop(log);
+        std::fs::remove_file(path).unwrap();
     }
 }
