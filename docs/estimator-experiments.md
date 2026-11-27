@@ -1561,6 +1561,15 @@ The 3 design misses are maps the estimator never completed (live 57 with spuriou
 
 Deterministic replay (capture 55 epoch 0, 128 paths, `CEIL_MS=0`, 2 threads): identical `QUAL` lines before and after (nothing sets the flag there). The remaining worst lag is inferred, not traced per path: the serial model-error estimate (`LATE` noise max 97 ms in both builds) and the covariance step of the full-row refit (`SLOW` lines show evidence about 140 ms of a 232 ms polish), which is not pre-empted once started.
 
+**Refit guard and folded evidence (observed; jolly busy at load average 26-50 from other sessions, pinned to 10 cores, so absolute lags are higher than above).** Pre-emption alone starved the full-row refit: up to 272-300 paths between two completed refits (`polishes` and `max_paths_between_polishes` in `TLEND`), against 14-46 without pre-emption. With the guard (a refit goes first, uninterrupted, once 8 paths passed without one) the gap fell to 14-33 paths. Folding the evidence's information from the row-block triangles took the evidence step of slow refits (`SLOW` lines) from a median of 69-111 ms to 27-58 ms; deterministic replays (capture 55 to 128 paths, synthetic 7001 to 60) gave identical `QUAL` lines at the same CPU. Final branch (merged with main f42a6e7) against main f42a6e7, three alternating runs each at load 29-36:
+
+| | median lag | p90 | worst | max queued | paths between refits | rec2/spur at n = 16, 32, 64, 128, 545 |
+|---|---|---|---|---|---|---|
+| main | 98 / 103 / 118 ms | 236 / 249 / 266 ms | 396 / 386 / 476 ms | 3 / 3 / 4 | not counted | 7/0, 10-11/0-1, 16/0, 24/0, 24/0 |
+| fixes | 30 / 49 / 46 ms | 97 / 109 / 122 ms | 278 / 278 / 296 ms | 1 / 1 / 2 | 10 / 12 / 15 | 7/0, 10/1, 16/0, 24/0, 24/0 |
+
+Two small changes after a review were not re-measured: a pre-empted joint refit round no longer counts toward `MAX_ROUNDS`, and a slice that spent its whole budget before the flag was seen counts as spent.
+
 **Contact term (observed; full event path with recorded players, so contacts are classified; `CEIL_MS=0`, 2 threads, deterministic, one run each; captures 33, 40, 55 to 128 paths, 45 to 62 and 48 to 48, their whole first epochs).** Almost every path ends in a contact there (15 of 16 at n = 16). Old = the gated term (full pull to 15 units, tapering to zero at 40); off = no contact rows; new = the robust one-sided surface likelihood (uniform penetration on `[-allowance, 0]` convolved with sd 0.25, mixed with a background of relative density 1e-5, so the cost is bounded at about 23 and monotone; the flat map pays that per contact). rec2 / spurious summed over the five captures:
 
 | | n = 16 | n = 32 | n = 64 or the end | n = 128 (3 captures) |
