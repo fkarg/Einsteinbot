@@ -38,9 +38,13 @@ pub struct InFlightShot {
 }
 
 /// A player an in-flight shot is predicted to kill.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
 pub struct PredictedKill {
     pub shooter: u32,
+    /// The in-flight shot (with `shooter`, its identity in `ShotBegin`).
+    pub angle_degrees: f64,
+    pub velocity: f64,
+    pub begun_ms: i64,
     pub victim: u32,
     /// Predicted impact time (unix ms, local clock).
     pub impact_ms: f64,
@@ -119,6 +123,9 @@ pub fn predict_kills(
                 if impact_ms > now_ms as f64 {
                     return Some(PredictedKill {
                         shooter: shot.player_id,
+                        angle_degrees: shot.angle_degrees,
+                        velocity: shot.velocity,
+                        begun_ms,
                         victim,
                         impact_ms,
                         flight_ticks,
@@ -154,6 +161,9 @@ mod tests {
     fn kill(victim: u32, impact_ms: f64, probability: f64) -> PredictedKill {
         PredictedKill {
             shooter: 7,
+            angle_degrees: 0.0,
+            velocity: 5.0,
+            begun_ms: 0,
             victim,
             impact_ms,
             flight_ticks: 30,

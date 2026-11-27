@@ -1,7 +1,8 @@
 use crate::coverage::path_cells;
 use crate::estimator::{ResidualCorrection, ResidualGate, ResidualModel};
 use crate::in_flight::{
-    DEFAULT_STEP_RATE, FIRE_LATENCY_MS, InFlightShot, SHOT_SLOTS, doom_probability, predict_kills,
+    DEFAULT_STEP_RATE, FIRE_LATENCY_MS, InFlightShot, PredictedKill, SHOT_SLOTS, doom_probability,
+    predict_kills,
 };
 use crate::map::{PlanetMap, Vec2};
 use crate::player_energy::{EnergyTracker, SPAWN_ENERGY};
@@ -220,9 +221,7 @@ impl BotState {
                 if let Some(now_ms) = now_ms
                     && old.as_ref() != Some(&position)
                 {
-                    let own = Some(*player_id) == self.own_id;
-                    self.energy
-                        .repositioned(*player_id, old.as_ref(), now_ms, own);
+                    self.energy.repositioned(*player_id, old.as_ref(), now_ms);
                 }
                 if !self.observed_spawn_locations.contains(&position) {
                     self.observed_spawn_locations.push(position.clone());
@@ -242,8 +241,7 @@ impl BotState {
                 // Every connection receives every ShotBegin broadcast. Shots take seconds to
                 // finish, so in-flight own shots must already count as known outcomes.
                 if let Some(now_ms) = now_ms {
-                    let own = Some(*player_id) == self.own_id;
-                    self.energy.shot_begin(*player_id, *velocity, now_ms, own);
+                    self.energy.shot_begin(*player_id, *velocity, now_ms);
                 }
                 let ordinal = self.begin_counts.entry(*player_id).or_insert(0);
                 *ordinal += 1;
@@ -404,6 +402,11 @@ impl BotState {
 pub const APPROACH_MIN_ENERGY: f64 = 15.0;
 /// Hit ranking weight of one unit of predicted impact offset, in flight ticks.
 const MISS_DISTANCE_TICKS: f64 = 5.0;
+/// How far ahead an in-flight shot predicted to kill us counts as a threat (`Decision::own_doom`):
+/// about the next decision (energy poll 1 s plus the map wait).
+const THREAT_HORIZON_MS: f64 = 1_500.0;
+/// Alternative hits recorded per decision (`Decision::top_hits`).
+const RECORDED_HITS: usize = 5;
 /// Flight ticks over which a predicted hit's chance falls by a factor e (the recalibrated
 /// `in_flight::kill_probability`: 0.72 below 40 ticks, 0.25 at 80-99).
 const HIT_TICKS_PER_EFOLD: f64 = 55.0;
@@ -421,9 +424,6 @@ pub struct TargetingSettings {
     /// A predicted hit whose victim an in-flight shot kills first with at least this chance is
     /// skipped (`in_flight::doom_probability`); above 1 disables doomed-target avoidance.
     pub doom_threshold: f64,
-    /// Spend the energy when the estimated playing time left is at most this
-    /// (`Urgency::RoundEnd`); 0 disables.
-    pub endgame_ms: f64,
     /// Kills a unit of energy gained is worth when ranking hits (the killer gains half the
     /// victim's energy); 0 ranks hits by flight and offset only.
     pub energy_value: f64,
@@ -438,7 +438,6 @@ impl Default for TargetingSettings {
             information_threshold: f64::INFINITY,
             coverage_penalty: 40.0,
             doom_threshold: 0.15,
-            endgame_ms: 0.0,
             energy_value: 0.0,
         }
     }
@@ -490,22 +489,36 @@ pub enum WaitReason {
     Cancelled,
 }
 
-/// Why the energy is spent now rather than saved.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Urgency {
-    /// The estimated end of play is near.
-    RoundEnd,
-}
-
 /// A targeting decision: the shot, or why there is none, and the context it was made in.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Decision {
     pub choice: Option<ShotChoice>,
     pub wait_reason: Option<WaitReason>,
-    pub urgency: Option<Urgency>,
     /// Estimated playing time left (`round_clock`); `None` until a full map was observed.
     pub round_time_left_ms: Option<i64>,
+    /// Chance an in-flight shot kills us within `THREAT_HORIZON_MS`; `None` without a clock.
+    pub own_doom: Option<f64>,
+    /// Ranked candidates (unknown outcomes first) and predicted hits among them.
+    pub candidates: usize,
+    pub hits: usize,
+    /// The best predicted hits in ranking order, before doomed ones are skipped.
+    pub top_hits: Vec<HitSummary>,
+}
+
+/// One considered hit, for the decision record.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct HitSummary {
+    pub velocity: i32,
+    pub angle_degrees: i32,
+    pub victim: u32,
+    pub flight_ticks: usize,
+    pub miss_distance: f64,
+    /// `hit_score`, lower is better.
+    pub score: f64,
+    pub victim_doom: Option<f64>,
+    pub victim_energy: Option<f64>,
+    /// In-flight shots predicted to kill the victim before this hit would land.
+    pub doomed_by: Vec<PredictedKill>,
 }
 
 impl Decision {
@@ -526,8 +539,11 @@ impl Decision {
     pub fn diagnostic_json(&self) -> serde_json::Value {
         serde_json::json!({
             "wait_reason": self.wait_reason,
-            "urgency": self.urgency,
             "round_time_left_ms": self.round_time_left_ms,
+            "own_doom": self.own_doom,
+            "candidates": self.candidates,
+            "hits": self.hits,
+            "top_hits": self.top_hits,
         })
     }
 }
@@ -622,17 +638,29 @@ impl TargetingPolicy {
             .iter()
             .map(|(&id, position)| (id, Vec2::new(f64::from(position.x), f64::from(position.y))))
             .collect::<Vec<_>>();
+        // Every in-flight shot's predicted kill (ours included): doomed targets, and the threat
+        // to us.
+        let kills = match state.clock_ms {
+            Some(now_ms) if !state.in_flight.is_empty() => predict_kills(
+                map,
+                correction,
+                &state.in_flight,
+                &players,
+                now_ms,
+                state.step_rate(),
+                self.world,
+                self.settings.max_simulation_ticks,
+                self.settings.target_radius,
+            ),
+            _ => Vec::new(),
+        };
         if let Some(now_ms) = state.clock_ms {
+            decision.own_doom = Some(doom_probability(
+                &kills,
+                own_id,
+                now_ms as f64 + THREAT_HORIZON_MS,
+            ));
             decision.round_time_left_ms = state.round_time_left_ms(now_ms);
-            // Every player restarts at 20 energy on the next map: spend it before the end.
-            // Once the estimated end has passed, the round is longer than estimated: the
-            // estimate no longer says anything.
-            if decision
-                .round_time_left_ms
-                .is_some_and(|left| left > 0 && (left as f64) <= self.settings.endgame_ms)
-            {
-                decision.urgency = Some(Urgency::RoundEnd);
-            }
         }
         let evaluate = |velocity: i32, angle: i32| -> Option<ShotChoice> {
             let shot = ShotObservation {
@@ -816,11 +844,6 @@ impl TargetingPolicy {
             .copied()
             .collect::<Vec<_>>();
         if let Some(now_ms) = state.clock_ms {
-            // The end card destroys every shot still in flight: a hit landing after the
-            // estimated end of play counts for nothing.
-            if let (Some(_), Some(left)) = (decision.urgency, decision.round_time_left_ms) {
-                hits.retain(|hit| impact_ms(hit, now_ms) <= (now_ms + left) as f64);
-            }
             for hit in &mut hits {
                 hit.victim_energy = state
                     .player_energy(hit.predicted_victim.unwrap(), impact_ms(hit, now_ms) as i64);
@@ -828,20 +851,11 @@ impl TargetingPolicy {
         }
         let energy_value = self.settings.energy_value;
         hits.sort_by(|left, right| compare_hit_quality(left, right, energy_value));
+        decision.candidates = pool.len();
+        decision.hits = hits.len();
         // Doomed-target avoidance: a hit on a player another in-flight shot (ours included)
         // kills first is wasted, so skip such hits unless ours lands first (the race rule).
         if let (Some(now_ms), false) = (state.clock_ms, hits.is_empty()) {
-            let kills = predict_kills(
-                map,
-                correction,
-                &state.in_flight,
-                &players,
-                now_ms,
-                state.step_rate(),
-                self.world,
-                self.settings.max_simulation_ticks,
-                self.settings.target_radius,
-            );
             for hit in &mut hits {
                 hit.victim_doom = Some(doom_probability(
                     &kills,
@@ -853,11 +867,33 @@ impl TargetingPolicy {
                 .iter()
                 .filter(|hit| hit.victim_doom.unwrap() >= self.settings.doom_threshold)
                 .count();
-            if skipped == hits.len() && decision.urgency.is_none() {
+            decision.top_hits = hits
+                .iter()
+                .take(RECORDED_HITS)
+                .map(|hit| {
+                    let victim = hit.predicted_victim.unwrap();
+                    let impact = impact_ms(hit, now_ms);
+                    HitSummary {
+                        velocity: hit.velocity,
+                        angle_degrees: hit.angle_degrees,
+                        victim,
+                        flight_ticks: hit.flight_ticks,
+                        miss_distance: hit.miss_distance,
+                        score: hit_score(hit, energy_value),
+                        victim_doom: hit.victim_doom,
+                        victim_energy: hit.victim_energy,
+                        doomed_by: kills
+                            .iter()
+                            .filter(|kill| kill.victim == victim && kill.impact_ms < impact)
+                            .copied()
+                            .collect(),
+                    }
+                })
+                .collect();
+            if skipped == hits.len() {
                 // Every predicted hit is doomed: wait for the targets to respawn rather than
-                // spend the energy on a shot that lands on nobody. At the round end the energy
-                // is lost anyway: fall through to another shot instead (doomed hits fired anyway
-                // were all wasted in P24's replays, 17 of 17).
+                // spend the energy on a shot that lands on nobody (P24: doomed hits fired
+                // anyway were all wasted in replays, 17 of 17).
                 return decision.waiting(WaitReason::AllHitsDoomed);
             }
             hits.retain(|hit| hit.victim_doom.unwrap() < self.settings.doom_threshold);
@@ -891,9 +927,9 @@ impl TargetingPolicy {
         }
 
         // A cheap shot without a predicted hit rarely hits (capture 55: 5 of 58 at a median
-        // energy of 3.6); saving energy until a hit is predicted pays off more, unless the
-        // energy is about to be lost (urgency).
-        if energy < APPROACH_MIN_ENERGY && decision.urgency.is_none() {
+        // energy of 3.6); saving energy until a hit is predicted pays off more (also when
+        // our death or the round end is near: P24 replays found no gain in firing anyway).
+        if energy < APPROACH_MIN_ENERGY {
             return decision.waiting(WaitReason::LowEnergy);
         }
         let approach = pool.into_iter().min_by(|left, right| {
@@ -974,19 +1010,21 @@ fn contact_before_target(planet: &crate::protocol::Planet, points: &[Point], pas
         .is_some_and(|entry| entry < passage)
 }
 
+/// Hit ranking score, lower is better. Map error grows along the path, so shorter flights hit
+/// far more often than central but long ones (capture 55: 5 of 7 under 30 ticks, 1 of 32 over
+/// 100): flight time, with the impact offset as a small penalty. The score reads as
+/// -HIT_TICKS_PER_EFOLD * ln(hit chance), so a kill worth (1 + energy_value * gain) kills (the
+/// killer gains half the victim's energy) earns HIT_TICKS_PER_EFOLD * ln(that).
+fn hit_score(choice: &ShotChoice, energy_value: f64) -> f64 {
+    let gain = choice.victim_energy.unwrap_or(SPAWN_ENERGY) / 2.0;
+    choice.flight_ticks as f64 + MISS_DISTANCE_TICKS * choice.miss_distance
+        - HIT_TICKS_PER_EFOLD * (energy_value * gain).ln_1p()
+}
+
+/// Rank by `hit_score`; save energy only on equal scores.
 fn compare_hit_quality(left: &ShotChoice, right: &ShotChoice, energy_value: f64) -> Ordering {
-    // Map error grows along the path, so shorter flights hit far more often than central but
-    // long ones (capture 55: 5 of 7 under 30 ticks, 1 of 32 over 100). Rank by flight time,
-    // with the impact offset as a small penalty; save energy only on equal scores. The score
-    // reads as -HIT_TICKS_PER_EFOLD * ln(hit chance), so a kill worth (1 + energy_value * gain)
-    // kills (the killer gains half the victim's energy) earns HIT_TICKS_PER_EFOLD * ln(that).
-    let score = |choice: &ShotChoice| {
-        let gain = choice.victim_energy.unwrap_or(SPAWN_ENERGY) / 2.0;
-        choice.flight_ticks as f64 + MISS_DISTANCE_TICKS * choice.miss_distance
-            - HIT_TICKS_PER_EFOLD * (energy_value * gain).ln_1p()
-    };
-    score(left)
-        .total_cmp(&score(right))
+    hit_score(left, energy_value)
+        .total_cmp(&hit_score(right, energy_value))
         .then_with(|| left.velocity.cmp(&right.velocity))
 }
 
@@ -1483,6 +1521,19 @@ mod tests {
         assert_eq!(next.predicted_victim, Some(2));
         assert_eq!(next.victim_doom, Some(0.0));
         assert!(next.doomed_hits_skipped > 0);
+        // The decision records the alternatives, and which in-flight shot dooms player 3.
+        let decision = policy.decide(&state, 8.0);
+        assert!(decision.hits >= decision.top_hits.len() && decision.candidates >= decision.hits);
+        let doomed = decision
+            .top_hits
+            .iter()
+            .find(|hit| hit.victim == 3)
+            .expect("the doomed hit is among the best");
+        assert_eq!(
+            (doomed.doomed_by[0].shooter, doomed.doomed_by[0].begun_ms),
+            (1, 0)
+        );
+        assert!(doomed.victim_doom.unwrap() >= 0.15);
 
         // Avoidance off: the doomed nearer target is chosen again.
         let off = TargetingPolicy::new(TargetingSettings {
@@ -1525,57 +1576,22 @@ mod tests {
         let decision = policy.decide(&state, 8.0);
         assert_eq!(decision.choice, None);
         assert_eq!(decision.wait_reason, Some(WaitReason::AllHitsDoomed));
-
-        // Near the end of the round the energy is lost anyway: rather than wait, fire another
-        // shot (not a doomed hit, which would land on nobody).
-        state.round_clock.new_map(Some(0));
-        state.set_round_play_ms(Some(4_000));
-        let urgent = TargetingPolicy::new(TargetingSettings {
-            endgame_ms: 3_000.0,
-            ..TargetingSettings::default()
-        })
-        .decide(&state, 8.0);
-        assert_eq!(urgent.urgency, Some(Urgency::RoundEnd));
-        assert_eq!(
-            urgent.choice.map(|choice| choice.reason),
-            Some(ShotReason::Approach)
-        );
     }
 
     #[test]
-    fn near_the_round_end_the_policy_fires_and_drops_hits_landing_after_it() {
+    fn decisions_record_the_round_time_left_after_a_full_observed_map() {
         let mut state = flat_field_state();
+        state.set_clock_ms(1_000);
+        let policy = TargetingPolicy::default();
+        // Joined mid-map: no estimate.
+        assert_eq!(policy.decide(&state, 8.0).round_time_left_ms, None);
         // A full map observed from its boundary at 0 to its last finished shot at 50 s, then
         // the next map starts at 60 s.
         state.observe_at(&ServerEvent::Planets { planets: vec![] }, 0);
         state.observe_at(&observed_shot((900.0, 900.0), 3.0, 15), 50_000);
         state.observe_at(&ServerEvent::Planets { planets: vec![] }, 60_000);
-        let policy = TargetingPolicy::new(TargetingSettings {
-            endgame_ms: 3_000.0,
-            ..TargetingSettings::default()
-        });
         state.set_clock_ms(100_000);
-        let early = policy.decide(&state, 2.0);
-        assert_eq!(early.round_time_left_ms, Some(10_000));
-        assert_eq!(early.wait_reason, Some(WaitReason::LowEnergy));
-
-        // 2 s left: an approach shot at any energy rather than holding it into the end card.
-        state.set_clock_ms(108_000);
-        let late = policy.decide(&state, 2.0);
-        assert_eq!(late.urgency, Some(Urgency::RoundEnd));
-        assert_eq!(late.choice.map(|c| c.reason), Some(ShotReason::Approach));
-        // With 8 energy the hit takes 50 ticks (about 1.7 s): it lands in time at 2.5 s left,
-        // not at 1 s left.
-        state.set_clock_ms(107_500);
-        assert_eq!(
-            policy.choose(&state, 8.0).map(|c| c.reason),
-            Some(ShotReason::Hit)
-        );
-        state.set_clock_ms(109_000);
-        assert_eq!(
-            policy.choose(&state, 8.0).map(|c| c.reason),
-            Some(ShotReason::Approach)
-        );
+        assert_eq!(policy.decide(&state, 8.0).round_time_left_ms, Some(10_000));
     }
 
     #[test]

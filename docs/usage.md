@@ -205,7 +205,8 @@ The `diagnostics` table records each targeting decision with the same per-captur
 
 - energy, the bot's player and shot history, spatial coverage;
 - the complete map belief and covariance used, whether a fit was pending, search duration;
-- the selected choice, or null when the policy falls back.
+- the selected choice (with its `flight_ticks`, `victim_doom` and the victim's inferred `victim_energy`), or null when the policy waits;
+- `decision`: why it waits when the choice is null (`wait_reason`: `low_energy`, `all_hits_doomed`, `no_target`, `no_candidate`, `cancelled`), the candidate and predicted-hit counts, the five best predicted hits before doomed ones are skipped (`top_hits`: shot, victim, flight ticks, miss distance, ranking score, doom chance, victim energy, and the in-flight shots predicted to kill that victim first with their predicted impact time and chance), the chance that an in-flight shot kills us within 1.5 s (`own_doom`), and the estimated playing time left in the round (`round_time_left_ms`, null until a full map was observed).
 
 To reconstruct ordering, join or union `diagnostics` and `events` by capture ID and sequence. Older captures have no such rows. The viewer-facing fields are listed in [coordination/viewer-estimator-contract.md](coordination/viewer-estimator-contract.md).
 

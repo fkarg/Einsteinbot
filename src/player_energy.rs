@@ -26,8 +26,11 @@ pub struct EnergyTracker {
     known: BTreeMap<u32, (f64, i64)>,
     /// Energy per second measured from our own energy reports.
     rate_per_s: Option<f64>,
-    /// Our latest energy report, and whether we shot or respawned since.
+    /// Our latest energy report, and whether anything but regeneration changed it since (a
+    /// shot, a respawn, a kill).
     last_own: Option<(f64, i64, bool)>,
+    /// Our player, from our energy reports.
+    own_id: Option<u32>,
     /// The latest finished shot (shooter, end point), the candidate killer of the next
     /// reposition.
     last_shot_end: Option<(u32, Point)>,
@@ -61,13 +64,22 @@ impl EnergyTracker {
         }
     }
 
-    /// A shot began (`own`: ours, so the next energy report does not measure the rate).
-    /// Debris of a kill begins as the victim's shots just before the respawn resets them.
-    pub fn shot_begin(&mut self, player: u32, velocity: f64, now_ms: i64, own: bool) {
+    /// A shot began. The server fires only with at least the velocity in energy, which corrects an
+    /// underestimate. Debris of a kill begins as the victim's shots just before the respawn
+    /// resets them.
+    pub fn shot_begin(&mut self, player: u32, velocity: f64, now_ms: i64) {
         if let Some(energy) = self.energy(player, now_ms) {
-            self.known.insert(player, (energy - velocity, now_ms));
+            self.known
+                .insert(player, (energy.max(velocity) - velocity, now_ms));
         }
-        if own && let Some(last) = &mut self.last_own {
+        self.disturb_own(player);
+    }
+
+    /// The next energy report does not measure the rate if `player` is us.
+    fn disturb_own(&mut self, player: u32) {
+        if Some(player) == self.own_id
+            && let Some(last) = &mut self.last_own
+        {
             last.2 = true;
         }
     }
@@ -80,7 +92,7 @@ impl EnergyTracker {
     /// just ended at the old position was the kill, and its shooter gains half the energy.
     /// A first sighting is a spawn too once a boundary was seen; before that (players present
     /// when we joined) the energy is unknown.
-    pub fn repositioned(&mut self, player: u32, old: Option<&Point>, now_ms: i64, own: bool) {
+    pub fn repositioned(&mut self, player: u32, old: Option<&Point>, now_ms: i64) {
         let shot_end = self.last_shot_end.take();
         let Some(old) = old else {
             if self.seen_boundary {
@@ -90,13 +102,12 @@ impl EnergyTracker {
         };
         let victim_energy = self.energy(player, now_ms);
         self.known.insert(player, (SPAWN_ENERGY, now_ms));
-        if own && let Some(last) = &mut self.last_own {
-            last.2 = true;
-        }
+        self.disturb_own(player);
         let killer = shot_end.and_then(|(shooter, end)| {
             ((end.x - old.x).hypot(end.y - old.y) <= KILL_RADIUS).then_some(shooter)
         });
         if let Some(killer) = killer.filter(|killer| *killer != player) {
+            self.disturb_own(killer);
             match (victim_energy, self.energy(killer, now_ms)) {
                 (Some(victim), Some(energy)) => {
                     self.known.insert(killer, (energy + victim / 2.0, now_ms));
@@ -128,6 +139,7 @@ impl EnergyTracker {
             });
         }
         self.last_own = Some((energy, now_ms, false));
+        self.own_id = Some(player);
         self.known.insert(player, (energy, now_ms));
     }
 }
@@ -144,7 +156,7 @@ mod tests {
     fn energy_follows_spawns_shots_kills_and_regeneration() {
         let mut tracker = EnergyTracker::default();
         // Players already present when we joined are unknown until they spawn.
-        tracker.repositioned(2, None, 0, false);
+        tracker.repositioned(2, None, 0);
         assert_eq!(tracker.energy(2, 0), None);
 
         // Our reports measure the rate: 5 energy in 2 s.
@@ -156,22 +168,26 @@ mod tests {
         tracker.new_map([1, 2, 3], 10_000);
         assert_eq!(tracker.energy(3, 12_000), Some(25.0));
 
+        // A shot proves its shooter had at least the velocity in energy.
+        tracker.shot_begin(1, 30.0, 10_000);
+        assert_eq!(tracker.energy(1, 10_000), Some(0.0));
+
         // Player 3 shoots with velocity 15, then player 2 kills player 3 (the shot ends at
         // player 3, who respawns): 2 gains half of 3's energy, 3 restarts at 20.
-        tracker.shot_begin(3, 15.0, 12_000, false);
+        tracker.shot_begin(3, 15.0, 12_000);
         assert_eq!(tracker.energy(3, 12_000), Some(10.0));
         tracker.shot_finished(2, Some(&at(503.0, 100.0)));
-        tracker.repositioned(3, Some(&at(500.0, 100.0)), 12_000, false);
+        tracker.repositioned(3, Some(&at(500.0, 100.0)), 12_000);
         assert_eq!(tracker.energy(3, 12_000), Some(20.0));
         assert_eq!(tracker.energy(2, 12_000), Some(30.0));
 
         // A respawn with no shot ending there (e.g. a self-kill elsewhere) transfers nothing.
         tracker.shot_finished(2, Some(&at(900.0, 900.0)));
-        tracker.repositioned(3, Some(&at(10.0, 10.0)), 12_000, false);
+        tracker.repositioned(3, Some(&at(10.0, 10.0)), 12_000);
         assert_eq!(tracker.energy(2, 12_000), Some(30.0));
 
         // After a boundary a newcomer (a join) spawns with 20.
-        tracker.repositioned(5, None, 12_000, false);
+        tracker.repositioned(5, None, 12_000);
         assert_eq!(tracker.energy(5, 12_000), Some(20.0));
 
         // Energy is capped at the server limit.
