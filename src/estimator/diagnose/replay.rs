@@ -11,7 +11,8 @@
 //!
 //! Environment (besides those of `diagnose.rs`): `NAME` (the `cfg=` label), `SLICES`,
 //! `SLICE_EVALS`, `CEIL_MS` (slice wall ceiling, 0 for none; default the production 250),
-//! `AUDIT`, `SCHEDULE`, `PLANETS` (known total count; absent: the prior), `CAP` (`max_planets`).
+//! `AUDIT`, `SCHEDULE`, `PLANETS` (known total count; absent: the prior), `CAP` (`max_planets`),
+//! `PREEMPT` (schedule mode: `0` lets a slice finish when a path arrives; default `1` pre-empts it).
 //! `UPD` lines carry the published belief's residual-correction state (`gate`: `on:<max>` or the
 //! reason) and the count-limit warning (`cap`, `limited`: the path it was first raised at, P23).
 use super::*;
@@ -170,12 +171,28 @@ fn replay_schedule(case: &Case, settings: Settings, period: u64) {
     let mut max_queued = 0;
     // Serial per-path phases of `observe` (ms) once the epoch has many paths (n > total / 2).
     let mut late: BTreeMap<Part, Vec<f64>> = BTreeMap::new();
+    // `PREEMPT=0`: slices are not pre-empted when a path arrives (the behaviour before the fix).
+    let preempt = std::sync::Arc::new(AtomicBool::new(false));
+    if env_list("PREEMPT", "1")[0] == 1 {
+        let (preempt, total) = (std::sync::Arc::clone(&preempt), total as u32);
+        std::thread::spawn(move || {
+            for k in 1..total {
+                std::thread::sleep((t0 + period * k).saturating_duration_since(Instant::now()));
+                preempt.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+    }
     for n in 1..=total {
         let arrival = t0 + period * (n as u32 - 1);
-        while Instant::now() < arrival {
+        loop {
+            // Cleared before the clock is read, so the arrival's flag is never lost.
+            preempt.store(false, std::sync::atomic::Ordering::SeqCst);
+            if Instant::now() >= arrival {
+                break;
+            }
             if estimator.search_pending() {
                 let started = Instant::now();
-                estimator.step(&never);
+                estimator.step_until(&never, &preempt);
                 slow_step(&estimator, started, &id, n - 1);
                 timeline(&estimator, n - 1, "slice");
             } else {

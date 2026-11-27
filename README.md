@@ -69,7 +69,7 @@ Each item says what the bot does, why it helps, and what it measured. The math b
 | **Reads gravity from curvature** | Turns each tick of every observed shot (anyone's) into an exact equation for the local gravity, instead of simulating whole shots. | Exact, cheap, and every shot in the game becomes data. | True map fits the rows to rounding noise ($\chi^2$/row ≈ 0.9 on 5,886 live paths). |
 | **Knows what it doesn't know** | Treats the pull of planets it has not found yet as a smooth, correlated error along each path, sized by how far away an unseen planet could be. | Without it, the fit counts one systematic error as thousands of independent clues and invents phantom planets. | Phantom planets at 8 paths: 79 → 1 (14 worlds). |
 | **Learns its own noise level honestly** | Sizes that error from how badly the current map *predicts* each new path before fitting it. | Fitted residuals understate the error; predictions don't. The error shrinks by itself as the map completes. | Residuals look like noise again ($\chi^2$/row ≈ 1, neighbour correlation ≈ 0 instead of 0.85-0.97). |
-| **Never stops to think** | Searches for planets in small resumable slices between shots and publishes a fresh map after every path. | Targeting always has a current map, even at 9 new paths per second. | Median publish lag 62-71 ms at 9 paths/s; all 24 planets after 128 paths (14 s) of a real game. |
+| **Never stops to think** | Searches for planets in small resumable slices between shots and publishes a fresh map after every path. | Targeting always has a current map, even at 9 new paths per second. | Median publish lag about 30 ms at 9 paths/s (worst about 150 ms); all 24 planets after 128 paths (14 s) of a real game. |
 | **Pays for every extra planet** | Adds or removes a planet only when the data become more probable after an Occam penalty. | Planets come from evidence, not from the search's appetite. | Same recall as before at the end of a map, with fewer phantoms. |
 | **Only proposes possible maps** | Never lets two estimated planets overlap or a planet cross the edge, exactly as the server's map generator requires. | A planet the generator could not produce is wrong by construction; it was splitting one real planet into three. | The split is gone; the default cap rose to 32 without new phantoms; CPU on one capture 476 s → 39 s. |
 | **Notices when its planet cap is too low** | When the map is at its planet cap (`--planets N`, else 32) and the unexplained pull along the paths is still planet-sized, it warns that the map may have more planets than that (stop report, live view, inspector). It never raises the cap itself. | A wrong `--planets` silently costs the missing planets; the warning tells you to raise it. | Raised in 26 of 26 replays with 1-4 planets left out, a median of 2 paths after reaching the cap; never in 20 replays with the right count at the cap. |
@@ -299,8 +299,10 @@ Publish lag is the time from a path's arrival to the publication of a map that i
 |---|---|---|---|
 | before P18 | 99-101 ms | 183-184 ms | 462-600 ms |
 | after P18 | 62-71 ms | 134-142 ms | 216-317 ms |
+| P18 build, jolly (10 cores) | 61-70 ms | 175-176 ms | 278-293 ms |
+| slices pre-empted by a new path, jolly (10 cores) | 30-31 ms | 81-93 ms | 148-164 ms |
 
-At most 1-2 paths are queued. Capture 55 is one game. The remaining worst lag comes from paths that arrive while a slice or full-row refit runs.
+At most 1-2 paths are queued. Capture 55 is one game. The last two rows were measured on another machine (jolly, pinned to 10 cores) than the first two (Mac); compare them with each other. With pre-emption a path that arrives during a search slice or the full-row refit no longer waits for it; the remaining worst lag is the serial model-error estimate (up to about 100 ms late in the map) and the covariance step of the full-row refit (not pre-empted once started). Recall was unchanged at 16, 64, 128 and 545 paths.
 
 ### Estimator: known versus estimated planet count
 

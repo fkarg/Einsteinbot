@@ -783,6 +783,57 @@ fn the_slice_limit_gives_the_same_belief_whatever_the_load() {
     }
 }
 
+// A pre-empted step does no work and spends no slice, so the work resumes exactly; a slice
+// pre-empted while it runs stops promptly, keeps its state and publishes nothing.
+#[test]
+fn a_preempted_step_keeps_its_work_for_the_next_one() {
+    let events = three_planet_events();
+    let run = |preempt_first: bool| {
+        let (mut estimator, cancelled) = estimator();
+        estimator.settings.slice_ceiling = None;
+        let mut belief = None;
+        for event in &events {
+            belief = estimator.observe(event, &cancelled).or(belief);
+            if preempt_first {
+                let summary = estimator.summary();
+                assert!(
+                    estimator
+                        .step_until(&cancelled, &AtomicBool::new(true))
+                        .is_none()
+                );
+                assert_eq!(estimator.summary(), summary);
+            }
+            belief = estimator.settle(&cancelled).or(belief);
+        }
+        belief.unwrap()
+    };
+    assert_eq!(run(true).map.planets, run(false).map.planets);
+
+    // Inside a fit the flag stops the solver at its next evaluation, keeping the best point.
+    let shots: Vec<Shot> = events
+        .iter()
+        .map(|event| shot_with_contact(event, &[]))
+        .collect();
+    let (never, set) = (AtomicBool::new(false), AtomicBool::new(true));
+    let start = [[520.0, 480.0, 35.0]];
+    let far = Instant::now() + Duration::from_secs(3600);
+    let fit = |preempt| {
+        Fit::new(&shots, WorldParameters::default(), &never, false, vec![])
+            .with_cut(far, preempt)
+            .refine(&start, &fit::Budget::UNLIMITED)
+            .unwrap()
+            .0[0]
+    };
+    let stopped = fit(&set);
+    assert!(
+        stopped
+            .iter()
+            .zip(start[0])
+            .all(|(a, b)| (a - b).abs() < 1e-6)
+    );
+    assert!(fit(&never) != stopped);
+}
+
 // A slice exits promptly when cancelled, and a reset drops the pending work.
 #[test]
 fn a_cancelled_slice_stops_and_a_reset_drops_pending_work() {

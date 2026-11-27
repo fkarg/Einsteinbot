@@ -208,6 +208,7 @@ impl Settings {
     fn slice<'a>(
         &'a self,
         cancelled: &'a AtomicBool,
+        preempt: &'a AtomicBool,
         stats: &'a Stats,
         noise: &'a Noise,
     ) -> Slice<'a> {
@@ -218,6 +219,7 @@ impl Settings {
             threads: self.threads,
             max_planets: self.cap(),
             cancelled,
+            preempt,
             stats,
         }
     }
@@ -398,7 +400,9 @@ impl Estimator {
                 }
             }
             self.stats.add(Part::Noise, started.elapsed());
-            let slice = self.settings.slice(cancelled, &self.stats, &noise);
+            // The path's own local refit is not pre-empted (nothing new can be waiting for it).
+            let never = AtomicBool::new(false);
+            let slice = self.settings.slice(cancelled, &never, &self.stats, &noise);
             self.search.add_path(&self.shots[self.searched], &slice);
             self.searched += 1;
             if cancelled.load(Ordering::SeqCst) {
@@ -485,6 +489,21 @@ impl Estimator {
     /// One unit of background work: adopt a finished audit, else one search slice, else the exact
     /// refit of the published map. Returns the belief when the published map changed.
     pub fn step(&mut self, cancelled: &AtomicBool) -> Option<MapBelief> {
+        self.step_until(cancelled, &AtomicBool::new(false))
+    }
+
+    /// `step` that stops early once `preempt` is set (new work is waiting, for the live map):
+    /// a cut slice keeps its pending state for the next one, and a cut polish is dropped (still
+    /// due). Neither publishes: the waiting path's update publishes the maintained map. Only a
+    /// wall clock sets `preempt`, so replays without it stay deterministic.
+    pub fn step_until(
+        &mut self,
+        cancelled: &AtomicBool,
+        preempt: &AtomicBool,
+    ) -> Option<MapBelief> {
+        if preempt.load(Ordering::Relaxed) {
+            return None;
+        }
         if self.audit.as_ref().is_some_and(Audit::finished) {
             if let Some(belief) = self.collect_audit() {
                 return Some(belief);
@@ -493,18 +512,24 @@ impl Estimator {
         if !self.search.idle() && self.slices_left > 0 {
             self.slices_left -= 1;
             let noise = self.noise();
-            let slice = self.settings.slice(cancelled, &self.stats, &noise);
+            let slice = self.settings.slice(cancelled, preempt, &self.stats, &noise);
             let before = self.stats.evaluations();
             let changed = self.search.step(&slice);
             let spent = self.stats.evaluations() - before;
+            let preempted = preempt.load(Ordering::Relaxed);
             self.limit = if self.search.idle() {
                 None
-            } else if spent >= self.settings.slice_evaluations {
+            } else if spent >= self.settings.slice_evaluations || preempted {
                 Some(SearchLimit::WorkBudget)
             } else {
                 Some(SearchLimit::TimeBudget)
             };
             self.polish_due |= changed;
+            if preempted {
+                // Not a spent slice: the next one continues the same work.
+                self.slices_left += 1;
+                return None;
+            }
             if changed {
                 let theta = self.search.theta.clone();
                 return Some(self.publish(&theta, None, false));
@@ -517,6 +542,7 @@ impl Estimator {
             // In place: every other user of `self.shots` sets its own noise.
             let noise = self.noise();
             noise::apply(&mut self.shots, &noise);
+            let far = started + Duration::from_secs(24 * 3600);
             let full = Fit::new(
                 &self.shots,
                 WorldParameters::default(),
@@ -524,6 +550,7 @@ impl Estimator {
                 true,
                 vec![],
             )
+            .with_cut(far, preempt)
             .with_stats(&self.stats);
             let theta = self.search.theta.clone();
             let (theta, evidence) = if theta.is_empty() {
@@ -536,6 +563,11 @@ impl Estimator {
                     threads: self.settings.threads,
                 };
                 let theta = full.refine(&theta, &budget).map_or(theta, |(t, _)| t);
+                if full.preempted() {
+                    self.polish_due = true;
+                    self.stats.add(Part::Polish, started.elapsed());
+                    return None;
+                }
                 // The covariance needs a Jacobian of all rows; a refit that used up its time
                 // leaves it out (`not_computed`) rather than run over the ceiling.
                 let evidence = deadline

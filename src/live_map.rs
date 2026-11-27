@@ -78,6 +78,9 @@ impl Published {
 pub(crate) struct LiveMap {
     published: Arc<Mutex<Published>>,
     sender: mpsc::Sender<WorkItem>,
+    /// Set (under the `published` lock, after the send) when a path or a settle request is
+    /// queued: the worker's search slice or polish stops early so the path is published sooner.
+    preempt: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -133,6 +136,7 @@ impl LiveMap {
                 Self {
                     published: Arc::new(Mutex::new(Published::default())),
                     sender,
+                    preempt: Arc::default(),
                 },
                 None,
             );
@@ -152,6 +156,8 @@ impl LiveMap {
         let published = Arc::new(Mutex::new(Published::default()));
         let (sender, receiver) = mpsc::channel::<WorkItem>();
         let worker_state = Arc::clone(&published);
+        let preempt = Arc::new(AtomicBool::new(false));
+        let worker_preempt = Arc::clone(&preempt);
         let worker = thread::spawn(move || {
             // Without the background audit (`Settings::audit_enabled`, off since P13).
             let mut estimator = Estimator::new(settings.clone());
@@ -172,13 +178,20 @@ impl LiveMap {
             loop {
                 // With search work left, events still go first; the work runs while none waits.
                 let item = if estimator.search_pending() {
-                    match receiver.try_recv() {
+                    // Clear the flag and look at the queue under the lock `observe` holds while it
+                    // sends and sets the flag: a path sent after the look always pre-empts.
+                    let (next, epoch, cancelled) = {
+                        let state = worker_state.lock().unwrap();
+                        worker_preempt.store(false, Ordering::SeqCst);
+                        (
+                            receiver.try_recv(),
+                            state.epoch,
+                            Arc::clone(&state.fit_cancel),
+                        )
+                    };
+                    match next {
                         Ok(item) => item,
                         Err(mpsc::TryRecvError::Empty) => {
-                            let (epoch, cancelled) = {
-                                let state = worker_state.lock().unwrap();
-                                (state.epoch, Arc::clone(&state.fit_cancel))
-                            };
                             if estimator_epoch != epoch {
                                 new_epoch(
                                     &mut estimator,
@@ -188,7 +201,7 @@ impl LiveMap {
                                 );
                                 continue;
                             }
-                            let belief = estimator.step(&cancelled);
+                            let belief = estimator.step_until(&cancelled, &worker_preempt);
                             let mut state = worker_state.lock().unwrap();
                             if let (true, Some(belief)) = (state.epoch == epoch, belief) {
                                 state.publish(belief, &estimator);
@@ -260,7 +273,14 @@ impl LiveMap {
                 }
             }
         });
-        (Self { published, sender }, worker)
+        (
+            Self {
+                published,
+                sender,
+                preempt,
+            },
+            worker,
+        )
     }
 
     /// A new map epoch.
@@ -302,7 +322,12 @@ impl LiveMap {
             event: event.clone(),
             arrived: Instant::now(),
         }) {
-            Ok(()) => Ok(watermark),
+            Ok(()) => {
+                if is_path(event) {
+                    self.preempt.store(true, Ordering::SeqCst);
+                }
+                Ok(watermark)
+            }
             Err(error) => {
                 state.pending = state.pending.saturating_sub(1);
                 state.pending_paths = state
@@ -342,7 +367,9 @@ impl LiveMap {
     /// the worker is done (at once without a worker).
     pub(crate) fn settle(&self, per_map: Duration) -> mpsc::Receiver<Settled> {
         let (reply, results) = mpsc::channel();
+        let _state = self.published.lock().unwrap();
         let _ = self.sender.send(WorkItem::Settle { per_map, reply });
+        self.preempt.store(true, Ordering::SeqCst);
         results
     }
 
@@ -652,6 +679,24 @@ mod tests {
         assert_eq!((maps[0].capture, maps[1].capture), (None, Some(7)));
         assert_eq!(maps[1].lag.paths, 2);
         assert!(maps[1].summary.is_some());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn a_queued_path_preempts_the_search_and_other_events_do_not() {
+        let (feed, worker) = LiveMap::spawn_with(Settings::default(), |_, _, _| None);
+        feed.observe(&ServerEvent::PlayerLeave { player_id: 1 })
+            .unwrap();
+        assert!(!feed.preempt.load(Ordering::SeqCst));
+        feed.observe(&ServerEvent::ShotFin {
+            player_id: 1,
+            angle: 0.0,
+            velocity: 2.0,
+            points: vec![],
+        })
+        .unwrap();
+        assert!(feed.preempt.load(Ordering::SeqCst));
+        drop(feed);
         worker.join().unwrap();
     }
 

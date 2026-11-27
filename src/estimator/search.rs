@@ -339,9 +339,19 @@ pub(super) struct Slice<'a> {
     pub threads: usize,
     pub max_planets: usize,
     pub cancelled: &'a AtomicBool,
+    /// Set when new work (a path) is waiting: the slice stops as at its deadline and keeps its
+    /// state for the next one. Nothing sets it in deterministic replays.
+    pub preempt: &'a AtomicBool,
     pub stats: &'a Stats,
     /// The noise of every fit of the slice.
     pub noise: &'a Noise,
+}
+
+impl Slice<'_> {
+    /// Whether the slice must stop now (deadline passed or pre-empted), keeping its best points.
+    fn cut(&self) -> bool {
+        Instant::now() >= self.deadline || self.preempt.load(Ordering::Relaxed)
+    }
 }
 
 /// The live map and its pending birth work.
@@ -459,7 +469,7 @@ impl Search {
         let shots = self.thin(slice.noise);
         while !self.idle()
             && stats.evaluations() - first < slice.evaluations
-            && Instant::now() < slice.deadline
+            && !slice.cut()
             && !cancelled.load(Ordering::Relaxed)
         {
             if self.theta.len() >= slice.max_planets && !self.deaths_due && self.partials.is_empty()
@@ -475,7 +485,7 @@ impl Search {
                 continue;
             }
             let joint = Fit::new(&shots, world, cancelled, true, vec![])
-                .with_deadline(slice.deadline)
+                .with_cut(slice.deadline, slice.preempt)
                 .with_stats(stats);
             let left = slice.evaluations - (stats.evaluations() - first);
             if self.deaths_due && self.partials.is_empty() {
@@ -543,7 +553,7 @@ impl Search {
                     false,
                     self.theta.iter().map(|t| planet_at(*t)).collect(),
                 )
-                .with_deadline(slice.deadline)
+                .with_cut(slice.deadline, slice.preempt)
                 .with_stats(stats)
             };
             // Candidates not fitted on the current rows and map: alone against the field of the map.
@@ -563,11 +573,14 @@ impl Search {
                         alone.refine(&[self.candidates[i].theta], &budget)
                     })
                 });
+                // An alone fit cut by the deadline or a pre-emption has not settled: it keeps its
+                // point and resumes from there in the next slice.
+                let settled = !slice.cut();
                 for (&i, fit) in todo.iter().zip(fitted) {
                     self.candidates[i] = match fit {
                         Some((t, chi2)) => Candidate {
                             theta: t[0],
-                            chi2: Some(chi2),
+                            chi2: settled.then_some(chi2),
                         },
                         None => Candidate {
                             theta: self.candidates[i].theta,
@@ -642,7 +655,7 @@ impl Search {
                     par_map(&todo, slice.threads, |&i| {
                         let counter = Stats::default();
                         let out = Fit::new(&shots, world, cancelled, true, vec![])
-                            .with_deadline(slice.deadline)
+                            .with_cut(slice.deadline, slice.preempt)
                             .with_stats(&counter)
                             .refine(&self.partials[i].theta, &budget);
                         (out, counter)
@@ -654,9 +667,10 @@ impl Search {
                     if let Some((t, _)) = out {
                         p.theta = t;
                     }
-                    // A refit cut by the slice deadline has not settled: it resumes in the next slice.
-                    p.done = (counter.evaluations() < each && Instant::now() < slice.deadline)
-                        || p.rounds >= MAX_ROUNDS;
+                    // A refit cut by the slice deadline or a pre-emption has not settled: it
+                    // resumes in the next slice.
+                    p.done =
+                        (counter.evaluations() < each && !slice.cut()) || p.rounds >= MAX_ROUNDS;
                     stats.absorb(&counter);
                 }
                 continue;
@@ -761,6 +775,7 @@ mod tests {
             threads: 2,
             max_planets: 24,
             cancelled,
+            preempt: cancelled,
             stats,
             noise,
         }

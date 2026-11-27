@@ -152,8 +152,10 @@ pub(super) struct Fit<'a> {
     shots: &'a [Shot],
     world: WorldParameters,
     cancelled: &'a AtomicBool,
-    /// `refine` stops improving (keeping its best point so far) at this instant.
+    /// `refine` stops improving (keeping its best point so far) at this instant, or once this
+    /// flag is set (pre-emption: new work is waiting).
     deadline: Option<Instant>,
+    preempt: Option<&'a AtomicBool>,
     use_contacts: bool,
     /// Planets held fixed; the fitted planets add to their field. Evidence needs this empty.
     fixed: Vec<Planet>,
@@ -188,6 +190,7 @@ impl<'a> Fit<'a> {
             world,
             cancelled,
             deadline: None,
+            preempt: None,
             use_contacts,
             fixed,
             base,
@@ -200,9 +203,22 @@ impl<'a> Fit<'a> {
         self
     }
 
+    #[cfg(test)]
     pub fn with_deadline(mut self, deadline: Instant) -> Self {
         self.deadline = Some(deadline);
         self
+    }
+
+    /// `refine` stops (keeping its best point) at `deadline` or once `preempt` is set.
+    pub fn with_cut(mut self, deadline: Instant, preempt: &'a AtomicBool) -> Self {
+        self.deadline = Some(deadline);
+        self.preempt = Some(preempt);
+        self
+    }
+
+    /// Whether `preempt` (see `with_cut`) is set.
+    pub fn preempted(&self) -> bool {
+        self.preempt.is_some_and(|p| p.load(Ordering::Relaxed))
     }
 
     /// Predicted second difference of every row of one path (per axis): the fixed planets'
@@ -760,7 +776,7 @@ impl Lm<'_> {
             .into_iter()
             .chain(self.budget.deadline)
             .any(|d| Instant::now() >= d);
-        if out_of_time || self.used >= self.budget.evaluations {
+        if out_of_time || self.fit.preempted() || self.used >= self.budget.evaluations {
             return false;
         }
         self.used += 1;
