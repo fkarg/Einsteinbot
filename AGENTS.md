@@ -51,6 +51,7 @@ Estimator/targeting work and the map inspector are developed by separate concurr
 ## Map inspector
 
 - Prefer visual representations (layers, glyphs, timeline strips, bars) over additional tables, text or numbers; add text only where a visual cannot carry the information (user policy, 2026-11-27).
+- Optimize for understanding why each decision was made and the delta to reality that made it turn out differently (predicted vs actual, and the map or target error that caused it).
 
 ## Keeping this file current
 
