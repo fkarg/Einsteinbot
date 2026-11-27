@@ -26,12 +26,14 @@ mod fit;
 mod lm;
 mod noise;
 mod rebuild;
+mod residual;
 mod rows;
 mod search;
 mod window;
 mod work;
 
 pub use eval::{position_rmse, shot_observations, shot_position_rmse};
+pub use residual::{GATE_ACCELERATION, ResidualCorrection, ResidualGate, ResidualModel};
 pub use work::{CeilingViolation, Part, PartCeilings, PartReport, UpdateReport};
 
 use crate::map::PlanetMap;
@@ -543,10 +545,51 @@ impl Estimator {
             })
             .count();
         self.stats.add(Part::Diagnostics, started.elapsed());
+        // The correction must match the published map (a birth explains part of the residual).
+        let started = Instant::now();
+        let noise = Noise::new(self.model, &belief.map.planets, &self.shots);
+        belief.residual_model = Some(self.model.into());
+        match residual::build(&belief.map.planets, &self.shots, &noise) {
+            Ok(correction) => {
+                belief.residual_correction = Some(correction);
+                belief.residual_correction_unavailable_reason = None;
+            }
+            Err(gate) => belief.residual_correction_unavailable_reason = Some(gate),
+        }
+        self.stats.add(Part::ResidualCorrection, started.elapsed());
         self.last_report = Some(self.stats.report(&self.settings.ceilings));
         self.belief = Some(belief.clone());
         belief
     }
+}
+
+/// The residual correction (`residual.rs`) of `map` from the paths `observations` of its epoch,
+/// for replays and recorded decisions. `model` is the recorded model-error scalars; without one
+/// they are estimated from the last `noise::WINDOW` paths' residuals against `map` (not
+/// prequential like the live estimator's, so the scale can come out lower).
+pub fn residual_correction(
+    map: &PlanetMap,
+    observations: &[ShotObservation],
+    model: Option<ResidualModel>,
+) -> (ResidualModel, Result<ResidualCorrection, ResidualGate>) {
+    let world = WorldParameters::default();
+    let shots: Vec<Shot> = observations
+        .iter()
+        .map(|obs| Shot::new(obs.clone(), None, world))
+        .collect();
+    let model = model.map(ModelError::from).unwrap_or_else(|| {
+        let noise = Noise::new(ModelError::PRIOR, &map.planets, &shots);
+        let series: Vec<noise::Series> = shots
+            .iter()
+            .rev()
+            .filter_map(|shot| shot.path.as_ref())
+            .take(noise::WINDOW)
+            .map(|path| noise::Series::new(path, &map.planets, &noise))
+            .collect();
+        noise::estimate(&series, None)
+    });
+    let noise = Noise::new(model, &map.planets, &shots);
+    (model.into(), residual::build(&map.planets, &shots, &noise))
 }
 
 #[cfg(test)]

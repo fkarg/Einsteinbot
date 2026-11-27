@@ -1,3 +1,4 @@
+use crate::estimator::ResidualCorrection;
 use crate::map::{PlanetMap, Vec2};
 use crate::protocol::{Point, ServerEvent};
 
@@ -86,7 +87,7 @@ pub fn simulate_shot(
     world: WorldParameters,
     max_samples: usize,
 ) -> Result<PredictedTrajectory, String> {
-    simulate_shot_with_players(map, shot, world, max_samples, &[], 0.0)
+    simulate_shot_with_players(map, None, shot, world, max_samples, &[], 0.0)
 }
 
 /// Simulate collisions against the latest known player positions, in server slot order.
@@ -99,11 +100,34 @@ pub fn simulate_targeting_shot(
     players: &[(u32, Vec2)],
     player_radius: f64,
 ) -> Result<PredictedTrajectory, String> {
-    simulate_shot_with_players(map, shot, world, max_samples, players, player_radius)
+    simulate_shot_with_players(map, None, shot, world, max_samples, players, player_radius)
+}
+
+/// `simulate_targeting_shot` with the residual correction added to the planets' field
+/// (`ResidualCorrection::at`, zero inside planet disks).
+pub fn simulate_corrected_targeting_shot(
+    map: &PlanetMap,
+    correction: Option<&ResidualCorrection>,
+    shot: &ShotObservation,
+    world: WorldParameters,
+    max_samples: usize,
+    players: &[(u32, Vec2)],
+    player_radius: f64,
+) -> Result<PredictedTrajectory, String> {
+    simulate_shot_with_players(
+        map,
+        correction,
+        shot,
+        world,
+        max_samples,
+        players,
+        player_radius,
+    )
 }
 
 fn simulate_shot_with_players(
     map: &PlanetMap,
+    correction: Option<&ResidualCorrection>,
     shot: &ShotObservation,
     world: WorldParameters,
     max_samples: usize,
@@ -121,9 +145,7 @@ fn simulate_shot_with_players(
     let mut position = Vec2::new(f64::from(start.x), f64::from(start.y));
     let angle = shot.angle_degrees.to_radians();
     let mut velocity = Vec2::new(shot.velocity * angle.cos(), -shot.velocity * angle.sin());
-    let mut acceleration = map
-        .acceleration(position)
-        .map_err(|error| error.to_string())?;
+    let mut acceleration = field(map, correction, position)?;
     let mut points = vec![Point {
         x: position.x as f32,
         y: position.y as f32,
@@ -135,6 +157,7 @@ fn simulate_shot_with_players(
         for _ in 0..world.substeps_per_tick {
             integrate_substep(
                 map,
+                correction,
                 &mut position,
                 &mut velocity,
                 &mut acceleration,
@@ -242,6 +265,7 @@ fn simulate_sampled_positions_impl(
         for _ in 0..world.substeps_per_tick {
             integrate_substep(
                 map,
+                None,
                 &mut position,
                 &mut velocity,
                 &mut acceleration,
@@ -317,8 +341,26 @@ fn to_point(point: Vec2) -> Point {
     }
 }
 
+/// The planets' field at `position` plus the correction there.
+fn field(
+    map: &PlanetMap,
+    correction: Option<&ResidualCorrection>,
+    position: Vec2,
+) -> Result<Vec2, String> {
+    let mut a = map
+        .acceleration(position)
+        .map_err(|error| error.to_string())?;
+    if let Some(correction) = correction {
+        let c = correction.at(position);
+        a.x += c.x;
+        a.y += c.y;
+    }
+    Ok(a)
+}
+
 fn integrate_substep(
     map: &PlanetMap,
+    correction: Option<&ResidualCorrection>,
     position: &mut Vec2,
     velocity: &mut Vec2,
     acceleration: &mut Vec2,
@@ -329,9 +371,7 @@ fn integrate_substep(
         position.x + velocity.x * dt + acceleration.x * 0.5 * dt * dt,
         position.y + velocity.y * dt + acceleration.y * 0.5 * dt * dt,
     );
-    let next_acceleration = map
-        .acceleration(next_position)
-        .map_err(|error| error.to_string())?;
+    let next_acceleration = field(map, correction, next_position)?;
     velocity.x += (acceleration.x + next_acceleration.x) * 0.5 * dt;
     velocity.y += (acceleration.y + next_acceleration.y) * 0.5 * dt;
     *position = next_position;

@@ -49,9 +49,11 @@ pub enum Part {
     Polish,
     /// Diagnostics of a published belief (position RMSE, contact bookkeeping; phase).
     Diagnostics,
+    /// The residual correction of a published belief (`residual.rs`; phase).
+    ResidualCorrection,
 }
 
-const PARTS: [Part; 15] = [
+const PARTS: [Part; 16] = [
     Part::WindowBuild,
     Part::Contacts,
     Part::ResidualEval,
@@ -67,10 +69,11 @@ const PARTS: [Part; 15] = [
     Part::Deaths,
     Part::Polish,
     Part::Diagnostics,
+    Part::ResidualCorrection,
 ];
 
 impl Part {
-    pub const ALL: [Part; 15] = PARTS;
+    pub const ALL: [Part; 16] = PARTS;
 
     fn is_leaf(self) -> bool {
         !matches!(
@@ -83,6 +86,7 @@ impl Part {
                 | Part::Deaths
                 | Part::Polish
                 | Part::Diagnostics
+                | Part::ResidualCorrection
         )
     }
 
@@ -103,6 +107,7 @@ impl Part {
             Part::Deaths => "deaths",
             Part::Polish => "polish",
             Part::Diagnostics => "diagnostics",
+            Part::ResidualCorrection => "residual_correction",
         }
     }
 
