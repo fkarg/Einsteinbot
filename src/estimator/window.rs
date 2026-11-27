@@ -32,6 +32,13 @@ const MIN_TICKS: usize = 5;
 /// live paths (`measure_residual_scale_*` in `measurements.rs`).
 const INTERPOLATION_SCALE: f64 = 1.0 / 15.0;
 
+/// A planet farther than this from a row's centre, and farther than `FAR_SPEEDS` times the
+/// path's distance per tick there, enters the row through a three-point rule matched to the
+/// kernel's second and fourth moments instead of all `2n - 1` nodes. Its error stays below 5% of the
+/// measurement floor (`far_planets_use_the_three_point_rule` in the tests).
+const FAR_DISTANCE: f64 = 60.0;
+const FAR_SPEEDS: f64 = 5.0;
+
 type V2 = [f64; 2];
 
 /// Standard deviation of the float32 rounding of a position value (uniform within +-ulp/2).
@@ -70,6 +77,11 @@ pub(super) struct PathData {
     row_node: Option<Vec<usize>>,
     /// Row centres of a thinned path (a full path's are its ticks).
     centers: Option<Vec<V2>>,
+    /// Per row: the three-point rule's positions (before, at and after the centre tick) and the
+    /// squared distance beyond which a planet uses it.
+    quad: Vec<([V2; 3], f64)>,
+    /// Weights of the three-point rule's outer and centre positions.
+    quad_weights: [f64; 2],
 }
 
 impl PathData {
@@ -105,6 +117,33 @@ impl PathData {
             .map(|i| (n - (i + 1).abs_diff(n)) as f64 * dt * dt)
             .collect();
         let rows = t - 2;
+        // The symmetric rule w1 f(-h) + w0 f(0) + w1 f(h) (h in ticks) matching the kernel's
+        // weight, second and fourth moments.
+        let moment = |k: i32| -> f64 {
+            kernel
+                .iter()
+                .enumerate()
+                .map(|(i, w)| w * ((i as f64 + 1.0 - n as f64) / n as f64).powi(k))
+                .sum()
+        };
+        let (m2, m4) = (moment(2), moment(4));
+        let h = (m4 / m2).sqrt();
+        let outer = m2 * m2 / (2.0 * m4);
+        let quad_weights = [outer, moment(0) - 2.0 * outer];
+        let quad = (0..rows)
+            .map(|r| {
+                let s = r + 1;
+                let points = [
+                    hermite(&ticks, v0, s - 1, 1.0 - h),
+                    ticks[s],
+                    hermite(&ticks, v0, s, h),
+                ];
+                let speed = (ticks[s + 1][0] - ticks[s - 1][0])
+                    .hypot(ticks[s + 1][1] - ticks[s - 1][1])
+                    / 2.0;
+                (points, FAR_DISTANCE.max(FAR_SPEEDS * speed).powi(2))
+            })
+            .collect();
         let y = [0, 1].map(|axis| {
             (0..rows)
                 .map(|r| ticks[r + 2][axis] - 2.0 * ticks[r + 1][axis] + ticks[r][axis])
@@ -170,6 +209,8 @@ impl PathData {
             whitener,
             row_node: None,
             centers: None,
+            quad,
+            quad_weights,
         })
     }
 
@@ -228,16 +269,9 @@ impl PathData {
             whitener,
             row_node: Some(row_node),
             centers: Some(keep.iter().map(|&r| self.ticks[r + 1]).collect()),
+            quad: keep.iter().map(|&r| self.quad[r]).collect(),
+            quad_weights: self.quad_weights,
         })
-    }
-
-    /// Nodes read by the rows `rows`.
-    pub fn node_range(&self, rows: std::ops::Range<usize>) -> std::ops::Range<usize> {
-        let n = self.substeps;
-        match &self.row_node {
-            None => rows.start * n + 1..(rows.end - 1) * n + 2 * n,
-            Some(v) => v[rows.start]..v[rows.end - 1] + 2 * n - 1,
-        }
     }
 
     fn first_node(&self, r: usize) -> usize {
@@ -265,6 +299,7 @@ impl PathData {
 
     /// `out[r] = sum_i kernel_i * field[node r * n + 1 + i]` for the rows `rows` (others are left
     /// alone) of one axis of the field at the nodes.
+    #[cfg(test)]
     pub fn apply(&self, field: &[f64], out: &mut [f64], rows: std::ops::Range<usize>) {
         for r in rows {
             let first = self.first_node(r);
@@ -277,17 +312,94 @@ impl PathData {
         }
     }
 
-    /// Whitened residual `L^-1 (y - W field)` of one axis.
-    pub fn residual(&self, axis: usize, field: &[f64], out: &mut [f64]) {
-        self.raw_residual(axis, field, out);
+    /// Add one planet's kernel-weighted field to every row's prediction `rows` (per axis): all
+    /// `2n - 1` nodes of a near row, the three-point rule otherwise.
+    pub fn add_planet(&self, x: f64, y: f64, mass: f64, rows: &mut [Vec<f64>; 2]) {
+        self.add_planet_terms(
+            x,
+            y,
+            |p| {
+                let (dx, dy) = (x - p[0], y - p[1]);
+                let d = dx.hypot(dy).max(1e-9);
+                let magnitude = mass / (d * d);
+                [dx / d * magnitude, dy / d * magnitude]
+            },
+            rows,
+        );
+    }
+
+    /// Add the kernel-weighted derivatives of one planet's field with respect to its
+    /// `[x, y, radius]` (`theta`), indexed `parameter * 2 + axis`, to `rows`.
+    pub fn add_planet_derivatives(
+        &self,
+        theta: [f64; 3],
+        mass: f64,
+        dmass: f64,
+        rows: &mut [Vec<f64>; 6],
+    ) {
+        self.add_planet_terms(
+            theta[0],
+            theta[1],
+            |p| {
+                let (dx, dy) = (theta[0] - p[0], theta[1] - p[1]);
+                let d2 = (dx * dx + dy * dy).max(1e-18);
+                let inverse_r3 = 1.0 / (d2 * d2.sqrt());
+                let inverse_r5 = inverse_r3 / d2;
+                let cross = -3.0 * mass * dx * dy * inverse_r5;
+                [
+                    mass * (inverse_r3 - 3.0 * dx * dx * inverse_r5),
+                    cross,
+                    cross,
+                    mass * (inverse_r3 - 3.0 * dy * dy * inverse_r5),
+                    dmass * dx * inverse_r3,
+                    dmass * dy * inverse_r3,
+                ]
+            },
+            rows,
+        );
+    }
+
+    fn add_planet_terms<const N: usize>(
+        &self,
+        x: f64,
+        y: f64,
+        term: impl Fn(V2) -> [f64; N],
+        rows: &mut [Vec<f64>; N],
+    ) {
+        let [outer, centre] = self.quad_weights;
+        for (r, (points, far2)) in self.quad.iter().enumerate() {
+            let (dx, dy) = (x - points[1][0], y - points[1][1]);
+            let mut sum = [0.0; N];
+            if dx * dx + dy * dy > *far2 {
+                let (a, b, c) = (term(points[0]), term(points[1]), term(points[2]));
+                for k in 0..N {
+                    sum[k] = outer * (a[k] + c[k]) + centre * b[k];
+                }
+            } else {
+                let first = self.first_node(r);
+                for (w, p) in self.kernel.iter().zip(&self.nodes[first..]) {
+                    let v = term(*p);
+                    for k in 0..N {
+                        sum[k] += w * v[k];
+                    }
+                }
+            }
+            for k in 0..N {
+                rows[k][r] += sum[k];
+            }
+        }
+    }
+
+    /// Whitened residual `L^-1 (y - prediction)` of one axis, from per-row predictions.
+    pub fn residual(&self, axis: usize, prediction: &[f64], out: &mut [f64]) {
+        self.raw_residual(axis, prediction, out);
         self.whiten(axis, out, 0);
     }
 
-    /// Unwhitened `y - W field` of one axis.
-    pub fn raw_residual(&self, axis: usize, field: &[f64], out: &mut [f64]) {
-        self.apply(field, out, 0..out.len());
-        for (o, y) in out.iter_mut().zip(&self.y[axis]) {
-            *o = y - *o;
+    /// Unwhitened `y - prediction` of one axis.
+    pub fn raw_residual(&self, axis: usize, prediction: &[f64], out: &mut [f64]) {
+        for ((o, y), p) in out.iter_mut().zip(&self.y[axis]).zip(prediction) {
+            *o = y - p;
         }
     }
 
@@ -361,6 +473,16 @@ fn tangent(ticks: &[V2], v0: V2, s: usize) -> V2 {
     })
 }
 
+/// The cubic Hermite interpolant at fraction `u` of tick interval `s`.
+fn hermite(ticks: &[V2], v0: V2, s: usize, u: f64) -> V2 {
+    let h00 = 2.0 * u.powi(3) - 3.0 * u * u + 1.0;
+    let h10 = u.powi(3) - 2.0 * u * u + u;
+    let h01 = -2.0 * u.powi(3) + 3.0 * u * u;
+    let h11 = u.powi(3) - u * u;
+    let (m0, m1) = (tangent(ticks, v0, s), tangent(ticks, v0, s + 1));
+    [0, 1].map(|a| h00 * ticks[s][a] + h10 * m0[a] + h01 * ticks[s + 1][a] + h11 * m1[a])
+}
+
 /// Cubic Hermite interpolation of the ticks at every substep.
 fn interpolate(ticks: &[V2], v0: V2, n: usize) -> Vec<V2> {
     let t = ticks.len();
@@ -370,13 +492,7 @@ fn interpolate(ticks: &[V2], v0: V2, n: usize) -> Vec<V2> {
             if s == t - 1 {
                 return ticks[s];
             }
-            let u = i as f64 / n as f64;
-            let h00 = 2.0 * u.powi(3) - 3.0 * u * u + 1.0;
-            let h10 = u.powi(3) - 2.0 * u * u + u;
-            let h01 = -2.0 * u.powi(3) + 3.0 * u * u;
-            let h11 = u.powi(3) - u * u;
-            let (m0, m1) = (tangent(ticks, v0, s), tangent(ticks, v0, s + 1));
-            [0, 1].map(|a| h00 * ticks[s][a] + h10 * m0[a] + h01 * ticks[s + 1][a] + h11 * m1[a])
+            hermite(ticks, v0, s, i as f64 / n as f64)
         })
         .collect()
 }
@@ -427,13 +543,120 @@ mod tests {
         for axis in 0..2 {
             let mut a = vec![0.0; full.row_count()];
             let mut b = vec![0.0; thin.row_count()];
-            full.raw_residual(axis, &field[axis], &mut a);
-            thin.raw_residual(axis, &thin_field[axis], &mut b);
+            full.apply(&field[axis], &mut a, 0..full.row_count());
+            thin.apply(&thin_field[axis], &mut b, 0..thin.row_count());
             for (i, &r) in keep.iter().enumerate() {
                 assert!((a[r] - b[i]).abs() < 1e-12, "row {r}: {} vs {}", a[r], b[i]);
             }
         }
         assert!(thin.nodes.len() < keep.len() * (2 * world.substeps_per_tick - 1));
+    }
+
+    /// The three-point rule for far planets stays far below the f32 rounding floor of every row
+    /// against the full kernel, on simulated paths from slow to the velocity cap, the field and
+    /// its parameter derivatives alike (near planets use the full kernel by construction).
+    #[test]
+    fn far_planets_use_the_three_point_rule() {
+        use crate::map::PlanetMap;
+        use crate::protocol::Planet;
+        use crate::simulation::{ShotObservation, simulate_shot};
+        let world = WorldParameters::default();
+        let planet = |x: f64, y: f64, radius: f64| Planet {
+            x,
+            y,
+            radius,
+            mass: radius.powi(3) / 10.0,
+        };
+        let planets = vec![
+            planet(700.0, 600.0, 40.0),
+            planet(1100.0, 900.0, 30.0),
+            planet(900.0, 300.0, 20.0),
+        ];
+        let map = PlanetMap {
+            planets: planets.clone(),
+        };
+        let (mut worst, mut far, mut near): (f64, usize, usize) = (0.0, 0, 0);
+        for velocity in [4.0, 8.0, 20.0, 50.0] {
+            for angle in (0..360).step_by(45) {
+                let angle = angle as f64;
+                let shot = ShotObservation {
+                    player_id: 1,
+                    angle_degrees: angle,
+                    velocity,
+                    points: vec![Point { x: 900.0, y: 650.0 }],
+                };
+                let path = simulate_shot(&map, &shot, world, 400).unwrap();
+                let Some(data) = PathData::new(&path.points, angle, velocity, world, 0.0) else {
+                    continue;
+                };
+                let rows = data.row_count();
+                for (points, far2) in &data.quad {
+                    for p in &planets {
+                        if (p.x - points[1][0]).powi(2) + (p.y - points[1][1]).powi(2) > *far2 {
+                            far += 1;
+                        } else {
+                            near += 1;
+                        }
+                    }
+                }
+                for p in &planets {
+                    let mut quick = [vec![0.0; rows], vec![0.0; rows]];
+                    data.add_planet(p.x, p.y, p.mass, &mut quick);
+                    let theta = [p.x, p.y, p.radius];
+                    let mut quick_d: [Vec<f64>; 6] = std::array::from_fn(|_| vec![0.0; rows]);
+                    data.add_planet_derivatives(
+                        theta,
+                        p.mass,
+                        3.0 * p.mass / p.radius,
+                        &mut quick_d,
+                    );
+                    for axis in 0..2 {
+                        let field: Vec<f64> = data
+                            .nodes
+                            .iter()
+                            .map(|n| {
+                                let (dx, dy) = (p.x - n[0], p.y - n[1]);
+                                let d = dx.hypot(dy);
+                                [dx, dy][axis] / d * p.mass / (d * d)
+                            })
+                            .collect();
+                        let mut exact = vec![0.0; rows];
+                        data.apply(&field, &mut exact, 0..rows);
+                        for r in 0..rows {
+                            let floor = data.floor_variance(axis, r).sqrt();
+                            let e = (quick[axis][r] - exact[r]).abs() / floor;
+                            worst = worst.max(e);
+                        }
+                        // The x-derivative of the field, against a central difference of the exact
+                        // kernel (scaled to the change a 0.1-unit move makes).
+                        let h = 1e-3;
+                        let shifted = |dx0: f64| -> Vec<f64> {
+                            let f: Vec<f64> = data
+                                .nodes
+                                .iter()
+                                .map(|n| {
+                                    let (dx, dy) = (p.x + dx0 - n[0], p.y - n[1]);
+                                    let d = dx.hypot(dy);
+                                    [dx, dy][axis] / d * p.mass / (d * d)
+                                })
+                                .collect();
+                            let mut out = vec![0.0; rows];
+                            data.apply(&f, &mut out, 0..rows);
+                            out
+                        };
+                        let (plus, minus) = (shifted(h), shifted(-h));
+                        for r in 0..rows {
+                            let numeric = (plus[r] - minus[r]) / (2.0 * h);
+                            let floor = data.floor_variance(axis, r).sqrt();
+                            let e = 0.1 * (quick_d[axis][r] - numeric).abs() / floor;
+                            worst = worst.max(e);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(far > 1000 && near > 10, "far {far} near {near}");
+        assert!(worst < 0.05, "worst error {worst} rounding sd");
     }
 
     /// The pentadiagonal factor reproduces the rounding-noise covariance of the rows computed

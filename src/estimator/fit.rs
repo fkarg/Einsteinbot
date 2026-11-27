@@ -86,17 +86,6 @@ pub(super) fn contact_residual(signed: f64, allowance: f64) -> f64 {
     error * (1.0 - t * t * (3.0 - 2.0 * t)) / sigma
 }
 
-/// Add the field of one planet at `nodes` (engine arithmetic order).
-fn add_planet_field(field: &mut [Vec<f64>; 2], nodes: &[[f64; 2]], x: f64, y: f64, mass: f64) {
-    for (i, p) in nodes.iter().enumerate() {
-        let (dx, dy) = (x - p[0], y - p[1]);
-        let d = dx.hypot(dy).max(1e-9);
-        let magnitude = mass / (d * d);
-        field[0][i] += dx / d * magnitude;
-        field[1][i] += dy / d * magnitude;
-    }
-}
-
 /// Acceleration at one observed tick that the model leaves unexplained.
 pub(super) struct Unexplained {
     pub position: [f64; 2],
@@ -158,9 +147,9 @@ impl<'a> Fit<'a> {
             .map(|shot| {
                 let mut field = [Vec::new(), Vec::new()];
                 if let (Some(path), false) = (&shot.path, fixed.is_empty()) {
-                    field = [vec![0.0; path.nodes.len()], vec![0.0; path.nodes.len()]];
+                    field = [vec![0.0; path.row_count()], vec![0.0; path.row_count()]];
                     for planet in &fixed {
-                        add_planet_field(&mut field, &path.nodes, planet.x, planet.y, planet.mass);
+                        path.add_planet(planet.x, planet.y, planet.mass, &mut field);
                     }
                 }
                 field
@@ -188,15 +177,17 @@ impl<'a> Fit<'a> {
         self
     }
 
+    /// Predicted second difference of every row of one path (per axis): the fixed planets'
+    /// plus `theta`'s kernel-weighted field.
     pub(super) fn field(&self, index: usize, path: &PathData, theta: &[[f64; 3]]) -> [Vec<f64>; 2] {
         let mut field = if self.base[index][0].is_empty() {
-            [vec![0.0; path.nodes.len()], vec![0.0; path.nodes.len()]]
+            [vec![0.0; path.row_count()], vec![0.0; path.row_count()]]
         } else {
             self.base[index].clone()
         };
         for th in theta {
             let planet = planet_at(*th);
-            add_planet_field(&mut field, &path.nodes, planet.x, planet.y, planet.mass);
+            path.add_planet(planet.x, planet.y, planet.mass, &mut field);
         }
         field
     }
@@ -254,34 +245,18 @@ impl<'a> Fit<'a> {
         for &(index, row) in starts {
             let path = self.shots[index].path.as_ref().expect("a path");
             let r = path.row_count();
-            let mut derivative = vec![vec![0.0; path.nodes.len()]; 6];
             let mut scratch = vec![0.0; r];
             for j in planets.clone() {
                 let th = &theta[j];
                 let rows = 0..r;
                 let mass = MASS_PER_RADIUS_CUBED * th[2].powi(3);
                 let dmass = 3.0 * MASS_PER_RADIUS_CUBED * th[2].powi(2);
-                // Nodes read by the rows: row `i` uses nodes `i * n + 1 ..= i * n + 2n - 1`.
-                for i in path.node_range(rows.clone()) {
-                    let p = path.nodes[i];
-                    let (dx, dy) = (th[0] - p[0], th[1] - p[1]);
-                    let d2 = (dx * dx + dy * dy).max(1e-18);
-                    let inverse_r3 = 1.0 / (d2 * d2.sqrt());
-                    let inverse_r5 = inverse_r3 / d2;
-                    let cross = -3.0 * mass * dx * dy * inverse_r5;
-                    // Index: parameter * 2 + axis.
-                    derivative[0][i] = mass * (inverse_r3 - 3.0 * dx * dx * inverse_r5);
-                    derivative[1][i] = cross;
-                    derivative[2][i] = cross;
-                    derivative[3][i] = mass * (inverse_r3 - 3.0 * dy * dy * inverse_r5);
-                    derivative[4][i] = dmass * dx * inverse_r3;
-                    derivative[5][i] = dmass * dy * inverse_r3;
-                }
+                let mut derivative: [Vec<f64>; 6] = std::array::from_fn(|_| vec![0.0; r]);
+                path.add_planet_derivatives(*th, mass, dmass, &mut derivative);
                 for param in 0..3 {
                     let column = (3 * (j - planets.start) + param) * total;
                     for axis in 0..2 {
-                        scratch.fill(0.0);
-                        path.apply(&derivative[param * 2 + axis], &mut scratch, rows.clone());
+                        scratch.copy_from_slice(&derivative[param * 2 + axis]);
                         path.whiten(axis, &mut scratch, rows.start);
                         for (i, v) in scratch.iter().enumerate().skip(rows.start) {
                             block[column + row + axis * r + i] = -v;
@@ -363,9 +338,20 @@ impl<'a> Fit<'a> {
         for shot in self.shots.iter().filter(|shot| shot.path.is_some()) {
             let path = shot.path.as_ref().expect("filtered");
             for (j, th) in theta.iter().enumerate() {
-                let (distance, px, py) = path.ticks[1..]
-                    .iter()
-                    .map(|p| ((th[0] - p[0]).hypot(th[1] - p[1]), p[0], p[1]))
+                // Closest point of the path (the chords between ticks: at high speed a planet can
+                // sit between two ticks).
+                let (distance, px, py) = path
+                    .ticks
+                    .windows(2)
+                    .map(|w| {
+                        let (a, b) = (w[0], w[1]);
+                        let (ex, ey) = (b[0] - a[0], b[1] - a[1]);
+                        let t = (((th[0] - a[0]) * ex + (th[1] - a[1]) * ey)
+                            / (ex * ex + ey * ey).max(1e-18))
+                        .clamp(0.0, 1.0);
+                        let (px, py) = (a[0] + t * ex, a[1] + t * ey);
+                        ((th[0] - px).hypot(th[1] - py), px, py)
+                    })
                     .min_by(|a, b| a.0.total_cmp(&b.0))
                     .expect("paths have ticks");
                 let value = (th[2] - distance).max(0.0) / PENALTY_SIGMA;
