@@ -1,5 +1,6 @@
 use crate::config::AppConfig;
 use crate::dummy::commands_for_energy;
+use crate::estimator::UpdateReport;
 use crate::event_store::{CaptureMetadata, EventLog};
 use crate::live_map::{LiveMap, MapProgress};
 use crate::map::PlanetMap;
@@ -286,8 +287,8 @@ fn run_session(
                             pending.energy = energy;
                             None
                         } else if targeting {
-                            let (progress, belief) = if oracle_map_for_policy {
-                                (map_feed.progress(), oracle_belief.clone())
+                            let (progress, belief, report) = if oracle_map_for_policy {
+                                (map_feed.progress(), oracle_belief.clone(), None)
                             } else {
                                 map_feed.snapshot_with_progress()
                             };
@@ -295,6 +296,7 @@ fn run_session(
                                 energy,
                                 &bot_state,
                                 belief.as_ref(),
+                                report.as_ref(),
                                 progress,
                                 false,
                                 0,
@@ -344,12 +346,13 @@ fn run_session(
             let (ready, fallback) = pending.map_wait_status(progress, now);
             if ready || fallback {
                 let pending = pending_energy.take().unwrap();
-                let (progress, belief) = map_feed.snapshot_with_progress();
+                let (progress, belief, report) = map_feed.snapshot_with_progress();
                 let wait_ms = pending.started.elapsed().as_millis() as u64;
                 let commands = target_commands(
                     pending.energy,
                     &bot_state,
                     belief.as_ref(),
+                    report.as_ref(),
                     progress,
                     fallback,
                     wait_ms,
@@ -417,6 +420,7 @@ fn target_commands(
     energy: f64,
     bot_state: &BotState,
     map_belief: Option<&MapBelief>,
+    update_report: Option<&UpdateReport>,
     progress: MapProgress,
     fallback: bool,
     wait_ms: u64,
@@ -463,8 +467,10 @@ fn target_commands(
                     "map_submitted_watermark": progress.submitted,
                     "map_processed_watermark": progress.processed,
                     "map_pending_events": progress.pending,
+                    "map_pending_paths": progress.pending_paths,
                     "map_source": map_source,
                     "map_belief": belief,
+                    "map_update_report": update_report,
                     "bot_state": bot_state.diagnostic_snapshot(),
                     "angle_step_degrees": angle_step_degrees,
                     "search_duration_ms": search_duration_ms,
@@ -600,6 +606,7 @@ mod tests {
             submitted: 2,
             processed: 1,
             pending: 1,
+            pending_paths: 1,
         };
 
         assert_eq!(
@@ -775,6 +782,15 @@ mod tests {
         assert_eq!(decision["energy"], 8.0);
         assert_eq!(decision["map_submitted_watermark"], 1);
         assert_eq!(decision["map_processed_watermark"], 1);
+        assert_eq!(decision["map_pending_paths"], 0);
+        // The fake fit reports no update; the key is still recorded (null, not omitted).
+        assert!(decision["map_update_report"].is_null());
+        assert!(
+            decision
+                .as_object()
+                .unwrap()
+                .contains_key("map_update_report")
+        );
         assert_eq!(decision["map_wait_fallback"], false);
         assert!(decision["map_wait_ms"].as_u64().unwrap() >= 300);
         drop(db);

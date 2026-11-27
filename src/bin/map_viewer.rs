@@ -317,6 +317,7 @@ fn list_decisions(path: &PathBuf, capture_id: i64) -> Result<Value, String> {
     {
         epoch_starts.push(sequence.map_err(|error| error.to_string())?);
     }
+    let feed = feed_events(&connection, capture_id)?;
     let rows = statement
         .query_map([capture_id], |row| {
             let data: String = row.get(3)?;
@@ -339,6 +340,9 @@ fn list_decisions(path: &PathBuf, capture_id: i64) -> Result<Value, String> {
                 "covariance": belief["covariance"].is_array(),
                 "covariance_reason": belief["covariance_unavailable_reason"],
                 "search_state": search_state(belief),
+                "map_pending_events": data["map_pending_events"],
+                "lag": map_lag(&data, &feed, sequence),
+                "update": update_summary(&data["map_update_report"]),
                 "map_epoch": epoch_starts
                     .partition_point(|start| *start <= sequence)
                     .checked_sub(1)
@@ -361,6 +365,97 @@ fn search_state(belief: &Value) -> Value {
         Some(limit) => limit.clone(),
     }
 }
+
+/// The capture's events that the live client feeds to the estimator, as `(sequence, is_path)`,
+/// with `None` for a `Planets` message (a map reset, which empties the queue).
+fn feed_events(
+    connection: &Connection,
+    capture_id: i64,
+) -> Result<Vec<(i64, Option<bool>)>, String> {
+    let mut statement = connection
+        .prepare("SELECT sequence, event_type FROM events WHERE capture_id=?1 AND event_type IN ('planets','shot_fin','player_position','player_leave') ORDER BY sequence")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([capture_id], |row| {
+            let kind: String = row.get(1)?;
+            Ok((
+                row.get::<_, i64>(0)?,
+                (kind != "planets").then_some(kind == "shot_fin"),
+            ))
+        })
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<_, _>>()
+        .map_err(|error| error.to_string())
+}
+
+/// How many observed paths the decision's belief had not seen yet: `paths` (recorded as
+/// `map_pending_paths`, or `inferred: true` when counted among the last `map_pending_events`
+/// estimator inputs recorded before the decision in its map epoch; the multi-bot client can
+/// record one input after a decision reads, so inferred counts may be one low). Null when the
+/// capture records neither.
+fn map_lag(data: &Value, feed: &[(i64, Option<bool>)], sequence: i64) -> Value {
+    let events = data["map_pending_events"].as_u64();
+    if let Some(paths) = data["map_pending_paths"].as_u64() {
+        return json!({"paths": paths, "events": events, "inferred": false});
+    }
+    let Some(events) = events else {
+        return Value::Null;
+    };
+    let before = &feed[..feed.partition_point(|(event, _)| *event < sequence)];
+    let paths = before
+        .iter()
+        .rev()
+        .map_while(|(_, is_path)| *is_path)
+        .take(events as usize)
+        .filter(|is_path| *is_path)
+        .count();
+    json!({"paths": paths, "events": events, "inferred": true})
+}
+
+/// The decision's `map_update_report` (work and timings of the estimator update that published
+/// its belief) with each part marked `phase` (wall time on the coordinating thread) or not (leaf:
+/// CPU time summed over threads, nested inside phases), plus `phase_ms`, the summed phase wall
+/// time. Null when the decision recorded no report (older captures, oracle-map decisions).
+fn update_summary(report: &Value) -> Value {
+    let Some(parts) = report["parts"].as_array() else {
+        return Value::Null;
+    };
+    let parts = parts
+        .iter()
+        .map(|part| {
+            let mut part = part.clone();
+            part["phase"] = json!(
+                part["part"]
+                    .as_str()
+                    .is_some_and(|name| PHASE_PARTS.contains(&name))
+            );
+            part
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "phase_ms": parts
+            .iter()
+            .filter(|part| part["phase"] == true)
+            .filter_map(|part| part["total_ms"].as_f64())
+            .sum::<f64>(),
+        "evaluations": report["evaluations"],
+        "violations": report["violations"],
+        "parts": parts,
+    })
+}
+
+/// `UpdateReport` phase parts (timed on the coordinating thread; their totals are wall time and
+/// do not overlap). Leaf parts are CPU time summed over threads and nest inside the phases.
+const PHASE_PARTS: [&str; 8] = [
+    "noise",
+    "warm_refit",
+    "seeding",
+    "birth_alone",
+    "birth_joint",
+    "deaths",
+    "polish",
+    "diagnostics",
+];
 
 /// Whether observations were still queued for the estimator when the decision read its belief.
 /// Scenario captures record `map_updating`; live captures record `map_pending_events`.
@@ -1521,6 +1616,110 @@ mod tests {
         });
         let belief = decode_belief(&data["map_belief"]).unwrap().unwrap();
         assert_eq!(belief.map.planets.len(), 1);
+    }
+
+    #[test]
+    fn decisions_report_map_lag_and_the_update_report_of_their_belief() {
+        use einsteinbot::estimator::{CeilingViolation, Part, PartReport, UpdateReport};
+        let path = std::env::temp_dir().join(format!(
+            "einsteinbot-viewer-lag-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let metadata = einsteinbot::event_store::CaptureMetadata {
+            started_at_unix_ms: 1,
+            process_id: std::process::id(),
+            host: "localhost".into(),
+            port: 3490,
+            client_name: "viewer-test".into(),
+            protocol_version: 8,
+        };
+        let mut log = einsteinbot::event_store::EventLog::create(&path, &metadata).unwrap();
+        let shot = ServerEvent::ShotFin {
+            player_id: 1,
+            angle: 0.0,
+            velocity: 2.0,
+            points: vec![],
+        };
+        let position = ServerEvent::PlayerPosition {
+            player_id: 1,
+            x: 1.0,
+            y: 1.0,
+        };
+        for event in [
+            shot.clone(),
+            ServerEvent::Planets { planets: vec![] },
+            shot.clone(),
+            shot.clone(),
+            position,
+            shot,
+        ] {
+            log.append(1, &RecordedEvent::Inbound(event)).unwrap();
+        }
+        let report = UpdateReport {
+            evaluations: 612,
+            parts: vec![
+                PartReport {
+                    part: Part::ResidualEval,
+                    calls: 600,
+                    total_ms: 900.0,
+                    longest_ms: 2.0,
+                },
+                PartReport {
+                    part: Part::WarmRefit,
+                    calls: 1,
+                    total_ms: 120.0,
+                    longest_ms: 120.0,
+                },
+                PartReport {
+                    part: Part::Polish,
+                    calls: 1,
+                    total_ms: 300.0,
+                    longest_ms: 300.0,
+                },
+            ],
+            violations: vec![CeilingViolation {
+                part: Part::Polish,
+                observed_ms: 300.0,
+                ceiling_ms: 250.0,
+            }],
+        };
+        for data in [
+            // Old live capture: lag inferred from the recorded inputs since the map reset (three
+            // paths and a position; the rest of the 5 are positions the client re-sends after a
+            // reset, which are not recorded, and the path before the reset is not counted).
+            json!({"map_belief": {"planets": []}, "map_pending_events": 5}),
+            json!({"map_belief": {"planets": []}, "map_pending_events": 2, "map_pending_paths": 1,
+                "map_update_report": serde_json::to_value(&report).unwrap()}),
+            json!({"map_belief": {"planets": []}}),
+        ] {
+            log.append_diagnostic(1, "bot", "target_decision", &data)
+                .unwrap();
+        }
+        let decisions = list_decisions(&path, 1).unwrap()["decisions"].clone();
+        assert_eq!(
+            decisions[0]["lag"],
+            json!({"paths": 3, "events": 5, "inferred": true})
+        );
+        assert!(decisions[0]["update"].is_null());
+        assert_eq!(
+            decisions[1]["lag"],
+            json!({"paths": 1, "events": 2, "inferred": false})
+        );
+        let update = &decisions[1]["update"];
+        assert_eq!(update["evaluations"], 612);
+        assert_eq!(update["phase_ms"], 420.0);
+        assert_eq!(update["violations"][0]["part"], "polish");
+        assert_eq!(update["violations"][0]["ceiling_ms"], 250.0);
+        assert_eq!(update["parts"][0]["part"], "residual_eval");
+        assert_eq!(update["parts"][0]["phase"], false);
+        assert_eq!(update["parts"][1]["phase"], true);
+        assert_eq!(update["parts"][1]["calls"], 1);
+        assert_eq!(update["parts"][1]["longest_ms"], 120.0);
+        // Neither pending count recorded (scenario captures before map_pending_events): unknown.
+        assert!(decisions[2]["lag"].is_null());
+        drop(log);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
