@@ -1,6 +1,6 @@
 //! Background map fitting; socket workers only enqueue observations and read beliefs.
-use crate::estimator::{Estimator, Settings, UpdateReport};
-use crate::game_stats::{MapRecord, RECENT_MAPS, Settled};
+use crate::estimator::{Estimator, EstimatorSummary, Settings, UpdateReport};
+use crate::game_stats::{Lag, MapRecord, RECENT_MAPS, Settled};
 use crate::protocol::{Planet, ServerEvent};
 use crate::strategy::MapBelief;
 use std::collections::VecDeque;
@@ -52,6 +52,7 @@ impl Published {
         if self.maps.back().is_none_or(|m| m.epoch != self.epoch) {
             self.maps.push_back(MapRecord {
                 epoch: self.epoch,
+                started: Some(Instant::now()),
                 ..MapRecord::default()
             });
             if self.maps.len() > RECENT_MAPS {
@@ -86,6 +87,19 @@ pub(crate) struct MapProgress {
     pub processed: u64,
     pub pending: usize,
     pub pending_paths: usize,
+}
+
+/// The current map epoch at a glance (`LiveMap::status`).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct MapStatus {
+    pub epoch: u64,
+    pub started: Option<Instant>,
+    pub summary: Option<EstimatorSummary>,
+    /// Disclosed planets (`sendplanets 1`), if any.
+    pub disclosed: Option<usize>,
+    /// Paths queued for the estimator and not yet published.
+    pub pending_paths: usize,
+    pub lag: Lag,
 }
 
 /// Run `estimator`'s pending work (and any path ingested by a cancelled update) for up to
@@ -306,6 +320,21 @@ impl LiveMap {
         let pending_paths = state.pending_paths;
         state.current().pending_paths = pending_paths;
         state.maps.iter().cloned().collect()
+    }
+
+    /// The current epoch's small live figures (no belief or truth copied), for the live view.
+    pub(crate) fn status(&self) -> MapStatus {
+        let mut state = self.published.lock().unwrap();
+        let pending_paths = state.pending_paths;
+        let record = state.current();
+        MapStatus {
+            epoch: record.epoch,
+            started: record.started,
+            summary: record.summary.clone(),
+            disclosed: record.truth.as_ref().map(Vec::len),
+            pending_paths,
+            lag: record.lag,
+        }
     }
 
     /// Ask the worker to settle each recent map for up to `per_map` after the work queued now,

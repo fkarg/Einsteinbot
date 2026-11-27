@@ -2,15 +2,16 @@ use crate::config::AppConfig;
 use crate::dummy::commands_for_energy;
 use crate::estimator::{Settings, UpdateReport};
 use crate::event_store::{CaptureMetadata, ClosedCapture, EventLog};
-use crate::game_stats::{self, SessionTally};
+use crate::game_stats::{self, Activity, SessionTally};
 use crate::live_map::{LiveMap, MapProgress};
 use crate::map::PlanetMap;
 use crate::map_change::{BoardChange, BoardModeDetector, BoundarySource, MapChangeDetector};
 use crate::protocol::{ClientCommand, EventParser, RecordedEvent, ServerEvent};
 use crate::rate_limit::ByteRateLimiter;
 use crate::strategy::{BotState, MapBelief, TargetingPolicy, TargetingSettings};
+use crate::tui;
 use std::error::Error;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -82,13 +83,17 @@ pub fn run(config: &AppConfig) -> ClientResult<()> {
         .iter()
         .map(|name| Arc::new(Mutex::new(SessionTally::new(name))))
         .collect();
-    // What is in memory now (only the shot tallies without a live map); printed once.
-    let printed = Arc::new(AtomicBool::new(false));
+    // What is in memory now (only the shot tallies without a live map); printed once. The lock
+    // is held while printing, so a second Ctrl+C during the print exits after it.
+    let printed = Arc::new(Mutex::new(false));
     let print_immediate = {
         let (map_feed, tallies, printed) =
             (map_feed.clone(), tallies.clone(), Arc::clone(&printed));
         move || {
-            if printed.swap(true, Ordering::SeqCst) {
+            let mut printed = printed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if std::mem::replace(&mut *printed, true) {
                 return Vec::new();
             }
             let maps = if live_map {
@@ -110,7 +115,9 @@ pub fn run(config: &AppConfig) -> ClientResult<()> {
     let stops = Arc::new(AtomicUsize::new(0));
     let signal_stops = Arc::clone(&stops);
     let print_on_exit = print_immediate.clone();
-    ctrlc::set_handler(move || {
+    // The signal handler; the live view calls it for a Ctrl+C key (raw mode has no SIGINT).
+    let interrupt: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        tui::restore();
         if signal_stops.fetch_add(1, Ordering::SeqCst) == 0 {
             signal_running.store(false, Ordering::SeqCst);
             eprintln!("Stopping: statistics follow (Ctrl+C again to exit now)");
@@ -119,7 +126,29 @@ pub fn run(config: &AppConfig) -> ClientResult<()> {
             eprintln!("Exiting now");
             std::process::exit(130);
         }
-    })?;
+    });
+    let signal_interrupt = Arc::clone(&interrupt);
+    ctrlc::set_handler(move || signal_interrupt())?;
+    // The live terminal view, when stdout is a terminal; stdout and stderr go to the run log
+    // meanwhile. Dropped (terminal restored) before the statistics.
+    let run_log = config.db_path.with_extension("log");
+    let view = if config.tui && io::stdout().is_terminal() {
+        let sources = tui::Sources {
+            tallies: tallies.clone(),
+            map: live_map.then(|| map_feed.clone()),
+            stops: Arc::clone(&stops),
+            interrupt,
+        };
+        match tui::start(sources, &run_log) {
+            Ok(view) => Some(view),
+            Err(error) => {
+                eprintln!("Live view unavailable ({error}); plain logging");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut workers = Vec::new();
     for (index, name) in names.into_iter().enumerate() {
         let config = config.clone();
@@ -138,7 +167,9 @@ pub fn run(config: &AppConfig) -> ClientResult<()> {
                 Ok(()) => running.load(Ordering::SeqCst),
                 Err(error) => connection_lost(error.as_ref()),
             };
+            tally.lock().unwrap().activity = Activity::Stopped;
             if lost {
+                tui::restore();
                 if let Err(error) = &result {
                     eprintln!("{name}: server connection lost ({error})");
                 }
@@ -162,6 +193,10 @@ pub fn run(config: &AppConfig) -> ClientResult<()> {
             }
             _ => {}
         }
+    }
+    if view.is_some() {
+        drop(view);
+        eprintln!("Run log: {}", run_log.display());
     }
     // Statistics: what is in memory now, then each recent map once it has settled.
     let maps = print_immediate();
@@ -323,7 +358,7 @@ fn run_session(
         }
         match stream.read(&mut buffer) {
             Ok(0) => {
-                eprintln!("Server closed the connection");
+                tui::note(format!("{name}: server closed the connection"));
                 break;
             }
             Ok(length) => {
@@ -342,7 +377,7 @@ fn run_session(
                         bot_state.own_id(),
                         bot_state.player_positions(),
                     );
-                    bot_state.observe(&event);
+                    bot_state.observe_at(&event, now_ms);
                     if let Some(source) = boundary {
                         // Shots, coverage and the belief of the old map no longer apply.
                         bot_state.start_new_map();
@@ -351,7 +386,10 @@ fn run_session(
                         if let Some(change) = board.new_map() {
                             report_board_change(&event_log, name, now_ms, change, "new_map")?;
                         }
-                        eprintln!("{name}: map boundary ({}): new map", source.as_str());
+                        tui::note(format!(
+                            "{name}: map boundary ({}): new map",
+                            source.as_str()
+                        ));
                         if canonical {
                             start_next_map(
                                 feeds_map,
@@ -408,6 +446,7 @@ fn run_session(
                         )?;
                     }
                     if let ServerEvent::OwnEnergy { energy, .. } = event {
+                        tally.lock().unwrap().energy = Some(energy);
                         // On the end card the server simulates nothing: send no commands.
                         let commands = if board.active() {
                             None
@@ -423,6 +462,7 @@ fn run_session(
                             pending.energy = energy;
                             None
                         } else if targeting {
+                            tally.lock().unwrap().activity = Activity::Aiming;
                             let (progress, belief, report) = if oracle_map_for_policy {
                                 (map_feed.progress(), oracle_belief.clone(), None)
                             } else {
@@ -489,6 +529,7 @@ fn run_session(
                 let pending = pending_energy.take().unwrap();
                 let (progress, belief, report) = map_feed.snapshot_with_progress();
                 let wait_ms = pending.started.elapsed().as_millis() as u64;
+                tally.lock().unwrap().activity = Activity::Aiming;
                 let commands = target_commands(
                     pending.energy,
                     &bot_state,
@@ -531,6 +572,13 @@ fn run_session(
             )?;
             last_energy_request = Instant::now();
         }
+        tally.lock().unwrap().activity = if board.active() {
+            Activity::BoardMode
+        } else if pending_energy.is_some() {
+            Activity::MapWait
+        } else {
+            Activity::WaitingEnergy
+        };
     }
 
     // Closing TCP is sufficient to leave the game, and never waits for rate-limit credit.
@@ -567,7 +615,7 @@ fn start_next_map(
         let mut log = log.lock().map_err(|_| "event log mutex poisoned")?;
         let closed = log.start_next_map(now_ms, source.as_str(), new_map_positions)?;
         report_closed_capture(&closed);
-        eprintln!("Recording map in capture {}", log.capture_id());
+        tui::note(format!("Recording map in capture {}", log.capture_id()));
         map_feed.set_capture(log.capture_id());
     }
     Ok(())
@@ -597,14 +645,14 @@ fn report_board_change(
     reason: &str,
 ) -> ClientResult<()> {
     let active = change == BoardChange::Entered;
-    eprintln!(
+    tui::note(format!(
         "{name}: {} ({reason})",
         if active {
             "board mode: pausing commands"
         } else {
             "board mode over: resuming"
         }
-    );
+    ));
     if let Some(log) = event_log {
         log.lock()
             .map_err(|_| "event log mutex poisoned")?
@@ -650,6 +698,7 @@ fn target_commands(
 ) -> ClientResult<Option<[ClientCommand; 2]>> {
     let mut state = bot_state.clone();
     state.set_map_belief(map_belief.cloned());
+    state.set_clock_ms(now_unix_ms()?);
     let started = Instant::now();
     let choice = policy.choose_while_running(&state, energy, running);
     if !running.load(Ordering::SeqCst) {
@@ -670,6 +719,8 @@ fn target_commands(
                 "uncertainty_available": choice.uncertainty_available,
                 "covered_fraction": choice.covered_fraction,
                 "contact_before_target": choice.contact_before_target,
+                "victim_doom": choice.victim_doom,
+                "doomed_hits_skipped": choice.doomed_hits_skipped,
             })
         });
         log.lock()
@@ -1313,6 +1364,7 @@ mod tests {
             clients: 3,
             db_path: "unused.sqlite".into(),
             planets: None,
+            tui: false,
         };
         let names = (0..config.clients)
             .map(|index| client_name(&config, index))

@@ -1,5 +1,8 @@
 use crate::coverage::path_cells;
 use crate::estimator::{ResidualCorrection, ResidualGate, ResidualModel};
+use crate::in_flight::{
+    DEFAULT_STEP_RATE, FIRE_LATENCY_MS, InFlightShot, SHOT_SLOTS, doom_probability, predict_kills,
+};
 use crate::map::{PlanetMap, Vec2};
 use crate::protocol::{Point, ServerEvent};
 use crate::simulation::{
@@ -133,16 +136,6 @@ struct KnownShot {
     angle_degrees: f64,
 }
 
-/// A shot that began but has not finished yet. `launch` is the player's tracked position when
-/// the begin event arrived (`None` when unknown); it never constrains candidates from elsewhere.
-#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
-struct InFlightShot {
-    player_id: u32,
-    launch: Option<Point>,
-    velocity: f64,
-    angle_degrees: f64,
-}
-
 #[derive(Clone, Debug, Default, serde::Deserialize)]
 pub struct BotState {
     own_id: Option<u32>,
@@ -156,6 +149,16 @@ pub struct BotState {
     known_shots: Vec<KnownShot>,
     covered_cells: BTreeSet<(i32, i32)>,
     in_flight: Vec<InFlightShot>,
+    /// Local time (unix ms) of the latest observed event, or set for a decision; `None` when
+    /// events are observed without a clock (doomed-target avoidance is then off).
+    #[serde(default)]
+    clock_ms: Option<i64>,
+    /// Server steps per second measured from begin/finish pairs (`None`: not measured yet).
+    #[serde(default)]
+    step_rate: Option<f64>,
+    /// Shots begun per player (slot reuse, `in_flight::SHOT_SLOTS`).
+    #[serde(default)]
+    begin_counts: BTreeMap<u32, u64>,
 }
 
 impl BotState {
@@ -184,7 +187,18 @@ impl BotState {
         }
     }
 
+    /// Observe an event without a clock (tests, offline tools): in-flight shots get no begin time.
     pub fn observe(&mut self, event: &ServerEvent) {
+        self.observe_event(event, None);
+    }
+
+    /// Observe an event received at `now_ms` (local unix ms).
+    pub fn observe_at(&mut self, event: &ServerEvent, now_ms: i64) {
+        self.clock_ms = Some(now_ms);
+        self.observe_event(event, Some(now_ms));
+    }
+
+    fn observe_event(&mut self, event: &ServerEvent, now_ms: Option<i64>) {
         match event {
             ServerEvent::Planets { .. } => self.start_new_map(),
             ServerEvent::OwnId { player_id } => self.own_id = Some(*player_id),
@@ -206,11 +220,20 @@ impl BotState {
             } => {
                 // Every connection receives every ShotBegin broadcast. Shots take seconds to
                 // finish, so in-flight own shots must already count as known outcomes.
+                let ordinal = self.begin_counts.entry(*player_id).or_insert(0);
+                *ordinal += 1;
+                let ordinal = *ordinal;
+                // The new shot takes the slot of the shooter's 16th-last one, ending it silently.
+                self.in_flight.retain(|shot| {
+                    shot.player_id != *player_id || shot.ordinal + SHOT_SLOTS > ordinal
+                });
                 self.in_flight.push(InFlightShot {
                     player_id: *player_id,
                     launch: self.player_positions.get(player_id).cloned(),
                     velocity: *velocity,
                     angle_degrees: *angle,
+                    begun_ms: now_ms,
+                    ordinal,
                 });
             }
             ServerEvent::ShotFin {
@@ -224,7 +247,10 @@ impl BotState {
                         && shot.velocity == *velocity
                         && shot.angle_degrees == *angle
                 }) {
-                    self.in_flight.swap_remove(index);
+                    let shot = self.in_flight.swap_remove(index);
+                    if let (Some(begun_ms), Some(now_ms)) = (shot.begun_ms, now_ms) {
+                        self.measure_step_rate(points.len(), now_ms - begun_ms);
+                    }
                 }
                 // Every connection receives every ShotFin broadcast, so each bot sees all
                 // completed trajectories and remembers their exact inputs and launch point.
@@ -240,6 +266,29 @@ impl BotState {
             }
             _ => {}
         }
+    }
+
+    /// Fold one finished shot's duration into the step-rate estimate. Short flights are skipped:
+    /// receive jitter of a step or two dominates them.
+    fn measure_step_rate(&mut self, point_count: usize, duration_ms: i64) {
+        if duration_ms < 1_000 || point_count < 2 {
+            return;
+        }
+        let sample = (point_count - 1) as f64 / (duration_ms as f64 / 1000.0);
+        self.step_rate = Some(match self.step_rate {
+            Some(rate) => 0.9 * rate + 0.1 * sample,
+            None => sample,
+        });
+    }
+
+    /// Server steps per second: measured, else `in_flight::DEFAULT_STEP_RATE`.
+    pub fn step_rate(&self) -> f64 {
+        self.step_rate.unwrap_or(DEFAULT_STEP_RATE)
+    }
+
+    /// Set the decision time (local unix ms) the policy times in-flight shots against.
+    pub fn set_clock_ms(&mut self, now_ms: i64) {
+        self.clock_ms = Some(now_ms);
     }
 
     /// Whether a trajectory with exactly this launch point, velocity and angle is already known
@@ -271,6 +320,9 @@ impl BotState {
             "known_shots": self.known_shots,
             "in_flight": self.in_flight,
             "covered_cells": self.covered_cells,
+            "clock_ms": self.clock_ms,
+            "step_rate": self.step_rate,
+            "begin_counts": self.begin_counts,
         })
     }
 
@@ -312,6 +364,9 @@ pub struct TargetingSettings {
     pub information_weight: f64,
     /// Maximum approach-distance penalty for retracing observed space (world units).
     pub coverage_penalty: f64,
+    /// A predicted hit whose victim an in-flight shot kills first with at least this chance is
+    /// skipped (`in_flight::doom_probability`); above 1 disables doomed-target avoidance.
+    pub doom_threshold: f64,
 }
 
 impl Default for TargetingSettings {
@@ -323,6 +378,7 @@ impl Default for TargetingSettings {
             information_threshold: 0.05,
             information_weight: 1.0,
             coverage_penalty: 40.0,
+            doom_threshold: 0.15,
         }
     }
 }
@@ -349,6 +405,11 @@ pub struct ShotChoice {
     pub predicted_victim: Option<u32>,
     /// Simulated ticks until the path ends (impact for a predicted hit).
     pub flight_ticks: usize,
+    /// Chance the predicted victim is killed by an in-flight shot before this one lands;
+    /// `None` when not computed (no predicted hit, or no clock).
+    pub victim_doom: Option<f64>,
+    /// Predicted hits skipped because their victim was doomed.
+    pub doomed_hits_skipped: usize,
 }
 
 pub struct TargetingPolicy {
@@ -518,6 +579,8 @@ impl TargetingPolicy {
                     _ => None,
                 },
                 flight_ticks: trajectory.points.len(),
+                victim_doom: None,
+                doomed_hits_skipped: 0,
             })
         };
         let mut candidates = Vec::new();
@@ -601,6 +664,44 @@ impl TargetingPolicy {
             .copied()
             .collect::<Vec<_>>();
         hits.sort_by(compare_hit_quality);
+        // Doomed-target avoidance: a hit on a player another in-flight shot (ours included)
+        // kills first is wasted, so skip such hits unless ours lands first (the race rule).
+        if let (Some(now_ms), false) = (state.clock_ms, hits.is_empty()) {
+            let kills = predict_kills(
+                map,
+                correction,
+                &state.in_flight,
+                &players,
+                now_ms,
+                state.step_rate(),
+                self.world,
+                self.settings.max_simulation_ticks,
+                self.settings.target_radius,
+            );
+            let ms_per_tick = 1000.0 / state.step_rate();
+            for hit in &mut hits {
+                let our_impact_ms =
+                    now_ms as f64 + FIRE_LATENCY_MS + hit.flight_ticks as f64 * ms_per_tick;
+                hit.victim_doom = Some(doom_probability(
+                    &kills,
+                    hit.predicted_victim.unwrap(),
+                    our_impact_ms,
+                ));
+            }
+            let skipped = hits
+                .iter()
+                .filter(|hit| hit.victim_doom.unwrap() >= self.settings.doom_threshold)
+                .count();
+            if skipped == hits.len() {
+                // Every predicted hit is doomed: wait for the targets to respawn rather than
+                // spend the energy on a shot that lands on nobody.
+                return None;
+            }
+            hits.retain(|hit| hit.victim_doom.unwrap() < self.settings.doom_threshold);
+            for hit in &mut hits {
+                hit.doomed_hits_skipped = skipped;
+            }
+        }
         if let Some(best_hit) = hits.first().copied() {
             return Some(ShotChoice {
                 reason: ShotReason::Hit,
@@ -989,6 +1090,8 @@ mod tests {
             predicted_hit: true,
             predicted_victim: Some(2),
             flight_ticks: 30,
+            victim_doom: None,
+            doomed_hits_skipped: 0,
         }
     }
 
@@ -1204,5 +1307,123 @@ mod tests {
             .choose(&state, APPROACH_MIN_ENERGY)
             .expect("enough energy for an approach shot");
         assert_eq!(choice.reason, ShotReason::Approach);
+    }
+
+    fn begin(state: &mut BotState, player_id: u32, angle: f64, velocity: f64, now_ms: i64) {
+        state.observe_at(
+            &ServerEvent::ShotBegin {
+                player_id,
+                angle,
+                velocity,
+            },
+            now_ms,
+        );
+    }
+
+    #[test]
+    fn in_flight_shots_carry_begin_times_and_free_reused_slots() {
+        let mut state = flat_field_state();
+        for k in 0..SHOT_SLOTS as i64 {
+            begin(&mut state, 2, k as f64, 5.0, 1_000 + k);
+        }
+        assert_eq!(state.in_flight.len(), SHOT_SLOTS as usize);
+        assert_eq!(state.in_flight[0].begun_ms, Some(1_000));
+        assert_eq!(
+            state.in_flight[0].launch,
+            Some(Point { x: 500.0, y: 100.0 })
+        );
+        // The 17th shot reuses the slot of the first, which the server drops without ShotFin.
+        begin(&mut state, 2, 99.0, 5.0, 2_000);
+        assert_eq!(state.in_flight.len(), SHOT_SLOTS as usize);
+        assert!(state.in_flight.iter().all(|shot| shot.angle_degrees != 0.0));
+        // Another player's shots keep their own slots.
+        begin(&mut state, 1, 0.0, 5.0, 2_000);
+        assert_eq!(state.in_flight.len(), SHOT_SLOTS as usize + 1);
+
+        // A finished shot leaves the list and measures the server step rate.
+        assert_eq!(state.step_rate(), DEFAULT_STEP_RATE);
+        let points = vec![Point { x: 100.0, y: 100.0 }; 61];
+        state.observe_at(
+            &ServerEvent::ShotFin {
+                player_id: 1,
+                angle: 0.0,
+                velocity: 5.0,
+                points,
+            },
+            4_000,
+        );
+        assert_eq!(state.in_flight.len(), SHOT_SLOTS as usize);
+        assert!((state.step_rate() - 30.0).abs() < 1e-9);
+    }
+
+    /// Own player 1 at (100, 100), opponents 2 at (500, 100) and 3 at (100, 400), flat field.
+    fn two_target_state() -> BotState {
+        let mut state = flat_field_state();
+        state.observe_at(
+            &ServerEvent::PlayerPosition {
+                player_id: 3,
+                x: 100.0,
+                y: 400.0,
+            },
+            0,
+        );
+        state
+    }
+
+    #[test]
+    fn policy_does_not_double_target_a_player_its_in_flight_shot_kills_first() {
+        let policy = TargetingPolicy::default();
+        let mut state = two_target_state();
+        let baseline = policy.choose(&state, 8.0).expect("baseline");
+        assert_eq!(baseline.predicted_victim, Some(3), "player 3 is nearer");
+
+        // Our earlier fast shot is on its way to player 3 and lands before any new shot.
+        begin(&mut state, 1, -90.0, 20.0, 0);
+        state.set_clock_ms(100);
+        let next = policy.choose(&state, 8.0).expect("another target");
+        assert_eq!(next.reason, ShotReason::Hit);
+        assert_eq!(next.predicted_victim, Some(2));
+        assert_eq!(next.victim_doom, Some(0.0));
+        assert!(next.doomed_hits_skipped > 0);
+
+        // Avoidance off: the doomed nearer target is chosen again.
+        let off = TargetingPolicy::new(TargetingSettings {
+            doom_threshold: f64::INFINITY,
+            ..TargetingSettings::default()
+        });
+        assert_eq!(off.choose(&state, 8.0).unwrap().predicted_victim, Some(3));
+    }
+
+    #[test]
+    fn policy_races_another_players_slow_shot_and_waits_when_every_target_is_doomed() {
+        let policy = TargetingPolicy::default();
+        let mut state = flat_field_state();
+        state.observe_at(
+            &ServerEvent::PlayerPosition {
+                player_id: 9,
+                x: 500.0,
+                y: 700.0,
+            },
+            0,
+        );
+        // Player 9 shoots straight up at player 2, 4 units per tick: impact after 149 ticks
+        // (about 4.9 s at 30.5 steps per second).
+        begin(&mut state, 9, 90.0, 4.0, 0);
+        state.set_clock_ms(100);
+        // Our 8-unit shot reaches player 2 in about 1.7 s: we win the race.
+        let race = policy.choose(&state, 8.0).expect("we land first");
+        assert_eq!(race.predicted_victim, Some(2));
+        assert_eq!(race.victim_doom, Some(0.0));
+
+        // At 4 s the slow shot lands before ours would: player 2 is doomed, aim at player 9.
+        state.set_clock_ms(4_000);
+        let late = policy.choose(&state, 8.0).expect("the other target");
+        assert_eq!(late.predicted_victim, Some(9));
+
+        // Our own fast shot is already on its way to player 9: every target is doomed, wait.
+        let angle = -(600.0f64).atan2(400.0).to_degrees();
+        begin(&mut state, 1, angle, 30.0, 3_900);
+        state.set_clock_ms(4_000);
+        assert_eq!(policy.choose(&state, 8.0), None);
     }
 }

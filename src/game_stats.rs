@@ -26,14 +26,47 @@ pub struct ShotTally {
     pub energy: f64,
 }
 
+/// What a session is doing now (shown by the live terminal view).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Activity {
+    #[default]
+    Connecting,
+    /// Waiting for the next energy report (or passive).
+    WaitingEnergy,
+    /// Holding a shot until the live map has seen the queued paths (bounded wait).
+    MapWait,
+    /// Searching for a shot.
+    Aiming,
+    /// The end card: no commands are sent.
+    BoardMode,
+    /// The session has ended.
+    Stopped,
+}
+
+impl Activity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Connecting => "connecting",
+            Self::WaitingEnergy => "waiting for energy",
+            Self::MapWait => "map wait",
+            Self::Aiming => "aiming",
+            Self::BoardMode => "board mode",
+            Self::Stopped => "stopped",
+        }
+    }
+}
+
 /// One session's own shots per map epoch. Epochs are counted by the session's map boundaries
 /// (`new_map`), as the live map counts the canonical session's, so the numbers agree with
-/// `MapRecord::epoch`.
+/// `MapRecord::epoch`. Also the session's latest energy and activity, for the live view.
 #[derive(Clone, Debug, Default)]
 pub struct SessionTally {
     pub name: String,
     epoch: u64,
     pub games: BTreeMap<u64, ShotTally>,
+    /// The latest reported energy.
+    pub energy: Option<f64>,
+    pub activity: Activity,
 }
 
 impl SessionTally {
@@ -42,6 +75,11 @@ impl SessionTally {
             name: name.to_owned(),
             ..Self::default()
         }
+    }
+
+    /// The shots of the current map epoch.
+    pub fn current_game(&self) -> ShotTally {
+        self.games.get(&self.epoch).cloned().unwrap_or_default()
     }
 
     /// A map boundary: later shots belong to the next epoch.
@@ -101,6 +139,8 @@ impl Lag {
 #[derive(Clone, Debug, Default)]
 pub struct MapRecord {
     pub epoch: u64,
+    /// When the live map started recording this epoch.
+    pub started: Option<std::time::Instant>,
     /// The capture recording this map, when recording.
     pub capture: Option<i64>,
     /// The disclosed planets (`Planets`), if the server sent them.
@@ -247,6 +287,16 @@ fn belief_lines(out: &mut String, belief: &MapBelief) {
     }
 }
 
+/// The search state: pending or not, with the limit the last update hit.
+pub fn search_state(summary: &EstimatorSummary) -> String {
+    match (summary.search_pending, summary.search_limit) {
+        (true, Some(limit)) => format!("pending ({limit:?})"),
+        (true, None) => "pending".to_owned(),
+        (false, Some(limit)) => format!("idle ({limit:?})"),
+        (false, None) => "settled".to_owned(),
+    }
+}
+
 fn summary_line(out: &mut String, summary: &EstimatorSummary) {
     let _ = writeln!(
         out,
@@ -254,12 +304,7 @@ fn summary_line(out: &mut String, summary: &EstimatorSummary) {
         summary.planets,
         summary.paths,
         summary.searched,
-        match (summary.search_pending, summary.search_limit) {
-            (true, Some(limit)) => format!("pending ({limit:?})"),
-            (true, None) => "pending".to_owned(),
-            (false, Some(limit)) => format!("idle ({limit:?})"),
-            (false, None) => "settled".to_owned(),
-        },
+        search_state(summary),
         summary.model.scale * 100.0,
         summary.model.length,
         summary.model.white,
