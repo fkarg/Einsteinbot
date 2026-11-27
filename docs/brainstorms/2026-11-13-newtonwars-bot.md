@@ -1134,3 +1134,7 @@ User: keep the UI up to date (notes coming). Plan: after P13 lands, a UI worker 
 ### User notes (2026-11-27)
 - Binaries: the bot CLI and the map viewer are needed; the others (field_scorecard, targeting_report, learning_scenarios, capture_learning_scenarios) look like temporary dev tooling: does each need to be separate? (Q17, open; session to propose.)
 - Capture 55: truth planet #6 has several impact points and a close flyby, still no planet estimate on main; user expects P13 may do better. Asked the P13 worker to check #6 through the full event path WITH contacts (diagnose replays carry no contacts; a known evaluation gap).
+
+### User reply Q17 (2026-11-27)
+User keeps the scenarios (learning_scenarios) and asks how useful they are / whether to expand them; otherwise fold the other dev binaries (field_scorecard, targeting_report, capture_learning_scenarios, ignored-test replay harnesses) into one dev binary for the session's own use. Decision: one `devtool` binary with subcommands, built as part of P14 (its `eval` subcommand is the P14 evaluator); overlapping code deleted, not ported; learning_scenarios' scenario definitions stay (shared with the viewer per the coordination contract), only its entry point may move. Session to answer the usefulness/expansion question for the scenarios.
+User also watched capture 55 live: many (later) shots still missed. A read-only diagnosis agent classifies our bots' misses (map error via true-map re-simulation, target moved, simulator mismatch, stale belief, no predicted hit, energy) over time.
