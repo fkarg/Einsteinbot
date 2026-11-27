@@ -1340,3 +1340,82 @@ The timeline (rec2 at n = 16/32/64/128) is 7/10-11/16/24 in both. Changes, all e
 What is left: the noise estimate is still 13 ms median and up to about 95 ms (the search sometimes needs many steps); a warm start from the previous estimate would cut that but makes each estimate depend on the previous one, so it was not done. The p90 and worst lag now come from paths arriving while a slice or the full-row refit runs (each up to its 250 ms ceiling); preempting those when a path is queued would be the next step.
 
 Reproduction: `cargo test --release --lib diagnose_replay -- --ignored --nocapture --test-threads=1` with `THREADS=10 CEIL_MS=0 SEEDS=- LIVE=55 EPOCH=0 PATHS=160 CHECKPOINTS=8,16,32,64,96,128,160` plus `PLANETS=n` or `CAP=n`; `SEEDS=7001 KS=26 LIVE=- PATHS=96`; the dev set `SEEDS=7001,7002,7003 KS=24 LIVE=40,36,33 PATHS=60`; throughput `SCHEDULE=110 THREADS=10 SEEDS=- LIVE=55 EPOCH=0 PATHS=545`. Compute: Mac about 25 CPU-minutes.
+
+### P21 results (2026-11-27, branch `p21` from main 0e71b27; `fit.rs` (`overlap_rows`, `feasible`, `OVERLAP_TOLERANCE`), `search.rs`, `audit.rs`, `DEFAULT_MAX_PLANETS`; harness `diagnose/replay.rs` with `CAP` and the new `MAPS`)
+
+**Answer.** With overlapping planets excluded, the concentric split of capture 55 is gone at caps 32 and 64 (24/24/0 from 96 to 161 paths, the same as cap 24), and the prior without `--planets` finds both synthetic 26-planet worlds at caps 32 and 64 (26/26/0 at 64 paths; cap 24 stops at 24). On the dev and held-out sets caps 24, 32 and 64 give identical maps through 32 paths and differ by at most one planet at 60; against main the change is within one or two planets per world (perturbation, see below). Recommended default cap: 32 (24 + 2 sd of the count prior); this branch sets it. 64 behaved the same everywhere tested, but no world here has more than 26 planets, so nothing distinguishes it from 32 yet; above 32 planets `--planets` is still needed.
+
+**What changed (observed in `../NewtonWars/simulation.c` `initPlanets`).** The generator draws radius U[20,40], mass r^3/10 and a centre in `[r, W-r] x [r, H-r]`, and redraws a planet until `distance > r_i + r_j` for every earlier one (not even touching). The estimator now enforces this:
+- In-arena bound: already enforced; the fit's logistic coordinates map every centre into `[r, W-r] x [r, H-r]` and the radius into [20, 40], and seeds are clamped. A unit test checks that a planet whose true centre is outside the range is fitted at the edge.
+- Overlap penalty: one residual row per planet pair (free-free and free-fixed, so alone fits and local refits see the fixed planets too), `max(0, r_i + r_j - distance) / 0.5`, with an analytic Jacobian, in both the dense evaluation and the QR reduction (`global_rows`: contacts then overlaps). It is the generator's rule itself (active from touching). On its own it does not stop a split: in the unit test two planets beside one true planet still converge to its centre, because the data gain outweighs a penalty of (55/0.5)^2.
+- Step barrier: the LM problem returns an infinite norm for a trial point where two planets (or a free and a fixed one) overlap by `OVERLAP_TOLERANCE` = 5 units or more; the step is rejected and the trust region shrinks, so iterates stay feasible (an infeasible start does not move). 5 units: found planets are typically within a unit or two (one-path position sd about 5); a concentric split overlaps by 40-60.
+- Hard rejection at the same tolerance: seeds overlapping a map planet, candidates overlapping a planet born since they were fitted (re-scoring), refit results (`search::refit`, used by the rebuild's births and deaths), adopted births and deaths of the live search, and the audit's candidate. Contacts are unchanged (they still never create a planet).
+
+How often the rules bind (Mac, temporary counters, one run each): capture 55 with cap 32, 160 paths: 10 seeds and 40 re-scored candidates rejected, 58 barrier step rejections, 1 adoption rejected; synthetic 7001 with 26 planets, 96 paths: 9 / 23 / 19 / 0; live 39 and synthetic 7006, 60 paths: 0-4 seeds, 24-26 candidates, 2-14 barrier steps, no adoption.
+
+**Capture 55 epoch 0 (truth 24; jolly, `THREADS=2 CEIL_MS=0`, deterministic, 161 paths).** Cells K / rec2 / spurious.
+
+| config | n=32 | n=64 | n=96 | n=128 | n=161 | fe end | CPU s |
+|---|---|---|---|---|---|---|---|
+| main, cap 32 | 16/12/2 | 19/19/0 | 26/24/0 | 26/24/0 | 26/24/0 | 3.8e-5 | 476 |
+| P21, cap 24 | 18/13/3 | 19/19/0 | 24/24/0 | 24/24/0 | 24/24/0 | 6.7e-5 | 45 |
+| P21, cap 32 | 18/13/3 | 19/19/0 | 24/24/0 | 24/24/0 | 24/24/0 | 4.5e-5 | 39 |
+| P21, cap 64 | 18/13/3 | 19/19/0 | 24/24/0 | 24/24/0 | 24/24/0 | 4.5e-5 | 40 |
+
+Main with cap 32 reproduces P18's 26 planets (the split counts as no spurious planet because all three share the true centre) and spends 12 times the CPU on it.
+
+**Synthetic worlds with 26 planets, prior without `--planets` (96 paths).** Cells rec2 / spurious at n = 32 / 64 / 96.
+
+| world | P21 cap 24 | P21 cap 32 | P21 cap 64 |
+|---|---|---|---|
+| 7001 | 22/0, 24/0, 24/0 (fe 9.6e-2) | 22/0, 26/0, 26/0 (fe 1.1e-5) | same as cap 32 |
+| 7002 | 21/0, 24/0, 24/0 (fe 1.0e-1) | 21/0, 26/0, 26/0 (fe 6.0e-6) | same as cap 32 |
+
+**Dev set (jolly, deterministic, 60 paths; live 48 has 48).** Cells rec2/rec15/spur, main (cap 24) -> P21 cap 32; fe/fu at the last path.
+
+| world | n=8 | n=16 | n=32 | n=60 | fe last | fu last | CPU s |
+|---|---|---|---|---|---|---|---|
+| 7001 | 10/10/0 -> 10/10/0 | 19/19/0 -> 19/19/0 | 22/22/0 -> 22/22/0 | 24/24/0 -> 24/24/0 | 7.5e-05 -> 7.5e-05 | 3.5e-04 -> 3.5e-04 | 16 -> 15 |
+| 7002 | 10/10/0 -> 10/10/0 | 17/17/0 -> 17/17/0 | 24/24/0 -> 24/24/0 | 24/24/0 -> 24/24/0 | 1.5e-04 -> 1.1e-05 | 1.9e-04 -> 1.6e-05 | 20 -> 20 |
+| 7003 | 5/8/0 -> 5/8/0 | 9/11/0 -> 9/11/0 | 19/21/0 -> 19/21/0 | 24/24/0 -> 24/24/0 | 4.7e-05 -> 4.7e-05 | 1.8e-04 -> 1.8e-04 | 20 -> 15 |
+| 7004 | 11/11/0 -> 11/11/0 | 17/18/0 -> 17/18/0 | 23/23/0 -> 23/23/0 | 24/24/0 -> 24/24/0 | 1.0e-05 -> 1.0e-05 | 4.1e-05 -> 4.1e-05 | 19 -> 18 |
+| 7005 | 11/11/0 -> 11/11/0 | 12/13/0 -> 12/13/0 | 23/23/0 -> 23/23/0 | 24/24/0 -> 24/24/0 | 1.8e-05 -> 4.8e-06 | 2.8e-05 -> 6.7e-06 | 18 -> 16 |
+| 7006 | 9/11/0 -> 9/11/0 | 21/21/0 -> 20/20/0 | 24/24/0 -> 24/24/0 | 24/24/0 -> 24/24/0 | 2.8e-05 -> 2.0e-05 | 3.1e-05 -> 2.5e-05 | 19 -> 16 |
+| 7007 | 10/10/0 -> 10/10/0 | 15/17/0 -> 15/17/0 | 20/22/0 -> 20/22/0 | 24/24/0 -> 24/24/0 | 3.4e-05 -> 2.4e-05 | 9.6e-05 -> 1.9e-05 | 22 -> 16 |
+| 7008 | 6/6/1 -> 6/6/1 | 15/15/0 -> 15/15/0 | 18/19/0 -> 18/19/0 | 24/24/0 -> 24/24/0 | 3.5e-04 -> 3.5e-04 | 1.0e-03 -> 1.0e-03 | 20 -> 19 |
+| live33 | 6/8/0 -> 6/8/0 | 8/11/0 -> 8/11/0 | 19/19/0 -> 19/19/0 | 24/24/0 -> 24/24/0 | 4.1e-05 -> 4.1e-05 | 8.4e-04 -> 8.4e-04 | 21 -> 17 |
+| live39 | 4/5/0 -> 4/5/0 | 10/11/0 -> 10/11/0 | 19/19/0 -> 19/19/0 | 20/23/0 -> 20/21/2 | 2.2e-03 -> 2.6e-03 | 1.5e-01 -> 1.4e+00 | 22 -> 19 |
+| live40 | 6/7/0 -> 6/7/0 | 8/9/0 -> 8/9/0 | 10/11/2 -> 10/11/2 | 18/20/1 -> 18/20/1 | 2.9e-04 -> 4.1e-03 | 8.9e-01 -> 4.2e+00 | 18 -> 14 |
+| live41 | 6/9/0 -> 6/8/1 | 9/11/1 -> 9/11/1 | 15/18/0 -> 15/18/0 | 22/22/1 -> 22/22/1 | 7.3e-04 -> 7.1e-04 | 1.7e+00 -> 1.7e+00 | 22 -> 19 |
+| live45 | 2/2/0 -> 2/2/0 | 7/8/0 -> 7/8/0 | 20/20/1 -> 20/20/1 | 21/21/2 -> 21/21/1 | 8.0e-04 -> 1.4e-03 | 8.5e-01 -> 1.7e+00 | 23 -> 21 |
+| live48 | 7/7/0 -> 7/7/0 | 12/14/0 -> 12/14/0 | 19/19/0 -> 19/19/0 | - -> - | 6.9e-04 -> 5.8e-04 | 2.0e+00 -> 1.6e+00 | 12 -> 11 |
+| **total** | 103/115/1 -> 103/114/2 | 179/195/1 -> 178/194/1 | 275/284/3 -> 275/284/3 | 297/302/4 -> 297/300/5 | | | 273 -> 235 |
+
+Totals of all four configurations (main cap 24 -> P21 cap 24 -> cap 32 -> cap 64): n=8 103/115/1 -> 103/114/2 (all three caps); n=16 179/195/1 -> 178/194/1; n=32 275/284/3 -> 275/284/3; n=60 (without live 48) 297/302/4 -> 297/300/5; CPU 273 -> 260 -> 235 -> 222 s. The caps differ only in the final fe of a few synthetic worlds (cap 32 and 64 keep searching once 24 are found and end closer to the truth, e.g. 7002 1.1e-4 -> 1.1e-5). Live 48 at 48 paths: 21/22/1 in every configuration.
+
+**Held-out (run once; synthetic 7101-7108, live 35, 37, 42, 43; live 34 has only 2 paths and is not scored; live 43 has 41).**
+
+| world | n=8 | n=16 | n=32 | n=60 | fe last | fu last | CPU s |
+|---|---|---|---|---|---|---|---|
+| 7101 | 10/11/0 -> 10/11/0 | 15/15/0 -> 15/15/0 | 16/19/0 -> 16/19/0 | 24/24/0 -> 24/24/0 | 2.3e-04 -> 2.1e-05 | 9.7e-04 -> 7.9e-05 | 30 -> 25 |
+| 7102 | 8/9/0 -> 8/9/0 | 13/15/0 -> 13/15/0 | 20/20/0 -> 20/20/0 | 24/24/0 -> 24/24/0 | 1.0e-04 -> 1.0e-04 | 7.8e-04 -> 7.8e-04 | 16 -> 13 |
+| 7103 | 8/9/0 -> 8/9/0 | 14/14/0 -> 14/14/0 | 21/21/0 -> 21/21/0 | 23/23/0 -> 23/23/0 | 1.4e-02 -> 1.4e-02 | 1.6e-01 -> 1.6e-01 | 13 -> 15 |
+| 7104 | 12/13/0 -> 12/13/0 | 14/16/0 -> 14/16/0 | 21/21/0 -> 21/21/0 | 24/24/0 -> 24/24/0 | 1.2e-05 -> 1.2e-05 | 3.8e-05 -> 3.8e-05 | 19 -> 14 |
+| 7105 | 7/9/0 -> 7/9/0 | 15/17/2 -> 16/18/0 | 22/22/0 -> 22/22/0 | 24/24/0 -> 24/24/0 | 1.1e-04 -> 1.1e-04 | 2.2e-03 -> 2.2e-03 | 19 -> 14 |
+| 7106 | 12/12/0 -> 12/12/0 | 18/18/0 -> 18/18/0 | 24/24/0 -> 24/24/0 | 24/24/0 -> 24/24/0 | 2.0e-05 -> 2.0e-05 | 2.6e-05 -> 2.6e-05 | 17 -> 12 |
+| 7107 | 9/10/0 -> 9/10/0 | 13/14/0 -> 13/14/0 | 22/22/0 -> 22/22/0 | 24/24/0 -> 24/24/0 | 1.4e-05 -> 1.2e-05 | 3.7e-05 -> 3.2e-05 | 17 -> 14 |
+| 7108 | 6/7/1 -> 6/7/1 | 12/13/0 -> 12/13/0 | 18/18/0 -> 18/18/0 | 24/24/0 -> 24/24/0 | 2.6e-04 -> 1.7e-04 | 4.4e-04 -> 2.9e-04 | 13 -> 11 |
+| live34 | - -> - | - -> - | - -> - | - -> - | 1.8e-01 -> 1.8e-01 | 5.1e-01 -> 5.1e-01 | 0 -> 0 |
+| live35 | 7/8/0 -> 7/8/0 | 11/11/0 -> 11/11/0 | 16/16/0 -> 16/16/0 | 24/24/0 -> 23/24/0 | 3.0e-04 -> 1.4e-03 | 6.2e-03 -> 2.1e-02 | 26 -> 28 |
+| live37 | 6/8/0 -> 6/8/0 | 10/10/0 -> 10/10/0 | 17/17/0 -> 17/17/0 | 21/21/1 -> 21/21/1 | 6.0e-03 -> 6.0e-03 | 3.2e-01 -> 3.2e-01 | 9 -> 9 |
+| live42 | 5/6/0 -> 4/6/0 | 10/10/0 -> 10/10/0 | 17/18/0 -> 17/18/0 | 20/20/2 -> 21/21/3 | 2.2e-03 -> 1.2e-03 | 3.1e-01 -> 3.8e-01 | 16 -> 16 |
+| live43 | 8/9/0 -> 6/8/0 | 11/12/0 -> 11/12/0 | 19/19/0 -> 19/19/0 | - -> - | 3.0e-02 -> 3.0e-02 | 1.5e-01 -> 1.5e-01 | 7 -> 6 |
+| **total** | 98/111/1 -> 95/110/1 | 156/165/2 -> 157/166/0 | 233/237/0 -> 233/237/0 | 256/256/3 -> 256/257/4 | | | 201 -> 178 |
+
+Totals of all four configurations: n=8 98/111/1 -> 95/110/1 (all caps); n=16 156/165/2 -> 157/166/0; n=32 233/237/0 -> 233/237/0; n=60 256/256/3 -> 256/256/3 (cap 24) and 256/257/4 (caps 32, 64; live 35 is 22/22/1 at cap 24 and 23/24/0 at 32 and 64); CPU 201 -> 183 -> 178 -> 176 s. Live 43 at 41 paths: 23/23/0 in every configuration.
+
+**Reading (inferred).** The per-world differences between main and P21 are perturbations, not the constraint removing true planets: the overlap rows change the floating-point summation of every reduction, so the deterministic runs diverge from the first path (evaluation counts already differ at n=1 on all five worlds compared: live 39, 40, 41, 45 and synthetic 7006), and the same commit on the Mac and on jolly also differs from the first path (platform arithmetic); live 39, worse on jolly (20/21/2 against main's 20/23/0), is 20/23/0 on the Mac for both branches. P6 measured several planets of run-to-run spread on live worlds. The sums match main within 1-3 planets at every checkpoint, in both directions. The larger caps cost nothing measurable on 24-planet worlds within 60 paths and, with the split excluded, nothing on capture 55 over 161 paths. CPU fell 11-14 % on the dev and held-out sets (presumably fewer candidates spent on overlapping hypotheses; not measured), and 12-fold on capture 55 at cap 32.
+
+Not tested: worlds with more than 26 planets, live play with the larger cap, captures longer than 161 paths, and the audit (off by default). Compute: jolly about 42 CPU-minutes (118 runs), Mac a few minutes.
+
+Reproduction: `cargo test --release --lib diagnose_replay -- --ignored --nocapture --test-threads=1` with `THREADS=2 CEIL_MS=0 CAP=n` and `SEEDS=- LIVE=55 EPOCH=0 PATHS=160 CHECKPOINTS=16,32,64,96,128,160`; `SEEDS=7001 KS=26 LIVE=- PATHS=96 CHECKPOINTS=32,64,96`; dev and held-out one world per process with `PATHS=60 CHECKPOINTS=8,16,32,60`; `MAPS=1` lists missed and spurious planets. Raw logs: jolly `/tmp/P21w/out`.

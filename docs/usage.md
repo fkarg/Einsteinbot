@@ -103,9 +103,9 @@ For example, `record = false`, `EINSTEINBOT_RECORD=false` or `--no-record` all d
 NewtonWars generates `planets` planets per map (server option, 1-64, default 24) and never sends the number.
 
 - **If you know it**, pass `--planets N` (`planets = N`, `EINSTEINBOT_PLANETS`). The estimator then uses it as fixed: with $K$ planets found, $N - K$ are still unseen, and it never fits more than $N$.
-- **Without it**, the unseen count is the mean excess over $K$ of a broad prior on the total: a discrete Gaussian centred on 24 with sd 4 over 1-64, conditioned on at least $K$ planets. That is about 2.9 unseen once 24 are found. The cap is `DEFAULT_MAX_PLANETS` (24). The prior is a choice, not calibrated.
+- **Without it**, the unseen count is the mean excess over $K$ of a broad prior on the total: a discrete Gaussian centred on 24 with sd 4 over 1-64, conditioned on at least $K$ planets. That is about 2.9 unseen once 24 are found. The cap is `DEFAULT_MAX_PLANETS` (32, the top of the prior's plausible range). The prior is a choice, not calibrated.
 
-Measured on replays (P18, [estimator-experiments.md](estimator-experiments.md)): a wrong fixed count costs planets when it is too low (the cap) and little when it is too high. A server with more than 24 planets needs `--planets`.
+Measured on replays (P18, P21, [estimator-experiments.md](estimator-experiments.md)): a wrong fixed count costs planets when it is too low (the cap) and little when it is too high. A server with more than 32 planets needs `--planets`.
 
 ## Live view
 
@@ -250,7 +250,8 @@ sequenceDiagram
 **Limits and what the belief reports.**
 
 - The belief holds one map and no alternatives.
-- $K$ is capped: `--planets N` when given, else `DEFAULT_MAX_PLANETS` (24).
+- $K$ is capped: `--planets N` when given, else `DEFAULT_MAX_PLANETS` (32).
+- Maps obey the generator's geometry: centres lie at least their radius inside the battlefield, and no two planets overlap by 5 units or more (the generator allows no overlap at all; the 5 units allow for estimation error). Fits never step into such an overlap, and seeds, candidates and adopted maps that overlap are rejected.
 - `MapBelief::search_limit` reports the cap (`planet_cap`), an unfinished search (`work_budget`) or a slice cut by its wall ceiling (`time_budget`).
 - Surface contacts are terminal points not explained by a known player, the margin or the trail limit. They add a gated surface constraint to the joint fit. A contact never creates a planet; a contact that disagrees with the fitted planets is counted in `unmatched_contacts`.
 - Covariance is a local approximation for the published map. It is unavailable, with a recorded reason, for a flat map (`no_planets`), when the data leave a planet's parameters undetermined or a planet sits at a bound (`under_identified`), or before the full-row refit (`not_computed`; a map published right after a path reports this). It does not describe missing planets.

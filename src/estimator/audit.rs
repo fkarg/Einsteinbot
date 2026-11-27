@@ -4,7 +4,7 @@
 //! the comparison) run on their own threads, so an audit never delays the publication of a map;
 //! the estimator collects a finished half between slices.
 use super::Shot;
-use super::fit::{Budget, Fit, theta_of};
+use super::fit::{Budget, Fit, any_overlap, theta_of};
 use super::noise::{Noise, with_noise};
 use super::rebuild::from_scratch;
 use super::search::refit;
@@ -86,7 +86,9 @@ impl Audit {
                 (None, Some(_)) => true,
                 _ => false,
             };
-            (better && !cancelled.load(Ordering::Relaxed)).then_some(candidate)
+            // `refit_of` falls back to the unrefit start, which must not overlap either.
+            (better && !any_overlap(&candidate) && !cancelled.load(Ordering::Relaxed))
+                .then_some(candidate)
         })
     }
 

@@ -184,6 +184,8 @@ Planets are born only from trajectory evidence ([`src/estimator/search.rs`](src/
 
 Surface contacts enter the fits as gated constraints but never create a planet. An observed tick inside a planet disk is penalized.
 
+Maps obey the generator's geometry (NewtonWars `initPlanets`). Every centre lies at least its radius inside the battlefield; the fit's coordinates enforce that. No two planets overlap, because the generator redraws a planet until it touches no other. The fit penalizes any overlap from touching on and never steps to an overlap of 5 units or more. Seeds, candidates and adopted maps that overlap that much are rejected; the 5 units allow for estimation error.
+
 **Scheduling.** The search is resumable. For each new path:
 
 ```mermaid
@@ -294,7 +296,7 @@ At most 1-2 paths are queued. Capture 55 is one game. The remaining worst lag co
 
 ### Estimator: known versus estimated planet count
 
-On the dev set, fixing $N = 24$ beats the default prior (24 ± 4) around 32 paths: explored-field RMSE 0.0046 vs 0.0202 (geometric means over 14 worlds). It is still somewhat better at 60 paths (1.1e-4 vs 1.7e-4). A fixed count that is too low stops at that count: on 26-planet synthetic worlds only `--planets 26` finds the last two planets under the default cap of 24.
+On the dev set, fixing $N = 24$ beats the default prior (24 ± 4) around 32 paths: explored-field RMSE 0.0046 vs 0.0202 (geometric means over 14 worlds). It is still somewhat better at 60 paths (1.1e-4 vs 1.7e-4). A fixed count that is too low stops at that count: on 26-planet synthetic worlds only `--planets 26` found the last two planets under the old default cap of 24. With overlapping planets excluded (P21), the default cap is 32: the prior alone then finds all 26, and caps 24, 32 and 64 give the same maps on the 24-planet replays.
 
 ### Targeting
 
@@ -328,7 +330,7 @@ P19, on recorded captures with `Planets` hidden:
 ### Known limitations
 
 - Recall dips at 16-32 paths, mostly on synthetic worlds the old estimator had already completed. The model-error scale estimate then sits at its bound and absorbs part of the missing planets' signal. At about 9 paths/s this window passes in 2-4 s.
-- The default cap is 24 planets. Raising it let one true planet split into three concentric ones on capture 55. Servers with more than 24 planets need `--planets N`.
+- The default cap is 32 planets. Servers with more than 32 planets need `--planets N`. Worlds with more than 26 planets have not been tested.
 - The uncertainty-probe branch never fired in capture 55. Covariance is usually `not_computed` at decision time, because the full-row refit lags the latest path.
 - The evidence prior (1/20 per planet), the planet-count prior, the interpolation variance and the hyperprior are heuristics.
 - Most cells above are one run, and live worlds vary by several planets between runs of similar configurations.

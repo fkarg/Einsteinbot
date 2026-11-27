@@ -17,7 +17,7 @@
 //! compare evidence. Contacts never create planets: they enter the joint fits only as gated
 //! surface constraints.
 use super::Shot;
-use super::fit::{Budget, Evidence, Fit, planet_at, theta_of};
+use super::fit::{Budget, Evidence, Fit, any_overlap, overlapping, planet_at, theta_of};
 use super::noise::{Noise, apply};
 use super::rows::thin_rows;
 use super::work::{Part, PartCeilings, Stats, par_map};
@@ -126,12 +126,22 @@ pub(super) fn mode_at(joint: &Fit, theta: &[[f64; 3]]) -> Option<Mode> {
     })
 }
 
+/// The refit of `start` as a mode; `None` when it cannot be evaluated or two of its planets
+/// overlap (`fit::overlapping`: the generator never places such maps).
 pub(super) fn refit(joint: &Fit, start: &[[f64; 3]], budget: &Budget) -> Option<Mode> {
     let (theta, _) = joint.refine(start, budget)?;
+    if any_overlap(&theta) {
+        return None;
+    }
     mode_at(joint, &theta)
 }
 
-/// Seed planets from the largest unexplained windows of the paths under `theta`.
+fn overlaps_any(planet: &[f64; 3], theta: &[[f64; 3]]) -> bool {
+    theta.iter().any(|other| overlapping(planet, other))
+}
+
+/// Seed planets from the largest unexplained windows of the paths under `theta`; a seed that
+/// overlaps a planet of `theta` is dropped.
 fn seeds(joint: &Fit, theta: &[[f64; 3]], world: WorldParameters) -> Vec<[f64; 3]> {
     let mut chosen: Vec<[f64; 2]> = Vec::new();
     let mut seeds = Vec::new();
@@ -152,11 +162,14 @@ fn seeds(joint: &Fit, theta: &[[f64; 3]], world: WorldParameters) -> Vec<[f64; 3
             let towards = |axis: usize| {
                 window.position[axis] + window.acceleration[axis] / magnitude * distance
             };
-            seeds.push([
+            let seed = [
                 towards(0).clamp(radius, world.battlefield_width - radius),
                 towards(1).clamp(radius, world.battlefield_height - radius),
                 radius,
-            ]);
+            ];
+            if !overlaps_any(&seed, theta) {
+                seeds.push(seed);
+            }
         }
     }
     seeds
@@ -422,6 +435,7 @@ impl Search {
             let refitted = slice
                 .stats
                 .time(Part::WarmRefit, || local.refine(&free, &budget));
+            // `refine` keeps the free planets off each other and off the fixed ones.
             self.theta = fixed;
             self.theta.extend(refitted.map_or(free, |(t, _)| t));
         }
@@ -568,7 +582,11 @@ impl Search {
                 let alone = alone();
                 let rescored = par_map(&self.candidates, slice.threads, |c| alone.chi2(&[c.theta]));
                 for (c, chi2) in self.candidates.iter_mut().zip(rescored) {
-                    c.chi2 = Some(chi2.unwrap_or(f64::INFINITY));
+                    // A candidate overlapping a planet born since it was fitted is out.
+                    c.chi2 = Some(
+                        chi2.filter(|_| !overlaps_any(&c.theta, &self.theta))
+                            .unwrap_or(f64::INFINITY),
+                    );
                 }
                 let mut ranked: Vec<&Candidate> = self
                     .candidates
@@ -648,6 +666,7 @@ impl Search {
             let child = self
                 .partials
                 .iter()
+                .filter(|p| !any_overlap(&p.theta))
                 .filter_map(|p| mode_at(&joint, &p.theta).map(|m| (m.log_evidence, &p.theta)))
                 .max_by(|a, b| a.0.total_cmp(&b.0));
             let deaths = self.deaths_due;
@@ -745,6 +764,35 @@ mod tests {
             stats,
             noise,
         }
+    }
+
+    /// A map holding a planet too small for its field (P18's concentric split): the unexplained
+    /// windows point at its centre, but no seed may overlap it.
+    #[test]
+    fn no_seed_overlaps_a_planet_of_the_map() {
+        use crate::estimator::tests::{planet, shot_in, shot_with_contact, world_of};
+        let truth = world_of(vec![planet(800.0, 500.0, 36.0)]);
+        let shots: Vec<Shot> = [
+            ((650.0, 500.0), 0.0),
+            ((800.0, 650.0), 270.0),
+            ((950.0, 520.0), 180.0),
+        ]
+        .into_iter()
+        .map(|(start, angle)| shot_with_contact(&shot_in(&truth, start, angle, 6.0), &[]))
+        .collect();
+        let cancelled = AtomicBool::new(false);
+        let world = WorldParameters::default();
+        let joint = Fit::new(&shots, world, &cancelled, true, vec![]);
+        let map = [[800.0, 500.0, 25.0]];
+        let unexplained = joint.unexplained(&map);
+        assert!(unexplained[0].significance > SEED_SIGNIFICANCE);
+        let towards_centre = unexplained.iter().take(20).all(|w| {
+            let (dx, dy) = (800.0 - w.position[0], 500.0 - w.position[1]);
+            dx * w.acceleration[0] + dy * w.acceleration[1] > 0.0
+        });
+        assert!(towards_centre);
+        let seeds = seeds(&joint, &map, world);
+        assert!(seeds.iter().all(|s| !overlapping(s, &map[0])), "{seeds:?}");
     }
 
     /// A path that arrives mid-search is absorbed: the pending candidates survive it and the
