@@ -285,12 +285,14 @@ Measured by replaying recorded decisions with the recorded belief and flying the
 |---|---|---|---|
 | P15 | rank hits by flight time, wait for energy, 500 ms map wait | 15 → 37 (capture 53), 49 → 91 (54), 22 → 47 (55); hits per 100 energy 11-48% higher | 2 |
 | P17 | residual correction | 79 → 84, 143 → 153, 97 → 104, 42 → 47, 109 → 141 on five recorded maps of captures 53-57, estimator settled at each decision | 4 |
+| P20 | skip targets predicted to die first (in-flight shots of all players) | 87 → 93 (53), 95 → 104 (55), 44 → 47 (56), 76 → 78 (57), 252 → 315 (58, four maps; wasted hits 112 → 62, hits per 100 energy 5.1 → 6.1) | 5 |
 
 Caveats:
 
 - P15's ranking was picked among about 9 variants on the same captures, so selection bias is possible.
 - P17's gain is almost all in the first half of each map. Deduplicated by victim position it is small but in the same direction. It costs 2-6% estimator time and about 10 ms per decision. The spreading was designed on the same captures.
-- Both replays hold the game still while the bot waits, so they overstate the value of waiting.
+- P20's doom threshold was chosen on the same captures; its kill chances are overconfident beyond 60 ticks of flight. Each decision is replayed separately, not as one alternative game. Cost about 5 ms per decision (worst 53 ms).
+- The replays hold the game still while the bot waits, so they overstate the value of waiting.
 - **Live**, one run on a shared local server with different opponents: 0.154 hits per decision after P15, against 0.114 in capture 55. Indicative only.
 
 ![One decision with its shot review: predicted versus observed path](docs/images/viewer-57-d937.jpg)

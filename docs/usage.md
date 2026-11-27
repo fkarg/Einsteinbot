@@ -277,6 +277,13 @@ Targeting is opt-in with `--target` or `targeting = true`.
 
 **Residual correction** ([`src/estimator/residual.rs`](../src/estimator/residual.rs)). Along every observed path, the unexplained field (what the published planets do not account for) is estimated as the posterior mean of the estimator's model-error process. The simulation adds it near those paths: strongest on them, fading with distance at the process's correlation length, never inside a planet. This lets aiming learn from observed paths where the map is still wrong or incomplete. When the model error is negligible (for example on a complete map) the correction is neither built nor applied. The belief records why (`residual_correction_unavailable_reason`) and the model scalars needed to rebuild it from a capture (`residual_model`).
 
+**Doomed targets** ([`src/in_flight.rs`](../src/in_flight.rs)). Every bot tracks every player's shots in flight, its own included (shooter, angle and velocity from `ShotBegin`, launch point from the shooter's tracked position). Each decision with a predicted hit simulates them on the current map (with the residual correction) to predict who dies and when, at the server step rate measured from this connection (about 30.5 steps per second locally).
+- A prediction counts with a heuristic chance by flight time: 0.75 under 60 ticks, 0.45 up to 79, 0.3 up to 99, else 0.15 (calibrated on captures 53-57; overconfident beyond 60 ticks on capture 58).
+- A predicted hit is skipped when its victim is predicted to die before our shot lands with at least `doom_threshold` (0.15). Kills predicted after our impact do not count: we win the race. All players stay targetable.
+- If every predicted hit is doomed, the bot waits for the next energy report. The decision records the victim's doom chance and how many doomed hits were skipped.
+- Shots the server drops silently (a 17th shot reusing a player's slot) are dropped from the list too.
+- A higher energy bar early in a map was measured and left out.
+
 **Timing.**
 
 - Before each decision a bot waits for submitted map work to finish and the map to be quiet for 300 ms, but at most 500 ms. Then it aims with the latest published belief (`map_wait_fallback=true` in the decision diagnostics when the wait timed out).
