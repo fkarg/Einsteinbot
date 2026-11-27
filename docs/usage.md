@@ -8,6 +8,7 @@ Operational reference: how to run the bot, what it records, how the estimator an
 - [Running the client](#running-the-client)
 - [Options and configuration](#options-and-configuration)
 - [Planet count](#planet-count)
+- [Live view](#live-view)
 - [Stopping and the stop report](#stopping-and-the-stop-report)
 - [Recording](#recording)
 - [How the estimator and targeting behave at run time](#how-the-estimator-and-targeting-behave-at-run-time)
@@ -91,6 +92,7 @@ cargo run -- --config einsteinbot.toml
 | oracle map | `--oracle-map`, `--no-oracle-map` | `EINSTEINBOT_ORACLE_MAP` | off |
 | clients | `--clients N` | `EINSTEINBOT_CLIENTS` | 1 |
 | planet count | `--planets N` | `EINSTEINBOT_PLANETS` | estimated |
+| live view | `--tui`, `--no-tui` | `EINSTEINBOT_TUI` | on when stdout is a terminal |
 
 `cargo run -- --help` prints the same list.
 
@@ -104,6 +106,16 @@ NewtonWars generates `planets` planets per map (server option, 1-64, default 24)
 - **Without it**, the unseen count is the mean excess over $K$ of a broad prior on the total: a discrete Gaussian centred on 24 with sd 4 over 1-64, conditioned on at least $K$ planets. That is about 2.9 unseen once 24 are found. The cap is `DEFAULT_MAX_PLANETS` (24). The prior is a choice, not calibrated.
 
 Measured on replays (P18, [estimator-experiments.md](estimator-experiments.md)): a wrong fixed count costs planets when it is too low (the cap) and little when it is too high. A server with more than 24 planets needs `--planets`.
+
+## Live view
+
+When stdout is a terminal, the client shows a live terminal view instead of the scrolling log:
+
+- **Per bot:** energy, shots and hits in the current map (counted as in the stop report), and what it is doing (aiming, waiting for energy, map wait, end card).
+- **Current map:** index, elapsed time, paths seen, planets `K` (and the disclosed count with `sendplanets 1`), queued paths, last and largest publish lag, search state.
+- **Events:** map boundaries, the end card, lost connections.
+
+It redraws four times a second from small snapshots on its own thread and never calls the estimator (about 0.1% of a core, measured; the client prints the figure when the view closes). While it is up, stdout and stderr go to a run log next to the SQLite file (`einsteinbot.log` by default, appended, not rotated). Ctrl+C closes the view and restores the terminal first, then prints the stop report; the terminal is also restored on errors and panics. `--no-tui` (`tui = false`, `EINSTEINBOT_TUI=false`) keeps plain logging, which is also used when stdout is not a terminal.
 
 ## Stopping and the stop report
 
