@@ -59,6 +59,9 @@ pub struct MapBelief {
     /// Model-error scalars the correction was (or would have been) built with; with `map` and
     /// the epoch's paths they rebuild it (`estimator::residual_correction`).
     pub residual_model: Option<ResidualModel>,
+    /// Whether the planet cap is likely below the true count (P23); `None`: not assessed (the
+    /// belief did not come from the estimator).
+    pub count_limit: Option<crate::estimator::CountLimit>,
 }
 
 impl MapBelief {
@@ -79,6 +82,7 @@ impl MapBelief {
             residual_correction: None,
             residual_correction_unavailable_reason: Some(ResidualGate::NotComputed),
             residual_model: None,
+            count_limit: None,
         }
     }
 
@@ -117,6 +121,7 @@ impl MapBelief {
             })),
             "residual_correction_unavailable_reason": self.residual_correction_unavailable_reason,
             "residual_model": self.residual_model,
+            "count_limit": self.count_limit,
         })
     }
 

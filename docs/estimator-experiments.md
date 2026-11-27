@@ -1419,3 +1419,46 @@ Totals of all four configurations: n=8 98/111/1 -> 95/110/1 (all caps); n=16 156
 Not tested: worlds with more than 26 planets, live play with the larger cap, captures longer than 161 paths, and the audit (off by default). Compute: jolly about 42 CPU-minutes (118 runs), Mac a few minutes.
 
 Reproduction: `cargo test --release --lib diagnose_replay -- --ignored --nocapture --test-threads=1` with `THREADS=2 CEIL_MS=0 CAP=n` and `SEEDS=- LIVE=55 EPOCH=0 PATHS=160 CHECKPOINTS=16,32,64,96,128,160`; `SEEDS=7001 KS=26 LIVE=- PATHS=96 CHECKPOINTS=32,64,96`; dev and held-out one world per process with `PATHS=60 CHECKPOINTS=8,16,32,60`; `MAPS=1` lists missed and spurious planets. Raw logs: jolly `/tmp/P21w/out`.
+
+### P23 results (2026-11-27, branch `p23` from main 2b6c21a; `mod.rs` (`CountLimit`, `count_limited`, `COUNT_LIMIT_*`), `game_stats.rs`, `tui.rs`, `web/map_viewer.js`; measurement build 79d0f78, harness `diagnose/replay.rs`)
+
+**Question.** When the planet count is limited below the truth (`--planets N` too low, or the default cap below a larger map), can the estimator tell? Measure three candidate signals, then implement the best as a warning.
+
+**Answer (observed).** Yes, with the residual correction's magnitude: a map at its cap whose correction (`max_magnitude`, the largest smoothed unexplained pull) exceeds 0.03 acceleration units on 3 of the last 5 polished maps at the cap. It flagged 26 of 26 replays with 1-4 planets left out (19 design + 7 held out), a median of 2 paths after the map reached the cap (max 46), and 0 of 20 replays with the right count at the cap (14 design + 6 held out). The other two signals fire on real captures with the right count and were rejected. The warning costs no extra computation (it reads the correction that every publication builds; a five-value window per epoch).
+
+**Design.** Deterministic replays (`THREADS=2 CEIL_MS=0`, one run each, jolly), 96 paths synthetic and 120 live. Only paths where the published map is at the cap can carry the signal (below the cap missing planets are normal). Each path is scored after its slices and the full-row polish.
+- Positives (19 reached the cap): synthetic seeds 7001-7004 with 26 planets and `PLANETS=24` or `CAP=24`; 7001, 7002 with 28 planets and `PLANETS=26` or `CAP=24`; live captures 53, 55, 56, 57, 58 maps 1-3 (all 24 planets) with `PLANETS=22`. Live 58 map 0 never reached 22 in 120 paths (not scored); captures 60 and 61 were not in the jolly copy of the database.
+- Negatives at the cap (14): synthetic 7001-7004 with 24 planets and `PLANETS=24`, 7001, 7002 with `CAP=24`, 7001, 7002 with 28 planets and `PLANETS=28`; live 53, 55, 56, 58 maps 1-3 with `PLANETS=24`. Live 57 with `PLANETS=24` stopped at 22 (not at the cap). Default runs (prior, cap 32) on 24- and 26-planet worlds and the five live captures never reach the cap, so they cannot raise the warning by construction.
+- Rule search: a signal fires on a path at the cap above a threshold; the warning holds when it fired on M of the last W such paths, for (M, W) in 1/1, 2/3, 3/5, 4/8, 6/8.
+
+**Signal 1, blocked-birth evidence gain (measurement build only).** At the cap, after the per-path death trial, the normal birth round (seeds, alone fits, joint refits of K+1) ran without adoption and recorded the best evidence gain over the maintained map. Positives: medians 48-18,000 nats. But with the right count on real captures the blocked 25th planet also gains: capture 55 median 403, max 10,142 nats; 53 max 1,063; 58 map 1 max 12,498 (the fixed count makes `N_u = 0.5`, so the background is small and any leftover structure of real data buys a planet; with the prior's 2.9 unseen the normal search at cap 32 does not add it, P21). Best rules: gain > 3,000 on 1 of 1: 19/19 detected, 2/14 false alarms; > 1,000 on 6 of 8: 15/19 and 3/14. It also costs: at the cap 300-650 evaluations per path instead of 80-150, and +40-75% replay CPU (live 53 at `PLANETS=24`: 96 s vs 68 s; synthetic 7001 26 planets: 56 s vs 32 s). Rejected.
+
+**Signal 2, prequential mismatch (measurement build only).** Each new path's normalized innovations against the maintained map before its refit, under the frozen model: chi2/row and lag-1 autocorrelation over the observed rows. They do not separate: positives' medians at the cap are chi2/row 0.01-0.93 and lag-1 -0.65 to 0.03, negatives 0.57-0.90 and -0.34 to 0.11. With planets left out the model-error scale grows (often to its bound `s = 1`) and absorbs the mismatch, so the innovations look like noise; single paths spike on both sides (chi2 > 20 on one path: 13/14 false alarms). The scale at its bound is a weaker version of signal 3: `s >= 1` on 2 of 3: 18/19 and 1/14 (live 58 map 1). Rejected.
+
+**Signal 3, the residual correction.** Its on/off state alone does not separate (on correct-count live maps it is usually on at 1e-3); its magnitude does. The deciding value of the 3-of-5 rule (the third largest of five consecutive at-cap maps, maximized over the run):
+
+| set | deciding value |
+|---|---|
+| negatives, synthetic | 0.0000-0.0037 |
+| negatives, live 55, 56, 58 maps 1-3 | 0.0005-0.0071 |
+| negatives, live 53 | 0.0150 |
+| positives, live 58 map 2 / live 57 / live 55 | 0.094 / 0.12 / 0.28 |
+| positives, others | 0.56-2.9 |
+
+| rule | detected | false alarms | paths from cap to detection (median / max) |
+|---|---|---|---|
+| > 0.01 on 1 of 1 | 19/19 | 2/14 | 0 / 0 |
+| > 0.03 on 1 of 1 | 19/19 | 2/14 | 0 / 44 |
+| > 0.01 on 3 of 5 | 19/19 | 1/14 | 2 / 14 |
+| **> 0.03 on 3 of 5 (chosen)** | **19/19** | **0/14** | **2 / 46** |
+| > 0.1 on 3 of 5 | 18/19 | 0/14 | 2 / 42 |
+
+The single-path false alarms are a 0.21 spike on the correct 28-planet synthetic world and 0.085 on live 53. 0.03 sits a factor 2 above the largest negative and 3 below the smallest positive. The slow case (live 58 map 2, 46 paths) has small values until a path passes the missing planets; live 57 (two spurious planets at the cap) flickers (the rule held on 13 of the 35 paths after its first detection), hence the latch.
+
+**Held out (implemented rule, run once).** Synthetic 7101-7103 with 26 planets and `PLANETS=24`: flagged 2 paths after the cap each. One planet left out: 7101 and 7102 with 25 planets and `PLANETS=24`, 7104 with 27 planets and `CAP=26`, live 53 with `PLANETS=23`: flagged after 2, 19, 2 and 2 paths. Negatives 7101-7103 with 24 planets and `PLANETS=24`: not flagged. Older live captures 39, 41, 42 with `PLANETS=24` and all their paths (130, 123, 141; Mac, `THREADS=3`; 45 has 62 paths and stopped at 22): at the cap from paths 84, 48, 63, not flagged; largest magnitude at the cap 9.9e-4, 5.0e-3 and none (gated on all 69 paths). The implemented rule reproduced the offline analysis on two design runs (synthetic 7001 26 planets flagged at path 48; live 53 with 24 not flagged).
+
+**Implementation.** `Estimator` keeps the magnitudes of the last 5 polished maps at the cap (`None` where no correction was applied, counted as below) and the path count at which the rule first held (latched per epoch, cleared on reset). The published belief and `EstimatorSummary` carry `CountLimit { cap, at_cap, detected_at_path, recent_magnitudes }` (`map_belief.count_limit`, `null` when not assessed). The stop report prints a warning line (or "planet cap N reached; no sign of more planets so far"), the live view appends `COUNT LIMITED (cap N: more planets likely)`, the inspector shows a red `K ≥ N!` pill (grey `K = N` at the cap without the warning). The cap is never raised automatically.
+
+**Reading and limits (inferred).** The correction measures what the map at the cap leaves unexplained along the paths; a planet the cap excludes leaves planet-scale pull (0.1-3) wherever a path passes it, a complete map leaves rounding-scale pull (<= 0.015). The same signal would fire on a misplaced or missing planet with a correct count at the cap; no such case appeared in the 20 negatives (none had a spurious planet at its last checkpoint, but per-path map errors at the cap were not scored), and the live negatives are only nine maps with a margin of a factor 2. The peer review (Codex) rated this the main open point: the signal measures "the map at its cap leaves planet-sized pull", which is the cap being too low or the map being wrong. The wording of the warning says "may have more planets" for that reason. In the 935 at-cap paths of the positives the correction was never gated off, so the gate did not hide a missing planet here. A planet no path passes near is not detected (it also does not matter for those paths). Not tested: more than 28 planets, the default cap 32 actually binding (no world has more than 32), live play, the audit (off by default).
+
+Reproduction: `cargo test --release --lib diagnose_replay -- --ignored --nocapture --test-threads=1` with `THREADS=2 CEIL_MS=0` and `SEEDS=<seed> KS=<k> LIVE=- PATHS=96 CHECKPOINTS=32,64,96 PLANETS=<n>` or `CAP=<n>`, or `SEEDS= LIVE=<capture> EPOCH=<e> PATHS=120 CHECKPOINTS=32,64,96,120 PLANETS=<n>`; `UPD` lines carry `cap=`, `limited=` and `gate=`. Signals 1 and 2: the same at 79d0f78 (`UPD` `gain=`, `chi2r=`, `lag1=`). Compute: jolly 53 CPU-minutes (49 design + 12 held-out runs), Mac about 10 CPU-minutes.

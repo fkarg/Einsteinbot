@@ -596,14 +596,6 @@ impl Gains {
     }
 }
 
-/// `Series::mismatch`.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) struct Mismatch {
-    pub chi2_per_row: f64,
-    pub lag1: f64,
-    pub rows: usize,
-}
-
 /// One path's prequential residuals: its raw residuals against the maintained map before the
 /// path was fitted, with its floor and the distance of each row centre to `U` at that moment.
 #[derive(Clone, Debug)]
@@ -681,30 +673,6 @@ impl Series {
             gains.whiten(&mut v);
             (v, gains.log_det)
         })
-    }
-
-    /// The prequential mismatch of the path under `model`: the mean squared normalized innovation
-    /// per observed row and axis (about 1 when the model explains the path) and the lag-1
-    /// autocorrelation of the innovations (about 0 when they are white), with the observed rows.
-    pub fn mismatch(&self, model: ModelError) -> Mismatch {
-        let (mut sum, mut lag, mut rows) = (0.0, 0.0, 0usize);
-        for (v, _) in self.innovations(model) {
-            for r in 0..v.len() {
-                if self.missing[r] {
-                    continue;
-                }
-                rows += 1;
-                sum += v[r] * v[r];
-                if r + 1 < v.len() && !self.missing[r + 1] {
-                    lag += v[r] * v[r + 1];
-                }
-            }
-        }
-        Mismatch {
-            chi2_per_row: if rows > 0 { sum / rows as f64 } else { 0.0 },
-            lag1: if sum > 0.0 { lag / sum } else { 0.0 },
-            rows,
-        }
     }
 
     /// Also treat the rows with `missing[r]` true as missing.

@@ -72,6 +72,7 @@ Each item says what the bot does, why it helps, and what it measured. The math b
 | **Never stops to think** | Searches for planets in small resumable slices between shots and publishes a fresh map after every path. | Targeting always has a current map, even at 9 new paths per second. | Median publish lag 62-71 ms at 9 paths/s; all 24 planets after 128 paths (14 s) of a real game. |
 | **Pays for every extra planet** | Adds or removes a planet only when the data become more probable after an Occam penalty. | Planets come from evidence, not from the search's appetite. | Same recall as before at the end of a map, with fewer phantoms. |
 | **Only proposes possible maps** | Never lets two estimated planets overlap or a planet cross the edge, exactly as the server's map generator requires. | A planet the generator could not produce is wrong by construction; it was splitting one real planet into three. | The split is gone; the default cap rose to 32 without new phantoms; CPU on one capture 476 s → 39 s. |
+| **Notices when its planet cap is too low** | When the map is at its planet cap (`--planets N`, else 32) and the unexplained pull along the paths is still planet-sized, it warns that the map may have more planets than that (stop report, live view, inspector). It never raises the cap itself. | A wrong `--planets` silently costs the missing planets; the warning tells you to raise it. | Raised in 26 of 26 replays with 1-4 planets left out, a median of 2 paths after reaching the cap; never in 20 replays with the right count at the cap. |
 | **Aims with what it can't explain yet** | Adds the still-unexplained pull seen along observed paths to its shot simulation; switches off once the map is complete. | Early in a map, paths near earlier shots are bent by planets the map lacks. | +5 to +32 true hits per replayed game, almost all early in the map. |
 | **Prefers short shots** | Ranks predicted hits by flight time first, miss distance second. | Map errors grow along a path; long shots rarely hit. | The ranking alone: true hits 15 → 23, 49 → 61, 22 → 46 on replayed games. |
 | **Doesn't shoot the doomed** | Simulates every shot in flight (all players, its own included) and skips targets that will die before its shot lands, unless its shot wins the race. | In busy games many shots hit where a player *was*. | Capture 58: true hits 252 → 315, wasted hits 112 → 62. |
@@ -299,6 +300,17 @@ At most 1-2 paths are queued. Capture 55 is one game. The remaining worst lag co
 
 On the dev set, fixing $N = 24$ beats the default prior (24 ± 4) around 32 paths: explored-field RMSE 0.0046 vs 0.0202 (geometric means over 14 worlds). It is still somewhat better at 60 paths (1.1e-4 vs 1.7e-4). A fixed count that is too low stops at that count: on 26-planet synthetic worlds only `--planets 26` found the last two planets under the old default cap of 24. With overlapping planets excluded (P21), the default cap is 32: the prior alone then finds all 26, and caps 24, 32 and 64 give the same maps on the 24-planet replays.
 
+**Detecting a cap below the truth (P23, branch p23).** A map at its cap whose residual correction (the smoothed unexplained pull, step 6) exceeds 0.03 acceleration units on 3 of the last 5 polished maps is flagged `count_limit` (latched for the map). Replays, one deterministic run each, 96 synthetic or 120 live paths:
+
+| set | runs | flagged | paths from reaching the cap to the flag |
+|---|---|---|---|
+| 2-4 planets left out (synthetic 26/28-planet worlds with `--planets 24`/`26` or cap 24; live captures 53, 55, 56, 57, 58 (three maps) with `--planets 22`) | 19 | 19 | median 2, max 46 |
+| held out: 2 left out (synthetic 7101-7103) | 3 | 3 | 2, 2, 2 |
+| held out: 1 left out (synthetic 25/27 planets, live 53 with `--planets 23`) | 4 | 4 | 2, 2, 2, 19 |
+| right count at the cap (synthetic 24/28 planets incl. 3 held out, live 53, 55, 56, 58 (three maps) and held-out 39, 41, 42 with `--planets 24`) | 20 | 0 | |
+
+With the right count the deciding value (third largest of five) stayed at or below 0.015 (live 53; at most 0.009 elsewhere); with planets left out it was at least 0.094. The live margin is only a factor of two on nine real maps. The extra blocked-birth search and the prequential mismatch were measured and rejected: both also fire on real captures with the right count.
+
 ### Targeting
 
 Measured by replaying recorded decisions with the recorded belief and flying the chosen shot on the true map.
@@ -331,7 +343,7 @@ P19, on recorded captures with `Planets` hidden:
 ### Known limitations
 
 - Recall dips at 16-32 paths, mostly on synthetic worlds the old estimator had already completed. The model-error scale estimate then sits at its bound and absorbs part of the missing planets' signal. At about 9 paths/s this window passes in 2-4 s.
-- The default cap is 32 planets. Servers with more than 32 planets need `--planets N`. Worlds with more than 26 planets have not been tested.
+- The default cap is 32 planets. Servers with more than 32 planets need `--planets N`; the count-limit warning says so once the map is at the cap (tested up to 28 planets). A misplaced planet at a correct cap could also raise it; no such case was seen.
 - The uncertainty-probe branch never fired in capture 55. Covariance is usually `not_computed` at decision time, because the full-row refit lags the latest path.
 - The evidence prior (1/20 per planet), the planet-count prior, the interpolation variance and the hyperprior are heuristics.
 - Most cells above are one run, and live worlds vary by several planets between runs of similar configurations.

@@ -362,9 +362,6 @@ pub(super) struct Search {
     /// At the planet cap a death trial has run since the last path or adoption (a successful one
     /// frees a slot, so the next birth makes it a swap).
     cap_trial_done: bool,
-    /// At the planet cap the birth round still runs once per path, but is never adopted: the
-    /// evidence gain of its best map over the maintained one (`NEG_INFINITY`: no candidate).
-    pub blocked_gain: Option<f64>,
 }
 
 impl Search {
@@ -445,7 +442,6 @@ impl Search {
         self.pending = true;
         self.seeded = false;
         self.cap_trial_done = false;
-        self.blocked_gain = None;
         for partial in &mut self.partials {
             partial.done = false;
             partial.rounds = 0;
@@ -468,14 +464,15 @@ impl Search {
         {
             if self.theta.len() >= slice.max_planets && !self.deaths_due && self.partials.is_empty()
             {
-                // At the cap a map holding a spurious planet must not freeze there: one death
-                // trial per path, whose success frees a slot. Then one birth round that is never
-                // adopted (`blocked_gain`).
-                if !self.cap_trial_done {
-                    self.cap_trial_done = true;
-                    self.deaths_due = true;
-                    continue;
+                // At the cap no birth is attempted, but a map holding a spurious planet must not
+                // freeze there: one death trial per path, whose success frees a slot.
+                if self.cap_trial_done {
+                    self.pending = false;
+                    break;
                 }
+                self.cap_trial_done = true;
+                self.deaths_due = true;
+                continue;
             }
             let joint = Fit::new(&shots, world, cancelled, true, vec![])
                 .with_deadline(slice.deadline)
@@ -534,9 +531,6 @@ impl Search {
                 self.candidates.truncate(MAX_CANDIDATES);
                 self.seeded = true;
                 if self.candidates.is_empty() {
-                    if self.theta.len() >= slice.max_planets {
-                        self.blocked_gain = Some(f64::NEG_INFINITY);
-                    }
                     self.finish();
                 }
                 continue;
@@ -624,9 +618,6 @@ impl Search {
                     })
                     .collect();
                 if self.partials.is_empty() {
-                    if self.theta.len() >= slice.max_planets {
-                        self.blocked_gain = Some(f64::NEG_INFINITY);
-                    }
                     self.finish();
                     continue;
                 }
@@ -680,12 +671,6 @@ impl Search {
                 .max_by(|a, b| a.0.total_cmp(&b.0));
             let deaths = self.deaths_due;
             self.deaths_due = false;
-            if !deaths && self.theta.len() >= slice.max_planets {
-                self.blocked_gain =
-                    Some(child.map_or(f64::NEG_INFINITY, |(evidence, _)| evidence - parent));
-                self.finish();
-                continue;
-            }
             match child {
                 Some((evidence, theta))
                     if evidence > parent && (deaths || theta.len() <= slice.max_planets) =>
