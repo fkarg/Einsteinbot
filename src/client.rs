@@ -700,7 +700,8 @@ fn target_commands(
     state.set_map_belief(map_belief.cloned());
     state.set_clock_ms(now_unix_ms()?);
     let started = Instant::now();
-    let choice = policy.choose_while_running(&state, energy, running);
+    let outcome = policy.decide_while_running(&state, energy, running);
+    let choice = outcome.choice;
     if !running.load(Ordering::SeqCst) {
         return Ok(None);
     }
@@ -721,6 +722,7 @@ fn target_commands(
                 "contact_before_target": choice.contact_before_target,
                 "victim_doom": choice.victim_doom,
                 "doomed_hits_skipped": choice.doomed_hits_skipped,
+                "victim_energy": choice.victim_energy,
             })
         });
         log.lock()
@@ -745,6 +747,7 @@ fn target_commands(
                     "map_wait_ms": wait_ms,
                     "map_wait_fallback": fallback,
                     "choice": decision,
+                    "decision": outcome.diagnostic_json(),
                 }),
             )?;
     }

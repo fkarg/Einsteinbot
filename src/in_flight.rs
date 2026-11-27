@@ -51,15 +51,19 @@ pub struct PredictedKill {
 }
 
 /// Chance that a shot our map predicts to hit really kills, by predicted flight ticks: map error
-/// grows along the path. Calibrated on captures 53-57 (in-flight shots predicted to hit on the
-/// recorded belief, outcome from the recorded events; pooled 0-59 ticks 66 of 89, 60-79 17 of
-/// 38, 80-99 9 of 28, 100+ 11 of 67). A heuristic, not a calibrated posterior.
+/// grows along the path. Recalibrated (P24) on captures 53 and 55-68 (54 duplicates 53/55;
+/// 69-71 held out): in-flight shots predicted to hit on the recorded belief, outcome from the
+/// recorded events; pooled 0-39 ticks 268 of 375, 40-59 145 of 253, 60-79 68 of 185, 80-99
+/// 37 of 146, 100-119 12 of 115, 120+ 10 of 191 (held out: 0.78, 0.65, 0.50, 0.35, 0.21,
+/// 0.05). A heuristic, not a calibrated posterior.
 pub fn kill_probability(flight_ticks: usize) -> f64 {
     match flight_ticks {
-        0..=59 => 0.75,
-        60..=79 => 0.45,
-        80..=99 => 0.3,
-        _ => 0.15,
+        0..=39 => 0.72,
+        40..=59 => 0.57,
+        60..=79 => 0.37,
+        80..=99 => 0.25,
+        100..=119 => 0.1,
+        _ => 0.05,
     }
 }
 
