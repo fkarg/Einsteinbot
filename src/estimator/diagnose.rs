@@ -91,6 +91,13 @@ fn synthetic(seed: u64, k: usize, paths: usize) -> Case {
 /// The first `paths` distinct paths of the first epoch of a live capture that discloses planets.
 fn live(capture: i64, paths: usize) -> Case {
     let events = EventLog::read_capture("einsteinbot.sqlite3", capture).unwrap();
+    // `EPOCH=k` (opt-in): the k-th map epoch, an epoch starting where the disclosed planets
+    // change (repeated identical `Planets` events stay in it). Without it, the first epoch up to
+    // the next `Planets` event, as before.
+    let epoch_wanted = std::env::var("EPOCH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+    let mut epoch = 0;
     let mut truth = Vec::new();
     let mut seen: Vec<ShotObservation> = Vec::new();
     for stored in events {
@@ -99,9 +106,23 @@ fn live(capture: i64, paths: usize) -> Case {
         };
         match &event {
             ServerEvent::Planets { planets } if truth.is_empty() => truth = planets.clone(),
+            ServerEvent::Planets { planets } if epoch_wanted.is_some() => {
+                if *planets != truth {
+                    if Some(epoch) == epoch_wanted {
+                        break;
+                    }
+                    epoch += 1;
+                    truth = planets.clone();
+                    seen.clear();
+                }
+            }
             // Only the first map epoch.
             ServerEvent::Planets { .. } => break,
-            ServerEvent::ShotFin { .. } if !truth.is_empty() && seen.len() < paths => {
+            ServerEvent::ShotFin { .. }
+                if !truth.is_empty()
+                    && seen.len() < paths
+                    && epoch_wanted.is_none_or(|e| e == epoch) =>
+            {
                 let obs = ShotObservation::try_from(&event).unwrap();
                 if !seen.contains(&obs) {
                     seen.push(obs);
@@ -111,7 +132,10 @@ fn live(capture: i64, paths: usize) -> Case {
         }
     }
     Case {
-        name: format!("live {capture} paths={}", seen.len()),
+        name: match epoch_wanted {
+            Some(e) => format!("live {capture}e{e} paths={}", seen.len()),
+            None => format!("live {capture} paths={}", seen.len()),
+        },
         truth,
         shots: seen.into_iter().map(exact_shot).collect(),
     }
