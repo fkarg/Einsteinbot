@@ -1462,3 +1462,24 @@ The single-path false alarms are a 0.21 spike on the correct 28-planet synthetic
 **Reading and limits (inferred).** The correction measures what the map at the cap leaves unexplained along the paths; a planet the cap excludes leaves planet-scale pull (0.1-3) wherever a path passes it, a complete map leaves rounding-scale pull (<= 0.015). The same signal would fire on a misplaced or missing planet with a correct count at the cap; no such case appeared in the 20 negatives (none had a spurious planet at its last checkpoint, but per-path map errors at the cap were not scored), and the live negatives are only nine maps with a margin of a factor 2. The peer review (Codex) rated this the main open point: the signal measures "the map at its cap leaves planet-sized pull", which is the cap being too low or the map being wrong. The wording of the warning says "may have more planets" for that reason. In the 935 at-cap paths of the positives the correction was never gated off, so the gate did not hide a missing planet here. A planet no path passes near is not detected (it also does not matter for those paths). Not tested: more than 28 planets, the default cap 32 actually binding (no world has more than 32), live play, the audit (off by default).
 
 Reproduction: `cargo test --release --lib diagnose_replay -- --ignored --nocapture --test-threads=1` with `THREADS=2 CEIL_MS=0` and `SEEDS=<seed> KS=<k> LIVE=- PATHS=96 CHECKPOINTS=32,64,96 PLANETS=<n>` or `CAP=<n>`, or `SEEDS= LIVE=<capture> EPOCH=<e> PATHS=120 CHECKPOINTS=32,64,96,120 PLANETS=<n>`; `UPD` lines carry `cap=`, `limited=` and `gate=`. Signals 1 and 2: the same at 79d0f78 (`UPD` `gain=`, `chi2r=`, `lag1=`). Compute: jolly 53 CPU-minutes (49 design + 12 held-out runs), Mac about 10 CPU-minutes.
+
+### Fixes results (2026-11-28, branch `fixes` from main 5bb1823; `search.rs`, `mod.rs`, `fit.rs`, `live_map.rs`, `tui.rs`; harnesses `diagnose_replay` (`PREEMPT`) and `diagnose_full_event_planet` (`CONTACTS`, `CEIL_MS`, `QUAL` lines))
+
+**Pre-emption (observed; jolly, one process at a time pinned to 10 cores, load 2-5 from the replay itself; capture 55 epoch 0 at 110 ms per path, all 545 paths, no audit; two alternating runs each).** Before = main 5bb1823, after = the pre-emption commit.
+
+| | median lag | p90 | worst | max queued | rec2/spur at n = 16, 32, 64, 128, 545 |
+|---|---|---|---|---|---|
+| before | 70 / 61 ms | 176 / 175 ms | 278 / 293 ms | 2 / 2 | 7/0, 12/2 (11/2), 16/0, 24/0, 24/0 |
+| after | 30 / 31 ms | 81 / 93 ms | 148 / 164 ms | 1 / 1 | 7/0, 10/0, 16/0, 24/0, 24/0 |
+
+Deterministic replay (capture 55 epoch 0, 128 paths, `CEIL_MS=0`, 2 threads): identical `QUAL` lines before and after (nothing sets the flag there). The remaining worst lag is inferred, not traced per path: the serial model-error estimate (`LATE` noise max 97 ms in both builds) and the covariance step of the full-row refit (`SLOW` lines show evidence about 140 ms of a 232 ms polish), which is not pre-empted once started.
+
+**Contact term (observed; full event path with recorded players, so contacts are classified; `CEIL_MS=0`, 2 threads, deterministic, one run each; captures 33, 40, 55 to 128 paths, 45 to 62 and 48 to 48, their whole first epochs).** Almost every path ends in a contact there (15 of 16 at n = 16). Old = the gated term (full pull to 15 units, tapering to zero at 40); off = no contact rows; new = the robust one-sided surface likelihood (uniform penetration on `[-allowance, 0]` convolved with sd 0.25, mixed with a background of relative density 1e-5, so the cost is bounded at about 23 and monotone; the flat map pays that per contact). rec2 / spurious summed over the five captures:
+
+| | n = 16 | n = 32 | n = 64 or the end | n = 128 (3 captures) |
+|---|---|---|---|---|
+| off | 42 / 0 | 81 / 6 | 104 / 4 | 72 / 0 |
+| old | 46 / 0 | 79 / 5 | 106 / 5 | 72 / 0 |
+| new | 46 / 0 | 80 / 3 | 106 / 6 | 72 / 0 |
+
+Explored field RMSE at n = 32, off / old / new: 33 0.051 / 0.111 / 0.051, 40 0.055 / 0.062 / 0.062, 45 2.9e-4 / 3.1e-4 / 2.9e-4, 48 0.053 / 0.053 / 0.022, 55 0.027 / 0.053 / 0.021. At 128 paths all three find 24/24 with explored RMSE within 10% (chi2 ratio vs truth: 33 24 / 25 / 20, 40 7.1 / 6.6 / 6.9, 55 28 / 8.9 / 25). Reading: the old term was neutral to slightly helpful on recall and hurt the 32-path field on two captures; the new one keeps the recall at 16 and 64 paths and has the lowest field error at 32 on four of five captures. One run each; differences of 1-2 planets are within the spread of search order. The deterministic replays of `diagnose_replay` carry no contacts and are unchanged.

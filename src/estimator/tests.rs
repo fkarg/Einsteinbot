@@ -489,11 +489,54 @@ fn cancellation_returns_no_belief() {
     );
 }
 
+// The contact term is a proper robust likelihood: zero on the penetration allowance, growing
+// monotonically with the distance from it on either side, and flat at the unexplained cost far
+// away (no pull and no push: before, it rose to 15 units and fell back to zero at 40, pushing
+// planets away from contacts in between). The flat map pays the unexplained cost per contact.
 #[test]
-fn contacts_beyond_the_gate_exert_no_pull() {
-    assert_eq!(fit::contact_residual(50.0, 0.5), 0.0);
-    assert_eq!(fit::contact_residual(-50.0, 0.5), 0.0);
-    assert!(fit::contact_residual(2.0, 0.5).abs() > 1.0);
+fn a_contact_costs_more_the_farther_it_lies_from_the_surface_up_to_a_bound() {
+    let (allowance, cap) = (0.6, fit::unexplained_contact());
+    assert!(fit::contact_residual(-allowance / 2.0, allowance).abs() < 1e-6);
+    assert!(
+        fit::contact_residual(-0.1, allowance).abs() < 1.0,
+        "inside the allowance"
+    );
+    let mut last = 0.0;
+    for step in 1..=400 {
+        let d = step as f64 * 0.05;
+        let (outside, inside) = (
+            fit::contact_residual(d, allowance),
+            fit::contact_residual(-allowance - d, allowance),
+        );
+        assert!(outside > 0.0 && inside < 0.0);
+        assert!(
+            outside >= last - 1e-9 && outside <= cap + 1e-9,
+            "{d}: {outside}"
+        );
+        assert!(
+            (inside + outside).abs() < 1e-6,
+            "symmetric about the allowance"
+        );
+        last = outside;
+    }
+    assert!(fit::contact_residual(0.5, allowance) > 0.5 * cap);
+    assert!((fit::contact_residual(20.0, allowance) - cap).abs() < 1e-6);
+    let (truth, event) = (contact_truth(), contact_event());
+    let shots = [shot_with_contact(&event, &[Point { x: 0.0, y: 0.0 }])];
+    let cancelled = AtomicBool::new(false);
+    let joint = Fit::new(&shots, WorldParameters::default(), &cancelled, true, vec![]);
+    let trajectory = Fit::new(
+        &shots,
+        WorldParameters::default(),
+        &cancelled,
+        false,
+        vec![],
+    );
+    let flat = joint.chi2(&[]).unwrap() - trajectory.chi2(&[]).unwrap();
+    assert!((flat - cap * cap).abs() < 1e-3, "{flat}");
+    let on = fit::theta_of(&truth.planets[0]);
+    let on_surface = joint.chi2(&[on]).unwrap() - trajectory.chi2(&[on]).unwrap();
+    assert!(on_surface < 1.0, "{on_surface}");
 }
 
 // Two separate hits are two planets, and each contact is explained by its own planet's surface.

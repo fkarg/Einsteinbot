@@ -16,9 +16,11 @@
 //! (`audit`) rebuilds the map from scratch (`rebuild`) and replaces the maintained map only when
 //! its evidence on all rows is higher.
 //!
-//! Surface contacts (`contacts`) are extra evidence only: a gated surface constraint on the
-//! joint fit that never creates a planet. Contact terms enter only planet-bearing models; the
-//! flat model has none. Oracle planets are never an input.
+//! Surface contacts (`contacts`) are extra evidence only: a robust surface likelihood in the
+//! joint fit (a contact lies on the surface of the planet it hit within its penetration
+//! allowance, or comes from a planet the map does not hold) that never creates a planet. Every
+//! map, the flat one included, carries one term per contact, so maps are compared on the same
+//! contacts. Oracle planets are never an input.
 mod audit;
 mod contacts;
 mod eval;
@@ -41,7 +43,7 @@ use crate::protocol::{Point, ServerEvent};
 use crate::simulation::{ShotObservation, WorldParameters};
 use crate::strategy::MapBelief;
 use audit::{Audit, Stage};
-use fit::{CONTACT_FULL, Evidence, Fit, planet_at};
+use fit::{CONTACT_MATCH, Evidence, Fit, planet_at};
 use noise::{ModelError, Noise, TickMask};
 use search::{Search, Slice};
 use std::collections::BTreeMap;
@@ -712,8 +714,8 @@ impl Estimator {
                 belief.contact_points.push(contact.point.clone());
             }
         }
-        // Contacts beyond the full-strength range of every planet surface are not fully
-        // explained by the map (a model mismatch, or planets this slice does not model).
+        // Contacts farther than `CONTACT_MATCH` from every planet surface: no found planet near
+        // them (a planet not found yet, or a model mismatch).
         belief.unmatched_contacts = belief
             .contact_points
             .iter()
@@ -722,7 +724,7 @@ impl Estimator {
                     ((f64::from(point.x) - planet.x).hypot(f64::from(point.y) - planet.y)
                         - planet.radius)
                         .abs()
-                        <= CONTACT_FULL
+                        <= CONTACT_MATCH
                 })
             })
             .count();

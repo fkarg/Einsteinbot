@@ -189,7 +189,7 @@ Planets are born only from trajectory evidence ([`src/estimator/search.rs`](src/
 4. **Adopt on evidence.** Keep the best one if the evidence rises.
 5. **Death trial.** Drop a weak planet, refit, and compare.
 
-Surface contacts enter the fits as gated constraints but never create a planet. An observed tick inside a planet disk is penalized.
+Surface contacts enter the fits as a bounded likelihood (on the hit planet's surface within one substep, or from a planet not found yet) but never create a planet. An observed tick inside a planet disk is penalized.
 
 Maps obey the generator's geometry (NewtonWars `initPlanets`). Every centre lies at least its radius inside the battlefield; the fit's coordinates enforce that. No two planets overlap, because the generator redraws a planet until it touches no other. The fit penalizes any overlap from touching on and never steps to an overlap of 5 units or more. Seeds, candidates and adopted maps that overlap that much are rejected; the 5 units allow for estimation error.
 

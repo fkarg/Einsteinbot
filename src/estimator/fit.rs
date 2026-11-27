@@ -31,14 +31,19 @@ const PENALTY_SIGMA: f64 = 0.5;
 /// error while excluding concentric or deeply nested splits. The fit's overlap penalty starts at
 /// touching (the generator's rule itself), so fits are pushed apart well before this bound.
 const OVERLAP_TOLERANCE: f64 = 5.0;
-const MIN_CONTACT_SIGMA: f64 = 0.25;
-/// A contact constrains the planet only near its surface: full weight within `CONTACT_FULL`,
-/// tapering smoothly to nothing at `CONTACT_GATE`. Farther contacts stay unexplained, so a
-/// contact cannot drag the fit. Heuristic: the gate exceeds the trajectory-only position
-/// uncertainty of a hit.
-const CONTACT_GATE: f64 = 40.0;
-/// A contact within this distance of a surface is fully constrained by it.
-pub(super) const CONTACT_FULL: f64 = 15.0;
+/// Slack of a contact's signed surface distance beyond its penetration allowance (f32 positions,
+/// substep geometry), as a Gaussian sd in world units.
+const CONTACT_SIGMA: f64 = 0.25;
+/// Density of a contact that comes from a source the map does not hold (a planet not found yet,
+/// anywhere in the arena) relative to one on a found planet's surface. Order of magnitude only:
+/// the surface band of a planet (circumference about 190 times a band of about 0.5) against the
+/// arena (about 1.6e6 square units), times the odds that the hit planet is not in the map
+/// (assumed about 1). A contact that no surface explains costs `2 ln(1 + 1 / CONTACT_BACKGROUND)`
+/// (about 23) whatever the map, so it neither drags nor repels planets.
+const CONTACT_BACKGROUND: f64 = 1e-5;
+/// Contacts farther than this from the surface of every planet are reported as unmatched (a
+/// coarse "no found planet near it" count for the belief, not part of the likelihood).
+pub(super) const CONTACT_MATCH: f64 = 15.0;
 /// Radius range of the local generator (an assumption about the server, not protocol fact).
 const RADIUS_RANGE: (f64, f64) = (20.0, 40.0);
 /// Mass is tied to the radius cubed, as the local generator does: `mass = 0.1 * radius^3`.
@@ -60,6 +65,10 @@ const REDUCTION_GROUPS: usize = 16;
 /// (Occam term near 0) free, and the flat-world test grows five such planets in a corner
 /// (P13, `docs/estimator-experiments.md`); a planet must be born from trajectory evidence.
 const PLANET_PRIOR_ODDS: f64 = 20.0;
+
+/// Diagnosis switch: fits leave the contact rows out (measures the contact term's effect).
+#[cfg(test)]
+pub(super) static CONTACTS_OFF: AtomicBool = AtomicBool::new(false);
 
 pub(super) fn planet_at(theta: [f64; 3]) -> Planet {
     Planet {
@@ -101,16 +110,43 @@ fn surface_error(theta: &[f64; 3], point: &Point) -> f64 {
     (f64::from(point.x) - theta[0]).hypot(f64::from(point.y) - theta[1]) - theta[2]
 }
 
-/// Normalized residual of a terminal contact whose signed distance outside the planet surface is
-/// `signed`. The projectile stops at the first substep inside the disk, so the true penetration is
-/// roughly uniform in `[-allowance, 0]`: centre there, with the matching standard deviation (never
-/// below `MIN_CONTACT_SIGMA`). The pull tapers to nothing between `CONTACT_FULL` and
-/// `CONTACT_GATE`, so a disagreeing contact is left unexplained instead of dragging the fit.
+/// Complementary error function (Numerical Recipes `erfcc`, relative error below 1.2e-7).
+fn erfc(x: f64) -> f64 {
+    let z = x.abs();
+    let t = 1.0 / (1.0 + 0.5 * z);
+    let poly = -z * z - 1.26551223
+        + t * (1.00002368
+            + t * (0.37409196
+                + t * (0.09678418
+                    + t * (-0.18628806
+                        + t * (0.27886807
+                            + t * (-1.13520398
+                                + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277))))))));
+    let value = t * poly.exp();
+    if x >= 0.0 { value } else { 2.0 - value }
+}
+
+/// Signed residual of a terminal contact whose signed distance outside the nearest planet surface
+/// is `signed`, from its log-likelihood. The projectile stops at the first substep inside the
+/// disk, so on the surface of the planet it hit the distance is uniform in `[-allowance, 0]`, plus
+/// a Gaussian slack `CONTACT_SIGMA` (one-sided: penetration, never a gap). The contact may also
+/// come from a planet the map does not hold (`CONTACT_BACKGROUND`). The residual is
+/// `sqrt(-2 ln)` of that mixture relative to its best value: zero on the allowance, growing with
+/// the distance from it, and flat at `unexplained_contact()` once the background dominates (a
+/// proper robust likelihood: monotone, bounded, no pull from far contacts).
 pub(super) fn contact_residual(signed: f64, allowance: f64) -> f64 {
-    let error = signed + allowance / 2.0;
-    let t = ((error.abs() - CONTACT_FULL) / (CONTACT_GATE - CONTACT_FULL)).clamp(0.0, 1.0);
-    let sigma = (allowance / 12f64.sqrt()).max(MIN_CONTACT_SIGMA);
-    error * (1.0 - t * t * (3.0 - 2.0 * t)) / sigma
+    let normal_cdf = |z: f64| 0.5 * erfc(-z / std::f64::consts::SQRT_2);
+    let on_surface =
+        |s: f64| normal_cdf((s + allowance) / CONTACT_SIGMA) - normal_cdf(s / CONTACT_SIGMA);
+    let relative = (on_surface(signed) / on_surface(-allowance / 2.0)).clamp(0.0, 1.0);
+    let cost = 2.0 * ((1.0 / CONTACT_BACKGROUND).ln_1p() - (relative / CONTACT_BACKGROUND).ln_1p());
+    cost.max(0.0).sqrt().copysign(signed + allowance / 2.0)
+}
+
+/// The residual of a contact that no planet of the map explains (also every contact of the flat
+/// map, so that maps with and without planets are compared on the same contacts).
+pub(super) fn unexplained_contact() -> f64 {
+    (2.0 * (1.0 / CONTACT_BACKGROUND).ln_1p()).sqrt()
 }
 
 /// Acceleration at one observed tick that the model leaves unexplained.
@@ -332,14 +368,18 @@ impl<'a> Fit<'a> {
         (res, jacobian)
     }
 
-    /// One gated surface term per contact (none without planets or with contacts off), with
-    /// their Jacobian (column-major) if wanted.
+    /// One surface-likelihood term per contact (none with contacts off; the flat map's are all
+    /// `unexplained_contact()`), with their Jacobian (column-major) if wanted.
     fn contact_rows(
         &self,
         theta: &[[f64; 3]],
         want_jacobian: bool,
     ) -> (Vec<f64>, Option<Vec<f64>>) {
-        let contacts: Vec<_> = if self.use_contacts && !theta.is_empty() {
+        #[cfg(test)]
+        let use_contacts = self.use_contacts && !CONTACTS_OFF.load(Ordering::Relaxed);
+        #[cfg(not(test))]
+        let use_contacts = self.use_contacts;
+        let contacts: Vec<_> = if use_contacts {
             self.shots
                 .iter()
                 .filter_map(|shot| shot.contact.as_ref())
@@ -350,9 +390,13 @@ impl<'a> Fit<'a> {
         let rows = contacts.len();
         let mut res = vec![0.0; rows];
         let mut jacobian = want_jacobian.then(|| vec![0.0; rows * 3 * theta.len()]);
+        if theta.is_empty() {
+            res.fill(unexplained_contact());
+            return (res, jacobian);
+        }
         for (row, contact) in contacts.into_iter().enumerate() {
-            // Each contact constrains only the planet whose surface it is closest to, so
-            // overlapping planets are never double counted.
+            // Each contact is explained by at most the planet whose surface it is closest to
+            // (the mixture's dominant term; planets never overlap), so none is double counted.
             let (j, signed) = theta
                 .iter()
                 .enumerate()
