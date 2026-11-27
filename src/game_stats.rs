@@ -2,7 +2,7 @@
 //! recent map epoch (`MapRecord`, printed at once), then each recent map's estimate after a short
 //! settle (`Settled`), scored against the disclosed planets when the server sent them
 //! (`sendplanets 1`). Truth is used here only to score, never as estimator input.
-use crate::estimator::{CountLimit, EstimatorSummary, UpdateReport};
+use crate::estimator::{CountLimit, EstimatorSummary, LearnedCount, UpdateReport};
 use crate::field_score::score_field;
 use crate::map::PlanetMap;
 use crate::protocol::{Planet, Point, ServerEvent};
@@ -396,6 +396,33 @@ fn summary_lines(out: &mut String, style: Style, summary: &EstimatorSummary) {
             optional(summary.rho0, 0),
         ),
     );
+    if let Some(learned) = &summary.learned {
+        line(out, style, "count", &learned_line(learned));
+    }
+}
+
+/// The dynamic planet count (P25, `--learn-planets`) in words: the count in use and its latest
+/// changes.
+pub fn learned_line(learned: &LearnedCount) -> String {
+    let changes: Vec<String> = learned
+        .changes
+        .iter()
+        .rev()
+        .take(3)
+        .rev()
+        .map(|c| format!("{}→{} map {} path {}", c.from, c.to, c.map, c.at_path))
+        .collect();
+    let mut text = format!("learned {} (start {})", learned.planets, learned.start);
+    if !changes.is_empty() {
+        let skipped = learned.changes.len() - changes.len();
+        let _ = write!(
+            text,
+            ": {}{}",
+            if skipped > 0 { "… " } else { "" },
+            changes.join(", ")
+        );
+    }
+    text
 }
 
 fn tally_lines(out: &mut String, style: Style, epoch: u64, sessions: &[SessionTally]) {
@@ -706,5 +733,35 @@ mod tests {
         let mut out = String::new();
         belief_lines(&mut out, Style(false), &belief);
         assert!(out.contains("WARNING at cap 24 with planet-sized residuals since path 57"));
+    }
+
+    #[test]
+    fn the_learned_count_is_reported_with_its_latest_changes() {
+        let mut summary = Estimator::new(Settings {
+            learn_planets: true,
+            ..Settings::default()
+        })
+        .summary();
+        let mut out = String::new();
+        summary_lines(&mut out, Style(false), &summary);
+        assert!(out.contains("learned 24 (start 24)\n"), "{out}");
+        let learned = summary.learned.as_mut().unwrap();
+        for (from, to) in [(24, 25), (25, 26), (26, 27), (27, 28)] {
+            learned.changes.push(crate::estimator::CountChange {
+                from,
+                to,
+                map: 1,
+                at_path: 40,
+            });
+        }
+        learned.planets = 28;
+        assert_eq!(
+            learned_line(learned),
+            "learned 28 (start 24): … 25→26 map 1 path 40, 26→27 map 1 path 40, 27→28 map 1 path 40"
+        );
+        // Without the dynamic mode there is no count line.
+        let mut out = String::new();
+        summary_lines(&mut out, Style(false), &Estimator::default().summary());
+        assert!(!out.contains("learned"));
     }
 }

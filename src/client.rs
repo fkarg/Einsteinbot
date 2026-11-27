@@ -68,6 +68,7 @@ pub fn run(config: &AppConfig) -> ClientResult<()> {
         config.targeting && !config.dummy && !config.oracle_map_for_policy,
         Settings {
             planets: config.planets,
+            learn_planets: config.learn_planets,
             ..Settings::default()
         },
     );
@@ -1364,6 +1365,7 @@ mod tests {
             clients: 3,
             db_path: "unused.sqlite".into(),
             planets: None,
+            learn_planets: false,
             tui: false,
         };
         let names = (0..config.clients)

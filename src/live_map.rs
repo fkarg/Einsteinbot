@@ -163,6 +163,7 @@ impl LiveMap {
                              retired: &mut VecDeque<(u64, Estimator)>,
                              epoch| {
                 let old = std::mem::replace(estimator, Estimator::new(settings.clone()));
+                estimator.carry_count(&old);
                 retired.push_back((*estimator_epoch, old));
                 if retired.len() >= RECENT_MAPS {
                     retired.pop_front();
