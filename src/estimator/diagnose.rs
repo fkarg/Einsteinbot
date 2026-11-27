@@ -322,3 +322,137 @@ fn diagnose_residual_correlation() {
         }
     }
 }
+
+/// Falsification test of a physics-derived model-error term (review F1, tier A): the field of
+/// the unfound planets as an Ornstein-Uhlenbeck process along each path, its variance from
+/// Campbell's theorem for `N_u` unseen planets uniform on the admissible region U (outside found
+/// planets' exclusion disks and the 20-unit no-hit tube around observed ticks) and its length
+/// the distance to U. Prints chi2/row and lag-1 autocorrelation of the Kalman innovations for the
+/// true map (N_u = 0) and the true map minus `DROP` central planets (N_u = DROP).
+#[test]
+#[ignore]
+fn diagnose_campbell_model_error() {
+    let drop: usize = std::env::var("DROP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
+    let world = WorldParameters::default();
+    // E[m^2] for r ~ U[20, 40], m = r^3 / 10.
+    let e_m2 = (40f64.powi(7) - 20f64.powi(7)) / (7.0 * 20.0) / 100.0;
+    let (w, h) = (world.battlefield_width, world.battlefield_height);
+    let diagonal = w.hypot(h);
+    for case in cases() {
+        let truth = theta_of_planets(&case.truth);
+        let c = [w / 2.0, h / 2.0];
+        let mut order: Vec<usize> = (0..truth.len()).collect();
+        order.sort_by(|&a, &b| {
+            (truth[a][0] - c[0])
+                .hypot(truth[a][1] - c[1])
+                .total_cmp(&(truth[b][0] - c[0]).hypot(truth[b][1] - c[1]))
+        });
+        let partial: Vec<[f64; 3]> = order[drop..].iter().map(|&i| truth[i]).collect();
+        let ticks: Vec<[f64; 2]> = case
+            .shots
+            .iter()
+            .filter_map(|s| s.path.as_ref())
+            .flat_map(|p| p.ticks.iter().copied())
+            .collect();
+        let cancelled = AtomicBool::new(false);
+        let fit = Fit::new(&case.shots, world, &cancelled, false, Vec::new());
+        for (label, theta, unseen) in [("true", &truth, 0usize), ("missing", &partial, drop)] {
+            // Admissible centres of an unseen planet on a 10-unit raster.
+            let found: Vec<Planet> = theta.iter().map(|t| planet_at(*t)).collect();
+            let mut admissible: Vec<[f64; 2]> = Vec::new();
+            let mut y = 25.0;
+            while y < h - 20.0 {
+                let mut x = 25.0;
+                while x < w - 20.0 {
+                    let free = found
+                        .iter()
+                        .all(|p| (p.x - x).hypot(p.y - y) > p.radius + 20.0)
+                        && ticks.iter().all(|t| (t[0] - x).hypot(t[1] - y) > 20.0);
+                    if free {
+                        admissible.push([x, y]);
+                    }
+                    x += 10.0;
+                }
+                y += 10.0;
+            }
+            let area = admissible.len() as f64 * 100.0;
+            let lambda = if area > 0.0 {
+                unseen as f64 / area
+            } else {
+                0.0
+            };
+            let (mut chi2, mut rows, mut num, mut den) = (0.0, 0usize, 0.0, 0.0);
+            for (i, shot) in case.shots.iter().enumerate() {
+                let Some(path) = &shot.path else { continue };
+                let n = path.row_count();
+                let field = fit.field(i, path, theta);
+                let ones = vec![1.0; path.nodes.len()];
+                let mut scale = vec![0.0; n];
+                path.apply(&ones, &mut scale, 0..n);
+                let centers: Vec<[f64; 2]> = (0..n).map(|r| path.center(r)).collect();
+                let distance: Vec<f64> = centers
+                    .iter()
+                    .map(|p| {
+                        admissible
+                            .iter()
+                            .map(|a| (a[0] - p[0]).hypot(a[1] - p[1]))
+                            .fold(f64::INFINITY, f64::min)
+                            .max(20.0)
+                    })
+                    .collect();
+                let sigma2: Vec<f64> = (0..n)
+                    .map(|r| {
+                        let d = distance[r];
+                        let v = lambda
+                            * e_m2
+                            * std::f64::consts::FRAC_PI_2
+                            * (1.0 / (d * d) - 1.0 / (diagonal * diagonal));
+                        scale[r] * scale[r] * v.max(0.0)
+                    })
+                    .collect();
+                for axis in 0..2 {
+                    let mut raw = vec![0.0; n];
+                    path.raw_residual(axis, &field[axis], &mut raw);
+                    let (mut u, mut p) = (0.0, sigma2[0]);
+                    let mut innovations = Vec::with_capacity(n);
+                    for r in 0..n {
+                        if r > 0 {
+                            let s = (centers[r][0] - centers[r - 1][0])
+                                .hypot(centers[r][1] - centers[r - 1][1]);
+                            let phi = (-s / distance[r]).exp();
+                            let a = if sigma2[r - 1] > 0.0 {
+                                phi * (sigma2[r] / sigma2[r - 1]).sqrt()
+                            } else {
+                                0.0
+                            };
+                            u *= a;
+                            p = a * a * p + (1.0 - phi * phi) * sigma2[r];
+                        }
+                        let s = p + path.floor_variance(axis, r);
+                        let nu = raw[r] - u;
+                        innovations.push(nu / s.sqrt());
+                        let k = p / s;
+                        u += k * nu;
+                        p *= 1.0 - k;
+                    }
+                    for pair in innovations.windows(2) {
+                        num += pair[0] * pair[1];
+                    }
+                    let ss: f64 = innovations.iter().map(|v| v * v).sum();
+                    den += ss;
+                    chi2 += ss;
+                    rows += n;
+                }
+            }
+            println!(
+                "CAMPBELL case={:?} map={label} unseen={unseen} admissible_area={area:.0} rows={rows} chi2_per_row={:.3e} lag1={:.3}",
+                case.name,
+                chi2 / rows as f64,
+                num / den
+            );
+        }
+    }
+}

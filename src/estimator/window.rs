@@ -250,6 +250,14 @@ impl PathData {
         self.y[0].len()
     }
 
+    /// Marginal measurement-noise variance (f32 rounding, interpolation and any relative term) of
+    /// row `r` on `axis`.
+    #[cfg(test)]
+    pub fn floor_variance(&self, axis: usize, r: usize) -> f64 {
+        let w = &self.whitener[axis];
+        w.diagonal[r].powi(2) + w.first[r].powi(2) + w.second[r].powi(2)
+    }
+
     /// Position on the path at the centre of row `r`.
     pub fn center(&self, r: usize) -> V2 {
         self.centers.as_ref().map_or(self.ticks[r + 1], |c| c[r])
