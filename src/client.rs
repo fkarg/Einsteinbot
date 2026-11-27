@@ -1,9 +1,10 @@
 use crate::config::AppConfig;
 use crate::dummy::commands_for_energy;
 use crate::estimator::UpdateReport;
-use crate::event_store::{CaptureMetadata, EventLog};
+use crate::event_store::{CaptureMetadata, ClosedCapture, EventLog};
 use crate::live_map::{LiveMap, MapProgress};
 use crate::map::PlanetMap;
+use crate::map_change::{BoardChange, BoardModeDetector, BoundarySource, MapChangeDetector};
 use crate::protocol::{ClientCommand, EventParser, RecordedEvent, ServerEvent};
 use crate::rate_limit::ByteRateLimiter;
 use crate::strategy::{BotState, MapBelief, TargetingPolicy, TargetingSettings};
@@ -46,7 +47,7 @@ pub fn run(config: &AppConfig) -> ClientResult<()> {
         names.join(", ")
     );
     let event_log = if config.record {
-        Some(Arc::new(Mutex::new(EventLog::create(
+        Some(Arc::new(Mutex::new(EventLog::create_session(
             &config.db_path,
             &CaptureMetadata {
                 started_at_unix_ms: now_unix_ms()?,
@@ -99,6 +100,7 @@ pub fn run(config: &AppConfig) -> ClientResult<()> {
         log.lock()
             .map_err(|_| "event log mutex poisoned")?
             .finish(now_unix_ms()?)
+            .map(|closed| closed.iter().for_each(report_closed_capture))
     } else {
         Ok(())
     };
@@ -210,6 +212,12 @@ fn run_session(
     let mut last_energy_request = Instant::now();
     let mut buffer = [0u8; 4096];
     let mut pending_energy: Option<PendingEnergy> = None;
+    let mut map_change = MapChangeDetector::default();
+    let mut board = BoardModeDetector::default();
+    // The first session records shared world events and owns the map fit and capture rollover;
+    // every session detects boundaries itself for its own targeting state and firing pause.
+    let canonical = bot_index == 0;
+    let feeds_map = targeting && !dummy && !oracle_map_for_policy && canonical;
     'session: loop {
         if !running.load(Ordering::SeqCst) {
             break;
@@ -225,7 +233,35 @@ fn run_session(
                         break 'session;
                     }
                     println!("{}", event_summary(&event));
+                    let now_ms = now_unix_ms()?;
+                    let boundary = map_change.observe(&event);
+                    if let Some(change) = board.observe(&event, now_ms) {
+                        report_board_change(&event_log, name, now_ms, change, "shot_finished")?;
+                    }
                     bot_state.observe(&event);
+                    if let Some(source) = boundary {
+                        // Shots, coverage and the belief of the old map no longer apply.
+                        bot_state.start_new_map();
+                        oracle_belief = None;
+                        if let Some(change) = board.new_map() {
+                            report_board_change(&event_log, name, now_ms, change, "new_map")?;
+                        }
+                        eprintln!("{name}: map boundary ({}): new map", source.as_str());
+                        if canonical {
+                            start_next_map(
+                                feeds_map,
+                                map_feed,
+                                &bot_state,
+                                &event_log,
+                                now_ms,
+                                source,
+                                map_change.boundary_positions(),
+                            )?;
+                            if let Some(pending) = &mut pending_energy {
+                                pending.last_map_event = Instant::now();
+                            }
+                        }
+                    }
                     if oracle_map_for_policy {
                         if let ServerEvent::Planets { planets } = &event {
                             oracle_belief = Some(MapBelief::new(
@@ -237,33 +273,17 @@ fn run_session(
                             bot_state.set_map_belief(oracle_belief.clone());
                         }
                     }
-                    if targeting && !dummy && !oracle_map_for_policy && bot_index == 0 {
-                        match &event {
-                            ServerEvent::Planets { .. } => {
-                                map_feed.reset();
-                                // Upstream can send our new position before Planets. Carry
-                                // the tracked snapshot across the epoch's queue invalidation.
-                                for (player_id, position) in bot_state.player_positions() {
-                                    map_feed.observe(&ServerEvent::PlayerPosition {
-                                        player_id: *player_id,
-                                        x: position.x,
-                                        y: position.y,
-                                    })?;
-                                }
-                                if let Some(pending) = &mut pending_energy {
-                                    pending.last_map_event = Instant::now();
-                                }
-                                eprintln!("LiveMap reset: new map epoch");
-                            }
+                    if feeds_map
+                        && matches!(
+                            event,
                             ServerEvent::ShotFin { .. }
-                            | ServerEvent::PlayerPosition { .. }
-                            | ServerEvent::PlayerLeave { .. } => {
-                                map_feed.observe(&event)?;
-                                if let Some(pending) = &mut pending_energy {
-                                    pending.last_map_event = Instant::now();
-                                }
-                            }
-                            _ => {}
+                                | ServerEvent::PlayerPosition { .. }
+                                | ServerEvent::PlayerLeave { .. }
+                        )
+                    {
+                        map_feed.observe(&event)?;
+                        if let Some(pending) = &mut pending_energy {
+                            pending.last_map_event = Instant::now();
                         }
                     }
                     if should_record_event(bot_index, &event) {
@@ -276,7 +296,10 @@ fn run_session(
                         )?;
                     }
                     if let ServerEvent::OwnEnergy { energy, .. } = event {
-                        let commands = if dummy {
+                        // On the end card the server simulates nothing: send no commands.
+                        let commands = if board.active() {
+                            None
+                        } else if dummy {
                             commands_for_energy(energy, &mut rand::rng())
                         } else if targeting && !oracle_map_for_policy {
                             let now = Instant::now();
@@ -340,6 +363,12 @@ fn run_session(
             Err(error) => return Err(error.into()),
         }
 
+        let now_ms = now_unix_ms()?;
+        if let Some(change) = board.poll(now_ms) {
+            report_board_change(&event_log, name, now_ms, change, "no_shot_finished")?;
+            pending_energy = None;
+        }
+
         if let Some(pending) = &pending_energy {
             let now = Instant::now();
             let progress = map_feed.progress();
@@ -397,6 +426,82 @@ fn run_session(
         stream.shutdown(Shutdown::Both)?;
     }
 
+    Ok(())
+}
+
+/// Map boundary on the canonical session: restart the live fit (keeping the tracked positions,
+/// which upstream may send before the boundary is recognized) and roll the capture over.
+fn start_next_map(
+    feeds_map: bool,
+    map_feed: &LiveMap,
+    bot_state: &BotState,
+    event_log: &Option<Arc<Mutex<EventLog>>>,
+    now_ms: i64,
+    source: BoundarySource,
+    new_map_positions: &[(u32, f32, f32)],
+) -> ClientResult<()> {
+    if feeds_map {
+        map_feed.reset();
+        for (player_id, position) in bot_state.player_positions() {
+            map_feed.observe(&ServerEvent::PlayerPosition {
+                player_id: *player_id,
+                x: position.x,
+                y: position.y,
+            })?;
+        }
+        eprintln!("LiveMap reset: new map epoch");
+    }
+    if let Some(log) = event_log {
+        let mut log = log.lock().map_err(|_| "event log mutex poisoned")?;
+        let closed = log.start_next_map(now_ms, source.as_str(), new_map_positions)?;
+        report_closed_capture(&closed);
+        eprintln!("Recording map in capture {}", log.capture_id());
+    }
+    Ok(())
+}
+
+fn report_closed_capture(closed: &ClosedCapture) {
+    if closed.kept {
+        eprintln!(
+            "Closed capture {} ({} completed paths)",
+            closed.capture_id, closed.completed_paths
+        );
+    } else {
+        eprintln!(
+            "Deleted capture {}: {} completed paths, fewer than {}",
+            closed.capture_id,
+            closed.completed_paths,
+            crate::event_store::MIN_COMPLETED_PATHS
+        );
+    }
+}
+
+fn report_board_change(
+    event_log: &Option<Arc<Mutex<EventLog>>>,
+    name: &str,
+    now_ms: i64,
+    change: BoardChange,
+    reason: &str,
+) -> ClientResult<()> {
+    let active = change == BoardChange::Entered;
+    eprintln!(
+        "{name}: {} ({reason})",
+        if active {
+            "board mode: pausing commands"
+        } else {
+            "board mode over: resuming"
+        }
+    );
+    if let Some(log) = event_log {
+        log.lock()
+            .map_err(|_| "event log mutex poisoned")?
+            .append_diagnostic(
+                now_ms,
+                name,
+                "board_mode",
+                &serde_json::json!({"active": active, "reason": reason}),
+            )?;
+    }
     Ok(())
 }
 
@@ -855,6 +960,191 @@ mod tests {
         );
         client.join().unwrap();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn end_card_pauses_commands_and_a_new_map_starts_a_new_capture() {
+        use std::io::{BufRead, BufReader};
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+        fn frame(words: &[[u8; 4]]) -> Vec<u8> {
+            words.concat()
+        }
+        let u = |value: u32| value.to_ne_bytes();
+        let f = |value: f32| value.to_ne_bytes();
+        let position = move |id, x, y| frame(&[u(3), u(id), f(x), f(y)]);
+        let energy = move || [u(8).to_vec(), u(1).to_vec(), 8f64.to_ne_bytes().to_vec()].concat();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (lines_tx, lines_rx) = mpsc::channel::<String>();
+        let (phase_tx, phase_rx) = mpsc::channel::<&str>();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.write_all(b"welcome> ").unwrap();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            socket.write_all(b"> ").unwrap();
+            std::thread::spawn(move || {
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    if lines_tx.send(line).is_err() {
+                        break;
+                    }
+                }
+            });
+            let mut frames = frame(&[u(1), u(1)]);
+            frames.extend(position(1, 100.0, 100.0));
+            frames.extend(position(2, 300.0, 300.0));
+            for _ in 0..3 {
+                // ShotFin of player 2 ending far from everyone.
+                frames.extend(frame(&[u(6), u(2)]));
+                frames.extend([0f64.to_ne_bytes(), 5f64.to_ne_bytes()].concat());
+                frames.extend(frame(&[u(1), f(900.0), f(900.0)]));
+            }
+            for _ in 0..3 {
+                frames.extend(frame(&[u(5), u(2)]));
+                frames.extend([0f64.to_ne_bytes(), 5f64.to_ne_bytes()].concat());
+            }
+            socket.write_all(&frames).unwrap();
+            // No shot finishes any more: the end card.
+            let quiet = crate::map_change::BOARD_QUIET_MS as u64 + 400;
+            std::thread::sleep(Duration::from_millis(quiet));
+            phase_tx.send("end card").unwrap();
+            socket.write_all(&energy()).unwrap();
+            std::thread::sleep(Duration::from_millis(400));
+            phase_tx.send("new map").unwrap();
+            let mut burst = position(1, 500.0, 500.0);
+            burst.extend(position(2, 700.0, 100.0));
+            socket.write_all(&burst).unwrap();
+            socket.write_all(&energy()).unwrap();
+            std::thread::sleep(Duration::from_millis(600));
+            socket
+        });
+        let path = std::env::temp_dir().join(format!(
+            "einsteinbot-end-card-{}-{}.sqlite",
+            std::process::id(),
+            now_unix_ms().unwrap()
+        ));
+        let log = Arc::new(Mutex::new(
+            EventLog::create_session(
+                &path,
+                &CaptureMetadata {
+                    started_at_unix_ms: 1,
+                    process_id: 42,
+                    host: "localhost".into(),
+                    port: 3490,
+                    client_name: "Einstein".into(),
+                    protocol_version: 8,
+                },
+            )
+            .unwrap(),
+        ));
+        let first_capture = log.lock().unwrap().capture_id();
+        let running = Arc::new(AtomicBool::new(true));
+        let worker_running = Arc::clone(&running);
+        let worker_log = Arc::clone(&log);
+        let client = std::thread::spawn(move || {
+            let (feed, _) = LiveMap::spawn(false);
+            let mut socket = TcpStream::connect(address).unwrap();
+            run_session(
+                &mut socket,
+                "Einstein",
+                0,
+                true,
+                false,
+                false,
+                &worker_running,
+                Some(worker_log),
+                &feed,
+            )
+        });
+        assert_eq!(
+            phase_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "end card"
+        );
+        assert_eq!(
+            phase_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "new map"
+        );
+        let _socket = server.join().unwrap();
+        running.store(false, Ordering::SeqCst);
+        client.join().unwrap().unwrap();
+        let lines: Vec<String> = lines_rx.try_iter().collect();
+        let commands: Vec<&str> = lines
+            .iter()
+            .map(|line| line.trim())
+            .filter(|line| *line != "u" && !line.starts_with("b "))
+            .collect();
+        // One velocity + angle pair, sent after the new map's energy, none on the end card.
+        assert_eq!(commands.len(), 2, "{lines:?}");
+        assert!(commands[0].starts_with("v "));
+
+        let db = rusqlite::Connection::open(&path).unwrap();
+        let second_capture = log.lock().unwrap().capture_id();
+        assert_ne!(second_capture, first_capture);
+        let count = |capture: i64, kind: &str| -> i64 {
+            db.query_row(
+                "SELECT COUNT(*) FROM events WHERE capture_id = ?1 AND event_type = ?2",
+                rusqlite::params![capture, kind],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(count(first_capture, "set_velocity"), 0);
+        assert_eq!(count(second_capture, "set_velocity"), 1);
+        assert_eq!(count(first_capture, "shot_fin"), 3);
+        let board: String = db
+            .query_row(
+                "SELECT data_json FROM diagnostics WHERE capture_id = ?1 AND kind = 'board_mode'",
+                [first_capture],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&board).unwrap()["active"],
+            true
+        );
+        let metadata: String = db
+            .query_row(
+                "SELECT metadata_json FROM captures WHERE id = ?1",
+                [second_capture],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let metadata: serde_json::Value = serde_json::from_str(&metadata).unwrap();
+        assert_eq!(
+            metadata["map"]["boundary_source"],
+            "all_players_repositioned"
+        );
+        assert_eq!(metadata["session"]["map_index"], 1);
+        // The new capture starts with the new map's positions, not the old map's.
+        let initial: Vec<String> = db
+            .prepare(
+                "SELECT event_json FROM events WHERE capture_id = ?1 AND event_type = 'player_position' ORDER BY sequence LIMIT 2",
+            )
+            .unwrap()
+            .query_map([second_capture], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let initial: Vec<(f64, f64)> = initial
+            .iter()
+            .map(|text| {
+                let event: serde_json::Value = serde_json::from_str(text).unwrap();
+                (
+                    event["event"]["x"].as_f64().unwrap(),
+                    event["event"]["y"].as_f64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(initial, [(500.0, 500.0), (700.0, 100.0)]);
+        drop(db);
+        drop(log);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

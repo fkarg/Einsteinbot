@@ -26,7 +26,7 @@
   async function fillCaptureSelect(){
     setStatus('Loading captures…');
     const data=await api('/api/captures'); const select=$('capture'); select.replaceChildren();
-    for(const c of data.captures){const option=document.createElement('option');option.value=c.id;const date=new Date(c.started_at_unix_ms).toLocaleString();const kind=c.metadata?.host==='synthetic-scenario'?'scenario':'live',revision=c.metadata?.build?.git_revision,older=kind==='scenario'&&data.captures.some(o=>o.metadata?.host==='synthetic-scenario'&&o.metadata?.client_name===c.metadata?.client_name&&o.id>c.id);option.textContent=`#${c.id} · ${kind}${older?' (older revision)':''} · ${c.metadata?.client_name||'capture'}${revision?` · ${revision.slice(0,8)}`:''} · ${date}`;select.append(option);}
+    for(const c of data.captures){const option=document.createElement('option');option.value=c.id;const date=new Date(c.started_at_unix_ms).toLocaleString();const kind=c.metadata?.host==='synthetic-scenario'?'scenario':'live',revision=c.metadata?.build?.git_revision,older=kind==='scenario'&&data.captures.some(o=>o.metadata?.host==='synthetic-scenario'&&o.metadata?.client_name===c.metadata?.client_name&&o.id>c.id),session=c.metadata?.session;option.textContent=`#${c.id} · ${kind}${older?' (older revision)':''} · ${c.metadata?.client_name||'capture'}${session?` · map ${session.map_index} of session ${session.id}`:''}${revision?` · ${revision.slice(0,8)}`:''} · ${date}`;select.append(option);}
     if(!data.captures.length){setStatus('No captures in this database');return false;}
     setStatus('');return true;
   }
@@ -290,12 +290,12 @@
   // ---- Captures overview: the landing table, one row per capture, sortable, with global metrics ----
   let overviewRows=[],overviewSort={key:'id',dir:-1};
   const overviewValue={
-    id:r=>r.id,kind:r=>r.kind,name:r=>r.name,decisions:r=>r.decisions,shots:r=>r.shots,
+    id:r=>r.id,kind:r=>r.kind,name:r=>r.name,map:r=>r.session?.map_index,decisions:r=>r.decisions,shots:r=>r.shots,
     estimated:r=>r.last?.planets,disclosed:r=>r.last?.accuracy?.actual_planets,missing:r=>r.last?.accuracy?.missing_planets,
     missingShare:r=>r.last?.accuracy?r.last.accuracy.missing_planets/Math.max(1,r.last.accuracy.actual_planets):null,
     centerError:r=>r.last?.accuracy?.median_center_error,search:r=>r.last?.search_state,
   };
-  const overviewColumns=[['id','#'],['kind','kind'],['name','name'],['decisions','decisions'],['shots','shots'],['estimated','est. planets'],['disclosed','truth'],['missing','missing'],['missingShare','missing %'],['centerError','median center err'],['search','search']];
+  const overviewColumns=[['id','#'],['kind','kind'],['name','name'],['map','map'],['decisions','decisions'],['shots','shots'],['estimated','est. planets'],['disclosed','truth'],['missing','missing'],['missingShare','missing %'],['centerError','median center err'],['search','search']];
   function middle(values){const a=values.filter(Number.isFinite).sort((x,y)=>x-y);if(!a.length)return null;const m=a.length>>1;return a.length%2?a[m]:(a[m-1]+a[m])/2;}
   async function loadOverview(){try{overviewRows=(await api('/api/overview')).captures;renderOverview();}catch(e){setStatus(e.message);}}
   function renderOverview(){
@@ -317,8 +317,8 @@
     table.append(head);
     for(const r of rows){
       const a=r.last?.accuracy,tr=document.createElement('tr');tr.className='row';
-      tr.title=`${new Date(r.started_at_unix_ms).toLocaleString()}${r.revision?` · ${r.revision.slice(0,8)}`:''}${r.last?.stage?` · ${r.last.stage}`:''}`;
-      const cells=[r.id,r.kind,r.name,r.decisions,r.shots,r.last?.planets??'—',a?.actual_planets??'—',a?.missing_planets??'—',a?pct(a.missing_planets/Math.max(1,a.actual_planets)):'—',a&&a.median_center_error!=null?fmt(a.median_center_error,1):'—',r.last?.search_state?.replaceAll('_',' ')??'—'];
+      tr.title=`${new Date(r.started_at_unix_ms).toLocaleString()}${r.session?` · session ${r.session.id}`:''}${r.revision?` · ${r.revision.slice(0,8)}`:''}${r.last?.stage?` · ${r.last.stage}`:''}`;
+      const cells=[r.id,r.kind,r.name,r.session?.map_index??'—',r.decisions,r.shots,r.last?.planets??'—',a?.actual_planets??'—',a?.missing_planets??'—',a?pct(a.missing_planets/Math.max(1,a.actual_planets)):'—',a&&a.median_center_error!=null?fmt(a.median_center_error,1):'—',r.last?.search_state?.replaceAll('_',' ')??'—'];
       for(const c of cells){const td=document.createElement('td');td.textContent=String(c);tr.append(td);}
       tr.addEventListener('click',()=>openCapture(r.id));table.append(tr);
     }

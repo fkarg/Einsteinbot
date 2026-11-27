@@ -11,5 +11,6 @@ pub mod simulation;
 pub mod strategy;
 
 mod live_map;
+pub mod map_change;
 
 pub mod field_score;
