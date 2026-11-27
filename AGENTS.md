@@ -48,6 +48,10 @@ See [`docs/brainstorms/2026-11-13-newtonwars-bot.md`](docs/brainstorms/2026-11-1
 
 Estimator/targeting work and the map inspector are developed by separate concurrent sessions. [`docs/coordination/viewer-estimator-contract.md`](docs/coordination/viewer-estimator-contract.md) is their shared protocol (file ownership, claims on shared files, additive diagnostics, the viewer/estimator data contract and open requests). Read it before touching diagnostics, the viewer, or scenario code, and stage explicit paths only when committing.
 
+## Map inspector
+
+- Prefer visual representations (layers, glyphs, timeline strips, bars) over additional tables, text or numbers; add text only where a visual cannot carry the information (user policy, 2026-11-27).
+
 ## Keeping this file current
 
 Update this file when project goals, settled architecture, development workflow, or durable conventions change. Keep transient discussion and unresolved design exploration in the linked session state; promote settled, lasting decisions here when useful.
