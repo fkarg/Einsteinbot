@@ -184,6 +184,9 @@ pub struct TruthScore {
     /// (`field_score`); `None` when unavailable.
     pub field_explored: Option<f64>,
     pub field_unexplored: Option<f64>,
+    /// The same RMSE for a flat (planet-free) map: the scale the field errors are judged on.
+    pub flat_explored: Option<f64>,
+    pub flat_unexplored: Option<f64>,
 }
 
 pub fn score(map: &PlanetMap, truth: &[Planet], observations: &[ShotObservation]) -> TruthScore {
@@ -209,6 +212,14 @@ pub fn score(map: &PlanetMap, truth: &[Planet], observations: &[ShotObservation]
         observations,
         WorldParameters::default(),
     );
+    let flat = score_field(
+        &PlanetMap {
+            planets: truth.to_vec(),
+        },
+        &MapBelief::new(PlanetMap { planets: vec![] }, None),
+        observations,
+        WorldParameters::default(),
+    );
     let rmse = |stats: Option<&crate::field_score::FieldStats>| stats.and_then(|s| s.vector_rmse);
     TruthScore {
         true_count: truth.len(),
@@ -229,64 +240,106 @@ pub fn score(map: &PlanetMap, truth: &[Planet], observations: &[ShotObservation]
         ),
         field_explored: field.as_ref().and_then(|f| rmse(f.explored.as_ref())),
         field_unexplored: field.as_ref().and_then(|f| rmse(f.unexplored.as_ref())),
+        flat_explored: flat.as_ref().and_then(|f| rmse(f.explored.as_ref())),
+        flat_unexplored: flat.as_ref().and_then(|f| rmse(f.unexplored.as_ref())),
     }
 }
 
 fn optional(value: Option<f64>, digits: usize) -> String {
-    value.map_or_else(|| "unavailable".to_owned(), |v| format!("{v:.digits$}"))
+    value.map_or_else(|| "n/a".to_owned(), |v| format!("{v:.digits$}"))
 }
 
-/// Per-planet centre sd (square root of the x and y variances summed), from the covariance.
-fn centre_sds(belief: &MapBelief) -> Option<Vec<f64>> {
-    let covariance = belief.parameter_covariance.as_ref()?;
-    Some(
-        (0..belief.map.planets.len())
-            .map(|i| (covariance[(3 * i, 3 * i)] + covariance[(3 * i + 1, 3 * i + 1)]).sqrt())
-            .collect(),
-    )
+/// A share as a whole percentage, `n/a` without a denominator.
+fn percent(part: f64, whole: f64) -> String {
+    if whole > 0.0 {
+        format!("{:.0}%", 100.0 * part / whole)
+    } else {
+        "n/a".to_owned()
+    }
 }
 
-fn belief_lines(out: &mut String, belief: &MapBelief) {
-    match centre_sds(belief) {
-        Some(sds) => {
-            let list: Vec<String> = sds.iter().map(|sd| format!("{sd:.2}")).collect();
-            let _ = writeln!(
-                out,
-                "    covariance: available; centre sd [{}]",
-                list.join(" ")
-            );
-        }
-        None => {
-            let _ = writeln!(
-                out,
-                "    covariance: unavailable ({})",
-                belief
-                    .covariance_unavailable_reason
-                    .map_or("no reason recorded".to_owned(), |r| format!("{r:?}"))
-            );
+/// ANSI styling for the stop report: on only when stderr is a terminal and `NO_COLOR` is unset.
+#[derive(Clone, Copy)]
+struct Style(bool);
+
+impl Style {
+    fn detect() -> Self {
+        use std::io::IsTerminal;
+        Style(std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none())
+    }
+    fn paint(self, code: &str, text: &str) -> String {
+        if self.0 {
+            format!("\x1b[{code}m{text}\x1b[0m")
+        } else {
+            text.to_owned()
         }
     }
-    match (
+    fn title(self, text: &str) -> String {
+        self.paint("1;36", text)
+    }
+    fn label(self, text: &str) -> String {
+        self.paint("2", &format!("{text:<9}"))
+    }
+    fn good(self, text: &str) -> String {
+        self.paint("32", text)
+    }
+    fn warn(self, text: &str) -> String {
+        self.paint("1;33", text)
+    }
+}
+
+/// One labelled, indented report line.
+fn line(out: &mut String, style: Style, label: &str, text: &str) {
+    let _ = writeln!(out, "  {} {text}", style.label(label));
+}
+
+/// Median and maximum per-planet centre sd (square root of the x and y variances summed).
+fn centre_sds(belief: &MapBelief) -> Option<(f64, f64)> {
+    let covariance = belief.parameter_covariance.as_ref()?;
+    let mut sds: Vec<f64> = (0..belief.map.planets.len())
+        .map(|i| (covariance[(3 * i, 3 * i)] + covariance[(3 * i + 1, 3 * i + 1)]).sqrt())
+        .collect();
+    sds.sort_by(f64::total_cmp);
+    Some((*sds.get(sds.len() / 2)?, *sds.last()?))
+}
+
+fn belief_lines(out: &mut String, style: Style, belief: &MapBelief) {
+    let covariance = match centre_sds(belief) {
+        Some((median, max)) => format!("centre sd median {median:.2}, max {max:.2}"),
+        None => format!(
+            "covariance n/a ({})",
+            belief
+                .covariance_unavailable_reason
+                .map_or("no reason".to_owned(), |r| format!("{r:?}"))
+        ),
+    };
+    let correction = match (
         &belief.residual_correction,
         belief.residual_correction_unavailable_reason,
     ) {
-        (Some(correction), _) => {
-            let _ = writeln!(
-                out,
-                "    residual correction: applied (max {:.2e}, {} rows, length {:.0})",
-                correction.max_magnitude, correction.rows, correction.length
-            );
-        }
-        (None, reason) => {
-            let _ = writeln!(
-                out,
-                "    residual correction: not applied ({})",
-                reason.map_or("no reason recorded".to_owned(), |r| format!("{r:?}"))
-            );
-        }
-    }
-    if let Some(line) = belief.count_limit.as_ref().and_then(count_limit_line) {
-        let _ = writeln!(out, "    {line}");
+        (Some(c), _) => format!("correction on (max {:.1e})", c.max_magnitude),
+        (None, reason) => format!(
+            "correction off ({})",
+            reason.map_or("no reason".to_owned(), |r| format!("{r:?}"))
+        ),
+    };
+    line(
+        out,
+        style,
+        "certainty",
+        &format!("{covariance} · {correction}"),
+    );
+    if let Some(text) = belief.count_limit.as_ref().and_then(count_limit_line) {
+        let text = if belief
+            .count_limit
+            .as_ref()
+            .is_some_and(|l| l.detected_at_path.is_some())
+        {
+            style.warn(&text)
+        } else {
+            text
+        };
+        line(out, style, "count", &text);
     }
 }
 
@@ -294,13 +347,10 @@ fn belief_lines(out: &mut String, belief: &MapBelief) {
 pub fn count_limit_line(limit: &CountLimit) -> Option<String> {
     match (limit.at_cap, limit.detected_at_path) {
         (_, Some(path)) => Some(format!(
-            "WARNING planet count limited: the map is at its cap of {} and still leaves planet-sized residuals (since path {path}); the map may have more planets than that; consider a larger --planets",
+            "WARNING at cap {} with planet-sized residuals since path {path}: maybe more planets (larger --planets)",
             limit.cap
         )),
-        (true, None) => Some(format!(
-            "planet cap {} reached; no sign of more planets so far",
-            limit.cap
-        )),
+        (true, None) => Some(format!("at cap {}; no sign of more planets", limit.cap)),
         (false, None) => None,
     }
 }
@@ -315,45 +365,60 @@ pub fn search_state(summary: &EstimatorSummary) -> String {
     }
 }
 
-fn summary_line(out: &mut String, summary: &EstimatorSummary) {
-    let _ = writeln!(
+fn summary_lines(out: &mut String, style: Style, summary: &EstimatorSummary) {
+    let count = summary
+        .model
+        .total_planets
+        .map_or("from prior".to_owned(), |n| format!("fixed {n}"));
+    line(
         out,
-        "    estimator: K={} paths={} searched={} search={} model s*100={:.3} l={:.0} white={:.1e} N_u={:.2} rho0={} expected total={:.1} ({})",
-        summary.planets,
-        summary.paths,
-        summary.searched,
-        search_state(summary),
-        summary.model.scale * 100.0,
-        summary.model.length,
-        summary.model.white,
-        summary.unseen,
-        optional(summary.rho0, 0),
-        summary.expected_total,
-        summary
-            .model
-            .total_planets
-            .map_or("count from the prior".to_owned(), |n| format!(
-                "count fixed at {n}"
-            ))
+        style,
+        "map",
+        &format!(
+            "{} planets · {} of {} paths searched · search {}",
+            summary.planets,
+            summary.searched,
+            summary.paths,
+            search_state(summary)
+        ),
+    );
+    line(
+        out,
+        style,
+        "model",
+        &format!(
+            "unseen {:.1} of ≈{:.0} ({count}) · noise s {:.3} l {:.0} white {:.0e} · ρ0 {}",
+            summary.unseen,
+            summary.expected_total,
+            summary.model.scale * 100.0,
+            summary.model.length,
+            summary.model.white,
+            optional(summary.rho0, 0),
+        ),
     );
 }
 
-fn tally_line(out: &mut String, epoch: u64, sessions: &[SessionTally]) {
+fn tally_lines(out: &mut String, style: Style, epoch: u64, sessions: &[SessionTally]) {
     for session in sessions {
         let Some(tally) = session.games.get(&epoch) else {
             continue;
         };
-        let _ = writeln!(
+        let rate = percent(f64::from(tally.hits), f64::from(tally.shots));
+        let per_energy = optional(
+            (tally.energy > 0.0).then(|| 100.0 * f64::from(tally.hits) / tally.energy),
+            1,
+        );
+        line(
             out,
-            "    {}: shots={} hits={} energy={:.0} hits/100 energy={}",
-            session.name,
-            tally.shots,
-            tally.hits,
-            tally.energy,
-            optional(
-                (tally.energy > 0.0).then(|| 100.0 * f64::from(tally.hits) / tally.energy),
-                2
-            )
+            style,
+            &session.name,
+            &format!(
+                "{} hit rate ({}/{}) · {} hits per 100 energy",
+                style.good(&rate),
+                tally.hits,
+                tally.shots,
+                per_energy
+            ),
         );
     }
 }
@@ -373,62 +438,59 @@ pub fn recent_epochs(maps: &[MapRecord], sessions: &[SessionTally]) -> Vec<u64> 
 
 /// Everything in memory about the recent map epochs, printed before any settling.
 pub fn immediate_report(maps: &[MapRecord], sessions: &[SessionTally]) -> String {
+    let style = Style::detect();
     let mut out = String::new();
     for epoch in recent_epochs(maps, sessions) {
         let map = maps.iter().find(|m| m.epoch == epoch);
-        let _ = writeln!(
-            out,
-            "map {epoch} (in memory now){}",
-            map.and_then(|m| m.truth.as_ref())
-                .map_or(String::new(), |t| format!(
-                    ": {} planets disclosed",
-                    t.len()
-                ))
-        );
-        tally_line(&mut out, epoch, sessions);
+        let mut title = format!("━ map {epoch} · now");
+        if let Some(capture) = map.and_then(|m| m.capture) {
+            let _ = write!(title, " · capture {capture}");
+        }
+        if let Some(truth) = map.and_then(|m| m.truth.as_ref()) {
+            let _ = write!(title, " · {} planets disclosed", truth.len());
+        }
+        let _ = writeln!(out, "{}", style.title(&title));
+        tally_lines(&mut out, style, epoch, sessions);
         let Some(map) = map else { continue };
         if let Some(summary) = &map.summary {
-            summary_line(&mut out, summary);
+            summary_lines(&mut out, style, summary);
         }
         match &map.belief {
-            Some(belief) => {
-                let _ = writeln!(
-                    out,
-                    "    published map: {} planets, search limit {}",
-                    belief.map.planets.len(),
-                    belief
-                        .search_limit
-                        .map_or("none".to_owned(), |l| format!("{l:?}"))
-                );
-                belief_lines(&mut out, belief);
-            }
-            None => {
-                let _ = writeln!(out, "    published map: none yet");
-            }
+            Some(belief) => belief_lines(&mut out, style, belief),
+            None => line(&mut out, style, "certainty", "no map published yet"),
         }
-        let _ = writeln!(
-            out,
-            "    map lag: {} paths queued; publish lag last {:.0} ms, max {:.0} ms over {} paths",
-            map.pending_paths, map.lag.last_ms, map.lag.max_ms, map.lag.paths
+        line(
+            &mut out,
+            style,
+            "lag",
+            &format!(
+                "{} queued · last {:.0} ms · max {:.0} ms over {} paths",
+                map.pending_paths, map.lag.last_ms, map.lag.max_ms, map.lag.paths
+            ),
         );
         if let Some(report) = &map.report {
+            let total: f64 = report.parts.iter().map(|p| p.total_ms).sum();
             let mut parts: Vec<_> = report.parts.iter().collect();
             parts.sort_by(|a, b| b.total_ms.total_cmp(&a.total_ms));
             let top: Vec<String> = parts
                 .iter()
-                .take(4)
-                .map(|p| format!("{} {:.0} ms", p.part.name(), p.total_ms))
+                .take(3)
+                .map(|p| format!("{} {}", p.part.name(), percent(p.total_ms, total)))
                 .collect();
-            let _ = writeln!(
-                out,
-                "    last update: {} evaluations; {}{}",
-                report.evaluations,
-                top.join(", "),
-                if report.violations.is_empty() {
-                    String::new()
-                } else {
-                    format!("; {} ceiling violations", report.violations.len())
-                }
+            let violations = if report.violations.is_empty() {
+                String::new()
+            } else {
+                style.warn(&format!(" · {} ceiling hits", report.violations.len()))
+            };
+            line(
+                &mut out,
+                style,
+                "update",
+                &format!(
+                    "{} evals · {}{violations}",
+                    report.evaluations,
+                    top.join(" · ")
+                ),
             );
         }
     }
@@ -437,45 +499,71 @@ pub fn immediate_report(maps: &[MapRecord], sessions: &[SessionTally]) -> String
 
 /// One map's settled estimate, scored against `truth` when the planets were disclosed.
 pub fn settled_report(settled: &Settled, truth: Option<&[Planet]>) -> String {
+    let style = Style::detect();
     let mut out = String::new();
+    let pending = if settled.summary.search_pending {
+        " · work still pending"
+    } else {
+        ""
+    };
     let _ = writeln!(
         out,
-        "map {} settled ({:.0} ms{}):",
-        settled.epoch,
-        settled.settle_ms,
-        if settled.summary.search_pending {
-            ", work still pending"
-        } else {
-            ""
-        }
+        "{}",
+        style.title(&format!(
+            "━ map {} · settled in {:.0} ms{pending}",
+            settled.epoch, settled.settle_ms
+        ))
     );
-    summary_line(&mut out, &settled.summary);
-    let _ = writeln!(
-        out,
-        "    planet count: {} found, estimate {} (expected total {:.1}){}",
-        settled.summary.planets,
-        settled.summary.likely_total,
-        settled.summary.expected_total,
-        truth.map_or(String::new(), |t| format!(", disclosed {}", t.len()))
+    summary_lines(&mut out, style, &settled.summary);
+    let disclosed = truth.map_or(String::new(), |t| format!(" · disclosed {}", t.len()));
+    line(
+        &mut out,
+        style,
+        "count",
+        &format!(
+            "{} found · likely {} in total{disclosed}",
+            settled.summary.planets, settled.summary.likely_total
+        ),
     );
     if let Some(belief) = &settled.belief {
-        belief_lines(&mut out, belief);
+        belief_lines(&mut out, style, belief);
         if let Some(truth) = truth {
             let s = score(&belief.map, truth, &settled.observations);
-            let _ = writeln!(
-                out,
-                "    vs disclosed: recall {}/{} within 2, {}/{} within 15, spurious {}, centre error {}, radius error {}, field RMSE explored {} unexplored {}",
-                s.recall2,
-                s.true_count,
-                s.recall15,
-                s.true_count,
-                s.spurious,
-                optional(s.centre_error, 2),
-                optional(s.radius_error, 2),
-                s.field_explored
-                    .map_or("unavailable".to_owned(), |v| format!("{v:.2e}")),
-                s.field_unexplored
-                    .map_or("unavailable".to_owned(), |v| format!("{v:.2e}")),
+            let n = s.true_count as f64;
+            line(
+                &mut out,
+                style,
+                "vs truth",
+                &format!(
+                    "found {} within 2 · {} within 15 · {} spurious",
+                    style.good(&percent(s.recall2 as f64, n)),
+                    percent(s.recall15 as f64, n),
+                    s.spurious
+                ),
+            );
+            line(
+                &mut out,
+                style,
+                "",
+                &format!(
+                    "centre error {} · radius error {}",
+                    optional(s.centre_error, 2),
+                    optional(s.radius_error, 2)
+                ),
+            );
+            let of_flat = |error: Option<f64>, flat: Option<f64>| match (error, flat) {
+                (Some(e), Some(f)) if f > 0.0 => format!("{:.2}%", 100.0 * e / f),
+                _ => "n/a".to_owned(),
+            };
+            line(
+                &mut out,
+                style,
+                "",
+                &format!(
+                    "field error vs flat: explored {} · unexplored {}",
+                    style.good(&of_flat(s.field_explored, s.flat_explored)),
+                    of_flat(s.field_unexplored, s.flat_unexplored)
+                ),
             );
         }
     }
@@ -582,10 +670,10 @@ mod tests {
         );
         let text = immediate_report(&maps, &[session]);
         assert!(!text.contains("map 1 "), "only the last {RECENT_MAPS} maps");
-        assert!(text.contains("map 2 (in memory now): 1 planets disclosed"));
-        assert!(text.contains("Curie: shots=3 hits=1 energy=50 hits/100 energy=2.00"));
-        assert!(text.contains("count fixed at 22"));
-        assert!(text.contains("covariance: unavailable (NotComputed)"));
+        assert!(text.contains("━ map 2 · now · 1 planets disclosed"));
+        assert!(text.contains("33% hit rate (1/3) · 2.0 hits per 100 energy"));
+        assert!(text.contains("(fixed 22)"));
+        assert!(text.contains("covariance n/a (NotComputed)"));
         let settled = Settled {
             epoch: 4,
             belief: maps[4].belief.clone(),
@@ -594,10 +682,8 @@ mod tests {
             settle_ms: 1000.0,
         };
         let text = settled_report(&settled, Some(&truth));
-        assert!(
-            text.contains("planet count: 0 found, estimate 22 (expected total 22.0), disclosed 1")
-        );
-        assert!(text.contains("recall 0/1 within 2, 0/1 within 15, spurious 0"));
+        assert!(text.contains("0 found · likely 22 in total · disclosed 1"));
+        assert!(text.contains("found 0% within 2 · 0% within 15 · 0 spurious"));
     }
 
     #[test]
@@ -612,14 +698,13 @@ mod tests {
         limit.at_cap = true;
         assert_eq!(
             count_limit_line(&limit).as_deref(),
-            Some("planet cap 24 reached; no sign of more planets so far")
+            Some("at cap 24; no sign of more planets")
         );
         limit.detected_at_path = Some(57);
         let mut belief = MapBelief::new(PlanetMap { planets: vec![] }, None);
         belief.count_limit = Some(limit);
         let mut out = String::new();
-        belief_lines(&mut out, &belief);
-        assert!(out.contains("WARNING planet count limited: the map is at its cap of 24"));
-        assert!(out.contains("(since path 57)"));
+        belief_lines(&mut out, Style(false), &belief);
+        assert!(out.contains("WARNING at cap 24 with planet-sized residuals since path 57"));
     }
 }
