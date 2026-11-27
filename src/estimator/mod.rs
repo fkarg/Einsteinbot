@@ -65,6 +65,11 @@ pub const DEFAULT_SLICE_CEILING: Duration = Duration::from_millis(250);
 pub const DEFAULT_SLICES_PER_PATH: usize = 6;
 /// Evaluations of the full-row refit of the published map.
 const POLISH_EVALUATIONS: u64 = 600;
+/// Once this many paths have arrived since the last completed full-row refit, the next refit goes
+/// before the search slices and is not pre-empted, so a steady stream of paths cannot starve the
+/// covariance and the count-limit warning (about a second at 9 paths per second). It delays at
+/// most one path by one refit at that interval.
+const POLISH_STARVED_PATHS: usize = 8;
 /// Count-limit warning (P23): a polished map at the planet cap whose residual correction still
 /// reaches this acceleration somewhere is evidence of a planet the cap leaves out. Measured: at
 /// most 0.015 (the third largest of five) on correct counts at the cap, at least 0.094 with two
@@ -249,6 +254,8 @@ pub struct Estimator {
     slices_left: usize,
     /// The published map has not been polished since the latest search change.
     polish_due: bool,
+    /// Paths given to the search since the last completed polish.
+    paths_since_polish: usize,
     /// Why the search has work left, if it has.
     limit: Option<SearchLimit>,
     pub settings: Settings,
@@ -306,6 +313,7 @@ impl Default for Estimator {
             belief: None,
             slices_left: 0,
             polish_due: false,
+            paths_since_polish: 0,
             limit: None,
             settings: Settings::default(),
             stats: Stats::default(),
@@ -407,6 +415,7 @@ impl Estimator {
             let slice = self.settings.slice(cancelled, &never, &self.stats, &noise);
             self.search.add_path(&self.shots[self.searched], &slice);
             self.searched += 1;
+            self.paths_since_polish += 1;
             if cancelled.load(Ordering::SeqCst) {
                 return None;
             }
@@ -511,7 +520,8 @@ impl Estimator {
                 return Some(belief);
             }
         }
-        if !self.search.idle() && self.slices_left > 0 {
+        let starved = self.polish_due && self.paths_since_polish >= POLISH_STARVED_PATHS;
+        if !starved && !self.search.idle() && self.slices_left > 0 {
             self.slices_left -= 1;
             let noise = self.noise();
             let slice = self.settings.slice(cancelled, preempt, &self.stats, &noise);
@@ -545,6 +555,8 @@ impl Estimator {
             let noise = self.noise();
             noise::apply(&mut self.shots, &noise);
             let far = started + Duration::from_secs(24 * 3600);
+            let never = AtomicBool::new(false);
+            let preempt = if starved { &never } else { preempt };
             let full = Fit::new(
                 &self.shots,
                 WorldParameters::default(),
@@ -579,6 +591,7 @@ impl Estimator {
                 (theta, evidence)
             };
             self.stats.add(Part::Polish, started.elapsed());
+            self.paths_since_polish = 0;
             return Some(self.publish(&theta, evidence, true));
         }
         None

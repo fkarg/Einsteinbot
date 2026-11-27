@@ -877,6 +877,44 @@ fn a_preempted_step_keeps_its_work_for_the_next_one() {
     assert!(fit(&never) != stopped);
 }
 
+// A steady stream of paths cannot starve the full-row refit: once `POLISH_STARVED_PATHS` paths
+// have arrived since the last one, the refit goes before the owed slices (and is not pre-empted).
+#[test]
+fn a_starved_full_row_refit_goes_before_the_slices() {
+    let truth = world_of(vec![planet(800.0, 500.0, 30.0)]);
+    let events: Vec<ServerEvent> = (0..8)
+        .map(|i| {
+            shot_in(
+                &truth,
+                (300.0 + 40.0 * i as f32, 200.0),
+                30.0 + 5.0 * i as f64,
+                6.0,
+            )
+        })
+        .collect();
+    let (mut estimator, cancelled) = estimator();
+    estimator.settings.slice_ceiling = None;
+    let polished = |belief: Option<MapBelief>| {
+        belief.is_some_and(|b| {
+            b.covariance_unavailable_reason != Some(CovarianceUnavailableReason::NotComputed)
+        })
+    };
+    estimator.observe(&events[0], &cancelled).unwrap();
+    assert!(!polished(estimator.step(&cancelled)), "a slice first");
+    for event in &events[1..] {
+        estimator.observe(event, &cancelled).unwrap();
+    }
+    assert!(estimator.slices_left > 0 && !estimator.search.idle());
+    assert!(
+        polished(estimator.step(&cancelled)),
+        "the starved refit first"
+    );
+    assert!(
+        !polished(estimator.step(&cancelled)),
+        "then the slices again"
+    );
+}
+
 // A slice exits promptly when cancelled, and a reset drops the pending work.
 #[test]
 fn a_cancelled_slice_stops_and_a_reset_drops_pending_work() {
