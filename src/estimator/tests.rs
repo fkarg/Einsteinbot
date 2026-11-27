@@ -21,7 +21,7 @@ impl ObserveSettled for Estimator {
     }
 }
 
-fn planet(x: f64, y: f64, radius: f64) -> Planet {
+pub(super) fn planet(x: f64, y: f64, radius: f64) -> Planet {
     Planet {
         x,
         y,
@@ -30,12 +30,17 @@ fn planet(x: f64, y: f64, radius: f64) -> Planet {
     }
 }
 
-fn world_of(planets: Vec<Planet>) -> PlanetMap {
+pub(super) fn world_of(planets: Vec<Planet>) -> PlanetMap {
     PlanetMap { planets }
 }
 
 /// A completed shot as the server would report it, simulated in `truth`.
-fn shot_in(truth: &PlanetMap, start: (f32, f32), angle: f64, velocity: f64) -> ServerEvent {
+pub(super) fn shot_in(
+    truth: &PlanetMap,
+    start: (f32, f32),
+    angle: f64,
+    velocity: f64,
+) -> ServerEvent {
     let shot = ShotObservation {
         player_id: 1,
         angle_degrees: angle,
@@ -187,7 +192,7 @@ fn one_planet_world_beats_flat_on_a_held_out_shot() {
     assert!(learned < flat / 2.0, "learned={learned} flat={flat}");
 }
 
-fn shot_with_contact(event: &ServerEvent, players: &[Point]) -> Shot {
+pub(super) fn shot_with_contact(event: &ServerEvent, players: &[Point]) -> Shot {
     let obs = shot_of(event);
     let contact = contacts::classify(&obs.points, players, WorldParameters::default());
     Shot::new(obs, contact, WorldParameters::default())
