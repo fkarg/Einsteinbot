@@ -14,22 +14,33 @@
     select,input,button { background:#172334; color:#e7edf6; border:1px solid #34445a; border-radius:5px; padding:6px 8px; font:inherit; }
     button { cursor:pointer; background:#21476a; border-color:#3976a6; }
     button:hover { background:#2b5d88; }
-    main { display:grid; grid-template-columns:minmax(0,1fr) 330px; min-height:calc(100vh - 56px); }
+    main { display:grid; grid-template-columns:minmax(0,1fr) 6px var(--side,400px); min-height:calc(100vh - 56px); }
+    #sideHandle { cursor:col-resize; background:#111a27; border-left:1px solid #263244; } #sideHandle:hover { background:#21476a; }
     .map-area { min-width:0; padding:12px; display:flex; flex-direction:column; gap:10px; }
     .toolbar { display:flex; flex-wrap:wrap; align-items:center; gap:12px; padding:8px 10px; background:#111a27; border:1px solid #263244; border-radius:7px; }
     .toolbar label { font-size:12px; }
     input[type=checkbox] { accent-color:#6ec8ff; }
     #map { width:100%; max-height:calc(100vh - 165px); aspect-ratio:1885/1060; background:#080d13; border:1px solid #263244; border-radius:5px; }
     .legend { display:flex; gap:14px; flex-wrap:wrap; color:#aab9cc; font-size:12px; align-items:center; }
-    .scale-legend { display:grid; grid-template-columns:auto minmax(120px,1fr) auto; align-items:center; gap:8px; color:#aab9cc; font:11px ui-monospace,monospace; }
+    .scale-legend { display:grid; grid-template-columns:auto minmax(120px,1fr) auto auto; align-items:center; gap:8px; color:#aab9cc; font:11px ui-monospace,monospace; }
+    .swatch { display:inline-block; width:16px; height:3px; vertical-align:middle; margin-right:5px; border-radius:2px; }
     .path-scale { display:none; }
-    .scale-bar { height:10px; border:1px solid #718198; border-radius:4px; background:linear-gradient(90deg,hsl(240 85% 56%),hsl(180 85% 56%),hsl(120 85% 56%),hsl(60 85% 56%),hsl(0 85% 56%)); }
+    .scale-bar { height:10px; border:1px solid #718198; border-radius:4px; background:linear-gradient(90deg,#440154,#3e4989,#26828e,#35b779,#fde725); }
     .dot { display:inline-block; width:9px;height:9px;border-radius:50%;margin-right:5px; }
-    aside { border-left:1px solid #263244; background:#0e1520; padding:14px; overflow:auto; max-height:calc(100vh - 56px); }
+    aside { background:#0e1520; padding:14px; overflow:auto; max-height:calc(100vh - 56px); min-width:0; }
     h2 { font-size:14px; margin:15px 0 7px; color:#d9e5f4; }
     h2:first-child { margin-top:0; }
-    .metrics { display:grid; grid-template-columns:1fr auto; gap:5px 10px; border:1px solid #263244; border-radius:6px; padding:9px; color:#9fb0c5; font-size:12px; }
-    .metrics b { color:#e7edf6; text-align:right; font-weight:600; }
+    .metrics { display:grid; grid-template-columns:max-content minmax(0,1fr); gap:5px 12px; border:1px solid #263244; border-radius:6px; padding:9px; color:#9fb0c5; font-size:12px; }
+    .metrics b { color:#e7edf6; text-align:right; font-weight:600; overflow-wrap:anywhere; }
+    .pills { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:8px; } .pill { border:1px solid; border-radius:10px; padding:1px 8px; font:12px ui-monospace,monospace; cursor:help; }
+    .glyphs { display:flex; flex-wrap:wrap; gap:2px; } .glyph { width:20px; height:20px; cursor:pointer; border-radius:4px; } .glyph:hover,.glyph.pinned { background:#1b2c42; } .glyph.pinned { outline:1px solid #ffe27a; }
+    .glyph-legend { display:grid; grid-template-columns:auto 1fr; gap:2px 8px; align-items:center; font:10px ui-monospace,monospace; color:#8799af; margin-top:6px; }
+    .glyph-legend .ramp { height:8px; border-radius:3px; background:linear-gradient(90deg,#3fd0c9,#f2d45c var(--tol),#ff4d6a); position:relative; margin:0 8px 12px 4px; }
+    .glyph-legend .ramp b { position:absolute; top:9px; transform:translateX(-50%); font-weight:400; }
+    .ubar-row { display:grid; grid-template-columns:34px 1fr 64px; gap:6px; align-items:center; font:11px ui-monospace,monospace; color:#9fb0c5; margin:3px 0; } .ubar-row span:last-child { text-align:right; }
+    .ubar { display:flex; height:14px; background:#111a27; border-radius:3px; overflow:hidden; } .ubar div { height:100%; min-width:1px; border-right:1px solid #0e1520; cursor:help; }
+    .ubar div.hit,.ulegend i.hit { box-shadow:inset 0 0 0 2px #ff2d55; } .ubar div.cut { width:14px; flex:none; background:repeating-linear-gradient(135deg,#ff9d4d 0 3px,transparent 3px 6px); }
+    .ulegend { display:flex; flex-wrap:wrap; gap:2px 10px; font:10px ui-monospace,monospace; color:#8799af; margin-top:4px; } .ulegend i { display:inline-block; width:9px; height:9px; margin-right:4px; vertical-align:-1px; }
     .controls { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
     .controls label { display:flex; flex-direction:column; align-items:stretch; font-size:12px; }
     .controls button { grid-column:1/-1; }
@@ -46,14 +57,14 @@
     .layergroups { display:flex; gap:12px; align-items:flex-end; } .lg { display:flex; flex-direction:column; gap:2px; } .lg small { font-size:10px; color:#7d8ea5; } .layer.unavailable { opacity:.5; } .layers { display:flex; } .layer { background:#172334; border-color:#34445a; border-radius:0; } .layer:first-child { border-radius:5px 0 0 5px; } .layer:last-child { border-radius:0 5px 5px 0; } .layer.active { background:#21476a; border-color:#ffe27a; color:#ffe27a; } .layer:disabled { opacity:.45; cursor:not-allowed; }
     details.explain ul { margin:6px 0; padding-left:18px; }
     .overview { padding:12px 16px; display:flex; flex-direction:column; gap:10px; max-width:1500px; } .overview .table th { cursor:pointer; user-select:none; } .overview .table th:nth-child(-n+3), .overview .table td:nth-child(-n+3) { text-align:left; }
-    .review table { margin-top:6px; } .review td.sw { width:14px; padding:0 4px 0 0; } .review .off { color:#6e7d91; } .review button { margin-top:6px; }
+    .review table { margin-top:6px; } .review .table th,.review .table td { white-space:normal; } .review td.sw { width:14px; padding:0 4px 0 0; } .review .off { color:#6e7d91; } .review button { margin-top:6px; }
     .scrubbar { display:flex; gap:6px; align-items:center; flex-wrap:wrap; } .scrubbar button { padding:3px 9px; }
-    #scrub { width:100%; height:118px; background:#080d13; border:1px solid #263244; border-radius:5px; cursor:ew-resize; touch-action:none; }
+    #scrub { width:100%; height:160px; background:#080d13; border:1px solid #263244; border-radius:5px; cursor:ew-resize; touch-action:none; }
     .table { width:100%; border-collapse:collapse; font:11px/1.4 ui-monospace,monospace; color:#b6c5d8; }
     .table th,.table td { text-align:right; border-bottom:1px solid #263244; padding:4px; }
     .table th,.table td { white-space:nowrap; padding:4px 3px; }
     .table th:first-child,.table td:first-child { text-align:left; }
-    @media(max-width:950px) { main { grid-template-columns:1fr; } aside { border-left:0;border-top:1px solid #263244;max-height:none; } #map { max-height:none; } }
+    @media(max-width:950px) { main { grid-template-columns:1fr; } #sideHandle { display:none; } aside { border-top:1px solid #263244;max-height:none; } #map { max-height:none; } }
   </style>
 </head>
 <body>
@@ -88,37 +99,41 @@
         </div>
         <label><input type="checkbox" id="beliefPlanets" checked> Estimated planets</label>
         <label id="actualPlanetsLabel"><input type="checkbox" id="actualPlanets" checked> Truth planets</label>
-        <label><input type="checkbox" id="paths"> Trajectories</label>
+        <label title="Every path of the current map epoch, coloured by its inferred outcome; older paths are fainter, the selected bot's are on top, paths newer than the belief are dashed."><input type="checkbox" id="paths" checked> Trajectories</label>
         <label><input type="checkbox" id="contacts"> Contacts</label>
         <label title="Places players were seen to appear in this map epoch (recorded by the bot; older captures lack them). Samples only: the set is incomplete and new spawns elsewhere are possible."><input type="checkbox" id="spawns"> Spawn samples</label>
         <label title="Dots at recorded path samples: observed path curvature minus the gravity of the fitted planets. A diagnostic that can include numerical noise; large clusters hint at a missing or misplaced planet."><input type="checkbox" id="pathResiduals"> Path residuals</label>
-        <label id="arrowsLabel" title="Arrows show the direction of the layer's vector: for Gravity belief the pull, for Belief error the belief's extra pull compared with truth (belief − truth). Colour still shows magnitude."><input type="checkbox" id="arrows" checked> Direction arrows</label>
-        <button id="zoomIn" type="button">Zoom in</button><button id="zoomOut" type="button">Zoom out</button><button id="resetView" type="button">Full map</button>
+        <button id="resetView" type="button" title="Scroll to zoom about the cursor, Shift+drag to pan, double-click for the full map">Full map</button>
       </div>
       <div id="tip"></div>
       <canvas id="map" width="1200" height="675" aria-label="Gravity and trajectory map"></canvas>
-      <div class="scale-legend"><span id="scaleMin">—</span><div class="scale-bar" id="scaleBar"></div><span id="scaleMax">—</span></div>
+      <div class="scale-legend"><span id="scaleMin">—</span><div class="scale-bar" id="scaleBar"></div><span id="scaleMax">—</span><span id="scaleUnit"></span></div>
       <div class="scale-legend path-scale" id="pathScale"><b>Path residual |r|</b><span id="pathMin">0</span><div class="scale-bar" id="pathScaleBar"></div><span id="pathMax">—</span></div>
       <div class="legend">
-        <span><i class="dot" style="background:#ffc45b"></i>estimated planet</span><span id="actualLegend"><i class="dot" style="background:#60dcff"></i>truth: close match <i class="dot" style="background:#ff9d4d"></i>center off <i class="dot" style="background:#e8d96d"></i>size off <i class="dot" style="background:#ff4d6a"></i>missing</span>
+        <span title="Outcome inferred from where each observed path ended">paths:</span><span><i class="swatch" style="background:#ff4d6a"></i>hit a player</span><span><i class="swatch" style="background:#ffb347"></i>planet surface</span><span><i class="swatch" style="background:#dfe6f0"></i>left the field</span><span><i class="swatch" style="background:#b98cff"></i>unknown</span>
+        <span>· <i class="dot" style="border:1.5px solid #f4f7ff"></i>estimated planet</span><span id="actualLegend" title="Truth is the planet list the server discloses with sendplanets 1: diagnosis only, never estimator input. Close: centre within 10 and radius within 5 units; missing: no estimate within 80 units."><i class="dot" style="border:1px solid #60dcff"></i>truth: close <i class="dot" style="border:1px solid #ff9d4d"></i>off <i class="dot" style="border:1px dashed #ff4d6a"></i>missing</span><span id="errorScale" style="color:#ff9d4d"></span>
       </div>
       <details class="explain"><summary>Help</summary>
         <ul>
-          <li><b>Gravity belief</b> is the field the bot simulates with: the gravity of the fitted planets. <b>Fit uncertainty</b> comes from the fit covariance; when it is missing the reason and fit size are shown. <b>Belief error</b> is belief minus truth and exists only when the capture has a truth map.</li>
-          <li><b>Truth</b> is the planet list the server discloses when it runs with <code>sendplanets 1</code>. It is diagnosis only and never an estimator input. <b>Direction arrows</b> point along the layer's vector (angles: 0° right, 90° down); for Belief error they point to where the belief pulls extra. Belief error colours are on a log scale. Hover shows a compact probe; click pins the full one. Dimmed layers say why they are unavailable.</li>
-          <li>Dark cells have no value for the layer (not zero gravity). Uncertainty comes from the fit covariance and ignores omitted planets and model error.</li>
-          <li>Truth planets are the game's own map, for diagnosis only. A truth planet is a <b>close match</b> when an estimate lies within 10 units and 5 units of radius; <b>center off</b> / <b>size off</b> exceed one threshold; <b>missing</b> has no estimate within 80 units. Pairs are one-to-one, closest first.</li>
-          <li>Spawn samples (blue squares) are positions where players were observed to appear in the current map epoch, as recorded by the bot. They are samples, not a complete set.</li>
-          <li>Contacts are path endpoints the estimator accepted as surface hits, not every collision.</li>
-          <li><b>Shot review</b> re-simulates the decision's chosen shot under the recorded belief and compares it with the shot that actually followed. Outcomes are read off the observed endpoint and are inferences, not server reports. The green timeline line is each decision's belief scored against the next 5 observed shots (median path error), which needs no truth map. Repairs change one planet of the belief to the truth one and re-simulate: a sensitivity, not proof of cause.</li>
-          <li>Faded dots are where a player stood before it moved. Scenario shots are labelled from what the scenario generator recorded: <b>training</b> shots build the baseline information, the <b>trial</b> shot is the policy's shot (muted versus bold lines).</li>
-          <li><b>Belief lag</b>: the estimator fits paths in the background (the live server produces several per second), so a decision can read a belief that has not seen the newest paths yet. “Lagged N paths” counts paths queued or being fitted when the decision read the belief; ≈ marks older captures where it is inferred from the recorded inputs. </li>
-          <li>The three strips under the timeline mark each decision: <b>belief lag</b> (pink: one path behind dim, two or more bright), <b>covariance</b> (gold: recorded, dim: not computed yet) and <b>search</b> (teal: work left, orange: a search slice hit its time ceiling, red: an update part exceeded its ceiling; dark: settled, planet cap, or not recorded).</li>
-          <li><b>Estimator update</b> lists the work of the update that published the belief (the latest path's local refit plus the search slices and full-row refit after it): calls and milliseconds per part. Orange rows exceeded their part ceiling; a time-cut search slice is reported as the search state.</li>
+          <li>Hover anything for numbers; click to pin it in Selection. Scroll zooms, Shift+drag pans, double-click shows the full map. Arrow keys step events, Shift+arrows decisions.</li>
+          <li>Timeline rows: planet counts, next-shot path error (log), events (decisions by bot, shot ends, red map resets), then per decision the belief lag (pink), covariance (gold; dim: not computed yet) and the estimator update's phase time (sqrt height; red cap: a part exceeded its ceiling, orange: a search slice was time-cut).</li>
+          <li>Outcomes, matches and repairs compare against truth for diagnosis only; distance is not cause.</li>
         </ul>
       </details>
     </section>
+    <div id="sideHandle" title="Drag to resize the sidebar"></div>
     <aside>
+      <h2>Captured belief</h2>
+      <div id="pills" class="pills"></div>
+      <div id="glyphs" class="glyphs"></div>
+      <div id="glyphLegend" class="glyph-legend" hidden title="One glyph per truth planet in truth order, then one violet diamond per estimate that matches no truth planet. Hover a glyph for the numbers; click it to select the planet.">
+        <span>fill: centre off</span><div class="ramp" style="--tol:54.6%"><b style="left:0">0</b><b style="left:54.6%">10</b><b style="left:100%">80</b></div>
+        <span>ring: radius off</span><div class="ramp" style="--tol:48.3%"><b style="left:0">0</b><b style="left:48.3%">5</b><b style="left:100%">40</b></div>
+        <span></span><span>units (log) · <span style="color:#ff4d6a">◌</span> missing · <span style="color:#c58cff">◇</span> extra estimate</span>
+      </div>
+      <div id="glyphNote" class="note"></div>
+      <div id="metrics" class="metrics"></div>
+      <h2>Estimator update</h2><div id="updateReport" class="review"></div>
       <h2>Selection</h2><div id="selection" class="metrics">Hover the map for a summary; click a planet, player, contact or trajectory to pin it.</div>
       <div id="decisionPanel" hidden>
         <h2>Decision</h2>
@@ -130,16 +145,17 @@
           <div id="reviewNote" class="note"></div>
           <div id="reviewRepairs"></div>
         </div>
-        <div id="degradePanel" class="review" hidden>
-          <h2>Degrade the truth map</h2>
-          <div class="note">Starts from perfect information, damages the map one way, lets the bot choose a shot on the damaged map, and flies it on the true map. The last column shows what the perfect-information shot itself would do if the damaged map were the real world.</div>
-          <div class="controls">
-            <label>Damage<select id="degradeKind"><option value="drop">Drop a planet near the path</option><option value="displace">Move the nearest planet</option><option value="resize">Resize the nearest planet</option><option value="phantom">Add a planet that is not there</option><option value="noise">Jitter every planet</option></select></label>
-            <button id="degradeRun" type="button">Run</button>
+        <details class="explain"><summary>Experiments</summary>
+          <div id="degradePanel" class="review" hidden>
+            <h2>Degrade the truth map</h2>
+            <div class="note">Starts from perfect information, damages the map one way, lets the bot choose a shot on the damaged map, and flies it on the true map. The last column shows what the perfect-information shot itself would do if the damaged map were the real world.</div>
+            <div class="controls">
+              <label>Damage<select id="degradeKind"><option value="drop">Drop a planet near the path</option><option value="displace">Move the nearest planet</option><option value="resize">Resize the nearest planet</option><option value="phantom">Add a planet that is not there</option><option value="noise">Jitter every planet</option></select></label>
+              <button id="degradeRun" type="button">Run</button>
+            </div>
+            <div id="degradeResult"></div>
           </div>
-          <div id="degradeResult"></div>
-        </div>
-        <details class="explain"><summary>Free simulation and audits</summary>
+          <h2>Free simulation and audits</h2>
           <div class="controls">
             <label>Gravity model<select id="model"><option value="belief">Recorded physical map</option><option value="actual">Truth map (actual)</option></select></label>
             <label>Velocity<input id="velocity" type="number" min="2" max="50" step="1" value="8"></label>
@@ -152,11 +168,6 @@
           <div id="comparison" class="metrics"></div>
         </details>
       </div>
-      <h2>Captured belief</h2>
-      <div id="metrics" class="metrics"></div>
-      <h2>Estimator update</h2><div id="updateReport" class="review"></div>
-      <div id="disclosedPanel"><h2>Truth planets</h2><div id="disclosedList"></div></div>
-      <h2>Estimated planets</h2><div id="planetList"></div>
     </aside>
   </main>
   <script src="/map_viewer.js"></script>
