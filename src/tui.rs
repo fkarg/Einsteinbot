@@ -23,7 +23,7 @@ use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -33,6 +33,9 @@ use std::time::{Duration, Instant};
 const REFRESH: Duration = Duration::from_millis(250);
 /// Events kept for the log area.
 const LOG_LINES: usize = 64;
+/// Size at which the run log is rotated (checked at start and on every redraw): it becomes
+/// `<log>.1`, replacing the previous one, and a new log is started. At most twice this is kept.
+const LOG_CAP: u64 = 32 << 20;
 
 /// The original stdout and stderr while the view is up (`None` otherwise).
 static SAVED: Mutex<Option<Saved>> = Mutex::new(None);
@@ -110,9 +113,50 @@ impl Drop for Tui {
     }
 }
 
-/// Start the view, sending stdout and stderr to `log_path` (appended) meanwhile.
+/// The rotated run log: `<log>.1`.
+fn rotated(log_path: &Path) -> PathBuf {
+    let mut name = log_path.as_os_str().to_owned();
+    name.push(".1");
+    PathBuf::from(name)
+}
+
+/// If the log at `log_path` has reached `cap` bytes, move it to `<log>.1` (replacing an older
+/// one) and return a new, empty log there; `None` while it is below the cap.
+fn rotate_if_full(log_path: &Path, cap: u64) -> io::Result<Option<File>> {
+    if std::fs::metadata(log_path).map_or(0, |m| m.len()) < cap {
+        return Ok(None);
+    }
+    std::fs::rename(log_path, rotated(log_path))?;
+    match File::options().create(true).append(true).open(log_path) {
+        Ok(log) => Ok(Some(log)),
+        Err(error) => {
+            // Put the log back, so the next check sees it full again instead of growing `.1`.
+            let _ = std::fs::rename(rotated(log_path), log_path);
+            Err(error)
+        }
+    }
+}
+
+/// Point stdout and stderr at `log`.
+fn redirect(log: &File) {
+    let _ = io::stdout().flush();
+    let _ = io::stderr().flush();
+    // SAFETY: `log` is an open file; fd 1 and 2 refer to it until the next `redirect` or
+    // `restore`.
+    unsafe {
+        libc::dup2(log.as_raw_fd(), libc::STDOUT_FILENO);
+        libc::dup2(log.as_raw_fd(), libc::STDERR_FILENO);
+    }
+}
+
+/// Start the view, sending stdout and stderr to `log_path` (appended; rotated at `LOG_CAP`)
+/// meanwhile.
 pub fn start(sources: Sources, log_path: &Path) -> io::Result<Tui> {
-    let log = File::options().create(true).append(true).open(log_path)?;
+    let log = match rotate_if_full(log_path, LOG_CAP) {
+        Ok(Some(log)) => log,
+        // Not full, or it cannot be rotated: append to it as it is.
+        Ok(None) | Err(_) => File::options().create(true).append(true).open(log_path)?,
+    };
     let _ = io::stdout().flush();
     let _ = io::stderr().flush();
     // SAFETY: duplicating the process's own standard descriptors; each result is checked.
@@ -137,11 +181,9 @@ pub fn start(sources: Sources, log_path: &Path) -> io::Result<Tui> {
         previous(info);
     }));
     let entered = execute!(screen, terminal::EnterAlternateScreen, cursor::Hide);
-    // SAFETY: `log` is an open file; fd 1 and 2 now refer to it until `restore`.
-    unsafe {
-        libc::dup2(log.as_raw_fd(), libc::STDOUT_FILENO);
-        libc::dup2(log.as_raw_fd(), libc::STDERR_FILENO);
-    }
+    redirect(&log);
+    drop(log);
+    let log_path = log_path.to_owned();
     let mut terminal = match entered.and_then(|()| Terminal::new(CrosstermBackend::new(screen))) {
         Ok(terminal) => terminal,
         Err(error) => {
@@ -161,6 +203,10 @@ pub fn start(sources: Sources, log_path: &Path) -> io::Result<Tui> {
                     let up = saved();
                     if up.is_none() {
                         break;
+                    }
+                    // Under the lock, so a rotation never redirects a restored stdout.
+                    if let Ok(Some(log)) = rotate_if_full(&log_path, LOG_CAP) {
+                        redirect(&log);
                     }
                     let view = snapshot(&sources, started.elapsed());
                     let log: Vec<String> = LOG
@@ -374,6 +420,31 @@ pub fn status_lines(view: &View) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::game_stats::Lag;
+
+    #[test]
+    fn a_full_run_log_is_rotated_into_one_older_file() {
+        let dir = std::env::temp_dir().join(format!("einsteinbot-log-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("run.log");
+        let read = |path: &Path| std::fs::read_to_string(path).unwrap();
+        std::fs::write(&log, "first").unwrap();
+        assert!(rotate_if_full(&log, 6).unwrap().is_none());
+        assert_eq!(read(&log), "first");
+        std::fs::write(&log, "second").unwrap();
+        let mut fresh = rotate_if_full(&log, 6).unwrap().expect("at the cap");
+        fresh.write_all(b"third").unwrap();
+        assert_eq!(
+            (read(&log), read(&rotated(&log))),
+            ("third".into(), "second".into())
+        );
+        std::fs::write(&log, "fourth").unwrap();
+        rotate_if_full(&log, 6).unwrap().expect("at the cap");
+        assert_eq!(
+            (read(&log), read(&rotated(&log))),
+            ("".into(), "fourth".into())
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn status_lines_show_map_figures_and_one_row_per_bot() {

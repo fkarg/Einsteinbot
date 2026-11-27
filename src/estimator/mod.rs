@@ -16,9 +16,11 @@
 //! (`audit`) rebuilds the map from scratch (`rebuild`) and replaces the maintained map only when
 //! its evidence on all rows is higher.
 //!
-//! Surface contacts (`contacts`) are extra evidence only: a gated surface constraint on the
-//! joint fit that never creates a planet. Contact terms enter only planet-bearing models; the
-//! flat model has none. Oracle planets are never an input.
+//! Surface contacts (`contacts`) are extra evidence only: a robust surface likelihood in the
+//! joint fit (a contact lies on the surface of the planet it hit within its penetration
+//! allowance, or comes from a planet the map does not hold) that never creates a planet. Every
+//! map, the flat one included, carries one term per contact, so maps are compared on the same
+//! contacts. Oracle planets are never an input.
 mod audit;
 mod contacts;
 mod count;
@@ -43,7 +45,7 @@ use crate::protocol::{Point, ServerEvent};
 use crate::simulation::{ShotObservation, WorldParameters};
 use crate::strategy::MapBelief;
 use audit::{Audit, Stage};
-use fit::{CONTACT_FULL, Evidence, Fit, planet_at};
+use fit::{CONTACT_MATCH, Evidence, Fit, planet_at};
 use noise::{ModelError, Noise, TickMask};
 use search::{Search, Slice};
 use std::collections::BTreeMap;
@@ -65,6 +67,11 @@ pub const DEFAULT_SLICE_CEILING: Duration = Duration::from_millis(250);
 pub const DEFAULT_SLICES_PER_PATH: usize = 6;
 /// Evaluations of the full-row refit of the published map.
 const POLISH_EVALUATIONS: u64 = 600;
+/// Once this many paths have arrived since the last completed full-row refit, the next refit goes
+/// before the search slices and is not pre-empted, so a steady stream of paths cannot starve the
+/// covariance and the count-limit warning (about a second at 9 paths per second). It delays at
+/// most one path by one refit at that interval.
+const POLISH_STARVED_PATHS: usize = 8;
 /// Count-limit warning (P23): a polished map at the planet cap whose residual correction still
 /// reaches this acceleration somewhere is evidence of a planet the cap leaves out. Measured: at
 /// most 0.015 (the third largest of five) on correct counts at the cap, at least 0.094 with two
@@ -82,8 +89,23 @@ pub enum CovarianceUnavailableReason {
     NotComputed,
     /// The published map has no planets: uncertainty about planets not yet found is not modelled.
     NoPlanets,
-    /// The data leave the planets' parameters (nearly) undetermined, or a planet sits at a bound.
-    UnderIdentified,
+    /// The full-row refit ran, but its Laplace evidence or posterior covariance could not be
+    /// computed (a non-finite residual or a failed Cholesky factorization).
+    FactorizationFailed,
+}
+
+/// Whether the data determine a planet of a published map (its covariance is the posterior under
+/// the Gaussian prior, so it always exists; this says how far to trust it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Identifiability {
+    /// Every posterior sd of `[x, y, radius]` is at most half the prior sd.
+    Identified,
+    /// The prior carries much of the precision: the sds are honest but wide.
+    PriorDominated,
+    /// The planet sits at a bound of the radius range or the battlefield, where the Gaussian
+    /// approximation does not hold (the sds may be too small or too large).
+    AtBound,
 }
 
 /// Why the planet search has work left in the published belief.
@@ -215,6 +237,7 @@ impl Settings {
     fn slice<'a>(
         &'a self,
         cancelled: &'a AtomicBool,
+        preempt: &'a AtomicBool,
         stats: &'a Stats,
         noise: &'a Noise,
     ) -> Slice<'a> {
@@ -225,6 +248,7 @@ impl Settings {
             threads: self.threads,
             max_planets: self.cap(),
             cancelled,
+            preempt,
             stats,
         }
     }
@@ -252,6 +276,11 @@ pub struct Estimator {
     slices_left: usize,
     /// The published map has not been polished since the latest search change.
     polish_due: bool,
+    /// Paths given to the search since the last completed polish.
+    paths_since_polish: usize,
+    /// The last polish was cut by its wall ceiling: it stays due but is retried only after the
+    /// next path, so `settle` cannot spin on a refit that does not fit in the ceiling.
+    polish_waits: bool,
     /// Why the search has work left, if it has.
     limit: Option<SearchLimit>,
     pub settings: Settings,
@@ -313,6 +342,8 @@ impl Default for Estimator {
             belief: None,
             slices_left: 0,
             polish_due: false,
+            paths_since_polish: 0,
+            polish_waits: false,
             limit: None,
             settings: Settings::default(),
             stats: Stats::default(),
@@ -410,9 +441,13 @@ impl Estimator {
                 }
             }
             self.stats.add(Part::Noise, started.elapsed());
-            let slice = self.settings.slice(cancelled, &self.stats, &noise);
+            // The path's own local refit is not pre-empted (nothing new can be waiting for it).
+            let never = AtomicBool::new(false);
+            let slice = self.settings.slice(cancelled, &never, &self.stats, &noise);
             self.search.add_path(&self.shots[self.searched], &slice);
             self.searched += 1;
+            self.paths_since_polish += 1;
+            self.polish_waits = false;
             if cancelled.load(Ordering::SeqCst) {
                 return None;
             }
@@ -494,44 +529,71 @@ impl Estimator {
     pub fn search_pending(&self) -> bool {
         self.audit.as_ref().is_some_and(Audit::finished)
             || (!self.search.idle() && self.slices_left > 0)
-            || self.polish_due
+            || (self.polish_due && !self.polish_waits)
     }
 
     /// One unit of background work: adopt a finished audit, else one search slice, else the exact
     /// refit of the published map. Returns the belief when the published map changed.
     pub fn step(&mut self, cancelled: &AtomicBool) -> Option<MapBelief> {
+        self.step_until(cancelled, &AtomicBool::new(false))
+    }
+
+    /// `step` that stops early once `preempt` is set (new work is waiting, for the live map):
+    /// a cut slice keeps its pending state for the next one, and a cut polish is dropped (still
+    /// due). Neither publishes: the waiting path's update publishes the maintained map. Only a
+    /// wall clock sets `preempt`, so replays without it stay deterministic.
+    pub fn step_until(
+        &mut self,
+        cancelled: &AtomicBool,
+        preempt: &AtomicBool,
+    ) -> Option<MapBelief> {
+        if preempt.load(Ordering::Relaxed) {
+            return None;
+        }
         if self.audit.as_ref().is_some_and(Audit::finished) {
             if let Some(belief) = self.collect_audit() {
                 return Some(belief);
             }
         }
-        if !self.search.idle() && self.slices_left > 0 {
+        let polish_ready = self.polish_due && !self.polish_waits;
+        let starved = polish_ready && self.paths_since_polish >= POLISH_STARVED_PATHS;
+        if !starved && !self.search.idle() && self.slices_left > 0 {
             self.slices_left -= 1;
             let noise = self.noise();
-            let slice = self.settings.slice(cancelled, &self.stats, &noise);
+            let slice = self.settings.slice(cancelled, preempt, &self.stats, &noise);
             let before = self.stats.evaluations();
             let changed = self.search.step(&slice);
             let spent = self.stats.evaluations() - before;
+            let preempted = preempt.load(Ordering::Relaxed);
             self.limit = if self.search.idle() {
                 None
-            } else if spent >= self.settings.slice_evaluations {
+            } else if spent >= self.settings.slice_evaluations || preempted {
                 Some(SearchLimit::WorkBudget)
             } else {
                 Some(SearchLimit::TimeBudget)
             };
             self.polish_due |= changed;
+            if preempted {
+                // A cut slice is not spent: the next one continues the same work.
+                self.slices_left += usize::from(spent < self.settings.slice_evaluations);
+                return None;
+            }
             if changed {
                 let theta = self.search.theta.clone();
                 return Some(self.publish(&theta, None, false));
             }
             return None;
         }
-        if self.polish_due {
+        if polish_ready {
             self.polish_due = false;
             let started = Instant::now();
             // In place: every other user of `self.shots` sets its own noise.
             let noise = self.noise();
             noise::apply(&mut self.shots, &noise);
+            // A starved refit is not pre-empted by paths, but every refit keeps the wall ceiling.
+            let deadline = self.settings.slice_ceiling.map(|ceiling| started + ceiling);
+            let never = AtomicBool::new(false);
+            let preempt = if starved { &never } else { preempt };
             let full = Fit::new(
                 &self.shots,
                 WorldParameters::default(),
@@ -539,27 +601,48 @@ impl Estimator {
                 true,
                 vec![],
             )
+            .with_cut(
+                deadline.unwrap_or(started + Duration::from_secs(24 * 3600)),
+                preempt,
+            )
             .with_stats(&self.stats);
             let theta = self.search.theta.clone();
+            // Cut by a waiting path or by the wall ceiling: nothing is published and the refit
+            // stays due (the starvation count keeps running). After a ceiling cut it waits for
+            // the next path, so a refit that cannot finish within the ceiling (heavy load) is
+            // tried once per path and the slices still get the time in between.
+            let cut = |estimator: &mut Self| {
+                estimator.polish_due = true;
+                estimator.stats.add(Part::Polish, started.elapsed());
+            };
+            let past = |deadline: Option<Instant>| deadline.is_some_and(|d| Instant::now() >= d);
             let (theta, evidence) = if theta.is_empty() {
                 (theta, None)
             } else {
-                let deadline = self.settings.slice_ceiling.map(|ceiling| started + ceiling);
                 let budget = fit::Budget {
                     evaluations: POLISH_EVALUATIONS,
                     deadline,
                     threads: self.settings.threads,
                 };
                 let theta = full.refine(&theta, &budget).map_or(theta, |(t, _)| t);
-                // The covariance needs a Jacobian of all rows; a refit that used up its time
-                // leaves it out (`not_computed`) rather than run over the ceiling.
-                let evidence = deadline
-                    .is_none_or(|deadline| Instant::now() < deadline)
-                    .then(|| full.evidence(&theta))
-                    .flatten();
+                if full.preempted() {
+                    cut(self);
+                    return None;
+                }
+                if past(deadline) {
+                    cut(self);
+                    self.polish_waits = true;
+                    return None;
+                }
+                let evidence = full.evidence(&theta, self.settings.threads);
+                if full.preempted() {
+                    cut(self);
+                    return None;
+                }
                 (theta, evidence)
             };
             self.stats.add(Part::Polish, started.elapsed());
+            self.paths_since_polish = 0;
             return Some(self.publish(&theta, evidence, true));
         }
         None
@@ -667,24 +750,21 @@ impl Estimator {
         let mut belief = MapBelief::new(PlanetMap { planets }, None);
         belief.covariance_unavailable_reason = match (theta.is_empty(), evidence) {
             (true, _) => Some(CovarianceUnavailableReason::NoPlanets),
-            (false, None) => Some(CovarianceUnavailableReason::NotComputed),
-            (
-                false,
-                Some(Evidence {
-                    covariance: None, ..
-                }),
-            ) => Some(CovarianceUnavailableReason::UnderIdentified),
             (
                 false,
                 Some(Evidence {
                     covariance: Some(covariance),
+                    identifiability,
                     ..
                 }),
             ) => {
                 belief.parameter_covariance =
                     Some(fit::covariance_xym(&covariance, &belief.map.planets));
+                belief.planet_identifiability = identifiability;
                 None
             }
+            (false, _) if polished => Some(CovarianceUnavailableReason::FactorizationFailed),
+            (false, _) => Some(CovarianceUnavailableReason::NotComputed),
         };
         belief.search_limit = if theta.len() >= self.settings.cap() {
             Some(SearchLimit::PlanetCap)
@@ -696,8 +776,8 @@ impl Estimator {
                 belief.contact_points.push(contact.point.clone());
             }
         }
-        // Contacts beyond the full-strength range of every planet surface are not fully
-        // explained by the map (a model mismatch, or planets this slice does not model).
+        // Contacts farther than `CONTACT_MATCH` from every planet surface: no found planet near
+        // them (a planet not found yet, or a model mismatch).
         belief.unmatched_contacts = belief
             .contact_points
             .iter()
@@ -706,7 +786,7 @@ impl Estimator {
                     ((f64::from(point.x) - planet.x).hypot(f64::from(point.y) - planet.y)
                         - planet.radius)
                         .abs()
-                        <= CONTACT_FULL
+                        <= CONTACT_MATCH
                 })
             })
             .count();

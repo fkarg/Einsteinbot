@@ -495,12 +495,35 @@ fn diagnose_full_event_planet() {
     if let Some(threads) = env_list("THREADS", "0").first() {
         TEST_THREADS.store(*threads, Ordering::Relaxed);
     }
+    // `CONTACTS=0`: fits without the contact term; `CEIL_MS=0`: no slice wall ceiling
+    // (deterministic). `QUAL` lines score the whole map at each checkpoint.
+    fit::CONTACTS_OFF.store(env_list("CONTACTS", "1")[0] == 0, Ordering::Relaxed);
     let events = EventLog::read_capture("einsteinbot.sqlite3", capture).unwrap();
     let mut estimator = Estimator::default();
+    if env_list("CEIL_MS", "-").first() == Some(&0) {
+        estimator.settings.slice_ceiling = None;
+    }
     let never = AtomicBool::new(false);
     let mut truth: Vec<Planet> = Vec::new();
     let (mut planets_events, mut identical, mut shots) = (0, 0, 0usize);
-    let checkpoints = [16usize, 32, 64, 128];
+    let checkpoints = env_list("CHECKPOINTS", "16,32,64,128");
+    let qual = |estimator: &Estimator, n: usize, truth: &[Planet]| {
+        let case = Case {
+            name: format!("capture {capture}"),
+            truth: truth.to_vec(),
+            shots: (estimator.shots.iter())
+                .map(|s| exact_shot(s.obs.clone()))
+                .collect(),
+        };
+        let contacts = estimator.shots.iter().filter(|s| s.contact.is_some());
+        println!(
+            "QUAL world=live{capture} cfg=contacts{} n={n} contacts={} unmatched={} {}",
+            env_list("CONTACTS", "1")[0],
+            contacts.count(),
+            estimator.belief().map_or(0, |b| b.unmatched_contacts),
+            quality(&case, n, &belief_theta(estimator))
+        );
+    };
     let max_paths = env_list("MAXPATHS", "128")[0];
     let report = |estimator: &Estimator, n: usize, truth: &[Planet]| {
         let t = &truth[index];
@@ -560,6 +583,7 @@ fn diagnose_full_event_planet() {
             shots = estimator.shots.len();
             if checkpoints.contains(&shots) {
                 report(&estimator, shots, &truth);
+                qual(&estimator, shots, &truth);
             }
             if shots >= max_paths {
                 break;
@@ -570,4 +594,5 @@ fn diagnose_full_event_planet() {
         "EPOCH capture={capture} planets_events={planets_events} identical_repeats={identical} paths={shots}"
     );
     report(&estimator, shots, &truth);
+    qual(&estimator, shots, &truth);
 }
