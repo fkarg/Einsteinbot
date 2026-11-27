@@ -548,11 +548,6 @@ impl<'a> Fit<'a> {
             .then(|| (DVector::from_vec(res), jacobian))
     }
 
-    /// The pivoted QR of the Jacobian with respect to the logistic coordinates `u` (of `theta`)
-    /// and `Q^T` of the residuals, without forming the full Jacobian: consecutive paths are
-    /// grouped by rows (from the data alone, so the result does not depend on `threads`), each
-    /// group's blocks are folded into one triangle on its own thread, and the triangles and the
-    /// contact and overlap rows are reduced last. `None` if cancelled or a residual is not finite.
     /// Rows of every path block with `k` planets.
     fn path_rows(&self, k: usize) -> usize {
         self.path_indices()
@@ -627,6 +622,10 @@ impl<'a> Fit<'a> {
         Some(information)
     }
 
+    /// The pivoted QR of the Jacobian with respect to the logistic coordinates `u` (of `theta`)
+    /// and `Q^T` of the residuals, without forming the full Jacobian: the path blocks folded into
+    /// triangles (`triangles`), then the triangles and the contact and overlap rows reduced last.
+    /// `None` if cancelled or a residual is not finite.
     fn reduce(&self, theta: &[[f64; 3]], u: &DVector<f64>, threads: usize) -> Option<Reduced> {
         if self.cancelled.load(Ordering::Relaxed) {
             return None;

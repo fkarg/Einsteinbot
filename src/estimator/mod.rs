@@ -565,8 +565,8 @@ impl Estimator {
             };
             self.polish_due |= changed;
             if preempted {
-                // Not a spent slice: the next one continues the same work.
-                self.slices_left += 1;
+                // A cut slice is not spent: the next one continues the same work.
+                self.slices_left += usize::from(spent < self.settings.slice_evaluations);
                 return None;
             }
             if changed {

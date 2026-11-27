@@ -661,9 +661,12 @@ impl Search {
                         (out, counter)
                     })
                 });
+                // A pre-empted round is not counted: at 9 paths per second every arrival would
+                // otherwise use up one of `MAX_ROUNDS` and settle refits far from converged.
+                let preempted = slice.preempt.load(Ordering::Relaxed);
                 for (&i, (out, counter)) in todo.iter().zip(fits) {
                     let p = &mut self.partials[i];
-                    p.rounds += 1;
+                    p.rounds += usize::from(!preempted);
                     if let Some((t, _)) = out {
                         p.theta = t;
                     }

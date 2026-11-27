@@ -127,11 +127,14 @@ fn rotate_if_full(log_path: &Path, cap: u64) -> io::Result<Option<File>> {
         return Ok(None);
     }
     std::fs::rename(log_path, rotated(log_path))?;
-    File::options()
-        .create(true)
-        .append(true)
-        .open(log_path)
-        .map(Some)
+    match File::options().create(true).append(true).open(log_path) {
+        Ok(log) => Ok(Some(log)),
+        Err(error) => {
+            // Put the log back, so the next check sees it full again instead of growing `.1`.
+            let _ = std::fs::rename(rotated(log_path), log_path);
+            Err(error)
+        }
+    }
 }
 
 /// Point stdout and stderr at `log`.
@@ -149,9 +152,10 @@ fn redirect(log: &File) {
 /// Start the view, sending stdout and stderr to `log_path` (appended; rotated at `LOG_CAP`)
 /// meanwhile.
 pub fn start(sources: Sources, log_path: &Path) -> io::Result<Tui> {
-    let log = match rotate_if_full(log_path, LOG_CAP)? {
-        Some(log) => log,
-        None => File::options().create(true).append(true).open(log_path)?,
+    let log = match rotate_if_full(log_path, LOG_CAP) {
+        Ok(Some(log)) => log,
+        // Not full, or it cannot be rotated: append to it as it is.
+        Ok(None) | Err(_) => File::options().create(true).append(true).open(log_path)?,
     };
     let _ = io::stdout().flush();
     let _ = io::stderr().flush();
