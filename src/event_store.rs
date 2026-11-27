@@ -1,10 +1,16 @@
 use crate::protocol::{RecordedEvent, ServerEvent};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::path::Path;
 
 pub type StoreResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
+
+/// A per-map capture with fewer completed paths (`ShotFin`/`ShotFinished`, any player, debris
+/// included) is deleted when it closes: nothing was learned there. Joining on the end card
+/// gives zero (the server simulates nothing until the next map); any kill alone gives ten.
+pub const MIN_COMPLETED_PATHS: usize = 3;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CaptureMetadata {
@@ -38,6 +44,70 @@ pub struct EventLog {
     connection: Connection,
     capture_id: i64,
     next_sequence: i64,
+    /// Present for live recordings with one capture per map (`create_session`).
+    session: Option<Session>,
+}
+
+/// How one closed per-map capture was handled.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClosedCapture {
+    pub capture_id: i64,
+    pub completed_paths: usize,
+    /// False when it had fewer than `MIN_COMPLETED_PATHS` and was deleted.
+    pub kept: bool,
+}
+
+/// Live-recording state: the metadata of the current map's capture and the latest world state
+/// seen in recorded events, written at the start of the next capture so it replays on its own.
+struct Session {
+    base_metadata: serde_json::Value,
+    metadata: serde_json::Value,
+    map_index: u64,
+    /// Whether the current capture began at an observed map boundary (not mid-map at connect).
+    started_at_boundary: bool,
+    started_at_unix_ms: i64,
+    completed_paths: usize,
+    game_mode: Option<ServerEvent>,
+    own_ids: BTreeMap<Option<String>, u32>,
+    energies: BTreeMap<String, f64>,
+}
+
+impl Session {
+    fn observe(&mut self, bot_name: Option<&str>, event: &RecordedEvent) {
+        let RecordedEvent::Inbound(event) = event else {
+            return;
+        };
+        match event {
+            ServerEvent::GameMode { .. } => self.game_mode = Some(event.clone()),
+            ServerEvent::OwnId { player_id } => {
+                self.own_ids.insert(bot_name.map(str::to_owned), *player_id);
+            }
+            ServerEvent::OwnEnergy { energy, .. } => {
+                self.energies
+                    .insert(bot_name.unwrap_or_default().to_owned(), *energy);
+            }
+            ServerEvent::ShotFin { .. } | ServerEvent::ShotFinished { .. } => {
+                self.completed_paths += 1
+            }
+            _ => {}
+        }
+    }
+
+    /// Initial events of a new capture: game mode, each bot's own id, the given positions.
+    fn initial_events(&self, positions: &[(u32, f32, f32)]) -> Vec<(Option<String>, ServerEvent)> {
+        let mut events: Vec<_> = self.game_mode.iter().map(|e| (None, e.clone())).collect();
+        events.extend(
+            self.own_ids
+                .iter()
+                .map(|(name, &player_id)| (name.clone(), ServerEvent::OwnId { player_id })),
+        );
+        events.extend(
+            positions
+                .iter()
+                .map(|&(player_id, x, y)| (None, ServerEvent::PlayerPosition { player_id, x, y })),
+        );
+        events
+    }
 }
 
 impl EventLog {
@@ -120,17 +190,163 @@ impl EventLog {
             connection,
             capture_id,
             next_sequence: 0,
+            session: None,
         })
+    }
+
+    /// Start a live recording with one capture per map. The first capture covers the map in
+    /// progress at connect; `start_next_map` closes it at each map boundary and opens the next.
+    /// All captures of one recording share `session.id` and number maps in `session.map_index`.
+    pub fn create_session(path: impl AsRef<Path>, metadata: &CaptureMetadata) -> StoreResult<Self> {
+        let mut log = Self::create_inner(path, metadata, None)?;
+        let base_metadata: serde_json::Value = serde_json::from_str(&log.connection.query_row(
+            "SELECT metadata_json FROM captures WHERE id = ?1",
+            [log.capture_id],
+            |row| row.get::<_, String>(0),
+        )?)?;
+        let mut session = Session {
+            base_metadata,
+            metadata: serde_json::Value::Null,
+            map_index: 0,
+            started_at_boundary: false,
+            started_at_unix_ms: metadata.started_at_unix_ms,
+            completed_paths: 0,
+            game_mode: None,
+            own_ids: BTreeMap::new(),
+            energies: BTreeMap::new(),
+        };
+        session.metadata = map_metadata(&session, None, 0);
+        log.write_metadata(&session.metadata)?;
+        log.session = Some(session);
+        Ok(log)
+    }
+
+    /// Close the current map's capture (deleting it when it has fewer than
+    /// `MIN_COMPLETED_PATHS` paths) and open the next map's capture of the same session. The new
+    /// capture starts with the known state as events (game mode, each bot's own id, and
+    /// `positions`, the new map's player positions received so far; the latest energies go to
+    /// metadata), so it replays on its own.
+    pub fn start_next_map(
+        &mut self,
+        timestamp_unix_ms: i64,
+        boundary_source: &str,
+        positions: &[(u32, f32, f32)],
+    ) -> StoreResult<ClosedCapture> {
+        let closed = self.close_map(timestamp_unix_ms, true)?;
+        let session = self
+            .session
+            .as_mut()
+            .ok_or("not a per-map recording session")?;
+        session.map_index += 1;
+        session.started_at_boundary = true;
+        session.started_at_unix_ms = timestamp_unix_ms;
+        session.completed_paths = 0;
+        let initial = session.initial_events(positions);
+        session.metadata = map_metadata(session, Some(boundary_source), initial.len());
+        self.connection.execute(
+            "INSERT INTO captures (started_at_unix_ms, metadata_json) VALUES (?1, ?2)",
+            params![timestamp_unix_ms, serde_json::to_string(&session.metadata)?],
+        )?;
+        self.capture_id = self.connection.last_insert_rowid();
+        self.next_sequence = 0;
+        if !closed.kept {
+            self.delete_capture(closed.capture_id)?;
+        }
+        for (bot_name, event) in initial {
+            self.append_for_bot(
+                timestamp_unix_ms,
+                bot_name.as_deref(),
+                &RecordedEvent::Inbound(event),
+            )?;
+        }
+        Ok(closed)
     }
 
     pub fn capture_id(&self) -> i64 {
         self.capture_id
     }
 
-    pub fn finish(&mut self, ended_at_unix_ms: i64) -> StoreResult<()> {
+    /// Close the capture. A per-map session capture records how its map ended and is deleted
+    /// when it has fewer than `MIN_COMPLETED_PATHS` completed paths.
+    pub fn finish(&mut self, ended_at_unix_ms: i64) -> StoreResult<Option<ClosedCapture>> {
+        if self.session.is_some() {
+            let closed = self.close_map(ended_at_unix_ms, false)?;
+            if !closed.kept {
+                self.delete_capture(closed.capture_id)?;
+            }
+            return Ok(Some(closed));
+        }
         self.connection.execute(
             "UPDATE captures SET ended_at_unix_ms = ?1 WHERE id = ?2",
             params![ended_at_unix_ms, self.capture_id],
+        )?;
+        Ok(None)
+    }
+
+    fn close_map(
+        &mut self,
+        ended_at_unix_ms: i64,
+        at_boundary: bool,
+    ) -> StoreResult<ClosedCapture> {
+        let session = self
+            .session
+            .as_mut()
+            .ok_or("not a per-map recording session")?;
+        let closed = ClosedCapture {
+            capture_id: self.capture_id,
+            completed_paths: session.completed_paths,
+            kept: session.completed_paths >= MIN_COMPLETED_PATHS,
+        };
+        if !closed.kept {
+            // Deleted by the caller once the next capture exists, so that no id is reused.
+            return Ok(closed);
+        }
+        // A map's duration is known only when both of its ends were observed boundaries;
+        // a capture that joined mid-map or stopped before the map ended has none.
+        let full = session.started_at_boundary && at_boundary;
+        let map = &mut session.metadata["map"];
+        map["ended_by"] = serde_json::json!(if at_boundary {
+            "boundary"
+        } else {
+            "disconnect"
+        });
+        map["ended_at_unix_ms"] = serde_json::json!(ended_at_unix_ms);
+        map["completed_paths"] = serde_json::json!(session.completed_paths);
+        map["duration_ms"] = if full {
+            serde_json::json!(ended_at_unix_ms - session.started_at_unix_ms)
+        } else {
+            serde_json::Value::Null
+        };
+        map["duration_unavailable_reason"] = match (session.started_at_boundary, at_boundary) {
+            (true, true) => serde_json::Value::Null,
+            (false, _) => serde_json::json!("joined_mid_map"),
+            (true, false) => serde_json::json!("disconnected_before_map_end"),
+        };
+        let metadata = serde_json::to_string(&session.metadata)?;
+        self.connection.execute(
+            "UPDATE captures SET ended_at_unix_ms = ?1, metadata_json = ?2 WHERE id = ?3",
+            params![ended_at_unix_ms, metadata, self.capture_id],
+        )?;
+        Ok(closed)
+    }
+
+    fn delete_capture(&self, capture_id: i64) -> StoreResult<()> {
+        let transaction = self.connection.unchecked_transaction()?;
+        for table in ["events", "diagnostics"] {
+            transaction.execute(
+                &format!("DELETE FROM {table} WHERE capture_id = ?1"),
+                [capture_id],
+            )?;
+        }
+        transaction.execute("DELETE FROM captures WHERE id = ?1", [capture_id])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn write_metadata(&self, metadata: &serde_json::Value) -> StoreResult<()> {
+        self.connection.execute(
+            "UPDATE captures SET metadata_json = ?1 WHERE id = ?2",
+            params![serde_json::to_string(metadata)?, self.capture_id],
         )?;
         Ok(())
     }
@@ -145,6 +361,9 @@ impl EventLog {
         bot_name: Option<&str>,
         event: &RecordedEvent,
     ) -> StoreResult<i64> {
+        if let Some(session) = &mut self.session {
+            session.observe(bot_name, event);
+        }
         let sequence = self.next_sequence;
         let event_json = serde_json::to_string(event)?;
         self.connection.execute(
@@ -199,6 +418,33 @@ impl EventLog {
     ) -> StoreResult<i64> {
         self.append(timestamp_unix_ms, &RecordedEvent::Inbound(event.clone()))
     }
+}
+
+/// The current map's capture metadata: the base (build, host, names, protocol) plus the session
+/// link and how the map started.
+fn map_metadata(
+    session: &Session,
+    boundary_source: Option<&str>,
+    initial_events: usize,
+) -> serde_json::Value {
+    let mut metadata = session.base_metadata.clone();
+    let base = &session.base_metadata;
+    metadata["session"] = serde_json::json!({
+        "id": format!("{}-{}", base["started_at_unix_ms"], base["process_id"]),
+        "map_index": session.map_index,
+    });
+    metadata["map"] = serde_json::json!({
+        "started_by": if session.started_at_boundary { "boundary" } else { "connect" },
+        "boundary_source": boundary_source,
+        "started_at_unix_ms": session.started_at_unix_ms,
+    });
+    if session.started_at_boundary {
+        metadata["initial_state"] = serde_json::json!({
+            "events": initial_events,
+            "energies": session.energies,
+        });
+    }
+    metadata
 }
 
 fn read_capture_events(connection: &Connection, capture_id: i64) -> StoreResult<Vec<StoredEvent>> {
@@ -537,5 +783,219 @@ mod tests {
         );
         drop(log);
         std::fs::remove_file(path).unwrap();
+    }
+
+    fn metadata_of(log: &EventLog, id: i64) -> Option<serde_json::Value> {
+        log.connection
+            .query_row(
+                "SELECT metadata_json FROM captures WHERE id = ?1",
+                [id],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .map(|text| serde_json::from_str(&text).unwrap())
+    }
+
+    fn shot(player_id: u32) -> RecordedEvent {
+        RecordedEvent::Inbound(ServerEvent::ShotFin {
+            player_id,
+            angle: 1.0,
+            velocity: 2.0,
+            points: vec![Point { x: 1.0, y: 2.0 }],
+        })
+    }
+
+    #[test]
+    fn map_rollover_writes_self_contained_linked_captures() {
+        let metadata = CaptureMetadata {
+            started_at_unix_ms: 1_000,
+            process_id: 42,
+            host: "127.0.0.1".to_owned(),
+            port: 3490,
+            client_name: "Einstein,Curie".to_owned(),
+            protocol_version: 8,
+        };
+        let mut log = EventLog::create_session(":memory:", &metadata).unwrap();
+        let first = log.capture_id();
+        let inbound = RecordedEvent::Inbound;
+        log.append_for_bot(
+            1_001,
+            None,
+            &inbound(ServerEvent::GameMode {
+                player_id: 1,
+                mode: 1,
+            }),
+        )
+        .unwrap();
+        log.append_for_bot(
+            1_002,
+            Some("Einstein"),
+            &inbound(ServerEvent::OwnId { player_id: 1 }),
+        )
+        .unwrap();
+        log.append_for_bot(
+            1_003,
+            Some("Curie"),
+            &inbound(ServerEvent::OwnId { player_id: 2 }),
+        )
+        .unwrap();
+        for (player_id, x) in [(1, 10.0), (2, 20.0)] {
+            let event = ServerEvent::PlayerPosition {
+                player_id,
+                x,
+                y: 5.0,
+            };
+            log.append_for_bot(1_004, None, &inbound(event)).unwrap();
+        }
+        let energy = ServerEvent::OwnEnergy {
+            player_id: 2,
+            energy: 7.5,
+        };
+        log.append_for_bot(1_006, Some("Curie"), &inbound(energy))
+            .unwrap();
+        for _ in 0..MIN_COMPLETED_PATHS {
+            log.append_for_bot(1_007, None, &shot(1)).unwrap();
+        }
+
+        let closed = log
+            .start_next_map(
+                2_000,
+                "all_players_repositioned",
+                &[(1, 10.0, 5.0), (2, 20.0, 5.0)],
+            )
+            .unwrap();
+        assert_eq!(
+            closed,
+            ClosedCapture {
+                capture_id: first,
+                completed_paths: MIN_COMPLETED_PATHS,
+                kept: true
+            }
+        );
+        let second = log.capture_id();
+        assert_ne!(second, first);
+        // The new capture replays on its own: game mode, each bot's id, the new map's positions.
+        let events = log.read_events().unwrap();
+        let initial: Vec<_> = events
+            .iter()
+            .map(|e| (e.sequence, e.bot_name.as_deref(), e.event.clone()))
+            .collect();
+        assert_eq!(
+            initial,
+            vec![
+                (
+                    0,
+                    None,
+                    inbound(ServerEvent::GameMode {
+                        player_id: 1,
+                        mode: 1
+                    })
+                ),
+                (
+                    1,
+                    Some("Curie"),
+                    inbound(ServerEvent::OwnId { player_id: 2 })
+                ),
+                (
+                    2,
+                    Some("Einstein"),
+                    inbound(ServerEvent::OwnId { player_id: 1 })
+                ),
+                (
+                    3,
+                    None,
+                    inbound(ServerEvent::PlayerPosition {
+                        player_id: 1,
+                        x: 10.0,
+                        y: 5.0
+                    })
+                ),
+                (
+                    4,
+                    None,
+                    inbound(ServerEvent::PlayerPosition {
+                        player_id: 2,
+                        x: 20.0,
+                        y: 5.0
+                    })
+                ),
+            ]
+        );
+        let old = metadata_of(&log, first).unwrap();
+        let new = metadata_of(&log, second).unwrap();
+        assert_eq!(old["session"]["id"], new["session"]["id"]);
+        assert_eq!(
+            (
+                old["session"]["map_index"].as_u64(),
+                new["session"]["map_index"].as_u64()
+            ),
+            (Some(0), Some(1))
+        );
+        assert_eq!(old["map"]["started_by"], "connect");
+        assert_eq!(old["map"]["ended_by"], "boundary");
+        // Joined mid-map: no duration, never a guess.
+        assert!(old["map"]["duration_ms"].is_null());
+        assert_eq!(old["map"]["duration_unavailable_reason"], "joined_mid_map");
+        assert_eq!(new["map"]["started_by"], "boundary");
+        assert_eq!(new["map"]["boundary_source"], "all_players_repositioned");
+        assert_eq!(new["initial_state"]["events"], 5);
+        assert_eq!(new["initial_state"]["energies"]["Curie"], 7.5);
+        assert_eq!(new["client_name"], "Einstein,Curie");
+        assert!(new["build"].is_object());
+
+        for _ in 0..MIN_COMPLETED_PATHS {
+            log.append_for_bot(2_100, None, &shot(2)).unwrap();
+        }
+        log.start_next_map(5_000, "planets", &[]).unwrap();
+        // A map observed from boundary to boundary has a duration.
+        let full = metadata_of(&log, second).unwrap();
+        assert_eq!(full["map"]["duration_ms"], 3_000);
+        assert!(full["map"]["duration_unavailable_reason"].is_null());
+        assert_eq!(full["map"]["completed_paths"], MIN_COMPLETED_PATHS);
+    }
+
+    #[test]
+    fn captures_with_too_few_paths_are_deleted_when_they_close() {
+        let metadata = CaptureMetadata {
+            started_at_unix_ms: 1_000,
+            process_id: 42,
+            host: "127.0.0.1".to_owned(),
+            port: 3490,
+            client_name: "Einstein".to_owned(),
+            protocol_version: 8,
+        };
+        let mut log = EventLog::create_session(":memory:", &metadata).unwrap();
+        let end_card = log.capture_id();
+        log.append_for_bot(
+            1_001,
+            Some("Einstein"),
+            &RecordedEvent::Inbound(ServerEvent::OwnId { player_id: 1 }),
+        )
+        .unwrap();
+        log.append_diagnostic(1_002, "Einstein", "target_decision", &serde_json::json!({}))
+            .unwrap();
+        for _ in 1..MIN_COMPLETED_PATHS {
+            log.append_for_bot(1_003, None, &shot(1)).unwrap();
+        }
+        let closed = log.start_next_map(2_000, "planets", &[]).unwrap();
+        assert!(!closed.kept);
+        assert!(metadata_of(&log, end_card).is_none());
+        let rows: i64 = log
+            .connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM events WHERE capture_id = ?1) + (SELECT COUNT(*) FROM diagnostics WHERE capture_id = ?1)",
+                [end_card],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0);
+        // The next capture still knows the bot's identity, and an empty last map goes too.
+        assert_eq!(
+            log.read_events().unwrap()[0].event,
+            RecordedEvent::Inbound(ServerEvent::OwnId { player_id: 1 })
+        );
+        let last = log.capture_id();
+        assert_eq!(log.finish(3_000).unwrap().map(|c| c.kept), Some(false));
+        assert!(metadata_of(&log, last).is_none());
     }
 }

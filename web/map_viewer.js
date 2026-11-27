@@ -13,6 +13,7 @@
   const OUTCOME_COLORS={player:'#ff4d6a',planet:'#ffb347',left_field:'#dfe6f0',unknown:'#b98cff'},OUTCOME_LABELS={player:'hit a player',planet:'planet surface',left_field:'left the field',unknown:'unknown'};
   const STATUS_LABEL={unknown:'no comparable belief',ok:'close match',location:'center off',size:'size off',both:'center and size off',missing:'missing'},LOCATION_TOL=10,SIZE_TOL=5,STATUS_COLORS={unknown:'#60dcff',ok:'#60dcff',location:'#ff9d4d',size:'#e8d96d',both:'#ff7a5c',missing:'#ff4d6a'};
   let view={x:0,y:0,width:W,height:H}, viewDrag=null, panned=false, heatCache=null, pathCache=null;
+  const stableRanges=new Map();
   const colors=['#54c8ff','#ffb45c','#b791ff','#7de3a1','#ff7899','#e8d96d','#88a7ff','#ffa1dc'];
   function setStatus(s){ $('status').textContent=s||''; }
   function fmt(v,n=2){ return v===null||v===undefined||v===''?'—':Number.isFinite(Number(v))?Number(v).toFixed(n):'—'; }
@@ -25,7 +26,7 @@
   async function fillCaptureSelect(){
     setStatus('Loading captures…');
     const data=await api('/api/captures'); const select=$('capture'); select.replaceChildren();
-    for(const c of data.captures){const option=document.createElement('option');option.value=c.id;const date=new Date(c.started_at_unix_ms).toLocaleString();const kind=c.metadata?.host==='synthetic-scenario'?'scenario':'live',revision=c.metadata?.build?.git_revision,older=kind==='scenario'&&data.captures.some(o=>o.metadata?.host==='synthetic-scenario'&&o.metadata?.client_name===c.metadata?.client_name&&o.id>c.id);option.textContent=`#${c.id} · ${kind}${older?' (older revision)':''} · ${c.metadata?.client_name||'capture'}${revision?` · ${revision.slice(0,8)}`:''} · ${date}`;select.append(option);}
+    for(const c of data.captures){const option=document.createElement('option');option.value=c.id;const date=new Date(c.started_at_unix_ms).toLocaleString();const kind=c.metadata?.host==='synthetic-scenario'?'scenario':'live',revision=c.metadata?.build?.git_revision,older=kind==='scenario'&&data.captures.some(o=>o.metadata?.host==='synthetic-scenario'&&o.metadata?.client_name===c.metadata?.client_name&&o.id>c.id),session=c.metadata?.session;option.textContent=`#${c.id} · ${kind}${older?' (older revision)':''} · ${c.metadata?.client_name||'capture'}${session?` · map ${session.map_index} of session ${session.id}`:''}${revision?` · ${revision.slice(0,8)}`:''} · ${date}`;select.append(option);}
     if(!data.captures.length){setStatus('No captures in this database');return false;}
     setStatus('');return true;
   }
@@ -115,14 +116,21 @@
     return Math.hypot(x,y);
   }
   // The heat layer as an image with one pixel per grid sample, rebuilt only when the snapshot, layer or carried σ changes.
-  // Every layer spans orders of magnitude (1/r² near planets), so colours are log-scaled between the 2nd and 99.5th percentile.
+  // Every layer spans orders of magnitude (1/r² near planets), so colours are log-scaled between the 2nd and 99.5th percentile
+  // of the samples seen so far in this capture.
   function heatLayer(){
     const g=snapshot?.field_grid,l=shownLayer(),key=`${l}|${g?.carried?.uncertainty||''}`;
     if(heatCache?.key===key)return heatCache;
     const n=(g?.columns||0)*(g?.rows||0),values=new Float32Array(n);let finite=[];
     for(let i=0;i<n;i++){const v=heatValue(g,l,i);values[i]=v;if(v>0&&Number.isFinite(v))finite.push(v);}
     finite.sort((a,b)=>a-b);const q=p=>finite[Math.min(finite.length-1,Math.floor((finite.length-1)*p))];
-    heatCache={key,count:finite.length,lo:finite.length?q(.02):null,hi:finite.length?q(.995):null,canvas:null};
+    // The range only widens within a capture and layer, so colours stay comparable while scrubbing: a later,
+    // smaller error is darker instead of being stretched to the same brightness.
+    const rangeKey=`${captureId}|${l}`,seen=stableRanges.get(rangeKey);
+    let rangeLo=finite.length?q(.02):null,rangeHi=finite.length?q(.995):null;
+    if(seen&&finite.length){rangeLo=Math.min(rangeLo,seen.lo);rangeHi=Math.max(rangeHi,seen.hi);}
+    if(finite.length)stableRanges.set(rangeKey,{lo:rangeLo,hi:rangeHi});
+    heatCache={key,count:finite.length,lo:rangeLo,hi:rangeHi,canvas:null};
     if(!finite.length)return heatCache;
     const lo=Math.log10(heatCache.lo),span=(Math.log10(heatCache.hi)-lo)||1,lut=LUTS[LAYER_RAMP[l]];
     const off=document.createElement('canvas');off.width=g.columns;off.height=g.rows;const octx=off.getContext('2d'),img=octx.createImageData(g.columns,g.rows),d=img.data;
@@ -150,7 +158,7 @@
     const unit=l==='uncertainty'?'field σ from the fit covariance':l==='error'?'|belief − truth gravity|':'|gravity| of the fitted planets';
     $('scaleMin').textContent=heat.count?fmtSig(heat.lo):'no data';$('scaleMax').textContent=heat.count?fmtSig(heat.hi):'no data';$('scaleUnit').textContent=`${unit} · log scale`;
     $('scaleBar').style.background=`linear-gradient(90deg,${RAMPS[LAYER_RAMP[l]].join(',')})`;
-    $('scaleBar').title=`Colours span the 2nd–99.5th percentile on a log scale · ${fmtSig(heat.lo)} to ${fmtSig(heat.hi)} · ${unit}`;
+    $('scaleBar').title=`Colours span the 2nd–99.5th percentile of everything seen in this capture so far, on a log scale · ${fmtSig(heat.lo)} to ${fmtSig(heat.hi)} · ${unit}`;
     const overlay=(fn)=>{ctx.save();ctx.setTransform(1,0,0,1,0,0);fn();ctx.restore();};
     if(banner)overlay(()=>{ctx.font=`${13*dpr}px system-ui`;const width=Math.min(canvas.width-16,ctx.measureText(banner).width+20*dpr);ctx.fillStyle='rgba(8,13,19,.82)';ctx.fillRect(8,8,width,26*dpr);ctx.fillStyle='#ffc66d';ctx.fillText(banner,18,26*dpr,width-12);});
     if(!heat.count)overlay(()=>{ctx.fillStyle='#ffc66d';ctx.font=`${14*dpr}px system-ui`;ctx.fillText(l==='uncertainty'?`Fit uncertainty unavailable: ${covarianceNote()||'no covariance in this snapshot'}.`:'No field values for this layer in this snapshot.',16*dpr,28*dpr);});
@@ -282,12 +290,12 @@
   // ---- Captures overview: the landing table, one row per capture, sortable, with global metrics ----
   let overviewRows=[],overviewSort={key:'id',dir:-1};
   const overviewValue={
-    id:r=>r.id,kind:r=>r.kind,name:r=>r.name,decisions:r=>r.decisions,shots:r=>r.shots,
+    id:r=>r.id,kind:r=>r.kind,name:r=>r.name,map:r=>r.session?.map_index,decisions:r=>r.decisions,shots:r=>r.shots,
     estimated:r=>r.last?.planets,disclosed:r=>r.last?.accuracy?.actual_planets,missing:r=>r.last?.accuracy?.missing_planets,
     missingShare:r=>r.last?.accuracy?r.last.accuracy.missing_planets/Math.max(1,r.last.accuracy.actual_planets):null,
     centerError:r=>r.last?.accuracy?.median_center_error,search:r=>r.last?.search_state,
   };
-  const overviewColumns=[['id','#'],['kind','kind'],['name','name'],['decisions','decisions'],['shots','shots'],['estimated','est. planets'],['disclosed','truth'],['missing','missing'],['missingShare','missing %'],['centerError','median center err'],['search','search']];
+  const overviewColumns=[['id','#'],['kind','kind'],['name','name'],['map','map'],['decisions','decisions'],['shots','shots'],['estimated','est. planets'],['disclosed','truth'],['missing','missing'],['missingShare','missing %'],['centerError','median center err'],['search','search']];
   function middle(values){const a=values.filter(Number.isFinite).sort((x,y)=>x-y);if(!a.length)return null;const m=a.length>>1;return a.length%2?a[m]:(a[m-1]+a[m])/2;}
   async function loadOverview(){try{overviewRows=(await api('/api/overview')).captures;renderOverview();}catch(e){setStatus(e.message);}}
   function renderOverview(){
@@ -309,8 +317,8 @@
     table.append(head);
     for(const r of rows){
       const a=r.last?.accuracy,tr=document.createElement('tr');tr.className='row';
-      tr.title=`${new Date(r.started_at_unix_ms).toLocaleString()}${r.revision?` · ${r.revision.slice(0,8)}`:''}${r.last?.stage?` · ${r.last.stage}`:''}`;
-      const cells=[r.id,r.kind,r.name,r.decisions,r.shots,r.last?.planets??'—',a?.actual_planets??'—',a?.missing_planets??'—',a?pct(a.missing_planets/Math.max(1,a.actual_planets)):'—',a&&a.median_center_error!=null?fmt(a.median_center_error,1):'—',r.last?.search_state?.replaceAll('_',' ')??'—'];
+      tr.title=`${new Date(r.started_at_unix_ms).toLocaleString()}${r.session?` · session ${r.session.id}`:''}${r.revision?` · ${r.revision.slice(0,8)}`:''}${r.last?.stage?` · ${r.last.stage}`:''}`;
+      const cells=[r.id,r.kind,r.name,r.session?.map_index??'—',r.decisions,r.shots,r.last?.planets??'—',a?.actual_planets??'—',a?.missing_planets??'—',a?pct(a.missing_planets/Math.max(1,a.actual_planets)):'—',a&&a.median_center_error!=null?fmt(a.median_center_error,1):'—',r.last?.search_state?.replaceAll('_',' ')??'—'];
       for(const c of cells){const td=document.createElement('td');td.textContent=String(c);tr.append(td);}
       tr.addEventListener('click',()=>openCapture(r.id));table.append(tr);
     }

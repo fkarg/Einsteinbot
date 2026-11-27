@@ -26,8 +26,9 @@ pub struct ShotTally {
     pub energy: f64,
 }
 
-/// One session's own shots per map epoch. Epochs are counted by `Planets` events, as the live
-/// map counts them, so the numbers agree with `MapRecord::epoch`.
+/// One session's own shots per map epoch. Epochs are counted by the session's map boundaries
+/// (`new_map`), as the live map counts the canonical session's, so the numbers agree with
+/// `MapRecord::epoch`.
 #[derive(Clone, Debug, Default)]
 pub struct SessionTally {
     pub name: String,
@@ -43,6 +44,11 @@ impl SessionTally {
         }
     }
 
+    /// A map boundary: later shots belong to the next epoch.
+    pub fn new_map(&mut self) {
+        self.epoch += 1;
+    }
+
     /// Count `event`; `players` are the positions known before it.
     pub fn observe(
         &mut self,
@@ -51,7 +57,6 @@ impl SessionTally {
         players: &BTreeMap<u32, Point>,
     ) {
         match event {
-            ServerEvent::Planets { .. } => self.epoch += 1,
             ServerEvent::ShotFin {
                 player_id,
                 velocity,
@@ -96,6 +101,8 @@ impl Lag {
 #[derive(Clone, Debug, Default)]
 pub struct MapRecord {
     pub epoch: u64,
+    /// The capture recording this map, when recording.
+    pub capture: Option<i64>,
     /// The disclosed planets (`Planets`), if the server sent them.
     pub truth: Option<Vec<Planet>>,
     pub belief: Option<MapBelief>,
@@ -440,7 +447,7 @@ mod tests {
             points: vec![Point { x: 0.0, y: 0.0 }, Point { x: end, y: 0.0 }],
         };
         tally.observe(&shot(1, 50.0), Some(1), &players);
-        tally.observe(&ServerEvent::Planets { planets: vec![] }, Some(1), &players);
+        tally.new_map();
         tally.observe(&shot(1, 98.0), Some(1), &players);
         tally.observe(&shot(2, 0.0), Some(1), &players);
         assert_eq!(

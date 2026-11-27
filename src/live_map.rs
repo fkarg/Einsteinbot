@@ -249,8 +249,8 @@ impl LiveMap {
         (Self { published, sender }, worker)
     }
 
-    /// A new map epoch; `truth` is the disclosed planets that started it (statistics only).
-    pub(crate) fn reset(&self, truth: Option<Vec<Planet>>) {
+    /// A new map epoch.
+    pub(crate) fn reset(&self) {
         let mut state = self.published.lock().unwrap();
         state.fit_cancel.store(true, Ordering::SeqCst);
         state.fit_cancel = Arc::new(AtomicBool::new(false));
@@ -261,7 +261,17 @@ impl LiveMap {
         state.report = None;
         state.pending = 0;
         state.pending_paths = 0;
-        state.current().truth = truth;
+        state.current();
+    }
+
+    /// The disclosed planets of the current map epoch (statistics only, never estimator input).
+    pub(crate) fn set_truth(&self, planets: Vec<Planet>) {
+        self.published.lock().unwrap().current().truth = Some(planets);
+    }
+
+    /// The capture recording the current map epoch.
+    pub(crate) fn set_capture(&self, capture: i64) {
+        self.published.lock().unwrap().current().capture = Some(capture);
     }
 
     pub(crate) fn observe(&self, event: &ServerEvent) -> Result<u64, mpsc::SendError<WorkItem>> {
@@ -371,7 +381,7 @@ mod tests {
         let (updating, belief) = feed.snapshot();
         assert!(updating);
         assert!(belief.is_some());
-        feed.reset(None);
+        feed.reset();
         assert!(feed.snapshot().1.is_none());
         release_tx.send(()).unwrap();
         drop(feed);
@@ -432,7 +442,7 @@ mod tests {
             .unwrap();
         started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(feed.snapshot().0);
-        feed.reset(None);
+        feed.reset();
         cancelled_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(!feed.snapshot().0);
         assert!(feed.snapshot().1.is_none());
@@ -475,7 +485,7 @@ mod tests {
         started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         feed.observe(&ServerEvent::PlayerLeave { player_id: 2 })
             .unwrap();
-        feed.reset(None);
+        feed.reset();
         feed.observe(&ServerEvent::PlayerPosition {
             player_id: 1,
             x: 10.0,
@@ -567,7 +577,7 @@ mod tests {
         assert!(part["calls"].is_u64());
         assert!(part["total_ms"].is_f64());
         assert!(part["longest_ms"].is_f64());
-        feed.reset(None);
+        feed.reset();
         assert!(feed.snapshot_with_progress().2.is_none());
         drop(feed);
         worker.join().unwrap();
@@ -598,7 +608,9 @@ mod tests {
             radius: 30.0,
             mass: 2700.0,
         }];
-        feed.reset(Some(truth.clone()));
+        feed.reset();
+        feed.set_truth(truth.clone());
+        feed.set_capture(7);
         feed.observe(&shot(200.0)).unwrap();
         feed.observe(&shot(300.0)).unwrap();
         let settled: Vec<Settled> = feed.settle(Duration::from_millis(200)).iter().collect();
@@ -608,6 +620,7 @@ mod tests {
         let maps = feed.maps();
         assert_eq!(maps.iter().map(|m| m.epoch).collect::<Vec<_>>(), vec![0, 1]);
         assert_eq!(maps[1].truth.as_ref(), Some(&truth));
+        assert_eq!((maps[0].capture, maps[1].capture), (None, Some(7)));
         assert_eq!(maps[1].lag.paths, 2);
         assert!(maps[1].summary.is_some());
         worker.join().unwrap();
@@ -636,7 +649,7 @@ mod tests {
         started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         feed.observe(&event).unwrap();
         let published = Arc::clone(&feed.published);
-        feed.reset(None);
+        feed.reset();
         drop(feed);
         release_tx.send(()).unwrap();
         worker.join().unwrap();
@@ -668,7 +681,7 @@ mod tests {
         feed.observe(&event).unwrap();
         let reset_feed = feed.clone();
         let resetter = thread::spawn(move || {
-            reset_feed.reset(None);
+            reset_feed.reset();
             reset_feed.observe(&event).unwrap();
             processed_tx.send(()).unwrap();
         });
