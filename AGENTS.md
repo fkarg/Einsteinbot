@@ -58,6 +58,10 @@ Estimator/targeting work and the map inspector are developed by separate concurr
 - Prefer visual representations (layers, glyphs, timeline strips, bars) over additional tables, text or numbers; add text only where a visual cannot carry the information (user policy, 2026-11-27).
 - Optimize for understanding why each decision was made and the delta to reality that made it turn out differently (predicted vs actual, and the map or target error that caused it).
 
+## README performance section
+
+README.md explains mathematically why the bot works and states how well it works with current numbers. Update that section in the same change whenever a landed change alters measured results (user policy, 2026-11-27); state the data (independent games, duplicates counted once) and the build each number comes from.
+
 ## Keeping this file current
 
 Update this file when project goals, settled architecture, development workflow, or durable conventions change. Keep transient discussion and unresolved design exploration in the linked session state; promote settled, lasting decisions here when useful.
