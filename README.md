@@ -297,7 +297,18 @@ At most 1-2 paths are queued. Capture 55 is one game. The remaining worst lag co
 
 ### Estimator: known versus estimated planet count
 
-On the dev set, fixing $N = 24$ beats the default prior (24 ± 4) around 32 paths: explored-field RMSE 0.0046 vs 0.0202 (geometric means over 14 worlds). It is still somewhat better at 60 paths (1.1e-4 vs 1.7e-4). A fixed count that is too low stops at that count: on 26-planet synthetic worlds only `--planets 26` found the last two planets under the old default cap of 24. With overlapping planets excluded (P21), the default cap is 32: the prior alone then finds all 26, and caps 24, 32 and 64 give the same maps on the 24-planet replays.
+On the 14 dev worlds, fixing $N = 24$ beat the default prior (24 ± 4) around 32 paths (explored-field RMSE 0.0046 vs 0.0202, geometric means). On real games it makes no systematic difference: 69 recorded maps with disclosed planets (all with 24 planets, captures up to 58, duplicate games counted once, reserved test captures excluded; build before P21, cap 24; one run each):
+
+| paths | maps | recall (prior / fixed) | spurious | explored field RMSE (prior / fixed; flat ≈ 0.63) | median $\chi^2$ ratio vs truth |
+|---|---|---|---|---|---|
+| 8 | 69 | 330 / 330 | 5 / 5 | 0.17 / 0.17 | 1.9e11 / 1.9e11 |
+| 16 | 69 | 625 / 624 | 29 / 26 | 0.12 / 0.12 | 2.2e11 / 2.2e11 |
+| 32 | 42 | 685 / 686 | 19 / 17 | 0.044 / 0.042 | 1.1e11 / 1.1e11 |
+| 64 | 33 | 715 / 713 | 23 / 28 | 6.1e-4 / 6.1e-4 | 3.0e6 / 4.6e6 |
+| 128 | 21 | 498 / 493 | 2 / 4 | 5.3e-5 / 7.2e-5 | 4.1e3 / 7.9e3 |
+| 256 | 8 | 189 / 189 | 0 / 0 | 2.1e-5 / 2.2e-5 | 24 / 47 |
+
+The $\chi^2$ ratio (exact-noise fit of the estimate over that of the true map) stays huge until a map is complete, because the rounding noise is tiny; it approaches 1 only once every planet sits within a fraction of a unit. A fixed count that is too low stops at that count: on 26-planet synthetic worlds only `--planets 26` found the last two planets under the old default cap of 24. With overlapping planets excluded (P21), the default cap is 32: the prior alone then finds all 26, and caps 24, 32 and 64 give the same maps on the 24-planet replays.
 
 ### Targeting
 
