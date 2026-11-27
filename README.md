@@ -3,7 +3,7 @@
 Einsteinbot is a Rust bot for [NewtonWars](https://github.com/Draradech/NewtonWars), a multiplayer game where you shoot through a field of planets whose gravity bends every shot. The server never tells the bot where the planets are. The bot works out the planets from the paths of every shot it sees, keeps one best-estimate map, and aims by simulating candidate shots on that map.
 
 ![Map inspector: the bot's gravity belief on live capture 57, every path of the map coloured by outcome, one glyph per true planet](docs/images/viewer-57-latest.jpg)
-*The bot's gravity belief after 363 paths on one live map (capture 57, four bots): 19 of 24 planets found, 5 missing, 1 extra estimate. Paths are coloured by outcome (red: hit a player, orange: hit a planet, white: left the field).*
+*The bot's estimated gravity field after 363 shot paths on one map of a recorded game (capture 57, four bots): 19 of 24 planets found, 5 missing, 1 extra estimate. Paths are coloured by outcome (red: hit a player, orange: hit a planet, white: left the field).*
 
 ## Quick start
 
@@ -38,6 +38,30 @@ You need a Rust toolchain and the NewtonWars source checked out next to this rep
 
 All options, the recording format and the offline tools are in [docs/usage.md](docs/usage.md). The inspector is documented in [docs/map-inspector.md](docs/map-inspector.md).
 
+## Terms
+
+The rest of this README uses these words in a fixed sense.
+
+- **Path**: the positions of one shot, one per game tick, from launch until it hits a player or a planet or leaves the battlefield (the rectangular playing field). Every player sees every shot, so all players' paths are data.
+- **Tick, substep**: the server reports positions once per tick; internally it integrates each tick in 25 substeps.
+- **Map**: one set of planets. The server switches to a new map from time to time, usually without saying so. A **map boundary** is the moment the bot detects a switch; it then forgets everything about the old map.
+- **End card**: the scoreboard shown when a round ends. The server stops moving shots then, so the bot stops firing.
+- **Belief**: the bot's current estimate of the map: one list of planets (centre and radius). The estimator works on its own copy and **publishes** a snapshot after every path; targeting aims with the latest published one.
+- **Row, residual**: each tick of a path gives one equation, a *row*, that compares the observed bend of the path with the bend the belief predicts there. The *residual* is observed minus predicted.
+- **Unseen planets**: true planets the belief does not contain yet.
+- **Birth, death**: the search adding a planet to the belief or removing one.
+- **Evidence**: the score that decides how many planets the belief has: how well the map explains the rows, minus a penalty per planet ([section 4](#4-model-selection-how-many-planets)).
+- **Cap**: the most planets the belief may hold: $N$ if you pass a known planet count with `--planets N`, otherwise 32.
+- **Residual correction**: extra pull that targeting adds where observed paths bend in a way the belief does not explain yet ([section 6](#6-aiming-on-an-imperfect-map)).
+- **Capture**: a recording (SQLite file) of one map as one bot saw it: positions, paths, the bot's decisions. Captures are numbered ("capture 55").
+- **World**: one map used for measurement. *Live* worlds are captures of real games; *synthetic* worlds are generated maps with simulated shots. *Dev* worlds were used while tuning; *held-out* worlds were run once afterwards, to check that the tuning did not just fit the dev worlds.
+- **Truth**: the real planets, known for synthetic worlds and for live games run with `sendplanets 1`. It is only used to score the bot, never as input.
+- **Replay**: feeding a capture to the estimator or targeting offline. Replays are deterministic.
+- **Recall, spurious**: recall counts true planets with an estimated planet within 2 units; spurious counts estimated planets with no true planet within 15 units.
+- **True hit**: a replay flies the shot the bot chose on the true map; it is a true hit if it hits a player there.
+- **$\chi^2$/row**: the sum of squared residuals, each divided by its modelled noise variance, per row. About 1 means the residuals look like the modelled noise; much more means the map or the noise model is wrong.
+- **P-numbers** (P13, P15, ...): numbered project changes. Estimator changes have their measurements in [docs/estimator-experiments.md](docs/estimator-experiments.md), the others in the [design log](docs/brainstorms/2026-11-13-newtonwars-bot.md).
+
 ## How it works
 
 ### Overview
@@ -55,9 +79,9 @@ flowchart LR
 
 1. **Watch the shots.** Every shot by every player is reported as a list of positions, one per game tick. A shot bends towards each planet, so its path carries information about the planets near it.
 2. **Read the curvature.** At each tick the bot measures how much the path bends. That bend is the gravity at that point, up to known factors. Each tick becomes one equation, called a *row*. The bot never has to simulate a whole shot to fit the map.
-3. **Say how wrong a row can be.** A row can be off for three reasons: the positions are rounded, the bot interpolates between ticks, and planets it has not found yet still pull on the shot. The bot models all three. The last one matters most: without it, the search invents planets to soak up the pull of distant ones.
-4. **Search for planets.** The bot adds a planet where the rows point to missing mass, removes one that no longer earns its place, and keeps a change only if it makes the data more probable after paying a penalty for every extra planet. The search runs in small resumable slices in the background, so a new map is published right after every new path.
-5. **Aim on the belief.** The bot simulates every legal shot on its current map, plus a correction for pull it can see along observed paths but has not explained yet. It prefers short flights, because map errors grow along a path, and it skips targets that someone else's shot already in flight will kill first.
+3. **Say how wrong a row can be.** A row can be off for three reasons: the positions are rounded, the bot has to interpolate the substep positions the server does not report, and unseen planets still pull on the shot. The bot models all three. The last one matters most: without it, the search invents planets to soak up the pull of distant ones.
+4. **Search for planets.** The bot adds a planet where the rows point to missing mass, removes one that no longer earns its place, and keeps a change only if it raises the evidence. The search runs in the background in small pieces of bounded work (*slices*) that can be paused and resumed, so a new belief is published right after every new path.
+5. **Aim on the belief.** The bot simulates every shot it may fire (angle and speed, within its energy) on its current map, plus the residual correction. It prefers short flights, because map errors grow along a path, and it skips targets that someone else's shot already in flight will kill first.
 6. **Notice new maps.** The server starts a new map without saying so. The bot recognises the moment when every player is moved at once, and starts a fresh map.
 
 ### The smart parts, in brief
@@ -67,12 +91,12 @@ Each item says what the bot does, why it helps, and what it measured. The math b
 | | What it does | Why it helps | Measured |
 |---|---|---|---|
 | **Reads gravity from curvature** | Turns each tick of every observed shot (anyone's) into an exact equation for the local gravity, instead of simulating whole shots. | Exact, cheap, and every shot in the game becomes data. | True map fits the rows to rounding noise ($\chi^2$/row ≈ 0.9 on 5,886 live paths). |
-| **Knows what it doesn't know** | Treats the pull of planets it has not found yet as a smooth, correlated error along each path, sized by how far away an unseen planet could be. | Without it, the fit counts one systematic error as thousands of independent clues and invents phantom planets. | Phantom planets at 8 paths: 79 → 1 (14 worlds). |
-| **Learns its own noise level honestly** | Sizes that error from how badly the current map *predicts* each new path before fitting it. | Fitted residuals understate the error; predictions don't. The error shrinks by itself as the map completes. | Residuals look like noise again ($\chi^2$/row ≈ 1, neighbour correlation ≈ 0 instead of 0.85-0.97). |
-| **Never stops to think** | Searches for planets in small resumable slices between shots and publishes a fresh map after every path. | Targeting always has a current map, even at 9 new paths per second. | Median publish lag 62-71 ms at 9 paths/s; all 24 planets after 128 paths (14 s) of a real game. |
-| **Pays for every extra planet** | Adds or removes a planet only when the data become more probable after an Occam penalty. | Planets come from evidence, not from the search's appetite. | Same recall as before at the end of a map, with fewer phantoms. |
-| **Only proposes possible maps** | Never lets two estimated planets overlap or a planet cross the edge, exactly as the server's map generator requires. | A planet the generator could not produce is wrong by construction; it was splitting one real planet into three. | The split is gone; the default cap rose to 32 without new phantoms; CPU on one capture 476 s → 39 s. |
-| **Notices when its planet cap is too low** | When the map is at its planet cap (`--planets N`, else 32) and the unexplained pull along the paths is still planet-sized, it warns that the map may have more planets than that (stop report, live view, inspector). It never raises the cap itself. | A wrong `--planets` silently costs the missing planets; the warning tells you to raise it. | Raised in 26 of 26 replays with 1-4 planets left out, a median of 2 paths after reaching the cap; never in 20 replays with the right count at the cap. |
+| **Knows what it doesn't know** | Treats the pull of planets it has not found yet as a smooth, correlated error along each path, sized by how far away an unseen planet could be. | Without it, the fit counts one systematic error as thousands of independent clues and invents phantom planets. | Spurious planets after 8 paths, summed over 14 dev worlds: 79 → 1. |
+| **Learns its own noise level honestly** | Sizes that error from how badly the current map *predicts* each new path before fitting it. | Fitted residuals understate the error; predictions don't. The error shrinks by itself as the map completes. | Residuals look like noise again ($\chi^2$/row ≈ 1, correlation of neighbouring residuals ≈ 0 instead of 0.85-0.97). |
+| **Never stops to think** | Searches for planets in small resumable slices between shots and publishes a fresh map after every path. | Targeting always has a current map, even at 9 new paths per second. | Median 62-71 ms from a path to a published belief that includes it, at 9 paths/s; all 24 planets after 128 paths (14 s) of a real game. |
+| **Pays for every extra planet** | Adds or removes a planet only when the evidence rises, which includes a penalty per planet. | Planets come from evidence, not from the search's appetite. | Same recall as before at the end of a map, with fewer spurious planets. |
+| **Only proposes possible maps** | Never lets two estimated planets overlap or a planet cross the edge, exactly as the server's map generator requires. | A planet the generator could not produce is wrong by construction; it was splitting one real planet into three. | The split is gone; the default cap rose to 32 without new spurious planets; CPU on one capture 476 s → 39 s. |
+| **Notices when its planet cap is too low** | When the map is at its planet cap (`--planets N`, else 32) and the unexplained pull along the paths is still planet-sized, it warns that the map may have more planets than that (in the report printed on Ctrl+C, the live terminal view and the inspector). It never raises the cap itself. | A wrong `--planets` silently costs the missing planets; the warning tells you to raise it. | Raised in 26 of 26 replays whose cap was 1-4 below the true count, a median of 2 paths after reaching the cap; never in 20 replays with the right count at the cap. |
 | **Aims with what it can't explain yet** | Adds the still-unexplained pull seen along observed paths to its shot simulation; switches off once the map is complete. | Early in a map, paths near earlier shots are bent by planets the map lacks. | +5 to +32 true hits per replayed game, almost all early in the map. |
 | **Prefers short shots** | Ranks predicted hits by flight time first, miss distance second. | Map errors grow along a path; long shots rarely hit. | The ranking alone: true hits 15 → 23, 49 → 61, 22 → 46 on replayed games. |
 | **Doesn't shoot the doomed** | Simulates every shot in flight (all players, its own included) and skips targets that will die before its shot lands, unless its shot wins the race. | In busy games many shots hit where a player *was*. | Capture 58: true hits 252 → 315, wasted hits 112 → 62. |
