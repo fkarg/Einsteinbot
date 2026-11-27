@@ -23,6 +23,7 @@ mod audit;
 mod contacts;
 mod eval;
 mod fit;
+mod lm;
 mod noise;
 mod rebuild;
 mod rows;

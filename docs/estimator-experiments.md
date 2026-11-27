@@ -1265,3 +1265,38 @@ Truth planet #6 of capture 55 (viewer numbering, 0-based; at (1032, 156), radius
 No path comes within its radius plus 60 before about 128 paths. By the end, 16 paths come within that distance and 6 recorded contacts lie on its surface. When every update is allowed to finish, main finds it, and so does P13. In the recorded live decisions of capture 55 (the build of that time, with the audit), the nearest belief planet stayed about 180 units from #6 for the whole epoch (19-23 planets). That is the falling-behind above, not a missed seed or evidence. The recorded choices were 108 `Hit`, 58 `Approach` and 1 without a choice, with `Approach` rising to about 40% after 20 s. No shots were uncertainty probes.
 
 Compute: jolly about 4,000 CPU-s (dev 716, the six long capture replays about 3,300, a third of it the duplicated epoch); Mac about 20 CPU-minutes.
+
+### P12b results (2026-11-27, branch `p12b` from main 174c80f; `src/estimator/lm.rs`, `Fit::reduce` in `fit.rs`)
+
+Question: the `levenberg-marquardt` crate pivots a dense QR of the full tall Jacobian on one thread at every Jacobian evaluation. Does replacing that with a QR reduced in parallel speed up the fit without changing the maps? Short answer (observed, one run per cell unless stated): yes. CPU falls 2.4 times on the dev worlds and wall time about 5 times on a 128-path capture replay, the maps are the same within run-to-run differences, and at 9 paths per second the search runs about twice as many slices. Something else now limits the high-rate case: two serial per-path phases (below).
+
+**Profile before (main, Mac, `sample` 40 s of the real-time capture 55 replay, 10 threads).** About half of the samples were threads waiting. Of the busy samples: the crate's QR (`PivotedQR::new` plus its least-squares setup) took 42%; the trajectory simulation in `publish` (`model_position_rmse` over every path, a diagnostic) 16%; the noise phase (`Gains::with_missing`, `whiten`, `Admissible`) 13%; the interior-penalty chord search with its `hypot` about 13%; field and derivative evaluation about 3%.
+
+**Change.** The trust-region loop and its subproblem are a port of the crate's code (Moré's `lmder`/`lmpar`/`qrsolv`, with the same tolerances, patience, step bound and termination tests). Only the source of the QR factor changed. Consecutive paths are grouped into about 16 groups by row count. The grouping depends on the data only, so the result does not depend on the thread count. On its own thread, each group builds its paths' Jacobian blocks (already whitened, chained to the logistic coordinates) and folds them into a triangle with unpivoted Householder QR, in buffers of at least max(256, 8n) rows. Rows with an all-zero Jacobian row are left out: they change neither R nor the leading part of Q^T f. Most interior penalties are such rows. The stacked triangles and the contact rows then get the pivoted QR. That gives the pivoted QR of the full Jacobian (J = Q1 R1 gives J P = Q1 R1 P, and the column pivoting sees the same norms in both). The full Jacobian is never formed. The dot products use eight partial sums, which halved the QR time. Evaluation counting, deadlines, cancellation and "best point evaluated" are unchanged. `JacobianEval` timings in a refinement now include the reduction. The Laplace evidence still uses the dense Jacobian. The crate remains as a dev-dependency only, as the reference in `the_solver_reaches_the_minimum_of_the_crate` (2- and 3-planet fits, with and without contacts: chi2 within 1e-6 relative, parameters within 1e-3). `the_reduced_factor_is_the_qr_of_the_full_jacobian` checks R^T R = J^T J and R^T Q^T f = J^T f, and that results are bitwise equal for 1, 2 and 8 threads. The `lm.rs` tests cover folding with zero rows and refolds, and an all-zero Jacobian. The dev replays found a panic on an all-zero Jacobian (live 45, about 37 paths), which is now fixed and tested.
+
+**Deterministic dev replays (jolly, no audit, 60 paths, 2 threads; main = `/tmp/P13/rev_noaudit`, same code as 174c80f; rec2/rec15/spur summed over 8 synthetic + 6 live worlds).**
+
+| n | 4 | 8 | 16 | 32 | 60 | CPU s |
+|---|---|---|---|---|---|---|
+| main -> P12b | 60/66/1 -> 60/66/1 | 104/116/1 -> 104/116/1 | 179/194/1 -> 178/194/1 | 283/292/1 -> 283/292/1 | 300/303/5 -> 299/302/3 | 711 -> 301 |
+
+Per world, the maps agree to within one planet at every checkpoint, except live 48 at 48 paths (21 -> 24). Rounding changes the order of the search, so small differences are expected.
+
+**Deterministic capture 55 epoch 0 (jolly, 400 paths, 2 threads, no audit; main = `/tmp/P13bin_rev`).** rec2/rec15/spur at n = 8, 16, 32, 64, 128, 256, 400. Main: 4/6/0, 6/8/0, 13/15/3, 19/19/0, 24/24/0, 24/24/0, 24/24/0. P12b: 4/6/0, 7/7/1, 13/15/3, 19/19/0, 24/24/0, 24/24/0, 24/24/0. CPU 493 -> 255 s, wall 410 -> 181 s.
+
+**Real-time replay, capture 55 epoch 0 (Mac, 10 threads, a path every 110 ms, all 545 paths, no audit; two alternating runs each; the user's NewtonWars server was listening on 3490 and other sessions kept the load average at 3-7).**
+
+| | n=16 | n=32 | n=64 | n=128 | n=256 | n=545 | slices | publish lag median / p90 / max ms |
+|---|---|---|---|---|---|---|---|---|
+| main run 1 | 6/0 | 9/1 | 16/0 | 22/0 | 24/0 | 24/0 | 161 | 215 / 573 / 1276 |
+| main run 2 | 6/0 | 10/1 | 16/0 | 22/0 | 24/0 | 24/0 | 205 | 171 / 299 / 582 |
+| P12b run 1 | 7/1 | 10/1 | 16/0 | 24/0 | 24/0 | 24/0 | 313 | 116 / 212 / 587 |
+| P12b run 2 | 7/1 | 12/0 | 18/0 | 24/0 | 24/0 | 24/0 | 388 | 104 / 251 / 1564 |
+
+(cells: rec2/spur.) P12b completes about twice as many slices and is complete at 128 paths in both runs; main is at 22 of 24 there. The worst lag does not improve, and it is not the solver. Late in the epoch, at 500 paths and more, each `observe` spends about 50 ms (up to 200 ms under load) in the noise phase and about 55 ms (up to 100 ms) in the `publish` diagnostics (`model_position_rmse` simulates every path again). Both are serial and grow with the path count, and together they exceed the 110 ms arrival period even with no search, so paths queue up (P12b run 2 at n = 515-527, `SLOW` lines). This is the next throughput item: P12b does not touch it.
+
+**Mac latency, live 33, `SCHEDULE=500`, 10 threads, no audit (two runs each, alternating, load 3-6).** Worst publish lag main 272 / 311 ms -> P12b 104 / 110 ms; final map 22/24/0 -> 24/24/0 (rec2/rec15/spur) in both runs.
+
+**Mac deterministic CPU, capture 55 epoch 0, 128 paths, 10 threads (load 5-13, so CPU seconds are noisy there).** main 128.5 s CPU / 95.5 s wall -> P12b 61-78 s CPU / 18-21 s wall; the maps are identical across the P12b runs. After the change, a `sample` of that run puts the QR (`reflect` + `dot`) at 32% of busy samples, then the noise whitening (13%), the chord search (13%), `Folder::add` (7%, before its row filter was vectorized) and the field and derivative evaluation (10%).
+
+Reproduction: as for P13 (`diagnose_replay`; `PATHS=60 CEIL_MS=0 THREADS=2 AUDIT=0` per world; `SCHEDULE=110 THREADS=10 SEEDS=- LIVE=55 EPOCH=0 PATHS=545`; `SCHEDULE=500 THREADS=10 SEEDS=- LIVE=33 PATHS=60`). Compute: jolly about 1,060 CPU-s, Mac about 15 CPU-minutes.
