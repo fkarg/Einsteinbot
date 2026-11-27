@@ -233,3 +233,331 @@ Verdict: adopt the relative-level polish as an opt-in, narrow form: relative-lev
 Production search if all of this were adopted: (1) cascade growth on thinned rows (500/1000/2000 rows, relative sd 0.1/0.02/0.005), about 2.2-3k full-row-equivalent evaluations (23-28k raw); (2) refit the map on full rows at relative sd 0.005, grow and delete on that evidence, repeat at 0.001, about 0.8-2.2k on complete maps and up to the 8-12k allowance on incomplete ones; (3) exact refit (10-100 evaluations), accepted if the exact chi2 falls and (no start planet moves 3 units or chi2/row <= 1.5), else keep the relative map; (4) no exact growth or deaths. Expected cost: about 3.5-6k full-row equivalents on a complete map, up to about 15k on an incomplete one, against 9-15k for E9 as it was. Limits: dev and held-out worlds are the synthetic generator (24 planets, 60 or 16/8 long paths at speed 8) and ten live captures, one run per cell, thresholds (3 units, 1.5) not tuned beyond one revision (the C override was added after the dev live results; the held-out was run once with it, the F hybrid was tried on dev and then held-out cases once); the relative term uses the observed acceleration, which is noisy at noise 0.1.
 
 Reproduction: `cargo test --release --lib diagnose_polish -- --ignored --nocapture --test-threads=1` with `PATHS`, `SEEDS`, `LIVE` (`-` for none), `NOISE`, `STAGE1`, `POLISH_BUDGET` and `POLISH` (comma-separated programs) as in the harness header, run in a directory with `einsteinbot.sqlite3` (the P4 capture subset in `/tmp/einsteinbot-p4`). Example for the held-out synthetic table: `PATHS=60 SEEDS=7101,7102,7103,7104,7105,7106,7107,7108 LIVE=- POLISH=0gd,0.001gd+0,0.005gd+0.001gd+0G3C1.5 POLISH_BUDGET=12000`.
+
+### P6 results (2026-11-27, branch `p6`, built on `e9c`; harness `src/estimator/diagnose/incremental.rs`, ignored tests `diagnose_incremental` and `diagnose_rebuild`; tables from `scripts/p6_tables.py`)
+
+Question: is the warm-started incremental structure "B" viable, i.e. can a map be kept up to date path by path at roughly constant cost, with from-scratch rebuilds only as an occasional audit? Production search is unchanged; this is a measurement prototype in the diagnosis harness. Truth is used only to score. Short answer: quality yes, steady-state latency yes (median 22 ms, worst 250 ms on the Mac at K=24 once the map has settled), worst-case latency no while planets are still being born (seconds, up to 20 s on the Mac), and the per-planet support test of Q13 cannot be built on a removal chi2.
+
+#### What B is here (configuration B*)
+
+`lv=0.02/0.005:cap=1000:rf=300:ev=1500:lr=100:dl=30:dn=4` (harness `CONFIGS` syntax). Per new path:
+1. Rows. The accumulated paths are kept at relative sd 0.02 and 0.005 (observed |a| times that, added to the noise, as in the E9 cascade). For each level the rows are thinned (at most 2 per 14-unit cell, strongest observed acceleration first, at most `cap` = 1000 rows of the 2 x 16k at 60 paths; the paths' windows are built once per path, thinning is redone per update, about 1 ms).
+2. Warm refit (`rf`, `lr`): only the planets within 100 units of a row of the new path are refit (300 evaluation cap); the others are fixed field. No evidence is computed for a refit.
+3. Births (`ev`): if the unexplained windows on those rows still seed a planet, evidence is computed and greedy births run as in the E9 cascade (seeds fitted alone, joint refits of the best three) until no birth improves the evidence, with a cap of 1500 evaluations per level. A map with no significant unexplained window pays nothing here.
+4. Deaths (`dl`, `dn`): every 4th update the two planets whose removal raises the chi2 least are removed, their neighbours within 100 units refit, and the removal is kept if the chi2 rises by less than 30. It changed no result in the four dev worlds where it was compared with no deaths (7001-7004, thresholds 10, 30, 100), so B* effectively has no deaths (candidates are ranked by the plain removal chi2, which misses the redundant pair described under Q4); an evidence-based death descent (`dv=300:dn=4`, depth 1) gave the same recall on four synthetic dev worlds (7001-7004: 100% at 32 paths) and 86% against 88% on the six live dev captures at 60 paths.
+5. Audit (`audit=N` adopts, `probe=N` only measures): a from-scratch rebuild on all paths so far (E9 cascade, then the E9c polish `0.005gd+0.001gd+0` with the guarded exact refit, polish budget 8000/12000 evaluations) is compared with the maintained map refit on all rows at relative 0.005 by the Laplace evidence at that level; the rebuild is adopted only if its evidence is higher.
+Quality is also shown "+ guarded exact refit" (E9c rule: exact refit of the current map, accepted if the exact chi2 falls and no planet moves 3 units or chi2/row <= 1.5, at most 600 evaluations; not kept in the state, and not timed).
+
+Evaluation counts: "full-row equivalent" = evaluations times (nodes of the row set / nodes of all rows of the accumulated paths), as in E9/E9c. Because a local refit has fewer unknowns the equivalent undercounts the cost of the thinned set; use wall time for latency.
+
+Machine and conditions. Latency: the Mac (10 cores, macOS), release build, the harness's `cores()` limited with a test-only override (`TEST_THREADS`, absent from non-test builds). The Mac was not idle: other sessions were running (load average 2 to 4 during the runs, 8 logged-in users), and during the production run, the first B run and the 1-thread run I compiled in the same checkout. Treat latencies as indicative to a factor of about 1.5. Quality: 14 dev worlds and 13 held-out worlds were run on `jolly` (2 threads per process, load 20-30); results are evaluation-budget deterministic, so thread count and load do not enter (not re-run on the Mac). Paths: synthetic in generator order (a fixed random order), live in capture order (first map epoch, at most 61 paths; capture 48 has 48, 43 has 41, 34 has 2). Exact noise (sd 0).
+
+#### Q1 update cost per new path (Mac, release, threads as stated)
+
+Synthetic seed 7001 (K=24), B*, 8 threads, 60 paths, by the accumulated path count:
+
+| paths at the update | updates | median ms | p90 ms | max ms | median evaluations | median full-row equiv | median K |
+|---|---|---|---|---|---|---|---|
+| 1-4 | 4 | 279 | 474 | 474 | 3370 | 3302 | 9 |
+| 5-8 | 4 | 2062 | 4706 | 4706 | 3584 | 3520 | 18 |
+| 9-16 | 8 | 110 | 10460 | 10460 | 46 | 30 | 24 |
+| 17-32 | 16 | 24 | 214 | 218 | 20 | 8 | 24 |
+| 33-60 | 28 | 22 | 244 | 249 | 18 | 4 | 24 |
+
+The same by variant and world (early = updates at 16 paths or fewer, when the map is still being grown from nothing; late = the rest):
+
+| run | threads | paths<=16: updates, median / p90 / max ms | paths>16: updates, median / p90 / max ms, median evals, median full-row equivalents, median K |
+|---|---|---|---|
+| production update, path by path (5 s time budget, 24 planet cap lifted to 32), synthetic 7001 | 8 | 16: 5013 / 5031 / 5035 | 44: 5091 / 5215 / 5295, 268, 268, 24 |
+| first B variant (cap 2000, full warm refit, evidence deaths every update), 7001 | 8 | 16: 2081 / 24705 / 25732 | 44: 2131 / 3216 / 4749, 194, 94, 24 |
+| cap 1000, no local refit, deaths every 4th update (40 paths), 7001 | 8 | 16: 1094 / 4335 / 5219 | 24: 169 / 1107 / 1542, 22, 8, 24 |
+| + local warm refit (two caps in one file: 1000 and 500 rows, 36 paths), 7001 | 8 | 32: 864 / 2953 / 3604 | 40: 21 / 880 / 1792, 20, 6, 24 |
+| local deaths every update (36 paths), 7001 | 8 | 16: 317 / 4749 / 10360 | 20: 215 / 224 / 230, 74, 26, 24 |
+| B*, 7001, K=24, 60 paths | 8 | 16: 312 / 4706 / 10460 | 44: 22 / 231 / 249, 20, 6, 24 |
+| B*, 4 threads, 40 paths | 4 | 16: 359 / 5366 / 12052 | 24: 24 / 218 / 232, 20, 7, 24 |
+| B*, 1 thread, 40 paths | 1 | 16: 667 / 10050 / 21696 | 24: 33 / 220 / 243, 20, 7, 24 |
+| B* with all rows (no thinning), 40 paths | 8 | 16: 823 / 5576 / 9411 | 24: 69 / 652 / 841, 18, 18, 24 |
+| B* cap 4000, 40 paths | 8 | 16: 458 / 5049 / 9829 | 24: 64 / 602 / 769, 20, 18, 24 |
+| B* cap 2000, 40 paths | 8 | 16: 440 / 5056 / 9906 | 24: 42 / 461 / 498, 18, 13, 24 |
+| B*, K=8 world (seed 7001), 40 paths | 8 | 16: 22 / 627 / 810 | 24: 14 / 40 / 54, 18, 2, 8 |
+| B*, K=16 world, 40 paths | 8 | 16: 124 / 1920 / 2341 | 24: 18 / 120 / 175, 19, 5, 16 |
+| B*, K=26 world, 40 paths | 8 | 16: 1012 / 14667 / 20940 | 24: 27 / 408 / 17482, 22, 15, 26 |
+| B*, live 33 (61 paths) | 8 | 16: 560 / 3264 / 6192 | 45: 23 / 1507 / 9475, 22, 10, 23 |
+| B*, live 40 | 8 | 16: 254 / 3591 / 3598 | 45: 22 / 4780 / 12289, 22, 15, 21 |
+| B*, live 45 | 8 | 16: 368 / 4262 / 5771 | 45: 1975 / 18034 / 19039, 1210, 503, 22 |
+| B* births capped at 300 evaluations, live 33 | 8 | 16: 266 / 1132 / 1180 | 45: 146 / 1073 / 1737, 684, 204, 22 |
+| births capped at 300, live 40 | 8 | 16: 165 / 669 / 886 | 45: 166 / 1202 / 2264, 354, 180, 19 |
+| births capped at 600, live 33 | 8 | 16: 253 / 1787 / 2451 | 45: 288 / 935 / 1860, 1265, 378, 22 |
+| births capped at 600, live 40 | 8 | 16: 175 / 1326 / 1569 | 45: 24 / 2791 / 4971, 24, 17, 22 |
+
+Reading:
+- Steady state (map complete, no births): 20-25 evaluations and 22-33 ms median, 230-250 ms worst (the update that runs the local death test; without it about 25 ms). Threads hardly matter: median 22 ms at 8 threads, 24 ms at 4, 33 ms at 1 (the refit and the evidence are mostly single-threaded). Observed: this is a constant-cost update, independent of the path count from 17 to 60 and of K between 8 and 26 (K=8 14 ms, K=16 18 ms, K=24 22 ms, K=26 27 ms median late).
+- The row cap is what makes it constant. With the local refit in place, 40-path replays: cap 1000 median 22 ms, cap 2000 42 ms, cap 4000 64 ms, all rows 69 ms (max 841 ms); medians rise with the path count without a cap and stay flat with it. Before the local refit (full warm refit of all planets, 1000-2000 rows) the median was 150-220 ms at 8 threads and 1.7-2.1 s with evidence-based deaths every update; the production update (exact rows, whole map, 5 s time budget) used its whole 5 s budget at every update from the 5th path on (250-440 evaluations at K=24 after 32 paths) and was cut by the budget.
+- Worst case (observed): any update that runs births is not bounded by this. On synthetic 7001 the 8th-16th updates (K grows from about 15 to 24) take up to 10 s, and a K=26 world had one 17.5 s update at 40 paths. On live captures at 8 threads (paths > 16): live 33 median 23 ms, p90 1.5 s, max 9.5 s; live 40 22 ms, p90 4.8 s, max 12.3 s; live 45 (a world whose map is still incomplete at 32 paths, 12 of 24 found) median 2.0 s, p90 18 s, max 19 s. Capping the births at 300 evaluations per update brings live 33/40 to median 146/166 ms, p90 1.1/1.2 s, max 1.7/2.3 s (600 evaluations: median 288/24 ms, p90 0.9/2.8 s, max 1.9/5.0 s) at a price in recall: live 33 recall(2) at 60 paths 22 uncapped, 18 (cap 300), 21 (cap 600); live 40 19, 17, 18 (one world each, no repeats).
+- The rebuild that B would use as an audit (observed on the Mac, 8 threads, synthetic 7005): 41 s at 16 paths, 28 s at 32, 56 s at 60; 3k-34k full-row equivalent evaluations (mean over the dev worlds: synthetic 34k at 4 paths, 16k at 16, 9.8k at 32, 3.8k at 60; live 33k, 27k, 18k, 13.5k). In raw evaluations a rebuild is 27-37k against about 20 per steady-state update (1400-1850 updates), and 1300-2500 updates in Mac wall time.
+
+#### Q2 quality against path count
+
+Recall(2) is the share of true planets with a fitted planet within 2 units, recall(15) within 15, spurious = fitted planets with no true planet within 15 units. "ratio <= 1.2" counts worlds whose exact chi2/row is at most 1.2 times the true map's; the median ratio is the median over worlds of that ratio. Field columns are the mean over worlds of the field RMSE divided by the RMSE of the empty (flat) map, on the 20-unit grid, explored = within 30 units of a row (acceleration units, truth only scores). The raw B map has a large exact chi2 ratio (1e3-1e5 even for 24/24 maps) because the relative-level fit leaves position errors of about 0.001-0.01 units, which the exact likelihood punishes; one guarded exact refit of the maintained map (row "+ guarded exact refit") gives 0.99 on every synthetic world from 32 paths on (live: complete only where the map is).
+
+#### Q2 quality, dev synthetic (7001-7008, 8 worlds)
+
+| map | n | worlds | recall2 | recall15 | spurious | K | ratio<=1.2 | median ratio | field expl/flat | unexpl/flat | whole/flat |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| B, no audit | 4 | 8 | 8% | 27% | 5.9 | 12.2 | 0/8 | 8.04e+09 | 2.18e-01 | 1.75e+01 | 1.67e+01 |
+| B, no audit | 8 | 8 | 46% | 61% | 4.9 | 19.5 | 0/8 | 5.45e+08 | 6.02e-02 | 9.67e+00 | 8.76e+00 |
+| B, no audit | 16 | 8 | 90% | 92% | 1.1 | 23.2 | 0/8 | 1.25e+04 | 1.11e-02 | 2.00e+00 | 1.63e+00 |
+| B, no audit | 32 | 8 | 100% | 100% | 0.0 | 24.0 | 0/8 | 1.38e+04 | 1.55e-04 | 2.73e-03 | 1.88e-03 |
+| B, no audit | 60 | 8 | 100% | 100% | 0.0 | 24.0 | 0/8 | 4.73e+04 | 1.04e-04 | 5.90e-04 | 3.21e-04 |
+| B, no audit + guarded exact refit | 4 | 8 | 8% | 27% | 5.9 | 12.2 | 0/8 | 8.04e+09 | 2.18e-01 | 1.75e+01 | 1.67e+01 |
+| B, no audit + guarded exact refit | 8 | 8 | 46% | 61% | 4.9 | 19.5 | 0/8 | 5.45e+08 | 6.02e-02 | 9.67e+00 | 8.76e+00 |
+| B, no audit + guarded exact refit | 16 | 8 | 90% | 92% | 1.1 | 23.2 | 5/8 | 1.01e+00 | 1.10e-02 | 2.00e+00 | 1.64e+00 |
+| B, no audit + guarded exact refit | 32 | 8 | 100% | 100% | 0.0 | 24.0 | 8/8 | 9.91e-01 | 6.80e-06 | 2.33e-05 | 1.74e-05 |
+| B, no audit + guarded exact refit | 60 | 8 | 100% | 100% | 0.0 | 24.0 | 8/8 | 9.96e-01 | 3.35e-06 | 5.54e-06 | 4.20e-06 |
+| B, audit every 16 | 4 | 8 | 8% | 27% | 5.9 | 12.2 | 0/8 | 8.04e+09 | 2.18e-01 | 1.75e+01 | 1.67e+01 |
+| B, audit every 16 | 8 | 8 | 46% | 61% | 4.9 | 19.5 | 0/8 | 5.45e+08 | 6.02e-02 | 9.67e+00 | 8.76e+00 |
+| B, audit every 16 | 16 | 8 | 91% | 93% | 1.1 | 23.4 | 0/8 | 1.25e+04 | 1.09e-02 | 8.38e-01 | 6.98e-01 |
+| B, audit every 16 | 32 | 8 | 100% | 100% | 0.0 | 24.0 | 0/8 | 1.38e+04 | 1.54e-04 | 2.72e-03 | 1.88e-03 |
+| B, audit every 16 | 60 | 8 | 100% | 100% | 0.0 | 24.0 | 0/8 | 4.73e+04 | 1.04e-04 | 5.88e-04 | 3.20e-04 |
+| B, audit every 8 | 4 | 8 | 8% | 27% | 5.9 | 12.2 | 0/8 | 8.04e+09 | 2.18e-01 | 1.75e+01 | 1.67e+01 |
+| B, audit every 8 | 8 | 8 | 55% | 67% | 5.9 | 22.0 | 0/8 | 8.90e+07 | 5.00e-02 | 1.31e+01 | 1.21e+01 |
+| B, audit every 8 | 16 | 8 | 91% | 93% | 1.0 | 23.4 | 0/8 | 4.51e+04 | 1.11e-02 | 1.66e+00 | 1.43e+00 |
+| B, audit every 8 | 32 | 8 | 100% | 100% | 0.0 | 24.0 | 0/8 | 1.38e+04 | 1.43e-04 | 1.20e-03 | 8.38e-04 |
+| B, audit every 8 | 60 | 8 | 100% | 100% | 0.0 | 24.0 | 0/8 | 7.68e+04 | 1.10e-04 | 5.61e-04 | 3.06e-04 |
+| from scratch (cascade + polish) | 4 | 8 | 26% | 40% | 8.0 | 17.6 | 0/8 | 2.19e+07 | 5.77e-02 | 3.24e+01 | 3.08e+01 |
+| from scratch (cascade + polish) | 8 | 8 | 55% | 67% | 5.9 | 22.0 | 0/8 | 8.90e+07 | 5.00e-02 | 1.31e+01 | 1.21e+01 |
+| from scratch (cascade + polish) | 16 | 8 | 86% | 92% | 1.4 | 23.4 | 5/8 | 9.83e-01 | 2.28e-02 | 2.72e+00 | 2.41e+00 |
+| from scratch (cascade + polish) | 32 | 8 | 96% | 97% | 1.0 | 24.5 | 6/8 | 9.91e-01 | 1.86e-02 | 3.19e-01 | 2.17e-01 |
+| from scratch (cascade + polish) | 60 | 8 | 100% | 100% | 0.0 | 24.0 | 8/8 | 9.96e-01 | 3.35e-06 | 5.54e-06 | 4.20e-06 |
+
+#### Q2 quality, dev live (33, 39, 40, 41, 45, 48; 48 has 48 paths so it is missing at 60)
+
+| map | n | worlds | recall2 | recall15 | spurious | K | ratio<=1.2 | median ratio | field expl/flat | unexpl/flat | whole/flat |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| B, no audit | 4 | 6 | 4% | 16% | 5.3 | 9.2 | 0/6 | 1.90e+08 | 2.12e-01 | 1.33e+01 | 1.30e+01 |
+| B, no audit | 8 | 6 | 27% | 42% | 5.8 | 15.8 | 0/6 | 2.44e+06 | 9.00e-02 | 1.02e+01 | 9.65e+00 |
+| B, no audit | 16 | 6 | 51% | 61% | 5.7 | 20.3 | 0/6 | 2.03e+06 | 2.03e-02 | 1.11e+01 | 9.98e+00 |
+| B, no audit | 32 | 6 | 72% | 78% | 3.3 | 22.2 | 0/6 | 3.39e+07 | 1.55e-02 | 3.55e+00 | 2.87e+00 |
+| B, no audit | 60 | 5 | 88% | 90% | 1.0 | 22.6 | 0/5 | 3.04e+07 | 1.79e-03 | 3.13e+01 | 2.16e+01 |
+| B, no audit + guarded exact refit | 4 | 6 | 4% | 16% | 5.3 | 9.2 | 0/6 | 1.90e+08 | 2.12e-01 | 1.33e+01 | 1.30e+01 |
+| B, no audit + guarded exact refit | 8 | 6 | 27% | 42% | 5.8 | 15.8 | 0/6 | 2.44e+06 | 9.00e-02 | 1.02e+01 | 9.65e+00 |
+| B, no audit + guarded exact refit | 16 | 6 | 51% | 61% | 5.7 | 20.3 | 0/6 | 2.03e+06 | 2.03e-02 | 1.11e+01 | 9.98e+00 |
+| B, no audit + guarded exact refit | 32 | 6 | 72% | 78% | 3.3 | 22.2 | 0/6 | 3.39e+07 | 1.55e-02 | 3.55e+00 | 2.87e+00 |
+| B, no audit + guarded exact refit | 60 | 5 | 88% | 90% | 1.0 | 22.6 | 0/5 | 3.04e+07 | 1.79e-03 | 3.13e+01 | 2.16e+01 |
+| B, audit every 16 | 4 | 6 | 4% | 16% | 5.3 | 9.2 | 0/6 | 1.90e+08 | 2.12e-01 | 1.33e+01 | 1.30e+01 |
+| B, audit every 16 | 8 | 6 | 27% | 42% | 5.8 | 15.8 | 0/6 | 2.44e+06 | 9.00e-02 | 1.02e+01 | 9.65e+00 |
+| B, audit every 16 | 16 | 6 | 56% | 65% | 5.0 | 20.7 | 0/6 | 1.08e+06 | 1.79e-02 | 1.01e+01 | 8.99e+00 |
+| B, audit every 16 | 32 | 6 | 81% | 85% | 1.8 | 22.3 | 1/6 | 6.61e+05 | 2.04e-03 | 4.40e+00 | 3.65e+00 |
+| B, audit every 16 | 60 | 5 | 88% | 89% | 1.2 | 22.6 | 0/5 | 1.10e+07 | 1.81e-03 | 2.50e+01 | 1.70e+01 |
+| B, audit every 8 | 4 | 6 | 4% | 16% | 5.3 | 9.2 | 0/6 | 1.90e+08 | 2.12e-01 | 1.33e+01 | 1.30e+01 |
+| B, audit every 8 | 8 | 6 | 31% | 47% | 5.3 | 16.5 | 0/6 | 1.46e+06 | 4.80e-02 | 1.45e+01 | 1.38e+01 |
+| B, audit every 8 | 16 | 6 | 56% | 65% | 5.2 | 20.8 | 0/6 | 1.37e+06 | 1.78e-02 | 1.37e+01 | 1.23e+01 |
+| B, audit every 8 | 32 | 6 | 81% | 86% | 1.3 | 22.0 | 1/6 | 5.46e+06 | 2.32e-03 | 4.51e+00 | 3.74e+00 |
+| B, audit every 8 | 60 | 5 | 91% | 92% | 0.8 | 23.0 | 0/5 | 8.86e+06 | 1.23e-03 | 2.51e+01 | 1.70e+01 |
+| from scratch (cascade + polish) | 4 | 6 | 19% | 30% | 7.0 | 14.2 | 0/6 | 7.55e+04 | 2.26e-02 | 9.24e+00 | 9.03e+00 |
+| from scratch (cascade + polish) | 8 | 6 | 26% | 44% | 6.0 | 16.5 | 0/6 | 9.85e+06 | 7.05e-02 | 2.09e+01 | 2.00e+01 |
+| from scratch (cascade + polish) | 16 | 6 | 52% | 62% | 5.3 | 20.5 | 0/6 | 1.24e+06 | 5.16e-02 | 1.98e+01 | 1.78e+01 |
+| from scratch (cascade + polish) | 32 | 6 | 76% | 81% | 3.3 | 23.0 | 1/6 | 4.88e+04 | 5.68e-02 | 5.63e+00 | 4.75e+00 |
+| from scratch (cascade + polish) | 60 | 5 | 79% | 85% | 2.8 | 23.4 | 0/5 | 1.47e+07 | 9.65e-02 | 2.47e+01 | 1.68e+01 |
+
+#### Q2 quality, held-out synthetic (7101-7108)
+
+| map | n | worlds | recall2 | recall15 | spurious | K | ratio<=1.2 | median ratio | field expl/flat | unexpl/flat | whole/flat |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| B, no audit | 4 | 8 | 4% | 24% | 5.9 | 11.6 | 0/8 | 8.69e+10 | 2.75e-01 | 6.96e+00 | 6.68e+00 |
+| B, no audit | 8 | 8 | 34% | 55% | 5.9 | 19.2 | 0/8 | 2.33e+09 | 1.75e-01 | 4.03e+00 | 3.63e+00 |
+| B, no audit | 16 | 8 | 76% | 84% | 3.1 | 23.5 | 0/8 | 1.18e+08 | 5.48e-02 | 8.64e+00 | 6.84e+00 |
+| B, no audit | 32 | 8 | 97% | 99% | 0.2 | 24.5 | 0/8 | 9.44e+03 | 6.39e-03 | 3.88e+00 | 2.66e+00 |
+| B, no audit | 60 | 8 | 100% | 100% | 0.0 | 24.4 | 0/8 | 2.71e+04 | 9.97e-05 | 8.23e-04 | 4.39e-04 |
+| B, no audit + guarded exact refit | 4 | 8 | 4% | 24% | 5.9 | 11.6 | 0/8 | 8.69e+10 | 2.75e-01 | 6.96e+00 | 6.68e+00 |
+| B, no audit + guarded exact refit | 8 | 8 | 34% | 55% | 5.9 | 19.2 | 0/8 | 2.33e+09 | 1.75e-01 | 4.03e+00 | 3.63e+00 |
+| B, no audit + guarded exact refit | 16 | 8 | 76% | 84% | 3.1 | 23.5 | 2/8 | 1.18e+08 | 5.48e-02 | 8.64e+00 | 6.84e+00 |
+| B, no audit + guarded exact refit | 32 | 8 | 97% | 99% | 0.2 | 24.5 | 7/8 | 9.91e-01 | 6.32e-03 | 3.88e+00 | 2.66e+00 |
+| B, no audit + guarded exact refit | 60 | 8 | 100% | 100% | 0.0 | 24.4 | 8/8 | 9.95e-01 | 6.79e-06 | 9.42e-06 | 7.69e-06 |
+| B, audit every 16 | 4 | 8 | 4% | 24% | 5.9 | 11.6 | 0/8 | 8.69e+10 | 2.75e-01 | 6.96e+00 | 6.68e+00 |
+| B, audit every 16 | 8 | 8 | 34% | 55% | 5.9 | 19.2 | 0/8 | 2.33e+09 | 1.75e-01 | 4.03e+00 | 3.63e+00 |
+| B, audit every 16 | 16 | 8 | 82% | 89% | 2.2 | 23.6 | 1/8 | 3.28e+07 | 3.63e-02 | 1.44e+00 | 1.20e+00 |
+| B, audit every 16 | 32 | 8 | 97% | 99% | 0.2 | 24.0 | 1/8 | 8.80e+03 | 6.38e-03 | 3.88e+00 | 2.66e+00 |
+| B, audit every 16 | 60 | 8 | 100% | 100% | 0.0 | 24.1 | 0/8 | 2.71e+04 | 9.92e-05 | 8.08e-04 | 4.34e-04 |
+| B, audit every 8 | 4 | 8 | 4% | 24% | 5.9 | 11.6 | 0/8 | 8.69e+10 | 2.75e-01 | 6.96e+00 | 6.68e+00 |
+| B, audit every 8 | 8 | 8 | 60% | 74% | 4.2 | 22.0 | 2/8 | 2.32e+08 | 7.84e-02 | 2.46e+00 | 2.25e+00 |
+| B, audit every 8 | 16 | 8 | 94% | 96% | 0.6 | 24.0 | 0/8 | 1.32e+04 | 7.10e-03 | 5.68e-01 | 4.82e-01 |
+| B, audit every 8 | 32 | 8 | 99% | 100% | 0.0 | 24.0 | 0/8 | 1.69e+04 | 1.21e-04 | 3.91e-03 | 2.69e-03 |
+| B, audit every 8 | 60 | 8 | 100% | 100% | 0.0 | 24.0 | 0/8 | 2.38e+04 | 9.86e-05 | 2.76e-04 | 1.67e-04 |
+| from scratch (cascade + polish) | 4 | 8 | 28% | 42% | 7.6 | 17.8 | 0/8 | 6.83e+07 | 5.80e-02 | 7.11e+00 | 6.80e+00 |
+| from scratch (cascade + polish) | 8 | 8 | 62% | 73% | 4.2 | 21.9 | 2/8 | 2.35e+08 | 7.82e-02 | 2.44e+00 | 2.23e+00 |
+| from scratch (cascade + polish) | 16 | 8 | 77% | 85% | 3.0 | 23.5 | 2/8 | 1.32e+08 | 6.82e-02 | 6.68e+00 | 5.48e+00 |
+| from scratch (cascade + polish) | 32 | 8 | 95% | 97% | 0.4 | 24.1 | 5/8 | 9.93e-01 | 2.30e-02 | 1.31e-01 | 9.65e-02 |
+| from scratch (cascade + polish) | 60 | 8 | 98% | 99% | 0.5 | 24.2 | 6/8 | 9.96e-01 | 1.10e-02 | 1.52e-01 | 7.18e-02 |
+
+#### Q2 quality, held-out live (34, 35, 37, 42, 43; 34 has 2 paths, 43 has 41; rows count only the captures that reach that many paths)
+
+| map | n | worlds | recall2 | recall15 | spurious | K | ratio<=1.2 | median ratio | field expl/flat | unexpl/flat | whole/flat |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| B, no audit | 4 | 4 | 5% | 19% | 4.8 | 9.2 | 0/4 | 6.44e+07 | 1.65e-01 | 7.86e+00 | 7.72e+00 |
+| B, no audit | 8 | 4 | 32% | 45% | 6.0 | 16.8 | 0/4 | 9.17e+06 | 7.52e-02 | 3.36e+01 | 3.18e+01 |
+| B, no audit | 16 | 4 | 55% | 61% | 5.2 | 20.0 | 0/4 | 3.82e+06 | 3.58e-02 | 1.23e+01 | 1.13e+01 |
+| B, no audit | 32 | 4 | 80% | 83% | 2.2 | 22.8 | 0/4 | 5.50e+06 | 3.86e-03 | 7.81e+00 | 6.45e+00 |
+| B, no audit | 60 | 3 | 92% | 96% | 0.3 | 23.7 | 0/3 | 3.05e+05 | 6.46e-04 | 1.37e-01 | 9.53e-02 |
+| B, no audit + guarded exact refit | 4 | 4 | 5% | 19% | 4.8 | 9.2 | 0/4 | 6.44e+07 | 1.65e-01 | 7.86e+00 | 7.72e+00 |
+| B, no audit + guarded exact refit | 8 | 4 | 32% | 45% | 6.0 | 16.8 | 0/4 | 9.17e+06 | 7.52e-02 | 3.36e+01 | 3.18e+01 |
+| B, no audit + guarded exact refit | 16 | 4 | 55% | 61% | 5.2 | 20.0 | 0/4 | 3.82e+06 | 3.58e-02 | 1.23e+01 | 1.13e+01 |
+| B, no audit + guarded exact refit | 32 | 4 | 80% | 83% | 2.2 | 22.8 | 0/4 | 5.50e+06 | 3.86e-03 | 7.81e+00 | 6.45e+00 |
+| B, no audit + guarded exact refit | 60 | 3 | 92% | 96% | 0.3 | 23.7 | 2/3 | 9.94e-01 | 5.37e-04 | 1.34e-01 | 9.39e-02 |
+| B, audit every 16 | 4 | 4 | 5% | 19% | 4.8 | 9.2 | 0/4 | 6.44e+07 | 1.65e-01 | 7.86e+00 | 7.72e+00 |
+| B, audit every 16 | 8 | 4 | 32% | 45% | 6.0 | 16.8 | 0/4 | 9.17e+06 | 7.52e-02 | 3.36e+01 | 3.18e+01 |
+| B, audit every 16 | 16 | 4 | 56% | 62% | 5.2 | 20.2 | 0/4 | 3.82e+06 | 3.38e-02 | 5.73e+00 | 5.30e+00 |
+| B, audit every 16 | 32 | 4 | 83% | 86% | 1.5 | 22.2 | 1/4 | 1.90e+06 | 1.69e-03 | 2.07e+00 | 1.73e+00 |
+| B, audit every 16 | 60 | 3 | 90% | 93% | 0.7 | 23.0 | 0/3 | 1.95e+06 | 1.09e-03 | 3.10e+00 | 2.29e+00 |
+| B, audit every 8 | 4 | 4 | 5% | 19% | 4.8 | 9.2 | 0/4 | 6.44e+07 | 1.65e-01 | 7.86e+00 | 7.72e+00 |
+| B, audit every 8 | 8 | 4 | 32% | 45% | 7.5 | 18.2 | 0/4 | 5.89e+06 | 7.25e-02 | 2.91e+01 | 2.80e+01 |
+| B, audit every 8 | 16 | 4 | 55% | 62% | 5.0 | 20.0 | 0/4 | 3.80e+06 | 3.31e-02 | 8.66e+00 | 7.96e+00 |
+| B, audit every 8 | 32 | 4 | 83% | 85% | 1.8 | 22.2 | 1/4 | 2.16e+06 | 1.66e-03 | 1.53e+00 | 1.28e+00 |
+| B, audit every 8 | 60 | 3 | 92% | 94% | 0.3 | 23.0 | 0/3 | 2.70e+07 | 1.47e-03 | 1.92e-01 | 1.36e-01 |
+| from scratch (cascade + polish) | 4 | 4 | 16% | 23% | 8.2 | 13.8 | 0/4 | 6.90e+05 | 9.84e-02 | 1.06e+01 | 1.04e+01 |
+| from scratch (cascade + polish) | 8 | 4 | 32% | 44% | 7.8 | 18.2 | 0/4 | 5.89e+06 | 7.53e-02 | 3.88e+01 | 3.73e+01 |
+| from scratch (cascade + polish) | 16 | 4 | 34% | 50% | 7.0 | 19.0 | 0/4 | 2.25e+08 | 1.20e-01 | 4.49e+01 | 4.16e+01 |
+| from scratch (cascade + polish) | 32 | 4 | 79% | 82% | 3.2 | 23.0 | 1/4 | 6.07e+05 | 1.83e-02 | 8.49e+00 | 7.02e+00 |
+| from scratch (cascade + polish) | 60 | 3 | 92% | 93% | 1.7 | 24.0 | 1/3 | 1.34e+06 | 2.47e-03 | 8.38e-01 | 6.14e-01 |
+
+What these say (observed):
+- Synthetic: B without audits reaches recall(2) 90% at 16 paths and 100% from 32 on, 0 spurious from 32 on (dev 8 of 8; held-out 97% at 32, 100% at 60). The from-scratch cascade with polish is 86% / 96% (dev, 16 / 32 paths) and 77% / 95% held-out, so B is at least as good from 16 paths on and better between 24 and 56 paths, where the rebuild is non-monotonic (dev 98%, 96%, 96%, 100%, 100% at 24, 32, 40, 48, 56). At 4 paths B is clearly worse than the cascade (dev 8% against 26%, held-out 4% against 28%); at 8 paths B is 46% against 55% (dev) and 34% against 62% (held-out).
+- Audit every 8 lifts the early counts (dev 55% at 8, held-out 60% at 8 and 94% at 16 against 76% without) and does nothing later; audit every 16 helps little (held-out 16 paths 82% against 76%).
+- Live: B 88% (dev, 5 captures with 60 paths) and 92% (held-out, 3 captures) against 79-80% and 92% for the rebuild; audits every 8 add 3 points (dev 91%). On live data a map that fits the exact likelihood like the truth (ratio 0.99 after the guarded exact refit) was reached only on held-out captures 35 (24/24), 43 (24/24 at 41 paths) and 37 (22/24); no dev capture reaches ratio 1.2 (final recall(2) 19-22 of 24, 20 for capture 48 at its 48 paths), and the ratio is 1e5-1e9 for the rest (live truth is degenerate; every method ends there).
+- The unexplored-area field error of an incomplete map is larger than the flat map's (ratio above 1 for B and for the rebuild at 8-16 paths, and for live at 60 paths where a few spurious or misplaced planets dominate the mean): a belief that publishes every planet found is worse than flat in unexplored areas until somewhere between 16 and 32 paths on synthetic data (2.0x flat at 16, 0.003x at 32). Explored-area error is already 16x (8 paths) to 90x (16 paths) below flat.
+- Exploration that preceded B* (seeds 7001-7004 and 7001-7003, one run per cell, evaluation counts only): a single relative level 0.005 diverged on 7003 (K 31, 40 s per update, killed at 29 paths); levels 0.1/0.02/0.005 were no better than 0.02/0.005 at 16 paths (90% against 96% on 3 worlds) and cost more early; deaths every update, every 4th update, a local death test (thresholds 10, 30, 100) and no deaths gave identical recall from 16 paths on; births capped at 1500 and deaths at 300 evaluations gave recall(2) at 8 paths of 22-35% (7001-7004) against 54% for the first variant (births 3000, no separate deaths cap; 7001-7003), a different world set, so only indicative; B* kept the cheaper form. B* was chosen on those dev worlds, so its dev numbers are fitted to them; the held-out numbers are the unselected ones.
+
+#### Q3 audit behaviour
+
+How often a from-scratch rebuild changes the maintained map (audits every 8 paths on the no-audit trajectory; the rebuild is computed and compared, never adopted). "Any change" = at least one planet moved more than 3 units (nearest rebuilt planet 3-15 units away), added (a rebuilt planet with none within 15 units of the maintained map) or removed (a maintained planet with none within 15 of the rebuild). "Rebuild better" = higher Laplace evidence at relative sd 0.005 on all rows after refitting the maintained map there (the adoption rule). "Worse on adoption" = the rebuild has lower recall(2) or more spurious planets than the maintained map. The ratio column is flattering to the rebuild because it ends with the guarded exact refit.
+
+#### Q3 audits on the no-audit trajectory (rebuild computed, never adopted), dev synthetic
+
+| cfg | paths<= | audits | any map change (moved>3 or added or removed) | mean moved | mean added | mean removed | rebuild better (rel. evidence) | rebuild rec2 > inc | rebuild rec2 < inc | rebuild worse on adoption (rec2 lower or spurious higher) | ratio_rb<ratio_inc |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| probe=8 | 8 | 8 | 8 | 3.0 | 6.2 | 3.8 | 8 | 6 | 0 | 5 | 8 |
+| probe=8 | 16 | 8 | 4 | 1.1 | 1.6 | 1.5 | 1 | 3 | 1 | 0 | 7 |
+| probe=8 | 32 | 16 | 4 | 0.2 | 0.7 | 0.5 | 0 | 1 | 3 | 0 | 13 |
+| probe=8 | 60 | 24 | 2 | 0.0 | 0.1 | 0.2 | 0 | 0 | 2 | 0 | 22 |
+
+#### Q3 audits on the no-audit trajectory (rebuild computed, never adopted), dev live
+
+| cfg | paths<= | audits | any map change (moved>3 or added or removed) | mean moved | mean added | mean removed | rebuild better (rel. evidence) | rebuild rec2 > inc | rebuild rec2 < inc | rebuild worse on adoption (rec2 lower or spurious higher) | ratio_rb<ratio_inc |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| probe=8 | 8 | 6 | 6 | 3.0 | 6.8 | 6.2 | 4 | 3 | 2 | 1 | 4 |
+| probe=8 | 16 | 6 | 6 | 2.0 | 4.3 | 4.3 | 2 | 3 | 3 | 0 | 4 |
+| probe=8 | 32 | 12 | 12 | 1.8 | 4.7 | 4.2 | 7 | 7 | 4 | 2 | 8 |
+| probe=8 | 60 | 17 | 17 | 1.8 | 3.1 | 2.5 | 8 | 6 | 8 | 2 | 13 |
+
+#### Q3 audits on the no-audit trajectory (rebuild computed, never adopted), held-out synthetic
+
+| cfg | paths<= | audits | any map change (moved>3 or added or removed) | mean moved | mean added | mean removed | rebuild better (rel. evidence) | rebuild rec2 > inc | rebuild rec2 < inc | rebuild worse on adoption (rec2 lower or spurious higher) | ratio_rb<ratio_inc |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| probe=8 | 8 | 8 | 8 | 3.9 | 7.5 | 4.8 | 7 | 6 | 2 | 2 | 7 |
+| probe=8 | 16 | 8 | 7 | 2.1 | 3.8 | 3.6 | 1 | 2 | 3 | 0 | 5 |
+| probe=8 | 32 | 16 | 9 | 0.8 | 0.9 | 1.1 | 5 | 5 | 3 | 1 | 13 |
+| probe=8 | 60 | 24 | 7 | 0.2 | 0.6 | 0.4 | 7 | 1 | 6 | 0 | 18 |
+
+#### Q3 audits on the no-audit trajectory (rebuild computed, never adopted), held-out live
+
+| cfg | paths<= | audits | any map change (moved>3 or added or removed) | mean moved | mean added | mean removed | rebuild better (rel. evidence) | rebuild rec2 > inc | rebuild rec2 < inc | rebuild worse on adoption (rec2 lower or spurious higher) | ratio_rb<ratio_inc |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| probe=8 | 8 | 4 | 4 | 3.0 | 4.8 | 3.2 | 3 | 1 | 1 | 3 | 4 |
+| probe=8 | 16 | 4 | 4 | 3.2 | 6.5 | 7.5 | 1 | 1 | 3 | 0 | 1 |
+| probe=8 | 32 | 8 | 8 | 1.1 | 4.0 | 3.9 | 3 | 4 | 3 | 1 | 4 |
+| probe=8 | 60 | 10 | 6 | 1.7 | 1.8 | 1.6 | 2 | 0 | 4 | 1 | 6 |
+
+Pooled over the dev and held-out worlds, audits every 8 paths: 179 audits, 59 where the rebuild has the higher evidence (adopted by the rule); of those 59, recall(2) rose in 36, stayed in 18 and fell in 5 (held-out synthetic at 8 paths twice, live dev twice, live held-out once); spurious planets rose in 15. Of the 120 rebuilds the rule rejected, the rebuild had lower recall(2) in 43 and higher in 13. So the rule rarely adopts a worse map (5 of 59 by recall, 15 of 59 by spurious count) and mostly rejects rebuilds that are worse. On synthetic data nothing was adopted after 24 paths in the dev worlds and 12 of 40 in the held-out ones (10 of which left recall unchanged); on live data 15 of 29 and 5 of 18 later audits were adopted, with 2 and 0 recall losses. A rebuild changes the maintained map in every live audit and, on dev synthetic worlds, in 8 of 8 audits at 8 paths, 4 of 8 at 16, 4 of 16 at 17-32 and 2 of 24 at 33-60.
+
+#### Q4 per-planet support statistic (Q13 data)
+
+For every planet of the no-audit maintained maps at 4, 8, 16, 32, 60 paths: `d05` = chi2 increase on all rows at relative sd 0.005 when the planet alone is removed (no refit), `d02` the same at 0.02, `dloc` the same after refitting the planets within 100 units of the removed one (300 evaluations). Correct = a true planet within 2 units; spurious = none within 15 (planets in between are in neither column). On live, "correct" = a planet of the last from-scratch map (61 or the capture's last path) within 5 units, spurious = none within 15 (at 60 paths this is the rebuild at the same path count, so that row is circular). "True planets hidden" = share of all true planets that are either not found or found with a statistic below the threshold; it is not computed for live. AUC = probability that a correct planet has a larger statistic than a spurious one.
+
+#### Q4 support statistic d05, dev synthetic (correct = true planet within 2 units, spurious = none within 15)
+
+| paths | correct planets | spurious planets | AUC | thr 1e+05: correct kept / spurious dropped / true hidden | thr 1e+06: correct kept / spurious dropped / true hidden | thr 3e+06: correct kept / spurious dropped / true hidden | thr 1e+07: correct kept / spurious dropped / true hidden | thr 3e+07: correct kept / spurious dropped / true hidden |
+|---|---|---|---|---|---|---|---|---|
+| 4 | 16 | 47 | 0.72 | 16/16 / 4/47 / 92% | 15/16 / 22/47 / 92% | 8/16 / 33/47 / 96% | 4/16 / 43/47 / 98% | 4/16 / 47/47 / 98% |
+| 8 | 91 | 40 | 0.69 | 89/91 / 3/40 / 54% | 84/91 / 19/40 / 56% | 50/91 / 30/40 / 74% | 10/91 / 33/40 / 95% | 4/91 / 39/40 / 98% |
+| 16 | 171 | 9 | 0.76 | 169/171 / 1/9 / 12% | 152/171 / 3/9 / 21% | 117/171 / 7/9 / 39% | 61/171 / 8/9 / 68% | 12/171 / 9/9 / 94% |
+| 32 | 192 | 0 | nan | 192/192 / 0/0 / 0% | 180/192 / 0/0 / 6% | 153/192 / 0/0 / 20% | 96/192 / 0/0 / 50% | 34/192 / 0/0 / 82% |
+| 60 | 192 | 0 | nan | 192/192 / 0/0 / 0% | 187/192 / 0/0 / 3% | 180/192 / 0/0 / 6% | 138/192 / 0/0 / 28% | 74/192 / 0/0 / 61% |
+
+#### Q4 support statistic dloc, dev synthetic (correct = true planet within 2 units, spurious = none within 15)
+
+| paths | correct planets | spurious planets | AUC | thr 1e+05: correct kept / spurious dropped / true hidden | thr 1e+06: correct kept / spurious dropped / true hidden | thr 3e+06: correct kept / spurious dropped / true hidden | thr 1e+07: correct kept / spurious dropped / true hidden | thr 3e+07: correct kept / spurious dropped / true hidden |
+|---|---|---|---|---|---|---|---|---|
+| 4 | 16 | 47 | 0.72 | 16/16 / 5/47 / 92% | 15/16 / 24/47 / 92% | 7/16 / 33/47 / 96% | 4/16 / 43/47 / 98% | 4/16 / 47/47 / 98% |
+| 8 | 91 | 40 | 0.68 | 88/91 / 3/40 / 54% | 82/91 / 19/40 / 57% | 49/91 / 30/40 / 74% | 10/91 / 33/40 / 95% | 4/91 / 39/40 / 98% |
+| 16 | 171 | 9 | 0.73 | 160/171 / 2/9 / 17% | 140/171 / 3/9 / 27% | 111/171 / 7/9 / 42% | 58/171 / 8/9 / 70% | 12/171 / 9/9 / 94% |
+| 32 | 192 | 0 | nan | 184/192 / 0/0 / 4% | 161/192 / 0/0 / 16% | 140/192 / 0/0 / 27% | 89/192 / 0/0 / 54% | 33/192 / 0/0 / 83% |
+| 60 | 192 | 0 | nan | 190/192 / 0/0 / 1% | 174/192 / 0/0 / 9% | 163/192 / 0/0 / 15% | 130/192 / 0/0 / 32% | 71/192 / 0/0 / 63% |
+
+#### Q4 support statistic d02, dev synthetic (correct = true planet within 2 units, spurious = none within 15)
+
+| paths | correct planets | spurious planets | AUC | thr 1e+05: correct kept / spurious dropped / true hidden | thr 1e+06: correct kept / spurious dropped / true hidden | thr 3e+06: correct kept / spurious dropped / true hidden | thr 1e+07: correct kept / spurious dropped / true hidden | thr 3e+07: correct kept / spurious dropped / true hidden |
+|---|---|---|---|---|---|---|---|---|
+| 4 | 16 | 47 | 0.72 | 12/16 / 24/47 / 94% | 4/16 / 43/47 / 98% | 2/16 / 47/47 / 99% | 1/16 / 47/47 / 99% | 0/16 / 47/47 / 100% |
+| 8 | 91 | 40 | 0.69 | 74/91 / 23/40 / 61% | 6/91 / 37/40 / 97% | 2/91 / 40/40 / 99% | 0/91 / 40/40 / 100% | 0/91 / 40/40 / 100% |
+| 16 | 171 | 9 | 0.77 | 143/171 / 4/9 / 26% | 35/171 / 9/9 / 82% | 9/171 / 9/9 / 95% | 3/171 / 9/9 / 98% | 0/171 / 9/9 / 100% |
+| 32 | 192 | 0 | nan | 173/192 / 0/0 / 10% | 68/192 / 0/0 / 65% | 20/192 / 0/0 / 90% | 4/192 / 0/0 / 98% | 0/192 / 0/0 / 100% |
+| 60 | 192 | 0 | nan | 186/192 / 0/0 / 3% | 123/192 / 0/0 / 36% | 54/192 / 0/0 / 72% | 11/192 / 0/0 / 94% | 0/192 / 0/0 / 100% |
+
+#### Q4 support statistic d05, held-out synthetic
+
+| paths | correct planets | spurious planets | AUC | thr 1e+05: correct kept / spurious dropped / true hidden | thr 1e+06: correct kept / spurious dropped / true hidden | thr 3e+06: correct kept / spurious dropped / true hidden | thr 1e+07: correct kept / spurious dropped / true hidden | thr 3e+07: correct kept / spurious dropped / true hidden |
+|---|---|---|---|---|---|---|---|---|
+| 4 | 8 | 47 | 0.83 | 8/8 / 2/47 / 96% | 8/8 / 17/47 / 96% | 5/8 / 36/47 / 97% | 2/8 / 43/47 / 99% | 1/8 / 46/47 / 99% |
+| 8 | 66 | 47 | 0.72 | 65/66 / 6/47 / 66% | 60/66 / 24/47 / 69% | 39/66 / 35/47 / 80% | 13/66 / 43/47 / 93% | 1/66 / 46/47 / 99% |
+| 16 | 147 | 25 | 0.81 | 146/147 / 4/25 / 24% | 126/147 / 13/25 / 34% | 90/147 / 22/25 / 53% | 39/147 / 24/25 / 80% | 6/147 / 24/25 / 97% |
+| 32 | 190 | 2 | 0.94 | 189/190 / 0/2 / 2% | 175/190 / 1/2 / 9% | 148/190 / 2/2 / 23% | 84/190 / 2/2 / 56% | 31/190 / 2/2 / 84% |
+| 60 | 195 | 0 | nan | 195/195 / 0/0 / -2% | 188/195 / 0/0 / 2% | 174/195 / 0/0 / 9% | 130/195 / 0/0 / 32% | 56/195 / 0/0 / 71% |
+
+#### Q4 support statistic d05, dev live (correct = a planet of the last from-scratch map within 5 units, spurious = none within 15; circular at 60, which is that map's own path count)
+
+| paths | correct planets | spurious planets | AUC | thr 1e+05: correct kept / spurious dropped / true hidden | thr 1e+06: correct kept / spurious dropped / true hidden | thr 3e+06: correct kept / spurious dropped / true hidden | thr 1e+07: correct kept / spurious dropped / true hidden | thr 3e+07: correct kept / spurious dropped / true hidden |
+|---|---|---|---|---|---|---|---|---|
+| 4 | 10 | 32 | 0.71 | 10/10 / 2/32 / n/a | 7/10 / 24/32 / n/a | 2/10 / 28/32 / n/a | 0/10 / 31/32 / n/a | 0/10 / 32/32 / n/a |
+| 8 | 51 | 35 | 0.79 | 51/51 / 7/35 / n/a | 36/51 / 26/35 / n/a | 17/51 / 30/35 / n/a | 3/51 / 33/35 / n/a | 0/51 / 35/35 / n/a |
+| 16 | 78 | 38 | 0.81 | 77/78 / 7/38 / n/a | 67/78 / 24/38 / n/a | 45/78 / 32/38 / n/a | 20/78 / 37/38 / n/a | 2/78 / 38/38 / n/a |
+| 32 | 105 | 25 | 0.74 | 105/105 / 1/25 / n/a | 92/105 / 13/25 / n/a | 73/105 / 15/25 / n/a | 46/105 / 20/25 / n/a | 20/105 / 23/25 / n/a |
+| 60 | 99 | 9 | 0.61 | 99/99 / 0/9 / n/a | 93/99 / 2/9 / n/a | 86/99 / 2/9 / n/a | 59/99 / 6/9 / n/a | 34/99 / 7/9 / n/a |
+
+#### Q4 support statistic d05, held-out live
+
+| paths | correct planets | spurious planets | AUC | thr 1e+05: correct kept / spurious dropped / true hidden | thr 1e+06: correct kept / spurious dropped / true hidden | thr 3e+06: correct kept / spurious dropped / true hidden | thr 1e+07: correct kept / spurious dropped / true hidden | thr 3e+07: correct kept / spurious dropped / true hidden |
+|---|---|---|---|---|---|---|---|---|
+| 4 | 10 | 19 | 0.78 | 10/10 / 5/19 / n/a | 2/10 / 17/19 / n/a | 0/10 / 18/19 / n/a | 0/10 / 19/19 / n/a | 0/10 / 19/19 / n/a |
+| 8 | 37 | 24 | 0.83 | 37/37 / 5/24 / n/a | 21/37 / 21/24 / n/a | 6/37 / 24/24 / n/a | 0/37 / 24/24 / n/a | 0/37 / 24/24 / n/a |
+| 16 | 56 | 20 | 0.89 | 56/56 / 7/20 / n/a | 38/56 / 18/20 / n/a | 16/56 / 20/20 / n/a | 4/56 / 20/20 / n/a | 0/56 / 20/20 / n/a |
+| 32 | 82 | 7 | 0.85 | 81/82 / 0/7 / n/a | 79/82 / 3/7 / n/a | 62/82 / 5/7 / n/a | 35/82 / 7/7 / n/a | 7/82 / 7/7 / n/a |
+| 60 | 67 | 2 | 0.94 | 67/67 / 0/2 / n/a | 62/67 / 1/2 / n/a | 57/67 / 2/2 / n/a | 39/67 / 2/2 / n/a | 19/67 / 2/2 / n/a |
+
+Summary. The removal chi2 does not separate spurious from correct planets: AUC 0.68-0.76 on synthetic worlds at 4-16 paths (spurious planets exist only there; none at 32 and 60 paths), 0.71-0.81 on live at up to 32 paths and 0.62 at 60. Medians are within a factor of 2 to 5 (order 6e6 for correct and 1-2e6 for spurious planets at 16 paths). Every threshold that removes most spurious planets hides a large share of the true ones: at 16 paths 3e6 drops 7 of 9 spurious planets and hides 39% of the true planets; at 8 paths it drops 30 of 40 and hides 74%; at 32 paths it would hide 20% and at 60 paths 6% of true planets with nothing to remove. The local refit changes little (dloc equals d05 to within 0.1% for 87% of the 826 planets: neighbours cannot take over the pull of a 20-40 unit planet). It does expose redundant planets: dloc is below 30 for 3 of the 826 planets, one planet at 4 paths whose removal lowers the chi2 even without a refit (111 units from any true planet) and the two halves of a split pair at 16 paths (each 2.3-3.5 units from the same true planet, dloc -2.0). B*'s death test ranks candidates by the plain removal chi2, so it did not try them; ranking by dloc would. A support test built on the chi2 increase of removing one planet is therefore not usable as a precision gate here; what removes the spurious planets in these runs is the continued fitting (spurious planets average 5.9 at 4 paths, 1.1 at 16, 0.0 at 32 on synthetic data).
+
+#### Held-out confirmation (one pass, B* with no audit, audit every 16, audit every 8; synthetic 7101-7108, live 34, 35, 37, 42, 43)
+
+Tables above. B* held up: recall(2) 97% at 32 paths and 100% at 60 (no audit), 100% with audit every 8 at 32; live 92% at 60 (rebuild 92%). Weaker than dev at 16 paths (76% against 90%; the rebuild 77% there), the same as dev at 60. Live 34 has 2 paths of data (no result); at the end of each capture recall(2) is 24/24 for 35, 24/24 for 43 (41 paths), 22 for 37 and 20 for 42.
+
+#### Verdict
+
+- Quality (observed): B is viable. From 16 paths on it equals or beats the from-scratch cascade-plus-polish on both synthetic and live data (above), including on held-out data; it is behind at 4-8 paths (the cascade's three-level start from nothing is better there). The incrementally maintained map is the better map after about 24 paths; rebuilds can be worse than the map they would replace (non-monotonic recall, 43 of the 120 rejected rebuilds had lower recall, 13 higher).
+- Latency (observed on the Mac, K=24): the target (median well under 100 ms, worst about 1 s) is met in steady state: median 22 ms, worst 250 ms at 8 threads, 33 ms and 243 ms at 1 thread, flat from 17 to 60 paths and across K = 8-26. It is not met while planets are being born: updates that run births take 1-20 s on the Mac (8 threads) and are frequent on live captures until the map has stabilised (live 45: median 2 s at 17-61 paths). Capping the births at 300 evaluations per update brought the live worst case to 1.7-2.3 s and the p90 to about 1.1 s at the price of 1-4 planets of recall at 60 paths (two captures); a cap that keeps the worst update near 1 s without losing recall (spreading births over several updates, a smaller joint-refit budget) was not tested (inferred: it needs a birth that can be resumed).
+- Deaths and the Q13 support test: with this machinery deaths did not change any result (only the continued fitting removes spurious planets), and a chi2-removal support statistic does not discriminate (Q4); only dloc found the 3 redundant planets in the replays. Do not gate publication on the removal chi2.
+- Audits: not needed on synthetic data after about 24 paths; cheap insurance early (audit at 8 paths adopted in 8 of 8 dev and 7 of 8 held-out worlds and lifted recall(2) at 8 paths from 46% to 55% (dev) and 34% to 60% (held-out)). On live data the rule adopts about half of the later rebuilds and they are better in most of them. A rebuild costs 3k-34k full-row equivalents and about 30-60 s on the Mac, so it must run in the background and be adopted only by the evidence rule.
+
+#### Recommended configuration (if B is built)
+
+Thinned row set of 1000 rows (at most 2 per 14-unit cell, strongest first; 2000 costs about 2x for no measured gain) at relative levels 0.02 then 0.005; local warm refit of the planets within 100 units of the new path (300 evaluations); births on the thinned rows with a per-update cap that needs a decision (1500 evaluations: best recall, worst update 10-20 s; 300: worst update about 2 s, recall down 1-4 planets); a cheap death pass only for redundancy (candidates ranked by dloc, remove if dloc < 30; untested as a pass, the 3 cases above are the evidence), not a support-threshold gate; one guarded exact refit of the published map (the chi2 ratio 0.99 needs it); audits: rebuild at 8 paths and then every 16 (or 24) in the background, adopted only if its relative-0.005 evidence on all rows is higher than the maintained map's after a refit there; for the first 8 paths a from-scratch cascade at each update is at least as good as B (4 paths 26-28% against 4-8%) and affordable (about 30 s).
+
+#### Not done, cut, limits
+
+- Cut: latency at 1 and 4 threads and the cap ablation were measured on one synthetic world (7001, 40 paths) only; live latency only at 8 threads (captures 33, 40, 45); the production comparison at 8 threads only and with its 5 s budget; no repeats (one run per cell, so run-to-run spread is unknown; the live recall differences of 1-4 planets between birth caps are single runs). Quality: the 14 dev and 13 held-out worlds were run for the three audit variants (no audit with probe, 16, 8); the ev=300/600 birth-cap runs are on the Mac for captures 33 and 40 only because `jolly` became unavailable (about 04:20) before the planned jolly runs for all six dev captures. Noise 0.1 was not run (B* and the relative levels are tuned on exact noise). The reserved scorecard cases (synthetic 12/18/44/49) and capture 52 were not touched.
+- Evidence: synthetic generator (24 planets, long paths at speed 8) and ten live captures with degenerate truth; B* was chosen on the dev worlds (seeds 7001-7004 for the ablations); only the final held-out pass is unselected. The paths of a live capture come in capture order, which is correlated in space; the synthetic order is random.
+- Earlier exploration runs (single level, three levels, cap 2000, evidence-based deaths) used earlier revisions of the harness (evidence computed at every update, full warm refit); only their quality/cost summaries are quoted, not mixed into the B* tables. The latency of the exact refit that produced "+ guarded exact refit" was not measured, and the maintained state is not that map.
+- The B map carries no covariance or weights (evidence is computed only when births run); `Mode` weights and the published belief were not built. Targeting integration was not tried.
+- A planet cap of 32 was used in the harness (production default 24); the K=26 world therefore exceeds the production cap.
+
+Reproduction (from the worktree, with `einsteinbot.sqlite3` present; `CACHE` holds from-scratch rebuilds so audits reuse them):
+`cargo test --release --lib diagnose_rebuild -- --ignored --nocapture --test-threads=1` with `CACHE=/tmp/P6cache THREADS=2 PATHS=60 SEEDS=7001 LIVE=-` (also `COUNTS=4,8,...`) fills the cache and prints the from-scratch rows.
+`cargo test --release --lib diagnose_incremental -- --ignored --nocapture --test-threads=1` with `CONFIGS="lv=0.02/0.005:rf=300:ev=1500:lr=100:dl=30:dn=4:cap=1000:probe=8"`, `PLANETS=1` for the Q4 lines, `PROD=1` for the production update, `THREADS=8`, `SEEDS`/`KS`/`LIVE`/`PATHS` as in the other harnesses (`audit=16`, `audit=8` instead of `probe=8` for the adopting runs; held-out `SEEDS=7101,...,7108`, `LIVE=34,35,37,42,43`). Tables: `python3 -I scripts/p6_tables.py {cost,latency,quality,audit,support} FILES [--worlds synthetic|live]`.

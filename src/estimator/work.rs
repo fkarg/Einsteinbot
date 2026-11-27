@@ -234,8 +234,16 @@ impl UpdateReport {
     }
 }
 
+/// Test-only thread limit (0: none), so the diagnosis harness can measure at 1, 4 and 8 threads.
+#[cfg(test)]
+pub(super) static TEST_THREADS: AtomicUsize = AtomicUsize::new(0);
+
 /// Logical cores available to the process.
 pub(super) fn cores() -> usize {
+    #[cfg(test)]
+    if TEST_THREADS.load(Ordering::Relaxed) > 0 {
+        return TEST_THREADS.load(Ordering::Relaxed);
+    }
     std::thread::available_parallelism().map_or(1, usize::from)
 }
 

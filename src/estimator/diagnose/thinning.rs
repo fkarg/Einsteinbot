@@ -68,6 +68,71 @@ pub(super) fn parse(spec: &str) -> Variant {
     }
 }
 
+/// The rows of `shots` to keep: at most `per_cell` per `cell`-unit cell and `cap` in all,
+/// strongest first (or in a deterministic pseudo-random order). Each path keeps its own noise
+/// model; a path left without rows has none. `strengths[s][r]` replaces the observed acceleration
+/// as the row preference when given.
+pub(super) fn thin_shots(
+    shots: &[Shot],
+    cell: f64,
+    per_cell: usize,
+    cap: usize,
+    strong: bool,
+    strengths: Option<&[Vec<f64>]>,
+) -> Vec<Shot> {
+    // (shot, row, strength, cell)
+    let mut candidates: Vec<(usize, usize, f64, (i64, i64))> = Vec::new();
+    for (s, shot) in shots.iter().enumerate() {
+        let Some(path) = &shot.path else { continue };
+        for r in 0..path.row_count() {
+            let c = path.center(r);
+            candidates.push((
+                s,
+                r,
+                strengths.map_or_else(|| path.strength(r), |v| v[s][r]),
+                ((c[0] / cell).floor() as i64, (c[1] / cell).floor() as i64),
+            ));
+        }
+    }
+    if strong {
+        candidates.sort_by(|a, b| b.2.total_cmp(&a.2));
+    } else {
+        // Deterministic pseudo-random order, independent of strength.
+        let hash = |s: usize, r: usize| {
+            let mut state = ((s as u64) << 32) | r as u64;
+            uniform(&mut state);
+            (uniform(&mut state) * 1e9) as u64
+        };
+        candidates.sort_by_key(|c| hash(c.0, c.1));
+    }
+    let mut count: std::collections::HashMap<(i64, i64), usize> = Default::default();
+    let mut kept: Vec<Vec<usize>> = vec![Vec::new(); shots.len()];
+    let mut total = 0;
+    for (s, r, _, cell) in candidates {
+        if total >= cap {
+            break;
+        }
+        let n = count.entry(cell).or_default();
+        if *n < per_cell {
+            *n += 1;
+            kept[s].push(r);
+            total += 1;
+        }
+    }
+    shots
+        .iter()
+        .zip(kept)
+        .map(|(shot, mut keep)| {
+            keep.sort_unstable();
+            Shot {
+                obs: shot.obs.clone(),
+                contact: None,
+                path: shot.path.as_ref().and_then(|p| p.thinned(&keep)),
+            }
+        })
+        .collect()
+}
+
 /// The shots of the search stage: relative noise term and/or thinned rows.
 /// `strengths[s][r]` replaces the observed acceleration as the row preference when given.
 pub(super) fn search_shots(
@@ -94,49 +159,7 @@ pub(super) fn search_shots(
         })
         .collect();
     if let Some((cell, per_cell, cap, strong)) = variant.thin {
-        // (shot, row, strength, cell)
-        let mut candidates: Vec<(usize, usize, f64, (i64, i64))> = Vec::new();
-        for (s, shot) in shots.iter().enumerate() {
-            let Some(path) = &shot.path else { continue };
-            for r in 0..path.row_count() {
-                let c = path.center(r);
-                candidates.push((
-                    s,
-                    r,
-                    strengths.map_or_else(|| path.strength(r), |v| v[s][r]),
-                    ((c[0] / cell).floor() as i64, (c[1] / cell).floor() as i64),
-                ));
-            }
-        }
-        if strong {
-            candidates.sort_by(|a, b| b.2.total_cmp(&a.2));
-        } else {
-            // Deterministic pseudo-random order, independent of strength.
-            let hash = |s: usize, r: usize| {
-                let mut state = ((s as u64) << 32) | r as u64;
-                uniform(&mut state);
-                (uniform(&mut state) * 1e9) as u64
-            };
-            candidates.sort_by_key(|c| hash(c.0, c.1));
-        }
-        let mut count: std::collections::HashMap<(i64, i64), usize> = Default::default();
-        let mut kept: Vec<Vec<usize>> = vec![Vec::new(); shots.len()];
-        let mut total = 0;
-        for (s, r, _, cell) in candidates {
-            if total >= cap {
-                break;
-            }
-            let n = count.entry(cell).or_default();
-            if *n < per_cell {
-                *n += 1;
-                kept[s].push(r);
-                total += 1;
-            }
-        }
-        for (shot, mut keep) in shots.iter_mut().zip(kept) {
-            keep.sort_unstable();
-            shot.path = shot.path.as_ref().and_then(|p| p.thinned(&keep));
-        }
+        shots = thin_shots(&shots, cell, per_cell, cap, strong, strengths);
     }
     shots
 }
@@ -284,9 +307,9 @@ fn grow_frozen(
     frozen
 }
 
-pub(super) fn prune(joint: &Fit, modes: &mut Vec<Mode>, run: &Run) {
+pub(super) fn prune(joint: &Fit, modes: &mut Vec<Mode>, run: &Run, depth: usize) {
     let mut parent = best(modes).clone();
-    for _ in 0..6 {
+    for _ in 0..depth {
         if parent.planets.is_empty() || work_done(run) {
             break;
         }
@@ -398,7 +421,7 @@ fn diagnose_thinning_search() {
                 let mut modes = vec![mode_at(&exact, &[]).unwrap()];
                 grow(&exact, &case.shots, &mut modes, &run, world);
                 if !growth_only {
-                    prune(&exact, &mut modes, &run);
+                    prune(&exact, &mut modes, &run, 6);
                 }
                 modes
             } else {
@@ -518,7 +541,7 @@ fn diagnose_thinning_search() {
                     show("after exact refit", &modes);
                     grow(&exact, &case.shots, &mut modes, &run2, world);
                     show("after exact growth", &modes);
-                    prune(&exact, &mut modes, &run2);
+                    prune(&exact, &mut modes, &run2, 6);
                     modes
                 }
             };

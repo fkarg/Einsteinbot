@@ -82,7 +82,7 @@ fn parse_program(spec: &str) -> Vec<Step> {
         .collect()
 }
 
-fn relative_shots(case: &Case, cap: Option<usize>, level: f64, noise: f64) -> Vec<Shot> {
+pub(super) fn relative_shots(case: &Case, cap: Option<usize>, level: f64, noise: f64) -> Vec<Shot> {
     let variant = Variant {
         thin: cap.map(|c| (14.0, 2, c, true)),
         relative: level,
@@ -106,17 +106,21 @@ fn acceleration(theta: &[[f64; 3]], p: [f64; 2]) -> [f64; 2] {
 }
 
 /// RMS acceleration error of `theta` against `truth` on a grid, over grid points within 30 units
-/// of a visited row (explored) and the others (unexplored); points inside a true planet are left
+/// of a visited row (explored), the others (unexplored) and all (whole); points inside a true planet are left
 /// out.
-fn field_rmse(case: &Case, theta: &[[f64; 3]], truth: &[[f64; 3]]) -> (f64, f64) {
+pub(super) fn field_rmse(
+    shots: &[Shot],
+    theta: &[[f64; 3]],
+    truth: &[[f64; 3]],
+) -> (f64, f64, f64) {
     let world = WorldParameters::default();
-    let visited: Vec<[f64; 2]> = case
-        .shots
+    let visited: Vec<[f64; 2]> = shots
         .iter()
         .filter_map(|s| s.path.as_ref())
         .flat_map(|p| (0..p.row_count()).map(|r| p.center(r)))
         .collect();
     let mut sums = [(0.0, 0usize); 2];
+    let mut whole = (0.0, 0usize);
     for i in 0..(world.battlefield_width / 20.0) as usize {
         for j in 0..(world.battlefield_height / 20.0) as usize {
             let p = [10.0 + 20.0 * i as f64, 10.0 + 20.0 * j as f64];
@@ -134,14 +138,16 @@ fn field_rmse(case: &Case, theta: &[[f64; 3]], truth: &[[f64; 3]]) -> (f64, f64)
             let s = &mut sums[usize::from(!explored)];
             s.0 += e;
             s.1 += 1;
+            whole.0 += e;
+            whole.1 += 1;
         }
     }
     let rms = |s: (f64, usize)| (s.0 / s.1.max(1) as f64).sqrt();
-    (rms(sums[0]), rms(sums[1]))
+    (rms(sums[0]), rms(sums[1]), rms(whole))
 }
 
 /// Median distance from each true planet to its nearest fitted one, and the mean of those below 15.
-fn position_error(theta: &[[f64; 3]], truth: &[[f64; 3]]) -> (f64, f64) {
+pub(super) fn position_error(theta: &[[f64; 3]], truth: &[[f64; 3]]) -> (f64, f64) {
     let mut d: Vec<f64> = truth
         .iter()
         .map(|p| {
@@ -160,7 +166,7 @@ fn position_error(theta: &[[f64; 3]], truth: &[[f64; 3]]) -> (f64, f64) {
 }
 
 /// Largest distance from a start planet to the nearest planet of `after`.
-fn displacement(start: &[[f64; 3]], after: &[[f64; 3]]) -> f64 {
+pub(super) fn displacement(start: &[[f64; 3]], after: &[[f64; 3]]) -> f64 {
     start
         .iter()
         .map(|s| {
@@ -213,7 +219,7 @@ fn diagnose_polish() {
         let report = |label: &str, theta: &[[f64; 3]], evals: u64| {
             let s = score(theta, &truth, &exact_fit, rows);
             let (med, mean) = position_error(theta, &truth);
-            let (explored, unexplored) = field_rmse(&case, theta, &truth);
+            let (explored, unexplored, _) = field_rmse(&case.shots, theta, &truth);
             println!(
                 "   {label}: K {} rec2 {} (supported {}/{supported_count}) rec15 {} spur {} ratio {:.3e} chi2/row {:.2} pos med {med:.2} mean<15 {mean:.2} field explored {explored:.2e} unexplored {unexplored:.2e} evals {evals}",
                 s.k,
@@ -316,7 +322,7 @@ fn diagnose_polish() {
                     grow(&joint, &shots, &mut modes, &run, world);
                 }
                 if step.deaths {
-                    prune(&joint, &mut modes, &run);
+                    prune(&joint, &mut modes, &run, 6);
                 }
                 equiv +=
                     (stats.evaluations() - evals_before) as f64 * cost as f64 / nodes(&case) as f64;
@@ -353,7 +359,7 @@ fn diagnose_polish() {
             }
             let s = score(&theta, &truth, &exact_fit, rows);
             let (med, mean) = position_error(&theta, &truth);
-            let (explored, unexplored) = field_rmse(&case, &theta, &truth);
+            let (explored, unexplored, _) = field_rmse(&case.shots, &theta, &truth);
             println!(
                 "RESULT {} | {program} | K {} rec2 {}/{} rec15 {} spur {} ratio {:.3e} | pos med {med:.2} mean<15 {mean:.2} | field explored {explored:.2e} unexplored {unexplored:.2e} | evals {} (stage1 {evals1}, equiv {equiv1:.0}, polish {}, polish equiv {equiv:.0})",
                 case.name,

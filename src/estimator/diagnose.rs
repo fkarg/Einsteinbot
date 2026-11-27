@@ -1018,5 +1018,6 @@ fn diagnose_normal_equations_optimizer() {
     }
 }
 
+mod incremental;
 mod polish;
 mod thinning;
