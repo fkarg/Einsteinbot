@@ -89,6 +89,9 @@ pub enum CovarianceUnavailableReason {
     NotComputed,
     /// The published map has no planets: uncertainty about planets not yet found is not modelled.
     NoPlanets,
+    /// The full-row refit ran, but its Laplace evidence or posterior covariance could not be
+    /// computed (a non-finite residual or a failed Cholesky factorization).
+    FactorizationFailed,
 }
 
 /// Whether the data determine a planet of a published map (its covariance is the posterior under
@@ -275,6 +278,9 @@ pub struct Estimator {
     polish_due: bool,
     /// Paths given to the search since the last completed polish.
     paths_since_polish: usize,
+    /// The last polish was cut by its wall ceiling: it stays due but is retried only after the
+    /// next path, so `settle` cannot spin on a refit that does not fit in the ceiling.
+    polish_waits: bool,
     /// Why the search has work left, if it has.
     limit: Option<SearchLimit>,
     pub settings: Settings,
@@ -337,6 +343,7 @@ impl Default for Estimator {
             slices_left: 0,
             polish_due: false,
             paths_since_polish: 0,
+            polish_waits: false,
             limit: None,
             settings: Settings::default(),
             stats: Stats::default(),
@@ -440,6 +447,7 @@ impl Estimator {
             self.search.add_path(&self.shots[self.searched], &slice);
             self.searched += 1;
             self.paths_since_polish += 1;
+            self.polish_waits = false;
             if cancelled.load(Ordering::SeqCst) {
                 return None;
             }
@@ -521,7 +529,7 @@ impl Estimator {
     pub fn search_pending(&self) -> bool {
         self.audit.as_ref().is_some_and(Audit::finished)
             || (!self.search.idle() && self.slices_left > 0)
-            || self.polish_due
+            || (self.polish_due && !self.polish_waits)
     }
 
     /// One unit of background work: adopt a finished audit, else one search slice, else the exact
@@ -547,7 +555,8 @@ impl Estimator {
                 return Some(belief);
             }
         }
-        let starved = self.polish_due && self.paths_since_polish >= POLISH_STARVED_PATHS;
+        let polish_ready = self.polish_due && !self.polish_waits;
+        let starved = polish_ready && self.paths_since_polish >= POLISH_STARVED_PATHS;
         if !starved && !self.search.idle() && self.slices_left > 0 {
             self.slices_left -= 1;
             let noise = self.noise();
@@ -575,13 +584,14 @@ impl Estimator {
             }
             return None;
         }
-        if self.polish_due {
+        if polish_ready {
             self.polish_due = false;
             let started = Instant::now();
             // In place: every other user of `self.shots` sets its own noise.
             let noise = self.noise();
             noise::apply(&mut self.shots, &noise);
-            let far = started + Duration::from_secs(24 * 3600);
+            // A starved refit is not pre-empted by paths, but every refit keeps the wall ceiling.
+            let deadline = self.settings.slice_ceiling.map(|ceiling| started + ceiling);
             let never = AtomicBool::new(false);
             let preempt = if starved { &never } else { preempt };
             let full = Fit::new(
@@ -591,13 +601,24 @@ impl Estimator {
                 true,
                 vec![],
             )
-            .with_cut(far, preempt)
+            .with_cut(
+                deadline.unwrap_or(started + Duration::from_secs(24 * 3600)),
+                preempt,
+            )
             .with_stats(&self.stats);
             let theta = self.search.theta.clone();
+            // Cut by a waiting path or by the wall ceiling: nothing is published and the refit
+            // stays due. A cut also restarts the starvation count, so a refit that cannot finish
+            // within the ceiling (heavy load) does not shut the search slices out.
+            let cut = |estimator: &mut Self| {
+                estimator.polish_due = true;
+                estimator.paths_since_polish = 0;
+                estimator.stats.add(Part::Polish, started.elapsed());
+            };
+            let past = |deadline: Option<Instant>| deadline.is_some_and(|d| Instant::now() >= d);
             let (theta, evidence) = if theta.is_empty() {
                 (theta, None)
             } else {
-                let deadline = self.settings.slice_ceiling.map(|ceiling| started + ceiling);
                 let budget = fit::Budget {
                     evaluations: POLISH_EVALUATIONS,
                     deadline,
@@ -605,16 +626,19 @@ impl Estimator {
                 };
                 let theta = full.refine(&theta, &budget).map_or(theta, |(t, _)| t);
                 if full.preempted() {
-                    self.polish_due = true;
-                    self.stats.add(Part::Polish, started.elapsed());
+                    cut(self);
                     return None;
                 }
-                // The covariance needs a Jacobian of all rows; a refit that used up its time
-                // leaves it out (`not_computed`) rather than run over the ceiling.
-                let evidence = deadline
-                    .is_none_or(|deadline| Instant::now() < deadline)
-                    .then(|| full.evidence(&theta, self.settings.threads))
-                    .flatten();
+                if past(deadline) {
+                    cut(self);
+                    self.polish_waits = true;
+                    return None;
+                }
+                let evidence = full.evidence(&theta, self.settings.threads);
+                if full.preempted() {
+                    cut(self);
+                    return None;
+                }
                 (theta, evidence)
             };
             self.stats.add(Part::Polish, started.elapsed());
@@ -739,6 +763,7 @@ impl Estimator {
                 belief.planet_identifiability = identifiability;
                 None
             }
+            (false, _) if polished => Some(CovarianceUnavailableReason::FactorizationFailed),
             (false, _) => Some(CovarianceUnavailableReason::NotComputed),
         };
         belief.search_limit = if theta.len() >= self.settings.cap() {

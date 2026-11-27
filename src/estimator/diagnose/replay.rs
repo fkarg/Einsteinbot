@@ -205,12 +205,16 @@ fn replay_schedule(case: &Case, settings: Settings, period: u64) {
     };
     let mut lags = Vec::with_capacity(total);
     let mut max_queued = 0;
-    // Completed full-row refits (their belief is no longer `not_computed`), the path count at
-    // the last one, and the most paths that arrived between two of them.
+    // Completed full-row refits of a map with planets (their belief has a covariance or a
+    // factorization failure; refits of the flat map are not counted), the path count at the last
+    // one, and the most paths that arrived between two of them.
     let (mut polishes, mut polished_at, mut polish_gap) = (0, 0, 0);
     let mut polished = |belief: Option<MapBelief>, n: usize| {
         if belief.is_some_and(|b| {
-            b.covariance_unavailable_reason != Some(CovarianceUnavailableReason::NotComputed)
+            matches!(
+                b.covariance_unavailable_reason,
+                None | Some(CovarianceUnavailableReason::FactorizationFailed)
+            )
         }) {
             polishes += 1;
             polish_gap = polish_gap.max(n - polished_at);

@@ -937,6 +937,46 @@ fn a_starved_full_row_refit_goes_before_the_slices() {
     );
 }
 
+// A full-row refit cut by its wall ceiling publishes nothing and stays due, but waits for the next
+// path, so `settle` cannot spin on a refit that never fits in the ceiling.
+#[test]
+fn a_refit_cut_by_its_ceiling_stays_due_until_the_next_path() {
+    let events = three_planet_events();
+    let (mut estimator, cancelled) = estimator();
+    estimator.settings.slice_ceiling = None;
+    for event in &events[..2] {
+        estimator.observe_settled(event, &cancelled);
+    }
+    assert!(!estimator.search.theta.is_empty());
+    estimator.settings.slice_ceiling = Some(Duration::ZERO);
+    estimator.observe(&events[2], &cancelled).unwrap();
+    let settled = estimator.settle(&cancelled);
+    assert!(settled.is_none_or(|b| b.parameter_covariance.is_none()));
+    assert!(estimator.polish_due && !estimator.search_pending());
+    estimator.observe(
+        &shot_in(&contact_truth(), (300.0, 900.0), 20.0, 6.0),
+        &cancelled,
+    );
+    assert!(estimator.search_pending());
+}
+
+// A refit that ran but could not factor its posterior says so, never `not_computed`.
+#[test]
+fn a_failed_factorization_has_its_own_reason() {
+    let (mut estimator, _) = estimator();
+    let theta = [[500.0, 500.0, 30.0]];
+    let polished = estimator.publish(&theta, None, true);
+    assert_eq!(
+        polished.covariance_unavailable_reason,
+        Some(CovarianceUnavailableReason::FactorizationFailed)
+    );
+    let unpolished = estimator.publish(&theta, None, false);
+    assert_eq!(
+        unpolished.covariance_unavailable_reason,
+        Some(CovarianceUnavailableReason::NotComputed)
+    );
+}
+
 // A slice exits promptly when cancelled, and a reset drops the pending work.
 #[test]
 fn a_cancelled_slice_stops_and_a_reset_drops_pending_work() {
