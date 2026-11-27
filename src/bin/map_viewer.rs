@@ -448,7 +448,7 @@ fn update_summary(report: &Value) -> Value {
 
 /// `UpdateReport` phase parts (timed on the coordinating thread; their totals are wall time and
 /// do not overlap). Leaf parts are CPU time summed over threads and nest inside the phases.
-const PHASE_PARTS: [&str; 8] = [
+const PHASE_PARTS: [&str; 9] = [
     "noise",
     "warm_refit",
     "seeding",
@@ -457,6 +457,7 @@ const PHASE_PARTS: [&str; 8] = [
     "deaths",
     "polish",
     "diagnostics",
+    "residual_correction",
 ];
 
 /// Whether observations were still queued for the estimator when the decision read its belief.

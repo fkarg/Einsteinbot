@@ -409,7 +409,7 @@ fn nearest_seed(seed: &[bool], nx: usize, ny: usize) -> Vec<Option<usize>> {
         );
         di * di + dj * dj
     };
-    let mut visit = |k: usize, neighbours: &[Option<usize>], nearest: &mut Vec<Option<usize>>| {
+    let visit = |k: usize, neighbours: &[Option<usize>], nearest: &mut Vec<Option<usize>>| {
         for n in neighbours.iter().flatten() {
             if let Some(s) = nearest[*n] {
                 if nearest[k].is_none_or(|t| distance2(k, s) < distance2(k, t)) {
