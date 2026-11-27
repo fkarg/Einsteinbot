@@ -80,7 +80,8 @@ impl Audit {
                     .unwrap_or(start)
             };
             let (maintained, candidate) = (refit_of(maintained), refit_of(candidate));
-            let evidence = |theta: &[[f64; 3]]| joint.evidence(theta).map(|e| e.log_evidence);
+            let evidence =
+                |theta: &[[f64; 3]]| joint.evidence(theta, threads).map(|e| e.log_evidence);
             let better = match (evidence(&maintained), evidence(&candidate)) {
                 (Some(old), Some(new)) => new > old,
                 (None, Some(_)) => true,

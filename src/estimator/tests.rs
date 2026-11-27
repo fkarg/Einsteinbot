@@ -240,7 +240,7 @@ fn trajectory_alone_recovers_a_hit_and_the_contact_refines_it() {
     assert!((alone[0][0] - joint[0][0]).hypot(alone[0][1] - joint[0][1]) < 1.0);
     let sd = |use_contacts, theta: &[[f64; 3]]| {
         let covariance = fit(use_contacts)
-            .evidence(theta)
+            .evidence(theta, 1)
             .unwrap()
             .covariance
             .expect("a hit is identified");
@@ -489,11 +489,54 @@ fn cancellation_returns_no_belief() {
     );
 }
 
+// The contact term is a proper robust likelihood: zero on the penetration allowance, growing
+// monotonically with the distance from it on either side, and flat at the unexplained cost far
+// away (no pull and no push: before, it rose to 15 units and fell back to zero at 40, pushing
+// planets away from contacts in between). The flat map pays the unexplained cost per contact.
 #[test]
-fn contacts_beyond_the_gate_exert_no_pull() {
-    assert_eq!(fit::contact_residual(50.0, 0.5), 0.0);
-    assert_eq!(fit::contact_residual(-50.0, 0.5), 0.0);
-    assert!(fit::contact_residual(2.0, 0.5).abs() > 1.0);
+fn a_contact_costs_more_the_farther_it_lies_from_the_surface_up_to_a_bound() {
+    let (allowance, cap) = (0.6, fit::unexplained_contact());
+    assert!(fit::contact_residual(-allowance / 2.0, allowance).abs() < 1e-6);
+    assert!(
+        fit::contact_residual(-0.1, allowance).abs() < 1.0,
+        "inside the allowance"
+    );
+    let mut last = 0.0;
+    for step in 1..=400 {
+        let d = step as f64 * 0.05;
+        let (outside, inside) = (
+            fit::contact_residual(d, allowance),
+            fit::contact_residual(-allowance - d, allowance),
+        );
+        assert!(outside > 0.0 && inside < 0.0);
+        assert!(
+            outside >= last - 1e-9 && outside <= cap + 1e-9,
+            "{d}: {outside}"
+        );
+        assert!(
+            (inside + outside).abs() < 1e-6,
+            "symmetric about the allowance"
+        );
+        last = outside;
+    }
+    assert!(fit::contact_residual(0.5, allowance) > 0.5 * cap);
+    assert!((fit::contact_residual(20.0, allowance) - cap).abs() < 1e-6);
+    let (truth, event) = (contact_truth(), contact_event());
+    let shots = [shot_with_contact(&event, &[Point { x: 0.0, y: 0.0 }])];
+    let cancelled = AtomicBool::new(false);
+    let joint = Fit::new(&shots, WorldParameters::default(), &cancelled, true, vec![]);
+    let trajectory = Fit::new(
+        &shots,
+        WorldParameters::default(),
+        &cancelled,
+        false,
+        vec![],
+    );
+    let flat = joint.chi2(&[]).unwrap() - trajectory.chi2(&[]).unwrap();
+    assert!((flat - cap * cap).abs() < 1e-3, "{flat}");
+    let on = fit::theta_of(&truth.planets[0]);
+    let on_surface = joint.chi2(&[on]).unwrap() - trajectory.chi2(&[on]).unwrap();
+    assert!(on_surface < 1.0, "{on_surface}");
 }
 
 // Two separate hits are two planets, and each contact is explained by its own planet's surface.
@@ -566,18 +609,22 @@ fn non_finite_shots_are_ignored_without_panicking() {
     assert!(belief.model_position_rmse.is_none());
 }
 
-// A mode at the radius bound has no trustworthy Gaussian approximation: no covariance, never a
-// tight-looking one. The same shots at an interior radius do identify the planet.
+// The covariance is the posterior under the Gaussian prior, so it always exists; a planet at a
+// bound (no trustworthy Gaussian approximation) or one the data barely see is marked, and does
+// not take the covariance of the other planets with it.
 #[test]
-fn a_mode_at_a_bound_reports_no_covariance() {
+fn every_planet_gets_a_covariance_and_its_identifiability() {
+    use crate::estimator::Identifiability::*;
     let cancelled = AtomicBool::new(false);
-    let covariance_at = |radius: f64| {
-        let truth = world_of(vec![planet(900.0, 500.0, radius)]);
+    let evidence_with = |planets: Vec<Planet>, extra: Option<[f64; 3]>| {
+        let truth = world_of(planets.clone());
         let shots = [
             shot_in(&truth, (500.0, 380.0), 0.0, 10.0),
             shot_in(&truth, (900.0, 150.0), 90.0, 8.0),
         ]
         .map(|event| Shot::new(shot_of(&event), None, WorldParameters::default()));
+        let mut theta: Vec<[f64; 3]> = planets.iter().map(fit::theta_of).collect();
+        theta.extend(extra);
         Fit::new(
             &shots,
             WorldParameters::default(),
@@ -585,13 +632,31 @@ fn a_mode_at_a_bound_reports_no_covariance() {
             false,
             Vec::new(),
         )
-        .evidence(&[[900.0, 500.0, radius]])
+        .evidence(&theta, 1)
         .unwrap()
-        .covariance
     };
-    assert!(covariance_at(30.0).is_some());
-    assert!(covariance_at(40.0).is_none());
-    assert!(covariance_at(20.0).is_none());
+    let evidence_at = |planets| evidence_with(planets, None);
+    let sd =
+        |evidence: &fit::Evidence, i: usize| evidence.covariance.as_ref().unwrap()[(i, i)].sqrt();
+    let interior = evidence_at(vec![planet(900.0, 500.0, 30.0)]);
+    assert_eq!(interior.identifiability, vec![Identified]);
+    assert!(sd(&interior, 0) < 5.0, "{}", sd(&interior, 0));
+    for radius in [20.0, 40.0] {
+        let at_bound = evidence_at(vec![planet(900.0, 500.0, radius)]);
+        assert_eq!(at_bound.identifiability, vec![AtBound], "{radius}");
+        assert!(at_bound.covariance.is_some());
+    }
+    // A second planet at the bound (before: no covariance for any planet) leaves the first
+    // identified with a tight covariance.
+    let both = evidence_at(vec![planet(900.0, 500.0, 30.0), planet(200.0, 940.0, 40.0)]);
+    assert_eq!(both.identifiability, vec![Identified, AtBound]);
+    assert!((0..3).all(|i| sd(&both, i) < 5.0));
+    // A small planet far from both paths: the data barely constrain it, its sds stay wide.
+    let far = evidence_with(
+        vec![planet(900.0, 500.0, 30.0)],
+        Some([1500.0, 900.0, 25.0]),
+    );
+    assert_eq!(far.identifiability, vec![Identified, PriorDominated]);
 }
 
 /// Deterministic uniform values in `[0, 1)`.
@@ -781,6 +846,135 @@ fn the_slice_limit_gives_the_same_belief_whatever_the_load() {
         assert_eq!(again.map.planets, first.map.planets, "{threads} threads");
         assert_eq!(again_work, work);
     }
+}
+
+// A pre-empted step does no work and spends no slice, so the work resumes exactly; a slice
+// pre-empted while it runs stops promptly, keeps its state and publishes nothing.
+#[test]
+fn a_preempted_step_keeps_its_work_for_the_next_one() {
+    let events = three_planet_events();
+    let run = |preempt_first: bool| {
+        let (mut estimator, cancelled) = estimator();
+        estimator.settings.slice_ceiling = None;
+        let mut belief = None;
+        for event in &events {
+            belief = estimator.observe(event, &cancelled).or(belief);
+            if preempt_first {
+                let summary = estimator.summary();
+                assert!(
+                    estimator
+                        .step_until(&cancelled, &AtomicBool::new(true))
+                        .is_none()
+                );
+                assert_eq!(estimator.summary(), summary);
+            }
+            belief = estimator.settle(&cancelled).or(belief);
+        }
+        belief.unwrap()
+    };
+    assert_eq!(run(true).map.planets, run(false).map.planets);
+
+    // Inside a fit the flag stops the solver at its next evaluation, keeping the best point.
+    let shots: Vec<Shot> = events
+        .iter()
+        .map(|event| shot_with_contact(event, &[]))
+        .collect();
+    let (never, set) = (AtomicBool::new(false), AtomicBool::new(true));
+    let start = [[520.0, 480.0, 35.0]];
+    let far = Instant::now() + Duration::from_secs(3600);
+    let fit = |preempt| {
+        Fit::new(&shots, WorldParameters::default(), &never, false, vec![])
+            .with_cut(far, preempt)
+            .refine(&start, &fit::Budget::UNLIMITED)
+            .unwrap()
+            .0[0]
+    };
+    let stopped = fit(&set);
+    assert!(
+        stopped
+            .iter()
+            .zip(start[0])
+            .all(|(a, b)| (a - b).abs() < 1e-6)
+    );
+    assert!(fit(&never) != stopped);
+}
+
+// A steady stream of paths cannot starve the full-row refit: once `POLISH_STARVED_PATHS` paths
+// have arrived since the last one, the refit goes before the owed slices (and is not pre-empted).
+#[test]
+fn a_starved_full_row_refit_goes_before_the_slices() {
+    let truth = world_of(vec![planet(800.0, 500.0, 30.0)]);
+    let events: Vec<ServerEvent> = (0..8)
+        .map(|i| {
+            shot_in(
+                &truth,
+                (300.0 + 40.0 * i as f32, 200.0),
+                30.0 + 5.0 * i as f64,
+                6.0,
+            )
+        })
+        .collect();
+    let (mut estimator, cancelled) = estimator();
+    estimator.settings.slice_ceiling = None;
+    let polished = |belief: Option<MapBelief>| {
+        belief.is_some_and(|b| {
+            b.covariance_unavailable_reason != Some(CovarianceUnavailableReason::NotComputed)
+        })
+    };
+    estimator.observe(&events[0], &cancelled).unwrap();
+    assert!(!polished(estimator.step(&cancelled)), "a slice first");
+    for event in &events[1..] {
+        estimator.observe(event, &cancelled).unwrap();
+    }
+    assert!(estimator.slices_left > 0 && !estimator.search.idle());
+    assert!(
+        polished(estimator.step(&cancelled)),
+        "the starved refit first"
+    );
+    assert!(
+        !polished(estimator.step(&cancelled)),
+        "then the slices again"
+    );
+}
+
+// A full-row refit cut by its wall ceiling publishes nothing and stays due, but waits for the next
+// path, so `settle` cannot spin on a refit that never fits in the ceiling.
+#[test]
+fn a_refit_cut_by_its_ceiling_stays_due_until_the_next_path() {
+    let events = three_planet_events();
+    let (mut estimator, cancelled) = estimator();
+    estimator.settings.slice_ceiling = None;
+    for event in &events[..2] {
+        estimator.observe_settled(event, &cancelled);
+    }
+    assert!(!estimator.search.theta.is_empty());
+    estimator.settings.slice_ceiling = Some(Duration::ZERO);
+    estimator.observe(&events[2], &cancelled).unwrap();
+    let settled = estimator.settle(&cancelled);
+    assert!(settled.is_none_or(|b| b.parameter_covariance.is_none()));
+    assert!(estimator.polish_due && !estimator.search_pending());
+    estimator.observe(
+        &shot_in(&contact_truth(), (300.0, 900.0), 20.0, 6.0),
+        &cancelled,
+    );
+    assert!(estimator.search_pending());
+}
+
+// A refit that ran but could not factor its posterior says so, never `not_computed`.
+#[test]
+fn a_failed_factorization_has_its_own_reason() {
+    let (mut estimator, _) = estimator();
+    let theta = [[500.0, 500.0, 30.0]];
+    let polished = estimator.publish(&theta, None, true);
+    assert_eq!(
+        polished.covariance_unavailable_reason,
+        Some(CovarianceUnavailableReason::FactorizationFailed)
+    );
+    let unpolished = estimator.publish(&theta, None, false);
+    assert_eq!(
+        unpolished.covariance_unavailable_reason,
+        Some(CovarianceUnavailableReason::NotComputed)
+    );
 }
 
 // A slice exits promptly when cancelled, and a reset drops the pending work.

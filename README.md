@@ -92,7 +92,7 @@ Each item says what the bot does, why it helps, and what it measured. The math b
 | **Reads gravity from curvature** | Turns each tick of every observed shot (anyone's) into an exact equation for the local gravity, instead of simulating whole shots. | Exact, cheap, and every shot in the game becomes data. | True map fits the rows to rounding noise ($\chi^2$/row ≈ 0.9 on 5,886 live paths). |
 | **Knows what it doesn't know** | Treats the pull of planets it has not found yet as a smooth, correlated error along each path, sized by how far away an unseen planet could be. | Without it, the fit counts one systematic error as thousands of independent clues and invents phantom planets. | Spurious planets after 8 paths, summed over 14 dev worlds: 79 → 1. |
 | **Learns its own noise level honestly** | Sizes that error from how badly the current map *predicts* each new path before fitting it. | Fitted residuals understate the error; predictions don't. The error shrinks by itself as the map completes. | Residuals look like noise again ($\chi^2$/row ≈ 1, correlation of neighbouring residuals ≈ 0 instead of 0.85-0.97). |
-| **Never stops to think** | Searches for planets in small resumable slices between shots and publishes a fresh map after every path. | Targeting always has a current map, even at 9 new paths per second. | Median 62-71 ms from a path to a published belief that includes it, at 9 paths/s; all 24 planets after 128 paths (14 s) of a real game. |
+| **Never stops to think** | Searches for planets in small resumable slices between shots and publishes a fresh map after every path. | Targeting always has a current map, even at 9 new paths per second. | Median 30-49 ms from a path to a published belief that includes it, at 9 paths/s on a busy 10-core machine (98-118 ms there before slices were pre-empted); all 24 planets after 128 paths (14 s) of a real game. |
 | **Pays for every extra planet** | Adds or removes a planet only when the evidence rises, which includes a penalty per planet. | Planets come from evidence, not from the search's appetite. | Same recall as before at the end of a map, with fewer spurious planets. |
 | **Only proposes possible maps** | Never lets two estimated planets overlap or a planet cross the edge, exactly as the server's map generator requires. | A planet the generator could not produce is wrong by construction; it was splitting one real planet into three. | The split is gone; the default cap rose to 32 without new spurious planets; CPU on one capture 476 s → 39 s. |
 | **Notices when its planet cap is too low** | When the map is at its planet cap (`--planets N`, else 32) and the unexplained pull along the paths is still planet-sized, it warns that the map may have more planets than that (in the report printed on Ctrl+C, the live terminal view and the inspector). It never raises the cap itself. | A wrong `--planets` silently costs the missing planets; the warning tells you to raise it. | Raised in 26 of 26 replays whose cap was 1-4 below the true count, a median of 2 paths after reaching the cap; never in 20 replays with the right count at the cap. |
@@ -215,7 +215,7 @@ A planet is born only from path data ([`src/estimator/search.rs`](src/estimator/
 4. **Adopt on evidence.** Keep the best one if the evidence rises.
 5. **Death trial.** Drop a weak planet, refit, and compare.
 
-A shot that ends on a planet's surface adds a constraint that the surface is there, but only if it agrees with a fitted planet; it never creates a planet. An observed tick inside a planet disk is penalized.
+A shot that ends on a planet's surface is evidence that a surface is there, within one substep of travel. It never creates a planet, and a contact that no found planet explains costs the same bounded amount for every map, so it neither drags nor repels planets. An observed tick inside a planet disk is penalized.
 
 Maps obey the geometry of the NewtonWars map generator (`initPlanets`). Every centre lies at least its radius inside the battlefield, and no two planets touch. The fit enforces the first and penalizes any overlap; it never steps to, and the search never keeps, an overlap of 5 units or more (the 5 units allow for estimation error).
 
@@ -323,8 +323,12 @@ Publish lag is the time from a path's arrival to the publication of a belief tha
 |---|---|---|---|
 | before P18 | 99-101 ms | 183-184 ms | 462-600 ms |
 | after P18 | 62-71 ms | 134-142 ms | 216-317 ms |
+| P18 build, jolly quiet | 61-70 ms | 175-176 ms | 278-293 ms |
+| slices and refit pre-empted, no refit guard, jolly quiet | 30-31 ms | 81-93 ms | 148-164 ms |
+| main f42a6e7, jolly busy | 98-118 ms | 236-266 ms | 386-476 ms |
+| fixes branch (pre-emption, refit guard, folded evidence), jolly busy | 30-49 ms | 97-122 ms | 278-296 ms |
 
-At most 1-2 paths are queued. Capture 55 is one game. The remaining worst lag comes from paths that arrive while a slice or full-row refit runs.
+At most 1-2 paths are queued with the fixes (3-4 on main when busy). Capture 55 is one game. The first two rows are the Mac; the rest are jolly pinned to 10 cores, "quiet" with nothing else running, "busy" at load average 29-36 from other work (three alternating runs each); compare rows on the same machine and load only. With pre-emption a path that arrives during a search slice or the full-row refit no longer waits for it. Pre-emption alone starved the full-row refit (and with it the covariance and the count-limit check) for up to 300 paths; the guard runs a refit uninterrupted once 8 paths have passed without one (10-15 paths between refits in the busy runs), which costs some of the worst-lag gain. Recall was unchanged at 16, 64, 128, 256 and 545 paths.
 
 ### Estimator: planet count
 
@@ -365,7 +369,7 @@ Detection of map boundaries and end cards (P19, section 7), tested on recorded c
 
 - Recall dips at 16-32 paths, mostly on synthetic worlds the old estimator had already completed. The estimated model-error scale $s$ (section 3) then sits at its upper bound and absorbs part of the missing planets' signal. At about 9 paths/s this window passes in 2-4 s.
 - The default cap is 32 planets. Servers with more than 32 planets need `--planets N` or `--learn-planets`; the count-limit warning says so once the map is at the cap (tested up to 28 planets). A misplaced planet at a correct cap could also raise it; no such case was seen.
-- Information probes are off: the covariance-based probe of earlier builds rarely fired (covariance is usually `not_computed` at decision time), and P24's cheap coverage probe cost kills in a closed-loop game.
+- Information probes are off. The covariance-based probe of earlier builds rarely fired, because the covariance was usually not available yet at decision time (since the fixes branch it exists more often). P24 replaced it with a cheap coverage probe, which cost kills in a closed-loop game.
 - The evidence prior (1/20 per planet), the planet-count prior, the interpolation variance and the prior on the noise scalars are heuristics.
 - Most cells above are one run, and live worlds vary by several planets between runs of similar configurations.
 - Bit-for-bit parity of the bot's simulator with the engine is not established; an audit on two captures matched most shots closely but had individual errors up to 13.46 units ([details](docs/map-inspector.md#simulator-parity-with-the-engine)).
