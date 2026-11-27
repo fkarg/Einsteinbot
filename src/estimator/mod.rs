@@ -165,7 +165,8 @@ pub struct Estimator {
     shots: Vec<Shot>,
     /// Prequential residuals of the latest paths (at most `noise::WINDOW`).
     series: Vec<noise::Series>,
-    /// The model-error scalars estimated from `series`.
+    /// The model-error scalars of the current fits: estimated from `series` without the latest
+    /// path's.
     model: ModelError,
     search: Search,
     /// Paths already given to the search (the rest were ingested when an update was cancelled).
@@ -269,19 +270,20 @@ impl Estimator {
             self.stats.add(part, elapsed);
         }
         while self.searched < self.shots.len() {
-            // Prequential residuals of the new path against the published map, then the
-            // model-error estimate and the local refit under it.
+            // The model-error estimate from the earlier paths' prequential residuals: a path is
+            // fitted (its local refit and the slices after it) under noise that has not seen it,
+            // so its own unexplained signature cannot widen the noise it is fitted with. Then its
+            // residuals against the published map join the window for the next path.
             let started = Instant::now();
             let published = self.published_planets();
-            let mut noise = Noise::new(self.model, &published, &self.shots[..=self.searched]);
+            self.model = noise::estimate(&self.series);
+            let noise = Noise::new(self.model, &published, &self.shots[..=self.searched]);
             if let Some(path) = &self.shots[self.searched].path {
                 self.series
                     .push(noise::Series::new(path, &published, &noise));
                 if self.series.len() > noise::WINDOW {
                     self.series.remove(0);
                 }
-                self.model = noise::estimate(&self.series);
-                noise.model = self.model;
             }
             self.stats.add(Part::Noise, started.elapsed());
             let slice = self.settings.slice(cancelled, &self.stats, &noise);
