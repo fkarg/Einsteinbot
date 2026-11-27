@@ -34,7 +34,7 @@ cd ../NewtonWars
 Each bot session opens one TCP connection. It reads the server's text welcome prompt, enters bot protocol 8, prints parsed game events, and requests energy once per second.
 
 ```sh
-cargo run                        # aims with the targeting policy (default)
+cargo run                        # aims with the targeting policy (default, same as --target)
 cargo run -- --no-target         # passive: watches and records
 cargo run -- --dummy             # small random shots
 cargo run -- --clients 3
@@ -44,7 +44,7 @@ cargo run -- --clients 3
 |---|---|---|
 | targeting | (default; `--target`) | aims by simulating candidate shots on the estimated map |
 | passive | `--no-target` | watches and records, never shoots |
-| dummy | `--dummy` | an integer velocity between 2 and `min(8, floor(energy))` and an integer angle from -180 through 180, at most one shot per energy response, once energy is at least 2; takes precedence over `--target` |
+| dummy | `--dummy` | an integer velocity between 2 and `min(8, floor(energy))` and an integer angle from -180 through 180, at most one shot per energy response, once energy is at least 2; takes precedence over targeting |
 | oracle | `--oracle-map` | uses the server's disclosed planets for local target simulation (explicit opt-in, for diagnosis) |
 
 Defaults:

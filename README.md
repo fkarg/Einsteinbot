@@ -26,7 +26,7 @@ You need a Rust toolchain and the NewtonWars source checked out next to this rep
    cargo run -- --clients 3      # three bots on one local server
    ```
 
-   With `--no-target` the bot only watches. It records everything it sees to `einsteinbot.sqlite3`. Press Ctrl+C once to stop and print a per-map report.
+   Targeting (`--target`) is the default; with `--no-target` the bot only watches. It records everything it sees to `einsteinbot.sqlite3`. Press Ctrl+C once to stop and print a per-map report.
 
 3. **Inspect what it believed**:
 
