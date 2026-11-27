@@ -119,7 +119,7 @@ fn distance(a: &[f64; 3], b: &[f64; 3]) -> f64 {
 }
 
 pub(super) fn mode_at(joint: &Fit, theta: &[[f64; 3]]) -> Option<Mode> {
-    let Evidence { log_evidence, .. } = joint.evidence(theta)?;
+    let Evidence { log_evidence, .. } = joint.evidence(theta, 1)?;
     Some(Mode {
         planets: theta.iter().map(|th| planet_at(*th)).collect(),
         log_evidence,

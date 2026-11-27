@@ -598,7 +598,7 @@ impl Estimator {
                 // leaves it out (`not_computed`) rather than run over the ceiling.
                 let evidence = deadline
                     .is_none_or(|deadline| Instant::now() < deadline)
-                    .then(|| full.evidence(&theta))
+                    .then(|| full.evidence(&theta, self.settings.threads))
                     .flatten();
                 (theta, evidence)
             };

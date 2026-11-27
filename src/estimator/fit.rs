@@ -553,10 +553,23 @@ impl<'a> Fit<'a> {
     /// grouped by rows (from the data alone, so the result does not depend on `threads`), each
     /// group's blocks are folded into one triangle on its own thread, and the triangles and the
     /// contact and overlap rows are reduced last. `None` if cancelled or a residual is not finite.
-    fn reduce(&self, theta: &[[f64; 3]], u: &DVector<f64>, threads: usize) -> Option<Reduced> {
-        if self.cancelled.load(Ordering::Relaxed) {
-            return None;
-        }
+    /// Rows of every path block with `k` planets.
+    fn path_rows(&self, k: usize) -> usize {
+        self.path_indices()
+            .iter()
+            .map(|&index| 2 * self.shots[index].path.as_ref().expect("a path").row_count() + k)
+            .sum()
+    }
+
+    /// The path blocks' Jacobians (chained to `u` when given, else with respect to `theta`) folded
+    /// into triangles: consecutive paths grouped by rows (from the data alone, so the result does
+    /// not depend on `threads`), each group on its own thread. `None` if a residual is not finite.
+    fn triangles(
+        &self,
+        theta: &[[f64; 3]],
+        u: Option<&DVector<f64>>,
+        threads: usize,
+    ) -> Option<Vec<Triangle>> {
         let (k, n) = (theta.len(), 3 * theta.len());
         let threads = self.evaluation_threads(k, threads);
         let paths = self.path_indices();
@@ -582,17 +595,44 @@ impl<'a> Fit<'a> {
                     return None;
                 }
                 let mut block = block.expect("requested");
-                self.chain(theta, u, &mut block, res.len());
+                if let Some(u) = u {
+                    self.chain(theta, u, &mut block, res.len());
+                }
                 folder.add(&block, &res);
             }
             Some(folder.finish())
         });
-        let triangles: Vec<Triangle> = triangles
-            .into_iter()
-            .collect::<Option<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .collect();
+        Some(
+            triangles
+                .into_iter()
+                .collect::<Option<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect(),
+        )
+    }
+
+    /// `J^T J` with respect to `theta`, from the folded path triangles (`R^T R` each) and the
+    /// global rows, without forming `J`.
+    fn information(&self, theta: &[[f64; 3]], threads: usize) -> Option<DMatrix<f64>> {
+        let n = 3 * theta.len();
+        let mut information = DMatrix::zeros(n, n);
+        for triangle in self.triangles(theta, None, threads)? {
+            let r = DMatrix::from_column_slice(n, n, &triangle.r);
+            information += r.tr_mul(&r);
+        }
+        let (res, block) = self.global_rows(theta, true);
+        let global = DMatrix::from_column_slice(res.len(), n, &block.expect("requested"));
+        information += global.tr_mul(&global);
+        Some(information)
+    }
+
+    fn reduce(&self, theta: &[[f64; 3]], u: &DVector<f64>, threads: usize) -> Option<Reduced> {
+        if self.cancelled.load(Ordering::Relaxed) {
+            return None;
+        }
+        let (n, total) = (3 * theta.len(), self.path_rows(theta.len()));
+        let triangles = self.triangles(theta, Some(u), threads)?;
         let (res, block) = self.global_rows(theta, true);
         if !res.iter().all(|v| v.is_finite()) {
             return None;
@@ -717,20 +757,21 @@ impl<'a> Fit<'a> {
         Some((theta, chi2))
     }
 
-    /// Laplace evidence and covariance at `theta` (all planets free, none fixed).
-    pub fn evidence(&self, theta: &[[f64; 3]]) -> Option<Evidence> {
+    /// Laplace evidence and covariance at `theta` (all planets free, none fixed); one evaluation
+    /// may use `threads`.
+    pub fn evidence(&self, theta: &[[f64; 3]], threads: usize) -> Option<Evidence> {
         let started = Instant::now();
-        let out = self.laplace(theta);
+        let out = self.laplace(theta, threads);
         if let Some(stats) = self.stats {
             stats.add(Part::Evidence, started.elapsed());
         }
         out
     }
 
-    fn laplace(&self, theta: &[[f64; 3]]) -> Option<Evidence> {
+    fn laplace(&self, theta: &[[f64; 3]], threads: usize) -> Option<Evidence> {
         debug_assert!(self.fixed.is_empty());
         let k = theta.len();
-        let (residuals, jacobian) = self.evaluate(theta, true, 1)?;
+        let (residuals, _) = self.evaluate(theta, false, threads)?;
         let chi2 = residuals.norm_squared();
         if k == 0 {
             return Some(Evidence {
@@ -739,9 +780,8 @@ impl<'a> Fit<'a> {
                 identifiability: Vec::new(),
             });
         }
-        let jacobian = jacobian.expect("requested");
         let covariance_started = Instant::now();
-        let information = jacobian.tr_mul(&jacobian);
+        let information = self.information(theta, threads)?;
         // Gaussian prior as wide as a uniform one over the allowed ranges.
         let prior_sd = |i: usize| {
             [
@@ -955,6 +995,33 @@ mod tests {
         for threads in [2, 8] {
             let other = fit.reduce(&theta, &u, threads).unwrap().unpivoted();
             assert!(other.0 == r && other.1 == qtb, "{threads} threads");
+        }
+    }
+
+    // The evidence's information is `J^T J` of the full Jacobian with respect to `theta`, folded
+    // in parallel without forming `J`, and the thread count changes nothing.
+    #[test]
+    fn the_folded_information_is_that_of_the_full_jacobian() {
+        let cancelled = AtomicBool::new(false);
+        let shots = three_planets();
+        let fit = Fit::new(&shots, WorldParameters::default(), &cancelled, true, vec![]);
+        let theta = [
+            [505.0, 497.0, 30.5],
+            [1195.0, 703.0, 27.0],
+            [905.0, 255.0, 25.5],
+        ];
+        let jacobian = fit.evaluate(&theta, true, 1).unwrap().1.unwrap();
+        let dense = jacobian.tr_mul(&jacobian);
+        let folded = fit.information(&theta, 1).unwrap();
+        assert!((&folded - &dense).amax() < 1e-10 * dense.amax());
+        let evidence = fit.evidence(&theta, 1).unwrap();
+        for threads in [2, 8] {
+            let other = fit.evidence(&theta, threads).unwrap();
+            assert_eq!(
+                other.log_evidence, evidence.log_evidence,
+                "{threads} threads"
+            );
+            assert_eq!(other.covariance, evidence.covariance, "{threads} threads");
         }
     }
 

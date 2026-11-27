@@ -240,7 +240,7 @@ fn trajectory_alone_recovers_a_hit_and_the_contact_refines_it() {
     assert!((alone[0][0] - joint[0][0]).hypot(alone[0][1] - joint[0][1]) < 1.0);
     let sd = |use_contacts, theta: &[[f64; 3]]| {
         let covariance = fit(use_contacts)
-            .evidence(theta)
+            .evidence(theta, 1)
             .unwrap()
             .covariance
             .expect("a hit is identified");
@@ -632,7 +632,7 @@ fn every_planet_gets_a_covariance_and_its_identifiability() {
             false,
             Vec::new(),
         )
-        .evidence(&theta)
+        .evidence(&theta, 1)
         .unwrap()
     };
     let evidence_at = |planets| evidence_with(planets, None);
