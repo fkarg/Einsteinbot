@@ -11,13 +11,14 @@
 //! Evidence is `-chi2/2 - Occam(Laplace) - K ln 20`, under the noise the shots carry
 //! (`noise.rs`; the same for every map compared, so the log-determinant is left out). The
 //! weights built from it are heuristic rankings, not calibrated probabilities.
+use super::Identifiability;
 use super::Shot;
 use super::lm::{self, Folder, Reduced, Triangle};
 use super::window::PathData;
 use super::work::{Part, Stats, par_map};
 use crate::protocol::{Planet, Point};
 use crate::simulation::WorldParameters;
-use nalgebra::{DMatrix, DVector, SymmetricEigen};
+use nalgebra::{DMatrix, DVector};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
@@ -48,11 +49,12 @@ pub(super) const CONTACT_MATCH: f64 = 15.0;
 const RADIUS_RANGE: (f64, f64) = (20.0, 40.0);
 /// Mass is tied to the radius cubed, as the local generator does: `mass = 0.1 * radius^3`.
 const MASS_PER_RADIUS_CUBED: f64 = 0.1;
-/// Planets closer than this to a bound (in the units of the bound) are saturated: no covariance.
+/// Planets closer than this to a bound (in the units of the bound) are saturated: their Gaussian
+/// approximation does not hold (`Identifiability::AtBound`).
 const BOUND_MARGIN: f64 = 0.5;
-/// The correlation matrix of the sensitivities must have its smallest eigenvalue above this, or
-/// the parameters are treated as under-identified.
-const MIN_CORRELATION_EIGENVALUE: f64 = 1e-4;
+/// A planet is identified by the data when every posterior sd of its `[x, y, radius]` is at most
+/// this fraction of the prior sd (the data, not the prior, carry at least 75% of the precision).
+const IDENTIFIED_SD_FRACTION: f64 = 0.5;
 const LM_PATIENCE: usize = 40;
 /// An evaluation with fewer planet-times-node terms than this is not split over threads.
 const PARALLEL_MIN_PLANET_NODES: usize = 40_000;
@@ -160,9 +162,11 @@ pub(super) struct Unexplained {
 
 pub(super) struct Evidence {
     pub log_evidence: f64,
-    /// `[x, y, radius]` covariance of all planets, `None` when the data leave the parameters
-    /// under-identified or a planet sits at a bound.
+    /// Posterior `[x, y, radius]` covariance of all planets under the Gaussian prior (`None`
+    /// only without planets).
     pub covariance: Option<DMatrix<f64>>,
+    /// Per planet: whether the data identify it (`covariance` is always defined).
+    pub identifiability: Vec<Identifiability>,
 }
 
 /// Limits of one `refine`: a deterministic evaluation count and an optional wall-clock instant
@@ -732,6 +736,7 @@ impl<'a> Fit<'a> {
             return Some(Evidence {
                 log_evidence: -0.5 * chi2,
                 covariance: None,
+                identifiability: Vec::new(),
             });
         }
         let jacobian = jacobian.expect("requested");
@@ -753,26 +758,45 @@ impl<'a> Fit<'a> {
             .cholesky()
             .map(|c| (0..3 * k).map(|i| c.l()[(i, i)].ln()).sum())?;
         let log_evidence = -0.5 * chi2 - occam - k as f64 * PLANET_PRIOR_ODDS.ln();
-        // No covariance for a mode saturated at a bound (the Gaussian approximation does not hold
-        // there) or with a badly conditioned (diagonal-normalized) information matrix.
-        let scale = DMatrix::from_diagonal(&information.diagonal().map(|d| d.sqrt().recip()));
-        let correlation = &scale * &information * &scale;
-        let well_conditioned = correlation.iter().all(|v| v.is_finite())
-            && SymmetricEigen::new(correlation).eigenvalues.min() > MIN_CORRELATION_EIGENVALUE;
-        let covariance = (well_conditioned && self.in_bounds(theta, BOUND_MARGIN))
-            .then(|| information.clone().try_inverse())
-            .flatten()
-            .map(|inverse| {
-                // Inflate when the residuals exceed what the noise model expects.
-                let dof = (self.data_rows() as f64 - 3.0 * k as f64).max(1.0);
-                inverse * (chi2 / dof).max(1.0)
-            });
+        // The posterior covariance under the same Gaussian prior, `(H / c + S^-2)^-1` with the
+        // likelihood inflated by `c` when the residuals exceed what the noise model expects: always
+        // defined, and close to the prior where the data say little. Per planet, whether the data
+        // or the prior determine it, and whether it sits at a bound (where the Gaussian
+        // approximation does not hold).
+        let dof = (self.data_rows() as f64 - 3.0 * k as f64).max(1.0);
+        let inflation = (chi2 / dof).max(1.0);
+        let posterior = DMatrix::from_fn(3 * k, 3 * k, |i, j| {
+            information[(i, j)] * prior_sd(i) * prior_sd(j) / inflation
+                + if i == j { 1.0 } else { 0.0 }
+        });
+        let covariance = posterior.cholesky().map(|c| c.inverse()).map(|scaled| {
+            DMatrix::from_fn(3 * k, 3 * k, |i, j| {
+                scaled[(i, j)] * prior_sd(i) * prior_sd(j)
+            })
+        });
+        let identifiability = covariance.as_ref().map(|covariance| {
+            (0..k)
+                .map(|j| {
+                    if !self.in_bounds(&theta[j..=j], BOUND_MARGIN) {
+                        Identifiability::AtBound
+                    } else if (0..3).all(|p| {
+                        let i = 3 * j + p;
+                        covariance[(i, i)].sqrt() <= IDENTIFIED_SD_FRACTION * prior_sd(i)
+                    }) {
+                        Identifiability::Identified
+                    } else {
+                        Identifiability::PriorDominated
+                    }
+                })
+                .collect()
+        });
         if let Some(stats) = self.stats {
             stats.add(Part::Covariance, covariance_started.elapsed());
         }
         log_evidence.is_finite().then_some(Evidence {
             log_evidence,
             covariance,
+            identifiability: identifiability.unwrap_or_default(),
         })
     }
 

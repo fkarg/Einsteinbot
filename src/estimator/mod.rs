@@ -87,8 +87,20 @@ pub enum CovarianceUnavailableReason {
     NotComputed,
     /// The published map has no planets: uncertainty about planets not yet found is not modelled.
     NoPlanets,
-    /// The data leave the planets' parameters (nearly) undetermined, or a planet sits at a bound.
-    UnderIdentified,
+}
+
+/// Whether the data determine a planet of a published map (its covariance is the posterior under
+/// the Gaussian prior, so it always exists; this says how far to trust it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Identifiability {
+    /// Every posterior sd of `[x, y, radius]` is at most half the prior sd.
+    Identified,
+    /// The prior carries much of the precision: the sds are honest but wide.
+    PriorDominated,
+    /// The planet sits at a bound of the radius range or the battlefield, where the Gaussian
+    /// approximation does not hold (the sds may be too small or too large).
+    AtBound,
 }
 
 /// Why the planet search has work left in the published belief.
@@ -698,24 +710,20 @@ impl Estimator {
         let mut belief = MapBelief::new(PlanetMap { planets }, None);
         belief.covariance_unavailable_reason = match (theta.is_empty(), evidence) {
             (true, _) => Some(CovarianceUnavailableReason::NoPlanets),
-            (false, None) => Some(CovarianceUnavailableReason::NotComputed),
-            (
-                false,
-                Some(Evidence {
-                    covariance: None, ..
-                }),
-            ) => Some(CovarianceUnavailableReason::UnderIdentified),
             (
                 false,
                 Some(Evidence {
                     covariance: Some(covariance),
+                    identifiability,
                     ..
                 }),
             ) => {
                 belief.parameter_covariance =
                     Some(fit::covariance_xym(&covariance, &belief.map.planets));
+                belief.planet_identifiability = identifiability;
                 None
             }
+            (false, _) => Some(CovarianceUnavailableReason::NotComputed),
         };
         belief.search_limit = if theta.len() >= self.settings.cap() {
             Some(SearchLimit::PlanetCap)

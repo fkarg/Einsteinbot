@@ -609,18 +609,22 @@ fn non_finite_shots_are_ignored_without_panicking() {
     assert!(belief.model_position_rmse.is_none());
 }
 
-// A mode at the radius bound has no trustworthy Gaussian approximation: no covariance, never a
-// tight-looking one. The same shots at an interior radius do identify the planet.
+// The covariance is the posterior under the Gaussian prior, so it always exists; a planet at a
+// bound (no trustworthy Gaussian approximation) or one the data barely see is marked, and does
+// not take the covariance of the other planets with it.
 #[test]
-fn a_mode_at_a_bound_reports_no_covariance() {
+fn every_planet_gets_a_covariance_and_its_identifiability() {
+    use crate::estimator::Identifiability::*;
     let cancelled = AtomicBool::new(false);
-    let covariance_at = |radius: f64| {
-        let truth = world_of(vec![planet(900.0, 500.0, radius)]);
+    let evidence_with = |planets: Vec<Planet>, extra: Option<[f64; 3]>| {
+        let truth = world_of(planets.clone());
         let shots = [
             shot_in(&truth, (500.0, 380.0), 0.0, 10.0),
             shot_in(&truth, (900.0, 150.0), 90.0, 8.0),
         ]
         .map(|event| Shot::new(shot_of(&event), None, WorldParameters::default()));
+        let mut theta: Vec<[f64; 3]> = planets.iter().map(fit::theta_of).collect();
+        theta.extend(extra);
         Fit::new(
             &shots,
             WorldParameters::default(),
@@ -628,13 +632,31 @@ fn a_mode_at_a_bound_reports_no_covariance() {
             false,
             Vec::new(),
         )
-        .evidence(&[[900.0, 500.0, radius]])
+        .evidence(&theta)
         .unwrap()
-        .covariance
     };
-    assert!(covariance_at(30.0).is_some());
-    assert!(covariance_at(40.0).is_none());
-    assert!(covariance_at(20.0).is_none());
+    let evidence_at = |planets| evidence_with(planets, None);
+    let sd =
+        |evidence: &fit::Evidence, i: usize| evidence.covariance.as_ref().unwrap()[(i, i)].sqrt();
+    let interior = evidence_at(vec![planet(900.0, 500.0, 30.0)]);
+    assert_eq!(interior.identifiability, vec![Identified]);
+    assert!(sd(&interior, 0) < 5.0, "{}", sd(&interior, 0));
+    for radius in [20.0, 40.0] {
+        let at_bound = evidence_at(vec![planet(900.0, 500.0, radius)]);
+        assert_eq!(at_bound.identifiability, vec![AtBound], "{radius}");
+        assert!(at_bound.covariance.is_some());
+    }
+    // A second planet at the bound (before: no covariance for any planet) leaves the first
+    // identified with a tight covariance.
+    let both = evidence_at(vec![planet(900.0, 500.0, 30.0), planet(200.0, 940.0, 40.0)]);
+    assert_eq!(both.identifiability, vec![Identified, AtBound]);
+    assert!((0..3).all(|i| sd(&both, i) < 5.0));
+    // A small planet far from both paths: the data barely constrain it, its sds stay wide.
+    let far = evidence_with(
+        vec![planet(900.0, 500.0, 30.0)],
+        Some([1500.0, 900.0, 25.0]),
+    );
+    assert_eq!(far.identifiability, vec![Identified, PriorDominated]);
 }
 
 /// Deterministic uniform values in `[0, 1)`.
