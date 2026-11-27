@@ -163,23 +163,27 @@ impl BotState {
         serde_json::from_value(snapshot.clone())
     }
 
+    /// Forget everything tied to the previous map (shots, coverage, belief, spawn sightings).
+    /// Called at every detected map boundary; a `Planets` message calls it too.
+    pub fn start_new_map(&mut self) {
+        self.known_shots.clear();
+        self.covered_cells.clear();
+        self.map_belief = None;
+        self.in_flight.clear();
+        // During map reinitialization, NewtonWars sends each player's new position
+        // immediately before that player's Planets message. Other entries may still
+        // be stale because those players' updates can arrive after this boundary.
+        self.observed_spawn_locations.clear();
+        if let Some(own_id) = self.own_id
+            && let Some(position) = self.player_positions.get(&own_id)
+        {
+            self.observed_spawn_locations.push(position.clone());
+        }
+    }
+
     pub fn observe(&mut self, event: &ServerEvent) {
         match event {
-            ServerEvent::Planets { .. } => {
-                self.known_shots.clear();
-                self.covered_cells.clear();
-                self.map_belief = None;
-                self.in_flight.clear();
-                // During map reinitialization, NewtonWars sends each player's new position
-                // immediately before that player's Planets message. Other entries may still
-                // be stale because those players' updates can arrive after this boundary.
-                self.observed_spawn_locations.clear();
-                if let Some(own_id) = self.own_id
-                    && let Some(position) = self.player_positions.get(&own_id)
-                {
-                    self.observed_spawn_locations.push(position.clone());
-                }
-            }
+            ServerEvent::Planets { .. } => self.start_new_map(),
             ServerEvent::OwnId { player_id } => self.own_id = Some(*player_id),
             ServerEvent::PlayerPosition { player_id, x, y } => {
                 let position = Point { x: *x, y: *y };

@@ -273,6 +273,8 @@ fn capture_overview(path: &PathBuf) -> Result<Value, String> {
             "ended_at_unix_ms": ended,
             "kind": if metadata["host"] == "synthetic-scenario" { "scenario" } else { "live" },
             "name": metadata["client_name"],
+            // Per-map live captures (2026-11-27 on) link their session; older ones lack it.
+            "session": metadata["session"],
             "revision": metadata["build"]["git_revision"],
             "shots": shots.get(&id).copied().unwrap_or(0),
             "decisions": decisions,
