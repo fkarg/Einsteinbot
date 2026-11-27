@@ -1,7 +1,10 @@
 use crate::coverage::path_cells;
+use crate::estimator::{ResidualCorrection, ResidualGate, ResidualModel};
 use crate::map::{PlanetMap, Vec2};
 use crate::protocol::{Point, ServerEvent};
-use crate::simulation::{ShotObservation, Termination, WorldParameters, simulate_targeting_shot};
+use crate::simulation::{
+    ShotObservation, Termination, WorldParameters, simulate_corrected_targeting_shot,
+};
 use nalgebra::DMatrix;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -41,6 +44,15 @@ pub struct MapBelief {
     /// Set when the planet-count search stopped at its cap or time budget rather than by running
     /// out of proposals.
     pub search_limit: Option<crate::estimator::SearchLimit>,
+    /// Residual correction for aiming (`estimator::residual`): the smoothed model error along
+    /// the observed paths, spread to nearby space. Targeting adds it to the planets' field.
+    pub residual_correction: Option<ResidualCorrection>,
+    /// Why `residual_correction` is absent (gated off or not computed). Absent is not zero
+    /// model error.
+    pub residual_correction_unavailable_reason: Option<ResidualGate>,
+    /// Model-error scalars the correction was (or would have been) built with; with `map` and
+    /// the epoch's paths they rebuild it (`estimator::residual_correction`).
+    pub residual_model: Option<ResidualModel>,
 }
 
 impl MapBelief {
@@ -58,7 +70,18 @@ impl MapBelief {
             unmatched_contacts: 0,
             model_position_rmse: None,
             search_limit: None,
+            residual_correction: None,
+            residual_correction_unavailable_reason: Some(ResidualGate::NotComputed),
+            residual_model: None,
         }
+    }
+
+    /// The residual correction at `position` (acceleration units); `None` when unavailable
+    /// (`residual_correction_unavailable_reason`), never a silent zero.
+    pub fn residual_correction_at(&self, position: Vec2) -> Option<Vec2> {
+        self.residual_correction
+            .as_ref()
+            .map(|correction| correction.at(position))
     }
 
     /// The belief as recorded in capture diagnostics (`map_belief`). Dropped fields are simply
@@ -81,6 +104,13 @@ impl MapBelief {
             "unmatched_contacts": self.unmatched_contacts,
             "model_position_rmse": self.model_position_rmse,
             "search_limit": self.search_limit,
+            "residual_correction": self.residual_correction.as_ref().map(|c| serde_json::json!({
+                "length": c.length,
+                "max_magnitude": c.max_magnitude,
+                "rows": c.rows,
+            })),
+            "residual_correction_unavailable_reason": self.residual_correction_unavailable_reason,
+            "residual_model": self.residual_model,
         })
     }
 
@@ -373,6 +403,10 @@ impl TargetingPolicy {
             .as_ref()
             .map(|belief| &belief.map)
             .unwrap_or(&empty_map);
+        let correction = state
+            .map_belief
+            .as_ref()
+            .and_then(|belief| belief.residual_correction.as_ref());
         let covariance_available = state.map_belief.as_ref().is_some_and(|belief| {
             belief
                 .parameter_covariance
@@ -395,8 +429,9 @@ impl TargetingPolicy {
                 velocity: f64::from(velocity),
                 points: vec![start.clone()],
             };
-            let result = simulate_targeting_shot(
+            let result = simulate_corrected_targeting_shot(
                 map,
+                correction,
                 &shot,
                 self.world,
                 self.settings.max_simulation_ticks.max(2),
@@ -584,8 +619,9 @@ impl TargetingPolicy {
                         velocity: f64::from(candidate.velocity),
                         points: vec![start.clone()],
                     };
-                    let trajectory = simulate_targeting_shot(
+                    let trajectory = simulate_corrected_targeting_shot(
                         &belief.map,
+                        correction,
                         &shot,
                         self.world,
                         self.settings.max_simulation_ticks.max(2),
