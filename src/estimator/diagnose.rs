@@ -262,3 +262,63 @@ fn belief_theta(estimator: &Estimator) -> Vec<[f64; 3]> {
         .map(|b| theta_of_planets(&b.map.planets))
         .unwrap_or_default()
 }
+
+/// Lag-1 autocorrelation of the whitened residuals along each path and chi2 per row, for the true
+/// map and the true map minus `DROP` planets, at the search's relative levels. Tests whether the
+/// row-independent relative noise over-counts a smooth model error.
+#[test]
+#[ignore]
+fn diagnose_residual_correlation() {
+    let drop: usize = std::env::var("DROP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
+    let world = WorldParameters::default();
+    for case in cases() {
+        let truth = theta_of_planets(&case.truth);
+        // Drop the planets nearest the battlefield centre (a deterministic choice).
+        let mut order: Vec<usize> = (0..truth.len()).collect();
+        let c = [
+            world.battlefield_width / 2.0,
+            world.battlefield_height / 2.0,
+        ];
+        order.sort_by(|&a, &b| {
+            (truth[a][0] - c[0])
+                .hypot(truth[a][1] - c[1])
+                .total_cmp(&(truth[b][0] - c[0]).hypot(truth[b][1] - c[1]))
+        });
+        let partial: Vec<[f64; 3]> = order[drop..].iter().map(|&i| truth[i]).collect();
+        for relative in [0.0, 0.02, 0.005] {
+            let shots: Vec<Shot> = case
+                .shots
+                .iter()
+                .map(|s| s.at_relative_level(world, relative))
+                .collect();
+            let cancelled = AtomicBool::new(false);
+            let fit = Fit::new(&shots, world, &cancelled, false, Vec::new());
+            for (label, theta) in [("true", &truth), ("missing", &partial)] {
+                let (mut num, mut den, mut chi2, mut rows) = (0.0, 0.0, 0.0, 0usize);
+                for (i, shot) in shots.iter().enumerate() {
+                    let Some(path) = &shot.path else { continue };
+                    let field = fit.field(i, path, theta);
+                    for axis in 0..2 {
+                        let mut r = vec![0.0; path.row_count()];
+                        path.residual(axis, &field[axis], &mut r);
+                        for w in r.windows(2) {
+                            num += w[0] * w[1];
+                        }
+                        den += r.iter().map(|v| v * v).sum::<f64>();
+                        chi2 += r.iter().map(|v| v * v).sum::<f64>();
+                        rows += r.len();
+                    }
+                }
+                println!(
+                    "RESCORR case={:?} relative={relative} map={label} rows={rows} chi2_per_row={:.3e} lag1={:.3}",
+                    case.name,
+                    chi2 / rows as f64,
+                    num / den
+                );
+            }
+        }
+    }
+}
