@@ -24,7 +24,8 @@ pub enum Part {
     Contacts,
     /// One residual evaluation (leaf).
     ResidualEval,
-    /// One residual and Jacobian evaluation (leaf).
+    /// One residual and Jacobian evaluation (leaf; in a refinement it includes the parallel QR
+    /// reduction of the Jacobian, `lm.rs`).
     JacobianEval,
     /// One Levenberg-Marquardt refinement, all its iterations (leaf).
     LmSolve,
