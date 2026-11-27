@@ -9,6 +9,7 @@ use super::search::{DEATH_DEPTH, Limits, Run, best, grow, mode_at, prune, refit}
 use super::work::{PartCeilings, Stats};
 use crate::simulation::WorldParameters;
 use std::sync::atomic::AtomicBool;
+use std::time::Instant;
 
 /// Search stages of the cascade: row cap and relative noise level, coarse to fine. The stages
 /// share one evaluation budget.
@@ -65,17 +66,19 @@ fn guard(exact: &Fit, rows: usize, start: &[[f64; 3]], result: Vec<[f64; 3]>) ->
     }
 }
 
-/// The map after a guarded exact refit of `theta` on all rows of `exact` (at most
-/// `EXACT_REFIT_EVALUATIONS` evaluations).
+/// The map after a guarded exact refit of `theta` on all rows of `exact`: at most
+/// `EXACT_REFIT_EVALUATIONS` evaluations and not past `deadline`. A refit cut by the deadline is
+/// a partial improvement (the guard still applies).
 pub(super) fn exact_refit(
     exact: &Fit,
     rows: usize,
     theta: &[[f64; 3]],
     threads: usize,
+    deadline: Option<Instant>,
 ) -> Vec<[f64; 3]> {
     let budget = Budget {
         evaluations: EXACT_REFIT_EVALUATIONS,
-        deadline: None,
+        deadline,
         threads,
     };
     match exact.refine(theta, &budget) {

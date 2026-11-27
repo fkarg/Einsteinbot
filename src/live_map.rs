@@ -5,6 +5,7 @@ use crate::strategy::MapBelief;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 fn live_estimator() -> Estimator {
     let mut estimator = Estimator::default();
@@ -93,6 +94,13 @@ impl LiveMap {
                             continue;
                         }
                         Err(mpsc::TryRecvError::Disconnected) => break,
+                    }
+                } else if estimator.audit_running() {
+                    // A finished audit is adopted even if no event comes.
+                    match receiver.recv_timeout(Duration::from_millis(200)) {
+                        Ok(item) => item,
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     }
                 } else if let Ok(item) = receiver.recv() {
                     item

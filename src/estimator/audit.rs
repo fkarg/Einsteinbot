@@ -107,9 +107,10 @@ impl Audit {
     /// Wait for the audit; `Some` is a map to adopt.
     pub(super) fn join(mut self) -> Option<Vec<[f64; 3]>> {
         let thread = self.thread.take().expect("joined once");
-        thread
-            .join()
-            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        thread.join().unwrap_or_else(|_| {
+            eprintln!("estimator: the audit panicked; the maintained map stays");
+            None
+        })
     }
 }
 

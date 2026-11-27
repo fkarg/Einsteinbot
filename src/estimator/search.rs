@@ -505,11 +505,12 @@ impl Search {
                         });
                     }
                 }
-                // Bounded list: fitted candidates by their last chi2, unfitted ones after.
+                // Bounded list: the new seeds (unfitted) first, then the fitted candidates by their
+                // last chi2.
                 self.candidates.sort_by(|a, b| {
                     a.chi2
-                        .unwrap_or(f64::INFINITY)
-                        .total_cmp(&b.chi2.unwrap_or(f64::INFINITY))
+                        .unwrap_or(f64::NEG_INFINITY)
+                        .total_cmp(&b.chi2.unwrap_or(f64::NEG_INFINITY))
                 });
                 self.candidates.truncate(MAX_CANDIDATES);
                 self.seeded = true;
@@ -633,7 +634,9 @@ impl Search {
                     if let Some((t, _)) = out {
                         p.theta = t;
                     }
-                    p.done = counter.evaluations() < each || p.rounds >= MAX_ROUNDS;
+                    // A refit cut by the slice deadline has not settled: it resumes in the next slice.
+                    p.done = (counter.evaluations() < each && Instant::now() < slice.deadline)
+                        || p.rounds >= MAX_ROUNDS;
                     stats.absorb(&counter);
                 }
                 continue;

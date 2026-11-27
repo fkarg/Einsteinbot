@@ -165,6 +165,8 @@ pub struct Estimator {
     /// Every path of the map epoch, at the exact noise model.
     shots: Vec<Shot>,
     search: Search,
+    /// Paths already given to the search (the rest were ingested when an update was cancelled).
+    searched: usize,
     audit: Option<Audit>,
     belief: Option<MapBelief>,
     /// Search slices still owed for the latest path.
@@ -187,6 +189,7 @@ impl Default for Estimator {
             players: BTreeMap::new(),
             shots: Vec::new(),
             search: Search::new(),
+            searched: 0,
             audit: None,
             belief: None,
             slices_left: 0,
@@ -210,7 +213,6 @@ impl Estimator {
         cancelled: &AtomicBool,
     ) -> Option<MapBelief> {
         let world = WorldParameters::default();
-        let mut first = self.shots.len();
         for event in events {
             if cancelled.load(Ordering::SeqCst) {
                 return None;
@@ -218,7 +220,6 @@ impl Estimator {
             match event {
                 ServerEvent::Planets { .. } => {
                     self.reset();
-                    first = 0;
                 }
                 ServerEvent::PlayerPosition { player_id, x, y } => {
                     self.players.insert(*player_id, Point { x: *x, y: *y });
@@ -254,26 +255,28 @@ impl Estimator {
                 _ => {}
             }
         }
-        if self.shots.len() == first {
+        if self.searched == self.shots.len() {
             return None;
         }
+        let before = self.searched;
         self.stats = Stats::default();
         for (part, elapsed) in self.pending_timings.drain(..) {
             self.stats.add(part, elapsed);
         }
-        for shot in &self.shots[first..] {
+        for shot in &self.shots[self.searched..] {
             let slice = self.settings.slice(cancelled, &self.stats);
             self.search.add_path(shot, &slice);
-        }
-        if cancelled.load(Ordering::SeqCst) {
-            return None;
+            self.searched += 1;
+            if cancelled.load(Ordering::SeqCst) {
+                return None;
+            }
         }
         self.slices_left = self.settings.slices_per_path;
         self.polish_due = true;
         self.limit = (!self.search.idle()).then_some(SearchLimit::WorkBudget);
         if self.audit.is_none()
             && self.settings.audit_enabled
-            && (first + 1..=self.shots.len()).any(audit::due)
+            && (before + 1..=self.searched).any(audit::due)
         {
             self.audit = Some(Audit::rebuild(
                 self.shots.clone(),
@@ -298,6 +301,11 @@ impl Estimator {
     /// Work counts and per-part timings of the most recent update.
     pub fn last_report(&self) -> Option<&UpdateReport> {
         self.last_report.as_ref()
+    }
+
+    /// Whether an audit is running, so that `step` will have a map to adopt at some point.
+    pub fn audit_running(&self) -> bool {
+        self.audit.is_some()
     }
 
     /// Whether `step` has work: a finished audit to adopt, search slices owed, or a map to polish.
@@ -351,8 +359,15 @@ impl Estimator {
                 (theta, None)
             } else {
                 let rows = rebuild::residual_rows(&self.shots);
-                let theta = rebuild::exact_refit(&exact, rows, &theta, self.settings.threads);
-                let evidence = exact.evidence(&theta);
+                let deadline = self.settings.slice_ceiling.map(|ceiling| started + ceiling);
+                let theta =
+                    rebuild::exact_refit(&exact, rows, &theta, self.settings.threads, deadline);
+                // The covariance needs a Jacobian of all rows; a refit that used up its time
+                // leaves it out (`not_computed`) rather than run over the ceiling.
+                let evidence = deadline
+                    .is_none_or(|deadline| Instant::now() < deadline)
+                    .then(|| exact.evidence(&theta))
+                    .flatten();
                 (theta, evidence)
             };
             self.stats.add(Part::Polish, started.elapsed());
@@ -404,6 +419,7 @@ impl Estimator {
         self.search.adopt(found);
         self.slices_left = self.settings.slices_per_path;
         self.polish_due = true;
+        self.limit = Some(SearchLimit::WorkBudget);
         let theta = self.search.theta.clone();
         Some(self.publish(&theta, None))
     }

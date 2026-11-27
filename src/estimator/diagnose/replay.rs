@@ -88,6 +88,26 @@ fn replay_deterministic(case: &Case, settings: Settings) {
     }
 }
 
+/// Prints what a step that took over 100 ms spent its time on (`SLOW` lines): the parts of the
+/// update report, longest first.
+fn slow_step(estimator: &Estimator, started: Instant, id: &str, n: usize) {
+    let ms = started.elapsed().as_secs_f64() * 1e3;
+    if ms < 100.0 {
+        return;
+    }
+    let mut parts: Vec<_> = estimator
+        .last_report()
+        .map(|r| r.parts.iter().filter(|p| p.part != Part::LmSolve).collect())
+        .unwrap_or_default();
+    parts.sort_by(|a, b| b.total_ms.total_cmp(&a.total_ms));
+    let top: Vec<String> = parts
+        .iter()
+        .take(4)
+        .map(|p| format!("{}:{:.0}", p.part.name(), p.total_ms))
+        .collect();
+    println!("SLOW world={id} n={n} ms={ms:.0} top={}", top.join(","));
+}
+
 /// A path every `period` ms; between arrivals the estimator works as the live map's worker does.
 fn replay_schedule(case: &Case, settings: Settings, period: u64) {
     let (id, name) = (world_id(case), name());
@@ -118,13 +138,17 @@ fn replay_schedule(case: &Case, settings: Settings, period: u64) {
         let arrival = t0 + period * (n as u32 - 1);
         while Instant::now() < arrival {
             if estimator.search_pending() {
+                let started = Instant::now();
                 estimator.step(&never);
+                slow_step(&estimator, started, &id, n - 1);
                 timeline(&estimator, n - 1, "slice");
             } else {
                 std::thread::sleep(arrival.saturating_duration_since(Instant::now()));
             }
         }
+        let started = Instant::now();
         estimator.observe(&event_of(&case.shots[n - 1]), &never);
+        slow_step(&estimator, started, &id, n);
         let lag = arrival.elapsed().as_secs_f64() * 1e3;
         worst_lag = worst_lag.max(lag);
         timeline(&estimator, n, "path");
