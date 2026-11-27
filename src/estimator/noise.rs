@@ -245,7 +245,7 @@ impl Admissible {
 
 /// Exact Euclidean nearest-`true` transform of a raster (Felzenszwalb and Huttenlocher's two
 /// passes, with the nearest node tracked): the index of the nearest free node per node.
-fn nearest_free(free: &[bool], nx: usize, ny: usize) -> Vec<u32> {
+pub(super) fn nearest_free(free: &[bool], nx: usize, ny: usize) -> Vec<u32> {
     const NONE: usize = usize::MAX;
     // Pass 1, along x: the nearest free column in the same row.
     let mut column = vec![NONE; nx * ny];

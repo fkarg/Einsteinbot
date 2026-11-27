@@ -11,8 +11,9 @@
 //!
 //! Environment (besides those of `diagnose.rs`): `NAME` (the `cfg=` label), `SLICES`,
 //! `SLICE_EVALS`, `CEIL_MS` (slice wall ceiling, 0 for none; default the production 250),
-//! `AUDIT`, `SCHEDULE`, `PLANETS` (known total count; absent: the prior), `CAP` (`max_planets`),
-//! `PREEMPT` (schedule mode: `0` lets a slice finish when a path arrives; default `1` pre-empts it).
+//! `AUDIT`, `SCHEDULE`, `PLANETS` (known total count; absent: the prior), `CAP` (`max_planets`), `LEARN`
+//! (the dynamic planet count of P25 from that start; `count=` on `UPD` lines), `PREEMPT` (schedule
+//! mode: `0` lets a slice finish when a path arrives; default `1` pre-empts it).
 //! `UPD` lines carry the published belief's residual-correction state (`gate`: `on:<max>` or the
 //! reason) and the count-limit warning (`cap`, `limited`: the path it was first raised at, P23).
 use super::*;
@@ -57,7 +58,16 @@ fn replay_deterministic(case: &Case, settings: Settings) {
     let audit = settings.audit_enabled;
     let mut estimator = Estimator::default();
     estimator.settings = settings;
+    // `LEARN=n`: the dynamic planet count (P25) starting from `n`.
+    if let Some(start) = env_list("LEARN", "-").first() {
+        estimator.settings.learn_planets = true;
+        estimator.settings.planets = Some(*start);
+        estimator.learner = Some(super::count::Learner::new(*start));
+    }
     let never = AtomicBool::new(false);
+    // P25 measurement: path coverage (hidden fractions) and the tick distance of missed planets.
+    let mut coverage = super::count::Coverage::new(WorldParameters::default());
+    let truth = theta_of_planets(&case.truth);
     println!(
         "WORLD {id} paths={total} threads={} cfg={name}",
         estimator.settings.threads
@@ -88,8 +98,30 @@ fn replay_deterministic(case: &Case, settings: Settings) {
             }
         });
         let limit = belief.and_then(|b| b.count_limit.as_ref());
+        coverage.cover(&estimator.shots);
+        let found = belief.map_or(vec![], |b| b.map.planets.clone());
+        let hid: Vec<String> = [60.0, 100.0, 150.0, 200.0, 300.0]
+            .iter()
+            .map(|r| format!("{:.4}", coverage.hidden_fraction(&found, *r)))
+            .collect();
+        let theta = belief_theta(&estimator);
+        let miss: Vec<String> = truth
+            .iter()
+            .filter(|t| !theta.iter().any(|p| distance(t, p) <= 15.0))
+            .map(|t| format!("{:.0}", coverage.tick_distance([t[0], t[1]])))
+            .collect();
         println!(
-            "UPD world={id} cfg={name} n={n} k={} evals={evals} publish_ms={publish_ms:.1} wall_ms={wall_ms:.1} noise_ms={noise_ms:.1} s100={:.3} l={:.0} white={:.1e} cap={} limited={} gate={gate}",
+            "HID world={id} n={n} k={} hid={} miss={}",
+            theta.len(),
+            hid.join(","),
+            if miss.is_empty() {
+                "-".into()
+            } else {
+                miss.join(",")
+            }
+        );
+        println!(
+            "UPD world={id} cfg={name} n={n} k={} evals={evals} publish_ms={publish_ms:.1} wall_ms={wall_ms:.1} noise_ms={noise_ms:.1} s100={:.3} l={:.0} white={:.1e} cap={} limited={} count={} gate={gate}",
             belief_theta(&estimator).len(),
             estimator.model.scale * 100.0,
             estimator.model.length,
@@ -97,6 +129,10 @@ fn replay_deterministic(case: &Case, settings: Settings) {
             limit.is_some_and(|l| l.at_cap),
             limit
                 .and_then(|l| l.detected_at_path)
+                .map_or("-".into(), |n| n.to_string()),
+            estimator
+                .settings
+                .planets
                 .map_or("-".into(), |n| n.to_string()),
         );
         if audit {
