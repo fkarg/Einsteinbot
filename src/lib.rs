@@ -16,6 +16,6 @@ pub mod map_change;
 pub mod field_score;
 pub mod game_stats;
 pub mod in_flight;
-pub mod player_energy;
+pub mod players;
 pub mod round_clock;
 mod tui;

@@ -5,7 +5,7 @@ use crate::in_flight::{
     predict_kills,
 };
 use crate::map::{PlanetMap, Vec2};
-use crate::player_energy::{EnergyTracker, SPAWN_ENERGY};
+use crate::players::{PlayerLedger, SPAWN_ENERGY};
 use crate::protocol::{Point, ServerEvent};
 use crate::round_clock::RoundClock;
 use crate::simulation::{
@@ -162,9 +162,9 @@ pub struct BotState {
     /// Playing time left in the round (`round_clock`).
     #[serde(default)]
     round_clock: RoundClock,
-    /// Every player's inferred energy (`player_energy`).
-    #[serde(default)]
-    energy: EnergyTracker,
+    /// Every player's inferred energy and round score (`players`).
+    #[serde(default, alias = "energy")]
+    players: PlayerLedger,
 }
 
 impl BotState {
@@ -182,7 +182,7 @@ impl BotState {
         let boundary = !self.player_positions.is_empty();
         self.round_clock.new_map(self.clock_ms.filter(|_| boundary));
         if let Some(now_ms) = self.clock_ms.filter(|_| boundary) {
-            self.energy
+            self.players
                 .new_map(self.player_positions.keys().copied(), now_ms);
         }
         self.known_shots.clear();
@@ -221,7 +221,7 @@ impl BotState {
                 if let Some(now_ms) = now_ms
                     && old.as_ref() != Some(&position)
                 {
-                    self.energy.repositioned(*player_id, old.as_ref(), now_ms);
+                    self.players.repositioned(*player_id, old.as_ref(), now_ms);
                 }
                 if !self.observed_spawn_locations.contains(&position) {
                     self.observed_spawn_locations.push(position.clone());
@@ -230,7 +230,7 @@ impl BotState {
             }
             ServerEvent::PlayerLeave { player_id } => {
                 self.player_positions.remove(player_id);
-                self.energy.player_left(*player_id);
+                self.players.player_left(*player_id);
                 self.in_flight.retain(|shot| shot.player_id != *player_id);
             }
             ServerEvent::ShotBegin {
@@ -241,7 +241,7 @@ impl BotState {
                 // Every connection receives every ShotBegin broadcast. Shots take seconds to
                 // finish, so in-flight own shots must already count as known outcomes.
                 if let Some(now_ms) = now_ms {
-                    self.energy.shot_begin(*player_id, *velocity, now_ms);
+                    self.players.shot_begin(*player_id, *velocity, now_ms);
                 }
                 let ordinal = self.begin_counts.entry(*player_id).or_insert(0);
                 *ordinal += 1;
@@ -275,7 +275,7 @@ impl BotState {
                         self.measure_step_rate(points.len(), now_ms - begun_ms);
                     }
                 }
-                self.energy.shot_finished(*player_id, points.last());
+                self.players.shot_finished(*player_id, points.last());
                 if let Some(now_ms) = now_ms {
                     self.round_clock.shot_finished(now_ms);
                 }
@@ -293,7 +293,7 @@ impl BotState {
             }
             ServerEvent::OwnEnergy { player_id, energy } => {
                 if let Some(now_ms) = now_ms {
-                    self.energy.own_energy(*player_id, *energy, now_ms);
+                    self.players.own_energy(*player_id, *energy, now_ms);
                 }
             }
             _ => {}
@@ -356,7 +356,7 @@ impl BotState {
             "step_rate": self.step_rate,
             "begin_counts": self.begin_counts,
             "round_clock": self.round_clock,
-            "energy": self.energy,
+            "players": self.players,
         })
     }
 
@@ -392,9 +392,14 @@ impl BotState {
         self.round_clock.set_play_ms(play_ms);
     }
 
-    /// The inferred energy of `player` at `now_ms`, `None` when unknown (`player_energy`).
+    /// The inferred energy of `player` at `now_ms`, `None` when unknown (`players`).
     pub fn player_energy(&self, player: u32, now_ms: i64) -> Option<f64> {
-        self.energy.energy(player, now_ms)
+        self.players.energy(player, now_ms)
+    }
+
+    /// The inferred bounty on killing `player` (`players`), `None` when unknown.
+    pub fn player_bounty(&self, player: u32) -> Option<u32> {
+        self.players.bounty(player)
     }
 }
 
@@ -422,11 +427,15 @@ pub struct TargetingSettings {
     /// Maximum approach-distance penalty for retracing observed space (world units).
     pub coverage_penalty: f64,
     /// A predicted hit whose victim an in-flight shot kills first with at least this chance is
-    /// skipped (`in_flight::doom_probability`); above 1 disables doomed-target avoidance.
+    /// skipped (`in_flight::doom_probability`); above 1 disables doomed-target avoidance. At
+    /// 0.05, the lowest `kill_probability`, any predicted kill dooms its victim: P24 replays
+    /// lost 16 true hits (5 held out) when kills more than 100 ticks away no longer did.
     pub doom_threshold: f64,
     /// Kills a unit of energy gained is worth when ranking hits (the killer gains half the
     /// victim's energy); 0 ranks hits by flight and offset only.
     pub energy_value: f64,
+    /// Weight of the victim's inferred bounty (extra score points) when ranking hits; 0 off.
+    pub bounty_value: f64,
 }
 
 impl Default for TargetingSettings {
@@ -437,8 +446,9 @@ impl Default for TargetingSettings {
             target_radius: 4.0,
             information_threshold: f64::INFINITY,
             coverage_penalty: 40.0,
-            doom_threshold: 0.15,
+            doom_threshold: 0.05,
             energy_value: 0.0,
+            bounty_value: 0.0,
         }
     }
 }
@@ -470,9 +480,11 @@ pub struct ShotChoice {
     pub victim_doom: Option<f64>,
     /// Predicted hits skipped because their victim was doomed.
     pub doomed_hits_skipped: usize,
-    /// The predicted victim's inferred energy at our impact (`player_energy`); `None` when
+    /// The predicted victim's inferred energy at our impact (`players`); `None` when
     /// unknown or not a hit.
     pub victim_energy: Option<f64>,
+    /// The predicted victim's inferred bounty (`players`); `None` when unknown or not a hit.
+    pub victim_bounty: Option<u32>,
 }
 
 /// Why the policy fired nothing.
@@ -517,6 +529,7 @@ pub struct HitSummary {
     pub score: f64,
     pub victim_doom: Option<f64>,
     pub victim_energy: Option<f64>,
+    pub victim_bounty: Option<u32>,
     /// In-flight shots predicted to kill the victim before this hit would land.
     pub doomed_by: Vec<PredictedKill>,
 }
@@ -757,6 +770,7 @@ impl TargetingPolicy {
                 victim_doom: None,
                 doomed_hits_skipped: 0,
                 victim_energy: None,
+                victim_bounty: None,
             })
         };
         let mut candidates = Vec::new();
@@ -849,8 +863,11 @@ impl TargetingPolicy {
                     .player_energy(hit.predicted_victim.unwrap(), impact_ms(hit, now_ms) as i64);
             }
         }
-        let energy_value = self.settings.energy_value;
-        hits.sort_by(|left, right| compare_hit_quality(left, right, energy_value));
+        for hit in &mut hits {
+            hit.victim_bounty = state.player_bounty(hit.predicted_victim.unwrap());
+        }
+        let values = (self.settings.energy_value, self.settings.bounty_value);
+        hits.sort_by(|left, right| compare_hit_quality(left, right, values));
         decision.candidates = pool.len();
         decision.hits = hits.len();
         // Doomed-target avoidance: a hit on a player another in-flight shot (ours included)
@@ -879,9 +896,10 @@ impl TargetingPolicy {
                         victim,
                         flight_ticks: hit.flight_ticks,
                         miss_distance: hit.miss_distance,
-                        score: hit_score(hit, energy_value),
+                        score: hit_score(hit, values),
                         victim_doom: hit.victim_doom,
                         victim_energy: hit.victim_energy,
+                        victim_bounty: hit.victim_bounty,
                         doomed_by: kills
                             .iter()
                             .filter(|kill| kill.victim == victim && kill.impact_ms < impact)
@@ -1014,17 +1032,19 @@ fn contact_before_target(planet: &crate::protocol::Planet, points: &[Point], pas
 /// far more often than central but long ones (capture 55: 5 of 7 under 30 ticks, 1 of 32 over
 /// 100): flight time, with the impact offset as a small penalty. The score reads as
 /// -HIT_TICKS_PER_EFOLD * ln(hit chance), so a kill worth (1 + energy_value * gain) kills (the
-/// killer gains half the victim's energy) earns HIT_TICKS_PER_EFOLD * ln(that).
-fn hit_score(choice: &ShotChoice, energy_value: f64) -> f64 {
+/// killer gains half the victim's energy) earns HIT_TICKS_PER_EFOLD * ln(that); likewise a
+/// kill worth (1 + bounty_value * bounty) points. `values` is (energy_value, bounty_value).
+fn hit_score(choice: &ShotChoice, (energy_value, bounty_value): (f64, f64)) -> f64 {
     let gain = choice.victim_energy.unwrap_or(SPAWN_ENERGY) / 2.0;
+    let bounty = f64::from(choice.victim_bounty.unwrap_or(0));
     choice.flight_ticks as f64 + MISS_DISTANCE_TICKS * choice.miss_distance
-        - HIT_TICKS_PER_EFOLD * (energy_value * gain).ln_1p()
+        - HIT_TICKS_PER_EFOLD * ((energy_value * gain).ln_1p() + (bounty_value * bounty).ln_1p())
 }
 
 /// Rank by `hit_score`; save energy only on equal scores.
-fn compare_hit_quality(left: &ShotChoice, right: &ShotChoice, energy_value: f64) -> Ordering {
-    hit_score(left, energy_value)
-        .total_cmp(&hit_score(right, energy_value))
+fn compare_hit_quality(left: &ShotChoice, right: &ShotChoice, values: (f64, f64)) -> Ordering {
+    hit_score(left, values)
+        .total_cmp(&hit_score(right, values))
         .then_with(|| left.velocity.cmp(&right.velocity))
 }
 
@@ -1185,7 +1205,7 @@ mod tests {
             ..test_choice()
         };
         assert_eq!(
-            compare_hit_quality(&grazing_short, &central_long, 0.0),
+            compare_hit_quality(&grazing_short, &central_long, (0.0, 0.0)),
             Ordering::Less
         );
 
@@ -1195,7 +1215,7 @@ mod tests {
             ..grazing_short
         };
         assert_eq!(
-            compare_hit_quality(&central_short, &grazing_short, 0.0),
+            compare_hit_quality(&central_short, &grazing_short, (0.0, 0.0)),
             Ordering::Less
         );
         assert_eq!(
@@ -1205,7 +1225,7 @@ mod tests {
                     ..central_short
                 },
                 &central_short,
-                0.0
+                (0.0, 0.0)
             ),
             Ordering::Less
         );
@@ -1227,6 +1247,7 @@ mod tests {
             victim_doom: None,
             doomed_hits_skipped: 0,
             victim_energy: None,
+            victim_bounty: None,
         }
     }
 
@@ -1618,6 +1639,43 @@ mod tests {
         assert_eq!(
             probing.decide(&covered, 2.0).wait_reason,
             Some(WaitReason::LowEnergy)
+        );
+    }
+
+    #[test]
+    fn hit_ranking_can_value_the_round_leaders_bounty() {
+        let mut state = two_target_state();
+        state.observe_at(&ServerEvent::Planets { planets: vec![] }, 1_000);
+        // Player 2 kills player 3, who respawns a little farther away: 2 leads the round.
+        state.observe_at(
+            &ServerEvent::ShotFin {
+                player_id: 2,
+                angle: 0.0,
+                velocity: 5.0,
+                points: vec![Point { x: 300.0, y: 400.0 }, Point { x: 102.0, y: 400.0 }],
+            },
+            1_500,
+        );
+        state.observe_at(
+            &ServerEvent::PlayerPosition {
+                player_id: 3,
+                x: 100.0,
+                y: 450.0,
+            },
+            1_500,
+        );
+        assert_eq!(state.player_bounty(2), Some(1));
+        let plain = TargetingPolicy::default().choose(&state, 8.0).unwrap();
+        assert_eq!(plain.predicted_victim, Some(3), "player 3 is still nearer");
+        let valued = TargetingPolicy::new(TargetingSettings {
+            bounty_value: 1.0,
+            ..TargetingSettings::default()
+        })
+        .choose(&state, 8.0)
+        .unwrap();
+        assert_eq!(
+            (valued.predicted_victim, valued.victim_bounty),
+            (Some(2), Some(1))
         );
     }
 

@@ -723,6 +723,7 @@ fn target_commands(
                 "victim_doom": choice.victim_doom,
                 "doomed_hits_skipped": choice.doomed_hits_skipped,
                 "victim_energy": choice.victim_energy,
+                "victim_bounty": choice.victim_bounty,
                 "flight_ticks": choice.flight_ticks,
             })
         });

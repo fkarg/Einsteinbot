@@ -1,4 +1,4 @@
-//! Every player's energy, inferred from the broadcast events.
+//! Every player's energy and round score, inferred from the broadcast events.
 //!
 //! The server reports only our own energy (`OwnEnergy`). The rules (NewtonWars
 //! `simulation.c`): every player gains the same energy per step up to a limit (default 200), a
@@ -8,6 +8,13 @@
 //! victim's new `PlayerPosition`), so a player's energy is known from their first observed
 //! spawn on. Players first seen without a spawn (already present when we joined) stay unknown,
 //! never guessed. The regeneration rate is measured from our own energy.
+//!
+//! The score is not sent to bots either (only drawn on the server's screen). Upstream's
+//! default extra-points mode (`best`) puts a bounty of one point on the round leader (most
+//! kills, then fewest deaths; none at 0:0): a kill scores 1 plus the victim's bounty, a
+//! self-kill is a death. Kills and deaths reset with every new map, so the leader is known only
+//! for a round observed from its boundary. Other servers may use another mode; the bounty is
+//! then a guess.
 
 use crate::protocol::Point;
 use std::collections::BTreeMap;
@@ -21,7 +28,7 @@ pub const DEFAULT_ENERGY_RATE: f64 = 2.5;
 const KILL_RADIUS: f32 = 12.0;
 
 #[derive(Clone, Debug, Default, PartialEq, serde::Deserialize, serde::Serialize)]
-pub struct EnergyTracker {
+pub struct PlayerLedger {
     /// Energy and the local time it was known at, per player with a known energy.
     known: BTreeMap<u32, (f64, i64)>,
     /// Energy per second measured from our own energy reports.
@@ -37,9 +44,13 @@ pub struct EnergyTracker {
     /// A map boundary was observed: every player seen for the first time since spawned (at
     /// the boundary or by joining) with `SPAWN_ENERGY`.
     seen_boundary: bool,
+    /// Round score and deaths per player since the observed boundary (empty when joined
+    /// mid-round).
+    #[serde(default)]
+    score: BTreeMap<u32, (u32, u32)>,
 }
 
-impl EnergyTracker {
+impl PlayerLedger {
     pub fn rate_per_s(&self) -> f64 {
         self.rate_per_s.unwrap_or(DEFAULT_ENERGY_RATE)
     }
@@ -51,12 +62,34 @@ impl EnergyTracker {
         Some((energy + regen).min(ENERGY_LIMIT.max(*energy)))
     }
 
-    /// A new map: every listed player respawns with `SPAWN_ENERGY`.
+    /// The bounty on killing `player` (1 for a round leader, else 0); `None` when the round's
+    /// score is not known.
+    pub fn bounty(&self, player: u32) -> Option<u32> {
+        let (kills, deaths) = *self.score.get(&player)?;
+        let max_kills = self.score.values().map(|score| score.0).max()?;
+        let min_deaths = self
+            .score
+            .values()
+            .filter(|score| score.0 == max_kills)
+            .map(|score| score.1)
+            .min()?;
+        let leads = (max_kills > 0 || min_deaths > 0) && (kills, deaths) == (max_kills, min_deaths);
+        Some(u32::from(leads))
+    }
+
+    /// Round score (kill points, deaths) of `player`; `None` when not known.
+    pub fn score(&self, player: u32) -> Option<(u32, u32)> {
+        self.score.get(&player).copied()
+    }
+
+    /// A new map: every listed player respawns with `SPAWN_ENERGY` and a clean score.
     pub fn new_map(&mut self, players: impl IntoIterator<Item = u32>, now_ms: i64) {
-        self.known = players
-            .into_iter()
-            .map(|id| (id, (SPAWN_ENERGY, now_ms)))
-            .collect();
+        self.known = BTreeMap::new();
+        self.score = BTreeMap::new();
+        for id in players {
+            self.known.insert(id, (SPAWN_ENERGY, now_ms));
+            self.score.insert(id, (0, 0));
+        }
         self.last_shot_end = None;
         self.seen_boundary = true;
         if let Some(own) = &mut self.last_own {
@@ -97,6 +130,7 @@ impl EnergyTracker {
         let Some(old) = old else {
             if self.seen_boundary {
                 self.known.insert(player, (SPAWN_ENERGY, now_ms));
+                self.score.insert(player, (0, 0));
             }
             return;
         };
@@ -106,6 +140,18 @@ impl EnergyTracker {
         let killer = shot_end.and_then(|(shooter, end)| {
             ((end.x - old.x).hypot(end.y - old.y) <= KILL_RADIUS).then_some(shooter)
         });
+        // Every death ends a shot at the victim; a move without one is a new map's respawn.
+        if let Some(killer) = killer {
+            let bounty = self.bounty(player).unwrap_or(0);
+            if killer != player
+                && let Some(score) = self.score.get_mut(&killer)
+            {
+                score.0 += 1 + bounty;
+            }
+            if let Some(score) = self.score.get_mut(&player) {
+                score.1 += 1;
+            }
+        }
         if let Some(killer) = killer.filter(|killer| *killer != player) {
             self.disturb_own(killer);
             match (victim_energy, self.energy(killer, now_ms)) {
@@ -121,6 +167,7 @@ impl EnergyTracker {
 
     pub fn player_left(&mut self, player: u32) {
         self.known.remove(&player);
+        self.score.remove(&player);
     }
 
     /// Our energy as reported by the server: exact, and a rate sample when nothing but
@@ -154,7 +201,7 @@ mod tests {
 
     #[test]
     fn energy_follows_spawns_shots_kills_and_regeneration() {
-        let mut tracker = EnergyTracker::default();
+        let mut tracker = PlayerLedger::default();
         // Players already present when we joined are unknown until they spawn.
         tracker.repositioned(2, None, 0);
         assert_eq!(tracker.energy(2, 0), None);
@@ -189,6 +236,17 @@ mod tests {
         // After a boundary a newcomer (a join) spawns with 20.
         tracker.repositioned(5, None, 12_000);
         assert_eq!(tracker.energy(5, 12_000), Some(20.0));
+
+        // The round score: 2 killed 3 once (3's other death was a respawn without a kill).
+        assert_eq!(tracker.score(2), Some((1, 0)));
+        assert_eq!(tracker.score(3), Some((0, 1)));
+        assert_eq!(tracker.bounty(2), Some(1));
+        assert_eq!(tracker.bounty(3), Some(0));
+        // Killing the leader scores two: 3 takes the lead (2 points, 1 death) from 2.
+        tracker.shot_finished(3, Some(&at(503.0, 100.0)));
+        tracker.repositioned(2, Some(&at(500.0, 100.0)), 12_000);
+        assert_eq!(tracker.score(3), Some((2, 1)));
+        assert_eq!((tracker.bounty(3), tracker.bounty(2)), (Some(1), Some(0)));
 
         // Energy is capped at the server limit.
         assert_eq!(tracker.energy(2, 1_000_000), Some(ENERGY_LIMIT));
