@@ -1341,6 +1341,21 @@ What is left: the noise estimate is still 13 ms median and up to about 95 ms (th
 
 Reproduction: `cargo test --release --lib diagnose_replay -- --ignored --nocapture --test-threads=1` with `THREADS=10 CEIL_MS=0 SEEDS=- LIVE=55 EPOCH=0 PATHS=160 CHECKPOINTS=8,16,32,64,96,128,160` plus `PLANETS=n` or `CAP=n`; `SEEDS=7001 KS=26 LIVE=- PATHS=96`; the dev set `SEEDS=7001,7002,7003 KS=24 LIVE=40,36,33 PATHS=60`; throughput `SCHEDULE=110 THREADS=10 SEEDS=- LIVE=55 EPOCH=0 PATHS=545`. Compute: Mac about 25 CPU-minutes.
 
+#### Prior versus fixed count on real captures (moved here from the README)
+
+69 recorded maps with disclosed planets (all with 24 planets, captures up to 58, duplicate games counted once, reserved test captures excluded; build before P21, cap 24; one deterministic run each). Default prior (24 ± 4) against `--planets 24`. Explored field RMSE: flat ≈ 0.63. The $\chi^2$ ratio is the exact-noise (rounding floor only) $\chi^2$ of the estimate over that of the true map, median over maps.
+
+| paths | maps | recall (prior / fixed) | spurious | explored field RMSE (prior / fixed) | median $\chi^2$ ratio vs truth |
+|---|---|---|---|---|---|
+| 8 | 69 | 330 / 330 | 5 / 5 | 0.17 / 0.17 | 1.9e11 / 1.9e11 |
+| 16 | 69 | 625 / 624 | 29 / 26 | 0.12 / 0.12 | 2.2e11 / 2.2e11 |
+| 32 | 42 | 685 / 686 | 19 / 17 | 0.044 / 0.042 | 1.1e11 / 1.1e11 |
+| 64 | 33 | 715 / 713 | 23 / 28 | 6.1e-4 / 6.1e-4 | 3.0e6 / 4.6e6 |
+| 128 | 21 | 498 / 493 | 2 / 4 | 5.3e-5 / 7.2e-5 | 4.1e3 / 7.9e3 |
+| 256 | 8 | 189 / 189 | 0 / 0 | 2.1e-5 / 2.2e-5 | 24 / 47 |
+
+The $\chi^2$ ratio stays huge until a map is complete, because the rounding noise is tiny; it approaches 1 only once every planet sits within a fraction of a unit.
+
 ### P21 results (2026-11-27, branch `p21` from main 0e71b27; `fit.rs` (`overlap_rows`, `feasible`, `OVERLAP_TOLERANCE`), `search.rs`, `audit.rs`, `DEFAULT_MAX_PLANETS`; harness `diagnose/replay.rs` with `CAP` and the new `MAPS`)
 
 **Answer.** With overlapping planets excluded, the concentric split of capture 55 is gone at caps 32 and 64 (24/24/0 from 96 to 161 paths, the same as cap 24), and the prior without `--planets` finds both synthetic 26-planet worlds at caps 32 and 64 (26/26/0 at 64 paths; cap 24 stops at 24). On the dev and held-out sets caps 24, 32 and 64 give identical maps through 32 paths and differ by at most one planet at 60; against main the change is within one or two planets per world (perturbation, see below). Recommended default cap: 32 (24 + 2 sd of the count prior); this branch sets it. 64 behaved the same everywhere tested, but no world here has more than 26 planets, so nothing distinguishes it from 32 yet; above 32 planets `--planets` is still needed.
@@ -1462,3 +1477,76 @@ The single-path false alarms are a 0.21 spike on the correct 28-planet synthetic
 **Reading and limits (inferred).** The correction measures what the map at the cap leaves unexplained along the paths; a planet the cap excludes leaves planet-scale pull (0.1-3) wherever a path passes it, a complete map leaves rounding-scale pull (<= 0.015). The same signal would fire on a misplaced or missing planet with a correct count at the cap; no such case appeared in the 20 negatives (none had a spurious planet at its last checkpoint, but per-path map errors at the cap were not scored), and the live negatives are only nine maps with a margin of a factor 2. The peer review (Codex) rated this the main open point: the signal measures "the map at its cap leaves planet-sized pull", which is the cap being too low or the map being wrong. The wording of the warning says "may have more planets" for that reason. In the 935 at-cap paths of the positives the correction was never gated off, so the gate did not hide a missing planet here. A planet no path passes near is not detected (it also does not matter for those paths). Not tested: more than 28 planets, the default cap 32 actually binding (no world has more than 32), live play, the audit (off by default).
 
 Reproduction: `cargo test --release --lib diagnose_replay -- --ignored --nocapture --test-threads=1` with `THREADS=2 CEIL_MS=0` and `SEEDS=<seed> KS=<k> LIVE=- PATHS=96 CHECKPOINTS=32,64,96 PLANETS=<n>` or `CAP=<n>`, or `SEEDS= LIVE=<capture> EPOCH=<e> PATHS=120 CHECKPOINTS=32,64,96,120 PLANETS=<n>`; `UPD` lines carry `cap=`, `limited=` and `gate=`. Signals 1 and 2: the same at 79d0f78 (`UPD` `gain=`, `chi2r=`, `lag1=`). Compute: jolly 53 CPU-minutes (49 design + 12 held-out runs), Mac about 10 CPU-minutes.
+
+### P25 results (2026-11-28, branch `p25` from main 85c9f68; `src/estimator/count.rs` (`Coverage`, `Learner`, `too_high`), hooks in `mod.rs`, `live_map.rs`, `config.rs`, `game_stats.rs`, `tui.rs`; harness `diagnose/replay.rs` with `HID` lines and `LEARN`)
+
+**Question.** With the count fixed above the truth, can the estimator tell? And does a dynamic mode (`--learn-planets`: start at 24, +1 on the P23 count-limit warning, -1 on a too-high signal, carried across maps) converge without oscillating?
+
+**Answer (observed, one deterministic run per cell).** Yes, with a coverage likelihood ratio gated on a quiet, settled map. The too-high signal fired in 15 of 18 design runs with the count 2-4 too high (the 3 misses are maps the estimator never completed) and in 0 of 16 with the right count. Held out, with the implemented rule (window 5): it lowered the count in 15 of 15 runs started at 26 on 24-planet maps (12 real games and 3 synthetic; 24 reached in 14, 25 in one within 160 paths) and fired once in 15 runs with the right count (live 67, raised back by the count-limit warning 9 paths later). The final window of 8 removes that false alarm in an offline re-analysis and changes nothing else on either set. The dynamic mode converged on 22- and 26-planet synthetic worlds from 24 in 10 of 11 runs; one stopped at 27 after a false count-limit raise at the right count. No run changed direction more than once.
+
+**Signal.** Candidate centres on a 10-unit raster inside the battlefield by 20. `Coverage` keeps the distance from each to the nearest observed tick (ticks snapped to the raster, exact distance transform, extended path by path). The hidden fraction `f(R)` is the share of centres farther than `R` from every tick and farther than `r_i + 20` from every found planet. With `N` planets placed uniformly and `K` found, "the other `N - K` all hidden" has likelihood `C(N, K) (1 - f)^K f^(N - K)`, so `L(N - 1) / L(N) = (N - K) / (N f)`. The rule fires on a polished map when `N f / (N - K) < T`, the residual correction's `max_magnitude` is below `M` on the last `W` polished maps (a gated correction counts as 0) and `K` has not changed for `P` polished maps.
+
+**Design.** jolly, `THREADS=2 CEIL_MS=0`, synthetic 128 paths, live 160 (first epoch, or `EPOCH=e` for capture 58). Positives (count above the truth, 18): synthetic seeds 7001-7004 with 22 planets and `PLANETS=24`, with 24 planets and `PLANETS=26`, 7001-7002 with 22 planets and `PLANETS=26`; live 53, 55, 56, 57 and 58 maps 0-3 (all 24 planets) with `PLANETS=26`. Negatives (right count, 16): synthetic 7001-7004 with 22 and 24 planets at that count; the same live maps with `PLANETS=24`. Each `UPD` line has a `HID` line with `f(R)` for R = 60, 100, 150, 200, 300 and the tick distance of each true planet not found (truth used only to score). Grid: R, T in 0.1-0.6 and 1, M in {0.01, 0.03}, P in {0, 8, 16}, W = 5.
+
+| rule (W = 5, P = 8) | detected | false alarms | note |
+|---|---|---|---|
+| no ratio (plateau and M = 0.01 only) | 16/18 | 2/16 | live 58 maps 2 and 3 (ratio 4.2 and 3.3: planets 100-560 from any tick not found) |
+| R = 200, T = 1, M = 0.03 | 17/18 | 1/16 | live 57 (four spurious planets absorb the pull of three missing ones 89-120 from ticks; ratio 0.37) |
+| **R = 200, T = 1, M = 0.01 (chosen)** | **15/18** | **0/16** | fired at paths 32-51 (synthetic), 43-102 (live) |
+| R = 300, T = 1, M = 0.01 | 16/18 | 0/16 | the negatives' ratio falls to 1.6-1.8; one synthetic negative had a true planet 222 from any tick missing for 6 paths |
+| R = 150, T = 1, M = 0.01 | 15/18 | 0/16 | the positives' lowest ratio is up to 0.55 (less margin) |
+
+The lowest ratio a run reached with the other conditions met: positives 0.24 or less on every completed map (synthetic about 0, live 53/55/56/58 maps 1 and 3: 0.20/0.09/0.24/0.00/0.02), negatives 3.3 and 4.2; T = 1 (the point where `N - 1` becomes more likely) sits in the gap. The misses: live 57 (spurious planets, the corrections stay large), 58 map 0 (32 paths), 58 map 2 (a spurious 25th planet). The synthetic worlds are covered much faster than the real games (`f(200)` near 0 by 50 paths versus 0.01-0.03 at 160 paths), because the real bots shoot from fixed positions. In real games a planet 140-310 units from every tick was still missed late in some maps; hence no reach above 200.
+
+**Held out (implemented rule, window 5, run once).** `LEARN=26` and `LEARN=24` on live captures 59-64 and 66-71 (each a distinct 24-planet game; 65 has 47 paths and was left out) and synthetic 7101-7103 with 24 planets:
+
+| start | runs | outcome |
+|---|---|---|
+| 26 (too high by 2) | 15 | all lowered; 24 reached in 14 (live first step at paths 60-123, median 67; second 67-157, median 101; synthetic 45/60/75 and 7 paths later), live 66 at 25 after 161 paths |
+| 24 (right) | 15 | 14 unchanged; live 67: 24 → 23 at path 91 (K = 23; corrections 0.020-0.027, then gated off by the model-error scale on 5 maps), back to 24 at path 100 by the count-limit warning |
+
+Every final map had the true count of planets except live 61 at 24 (23 found). Re-analysis of the first decision of each held-out run offline (`wcheck.py`) with W = 6 or 8: 15/15 detected, 0/15 false alarms, same median; the design set is unchanged at 15/18 and 0/16. The final rule uses W = 8; this choice was made after seeing the held-out set.
+
+**Dynamic mode from 24 (implemented rule, window 5).** 22-planet synthetic 7001-7004: 24 → 23 → 22 at paths 32-51 and 7 later, then unchanged. 26-planet synthetic 7001-7004 and held-out 7101-7103: the count-limit warning raised 24 → 25 at paths 30-50 and 25 → 26 at paths 36-83, then unchanged in 6 of 7. In 7102 it also raised 26 → 27 at path 65: the 26th planet was found at path 60, and the correction stayed at 0.030-0.037 for several polished maps while the map converged (the P23 threshold is 0.03). The floor (never below the highest count a raise reached) then keeps 27 for the session. A count one too high costs little (P18). Codex (peer review) suggested evaluating a requirement that the cap be held for some paths before the warning raises the count, or a raise threshold of 0.05 for the dynamic mode only; neither was measured.
+
+**Implementation.** `Learner` (per estimator, carried by `reset` and `Estimator::carry_count`, which the live map calls for each new epoch's estimator) holds `LearnedCount { planets, start, floor, changes }` and the current map's window and plateau. `Estimator::learn` runs on every polished map: a change sets `settings.planets`, clears the count-limit window and latch and restarts the search (`Search::adopt` of the same map) with fresh slices. `--planets` wins (`start_learning` does nothing with a given count). The summary carries `learned`; the stop report prints `count  learned N (start 24): 24→25 map 0 path 48, ...`, the live view `N n learned`. The coverage costs one distance transform per path and one pass over about 17,000 centres per polished map, only in the dynamic mode.
+
+**Limits (inferred).** The likelihood treats each centre as reached or not, with a fixed reach; a planet within 200 of a path can be missed for a while (seen at 222 and 172 units), so the gates on the correction and the plateau carry part of the decision. The fitted `K` is not the number of true planets found: a completed-looking map with spurious planets can meet the gates (live 57 at M = 0.03). Not tested: real servers with counts other than 24, sessions over several maps (unit-tested), counts above 26 in the dynamic mode, live play.
+
+Reproduction: `cargo test --release --lib diagnose_replay -- --ignored --nocapture --test-threads=1` with `THREADS=2 CEIL_MS=0` and `SEEDS=<seed> KS=<k> LIVE=- PATHS=128 CHECKPOINTS=32,64,96,128 PLANETS=<n>` or `LEARN=<start>`, or `SEEDS= LIVE=<capture> EPOCH=<e> PATHS=160 CHECKPOINTS=32,64,96,128,160` with the same; `HID` lines carry `hid=` (f at 60/100/150/200/300) and `miss=`, `UPD` lines `count=`. Analysis scripts: `/tmp/P25scripts/{an,det,margin,dyn,raise,wcheck}.py` (jolly copies in `/tmp/P25w`, logs in `/tmp/P25w/out1` (design) and `/tmp/P25w/out` (held out and dynamic)). Compute: jolly 92 CPU-minutes (76 runs), Mac only unit tests.
+
+## Planet count (in the README until 2026-11-28)
+
+Does telling the bot the true count ($N = 24$ via `--planets 24`) help, compared with the default prior on the count (centre 24, sd 4, README "How it works" section 3)? The field error is the *explored-field RMSE*: the root mean square error of the estimated gravity vector against the truth, on the 20-unit grid cells that some earlier path crossed. An empty map (*flat*) scores about 0.63.
+
+On the 14 dev worlds the fixed count was better around 32 paths (explored-field RMSE 0.0046 vs 0.0202, geometric means over the worlds). On real games it makes no systematic difference: 69 recorded maps with disclosed planets (all with 24 planets, captures up to 58, duplicate games counted once, captures reserved for final tests excluded; built before P21 added the no-overlap rule, cap 24; one run each). Maps with fewer paths drop out of the later rows:
+
+| paths | maps | true planets | recall (prior / fixed) | explored-field RMSE (prior / fixed) |
+|---|---|---|---|---|
+| 8 | 69 | 1656 | 330 / 330 | 0.17 / 0.17 |
+| 16 | 69 | 1656 | 625 / 624 | 0.12 / 0.12 |
+| 32 | 42 | 1008 | 685 / 686 | 0.044 / 0.042 |
+| 64 | 33 | 792 | 715 / 713 | 6.1e-4 / 6.1e-4 |
+| 128 | 21 | 504 | 498 / 493 | 5.3e-5 / 7.2e-5 |
+| 256 | 8 | 192 | 189 / 189 | 2.1e-5 / 2.2e-5 |
+
+Spurious planets and the $\chi^2$ ratio against the true map are in the P18 section of [docs/estimator-experiments.md](estimator-experiments.md). A fixed count that is too low stops at that count: on 26-planet synthetic worlds only `--planets 26` found the last two planets under the old default cap of 24. Since overlapping planets are excluded (P21), the default cap is 32: the prior alone then finds all 26, and caps 24, 32 and 64 give the same maps on the 24-planet replays.
+
+**Detecting a cap below the truth (P23).** The count-limit warning is raised when the map is at its cap and its residual correction (the largest smoothed unexplained pull, section 6) exceeds 0.03 acceleration units on 3 of the last 5 maps after their full-row refit; once raised it stays for the rest of the map. Deterministic replays, one run each, 96 synthetic or 120 live paths:
+
+- Raised in all 26 runs whose cap was 1-4 planets below the truth (synthetic 25- to 28-planet worlds, live captures 53 and 55-58; 7 of the runs held out), a median of 2 paths after the map reached the cap, at most 46.
+- Never raised in the 20 runs with the right count at the cap.
+- The deciding value (third largest of the five) stayed at or below 0.015 with the right count and was at least 0.094 with planets left out. On real maps the margin to the 0.03 threshold is only a factor of two, measured on nine maps.
+- Two other signals also fired with the right count and were rejected. The full sets and rules are in the P23 section of [docs/estimator-experiments.md](estimator-experiments.md).
+
+**Detecting a count above the truth, and learning the count (P25, branch p25).** With the count fixed at $N$ and $K < N$ planets found, the $N - K$ others must hide where no path has been. Let $f$ be the fraction of possible planet centres farther than 200 units from every observed tick and not overlapping a found planet. For uniformly placed planets, "exactly $K$ within reach" has likelihood $\binom{N}{K}(1-f)^K f^{N-K}$, so $N - 1$ is more likely than $N$ when $N f / (N - K) < 1$. The *too-high signal* needs that, plus a residual correction below 0.01 on the last 8 polished maps and $K$ unchanged for 8. `--learn-planets` uses it to lower the count by one and the count-limit warning to raise it by one, never below the highest count a raise reached. Replays, one deterministic run each (jolly, 2 threads), 128 synthetic or 160 live paths, measured with a window of 5:
+
+| set | runs | signal fired | paths into the map |
+|---|---|---|---|
+| count 2-4 too high (synthetic 22/24-planet worlds with $N$ = 24/26; live 53, 55, 56, 57, 58 (four maps) with $N = 26$) | 18 | 15 | synthetic 32-51, live 43-102 |
+| right count (synthetic 22/24 with $N$ = 22/24; the same live maps with $N = 24$) | 16 | 0 | |
+| held out: started at 26 on 24-planet maps (live captures 59-64 and 66-71, one game each; synthetic 7101-7103) | 15 | 15 (24 reached in 14, 25 in one) | first step 45-123, median 65 |
+| held out: started at 24, right count (the same maps) | 15 | 1 (live 67; raised back 9 paths later) | 91 |
+
+The 3 design misses are maps the estimator never completed (live 57 with spurious planets, 58 map 0 with 32 paths, 58 map 2 with a spurious 25th planet). On completed maps with the count too high the ratio fell to 0.24 or less; with the right count and the other two conditions met it stayed at 3.3 or more (live 58 maps 2 and 3, planets 100-560 units from any path); without the ratio those two would have fired. The held-out false alarm came after 5 gated corrections in a row between corrections of 0.02-0.03; the final window of 8 would not have fired there and changes nothing else on either set (re-analysed offline, so this choice is not held out). Starting from 24: 22-planet worlds reached 22 (4 of 4, by path 58); 26-planet worlds reached 26 and stayed (6 of 7, by path 83); in one (7102) the count-limit warning fired at the right count (correction 0.030-0.037 just after the 26th planet was found) and the count stayed at 27.
+
