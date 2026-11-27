@@ -177,7 +177,13 @@ def study(args):
         t.start()
     for t in threads:
         t.join()
-    feasible = [t for t in st.trials if t.value is not None and not t.user_attrs.get("pruned_early")
+    write_best(st, args)
+
+
+def write_best(st, args):
+    """The best complete (not pruned) feasible trial as best.json."""
+    feasible = [t for t in st.trials if t.state.name == "COMPLETE"
+                and t.value is not None and not t.user_attrs.get("pruned_early")
                 and all(c <= 0 for c in t.user_attrs.get("constraints", [1]))]
     best = min(feasible, key=lambda t: t.value)
     params = {k: best.params[k] for k in DEFAULTS}
@@ -185,6 +191,13 @@ def study(args):
         json.dump(config_json(params), f, indent=1)
     print(json.dumps({"best_trial": best.number, "value": best.value, "params": params,
                       "trials": len(st.trials), "cpu_h": cpu_h()}), flush=True)
+
+
+def best(args):
+    """Pick the best trial of a stopped study (`study` stops at its budget; this ends it early)."""
+    import optuna
+    st = optuna.load_study(study_name="p14", storage=f"sqlite:///{args.out}/study.db")
+    write_best(st, args)
 
 
 def holdout(args):
@@ -217,7 +230,7 @@ def holdout(args):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("command", choices=["study", "holdout"])
+    p.add_argument("command", choices=["study", "best", "holdout"])
     p.add_argument("--devtool", required=True)
     p.add_argument("--db", required=True)
     p.add_argument("--out", required=True)
@@ -227,9 +240,9 @@ def main():
     p.add_argument("--parallel", type=int, default=4)
     p.add_argument("--batch", type=int, default=7)
     p.add_argument("--workers", type=int, default=28)
-    p.add_argument("--capture-refit-paths", type=int, default=120)
+    p.add_argument("--capture-refit-paths", type=int, default=200)
     args = p.parse_args()
-    study(args) if args.command == "study" else holdout(args)
+    {"study": study, "best": best, "holdout": holdout}[args.command](args)
 
 
 if __name__ == "__main__":
