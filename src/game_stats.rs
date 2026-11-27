@@ -2,7 +2,7 @@
 //! recent map epoch (`MapRecord`, printed at once), then each recent map's estimate after a short
 //! settle (`Settled`), scored against the disclosed planets when the server sent them
 //! (`sendplanets 1`). Truth is used here only to score, never as estimator input.
-use crate::estimator::{EstimatorSummary, UpdateReport};
+use crate::estimator::{CountLimit, EstimatorSummary, UpdateReport};
 use crate::field_score::score_field;
 use crate::map::PlanetMap;
 use crate::protocol::{Planet, Point, ServerEvent};
@@ -284,6 +284,24 @@ fn belief_lines(out: &mut String, belief: &MapBelief) {
                 reason.map_or("no reason recorded".to_owned(), |r| format!("{r:?}"))
             );
         }
+    }
+    if let Some(line) = belief.count_limit.as_ref().and_then(count_limit_line) {
+        let _ = writeln!(out, "    {line}");
+    }
+}
+
+/// The count-limit warning (P23) in words; `None` below the cap (nothing to say).
+pub fn count_limit_line(limit: &CountLimit) -> Option<String> {
+    match (limit.at_cap, limit.detected_at_path) {
+        (_, Some(path)) => Some(format!(
+            "WARNING planet count limited: the map is at its cap of {} and still leaves planet-sized residuals (since path {path}); the map may have more planets than that; consider a larger --planets",
+            limit.cap
+        )),
+        (true, None) => Some(format!(
+            "planet cap {} reached; no sign of more planets so far",
+            limit.cap
+        )),
+        (false, None) => None,
     }
 }
 
@@ -580,5 +598,28 @@ mod tests {
             text.contains("planet count: 0 found, estimate 22 (expected total 22.0), disclosed 1")
         );
         assert!(text.contains("recall 0/1 within 2, 0/1 within 15, spurious 0"));
+    }
+
+    #[test]
+    fn the_count_limit_warning_is_reported_at_the_cap_only() {
+        let mut limit = CountLimit {
+            cap: 24,
+            at_cap: false,
+            detected_at_path: None,
+            recent_magnitudes: vec![],
+        };
+        assert_eq!(count_limit_line(&limit), None);
+        limit.at_cap = true;
+        assert_eq!(
+            count_limit_line(&limit).as_deref(),
+            Some("planet cap 24 reached; no sign of more planets so far")
+        );
+        limit.detected_at_path = Some(57);
+        let mut belief = MapBelief::new(PlanetMap { planets: vec![] }, None);
+        belief.count_limit = Some(limit);
+        let mut out = String::new();
+        belief_lines(&mut out, &belief);
+        assert!(out.contains("WARNING planet count limited: the map is at its cap of 24"));
+        assert!(out.contains("(since path 57)"));
     }
 }

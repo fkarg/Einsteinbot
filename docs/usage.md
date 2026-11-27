@@ -107,12 +107,14 @@ NewtonWars generates `planets` planets per map (server option, 1-64, default 24)
 
 Measured on replays (P18, P21, [estimator-experiments.md](estimator-experiments.md)): a wrong fixed count costs planets when it is too low (the cap) and little when it is too high. A server with more than 32 planets needs `--planets`.
 
+**Count-limit warning (P23).** When the map holds as many planets as the cap allows and still leaves a planet-sized unexplained pull, the estimator flags the map as *count limited*: the residual correction (the smoothed unexplained pull along the observed paths) exceeds 0.03 acceleration units on 3 of the last 5 fully refit maps at the cap. The flag stays for the rest of the map. It is a warning only: the cap is never raised automatically; restart with a larger `--planets` if you see it. On replays it was raised 2 paths after reaching the cap (median) whenever 1-4 planets were left out, and never in 20 replays with the right count at the cap. It uses the correction the estimator computes anyway, so it costs nothing measurable. A map below its cap is never flagged, and no flag is not proof that the count is right (a planet no path passes near leaves no pull), and a misplaced planet at a correct cap could in principle raise it (not seen).
+
 ## Live view
 
 When stdout is a terminal, the client shows a live terminal view instead of the scrolling log:
 
 - **Per bot:** energy, shots and hits in the current map (counted as in the stop report), and what it is doing (aiming, waiting for energy, map wait, end card).
-- **Current map:** index, elapsed time, paths seen, planets `K` (and the disclosed count with `sendplanets 1`), queued paths, last and largest publish lag, search state.
+- **Current map:** index, elapsed time, paths seen, planets `K` (and the disclosed count with `sendplanets 1`), `COUNT LIMITED (cap N: more planets?)` when the count-limit warning is up, queued paths, last and largest publish lag, search state.
 - **Events:** map boundaries, the end card, lost connections.
 
 It redraws four times a second from small snapshots on its own thread and never calls the estimator (about 0.1% of a core, measured; the client prints the figure when the view closes). While it is up, stdout and stderr go to a run log next to the SQLite file (`einsteinbot.log` by default, appended, not rotated). Ctrl+C closes the view and restores the terminal first, then prints the stop report; the terminal is also restored on errors and panics. `--no-tui` (`tui = false`, `EINSTEINBOT_TUI=false`) keeps plain logging, which is also used when stdout is not a terminal.
@@ -136,6 +138,7 @@ The first Ctrl+C stops every session and prints a report for each recent map (th
 - the estimator state: planets $K$, paths, search state, the model-error scalars, the unseen count and $\rho_0$, the expected total;
 - the covariance, or why it is unavailable, with each planet's centre sd;
 - the residual correction state;
+- at the cap: the count-limit warning (with the path it was raised at), or that there is no sign of more planets;
 - the map lag: queued paths and publish lag;
 - the last update's work;
 - each bot's shots, hits (an own shot ending within 4.1 units of another player) and energy spent (the sum of the shots' velocities).

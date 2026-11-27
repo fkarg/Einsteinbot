@@ -329,6 +329,14 @@ pub fn status_lines(view: &View) -> Vec<String> {
             if let Some(disclosed) = status.disclosed {
                 let _ = write!(line, " (disclosed {disclosed})");
             }
+            if let Some(limit) = status
+                .summary
+                .as_ref()
+                .map(|summary| &summary.count_limit)
+                .filter(|limit| limit.limited())
+            {
+                let _ = write!(line, "  COUNT LIMITED (cap {}: more planets?)", limit.cap);
+            }
             lines.push(line);
             lines.push(format!(
                 "  queued paths {}  publish lag last {:.0} ms max {:.0} ms  search {}",
@@ -409,6 +417,30 @@ mod tests {
         assert_eq!(lines[4], "Einstein           12.3      7     2  aiming");
         assert_eq!(lines[5], "Curie                 -      0     0  board mode");
         assert_eq!(lines.len(), 6);
+    }
+
+    #[test]
+    fn status_lines_warn_when_the_planet_count_is_limited() {
+        let mut summary = crate::estimator::Estimator::new(crate::estimator::Settings {
+            planets: Some(22),
+            ..Default::default()
+        })
+        .summary();
+        summary.count_limit.detected_at_path = Some(40);
+        let view = View {
+            map: Some(MapView {
+                status: MapStatus {
+                    summary: Some(summary),
+                    ..MapStatus::default()
+                },
+                elapsed: None,
+            }),
+            ..View::default()
+        };
+        assert_eq!(
+            status_lines(&view)[1],
+            "map 0  elapsed -  paths 0  K 0  COUNT LIMITED (cap 22: more planets?)"
+        );
     }
 
     #[test]

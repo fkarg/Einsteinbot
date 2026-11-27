@@ -889,3 +889,72 @@ fn the_jacobian_matches_finite_differences_and_threads_change_nothing() {
         assert!(error < 1e-3 * scale, "column {column}: {error} vs {scale}");
     }
 }
+
+// The count-limit rule: enough recent polished maps at the cap with a planet-sized residual.
+#[test]
+fn the_count_limit_rule_needs_three_of_the_last_five_large_residuals() {
+    let large = Some(2.0 * COUNT_LIMIT_ACCELERATION);
+    let small = Some(0.5 * COUNT_LIMIT_ACCELERATION);
+    assert!(!count_limited(&[]));
+    assert!(!count_limited(&[large, large, small, None, small]));
+    assert!(count_limited(&[large, small, large, None, large]));
+    // Not computed (gated) counts as below the threshold, never as evidence.
+    assert!(!count_limited(&[None, None, large, large, None]));
+    // Only the last five count.
+    assert!(!count_limited(&[
+        large, large, large, small, small, small, None, None
+    ]));
+}
+
+fn count_limit_events() -> (PlanetMap, Vec<ServerEvent>) {
+    let truth = world_of(vec![
+        planet(500.0, 500.0, 30.0),
+        planet(1200.0, 700.0, 30.0),
+        planet(900.0, 200.0, 25.0),
+    ]);
+    let events = [0.0, 10.0, -10.0, 20.0, -20.0]
+        .iter()
+        .flat_map(|turn| {
+            [
+                ((350.0, 500.0), 0.0),
+                ((1050.0, 700.0), 0.0),
+                ((900.0, 400.0), 90.0),
+            ]
+            .map(|(start, angle)| (start, angle + turn))
+        })
+        .map(|(start, angle)| shot_in(&truth, start, angle, 6.0))
+        .collect();
+    (truth, events)
+}
+
+// A known count below the truth is flagged once the map at the cap keeps a planet-sized residual;
+// the correct count is not, and the cap is never raised.
+#[test]
+fn a_count_below_the_truth_is_flagged_and_the_correct_count_is_not() {
+    let (_, events) = count_limit_events();
+    let run = |planets: usize| {
+        let (mut estimator, cancelled) = estimator();
+        estimator.settings.planets = Some(planets);
+        let belief = events
+            .iter()
+            .filter_map(|event| estimator.observe_settled(event, &cancelled))
+            .last()
+            .unwrap();
+        (belief, estimator.summary())
+    };
+    let (low, summary) = run(2);
+    let limit = low.count_limit.as_ref().unwrap();
+    assert_eq!(low.map.planets.len(), 2, "the cap is never raised");
+    assert!(limit.at_cap && limit.limited(), "{limit:?}");
+    assert_eq!(summary.count_limit, *limit);
+    let json = low.diagnostic_json();
+    assert_eq!(json["count_limit"]["cap"], 2);
+    assert!(json["count_limit"]["detected_at_path"].is_u64());
+
+    let (right, _) = run(3);
+    let limit = right.count_limit.as_ref().unwrap();
+    assert!(limit.at_cap && !limit.limited(), "{limit:?}");
+    // A belief not from the estimator is not assessed (null), never "not limited".
+    let other = MapBelief::new(PlanetMap { planets: vec![] }, None);
+    assert!(other.diagnostic_json()["count_limit"].is_null());
+}

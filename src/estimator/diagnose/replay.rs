@@ -12,6 +12,8 @@
 //! Environment (besides those of `diagnose.rs`): `NAME` (the `cfg=` label), `SLICES`,
 //! `SLICE_EVALS`, `CEIL_MS` (slice wall ceiling, 0 for none; default the production 250),
 //! `AUDIT`, `SCHEDULE`, `PLANETS` (known total count; absent: the prior), `CAP` (`max_planets`).
+//! `UPD` lines carry the published belief's residual-correction state (`gate`: `on:<max>` or the
+//! reason) and the count-limit warning (`cap`, `limited`: the path it was first raised at, P23).
 use super::*;
 
 fn settings() -> Settings {
@@ -73,12 +75,28 @@ fn replay_deterministic(case: &Case, settings: Settings) {
                 .map(|p| p.total_ms)
                 .sum()
         });
+        let belief = estimator.belief();
+        let gate = belief.map_or("none".to_string(), |b| {
+            match (
+                &b.residual_correction,
+                b.residual_correction_unavailable_reason,
+            ) {
+                (Some(c), _) => format!("on:{:.1e}", c.max_magnitude),
+                (None, Some(r)) => format!("{r:?}"),
+                (None, None) => "none".into(),
+            }
+        });
+        let limit = belief.and_then(|b| b.count_limit.as_ref());
         println!(
-            "UPD world={id} cfg={name} n={n} k={} evals={evals} publish_ms={publish_ms:.1} wall_ms={wall_ms:.1} noise_ms={noise_ms:.1} s100={:.3} l={:.0} white={:.1e}",
+            "UPD world={id} cfg={name} n={n} k={} evals={evals} publish_ms={publish_ms:.1} wall_ms={wall_ms:.1} noise_ms={noise_ms:.1} s100={:.3} l={:.0} white={:.1e} cap={} limited={} gate={gate}",
             belief_theta(&estimator).len(),
             estimator.model.scale * 100.0,
             estimator.model.length,
-            estimator.model.white
+            estimator.model.white,
+            limit.is_some_and(|l| l.at_cap),
+            limit
+                .and_then(|l| l.detected_at_path)
+                .map_or("-".into(), |n| n.to_string()),
         );
         if audit {
             let before = belief_theta(&estimator);

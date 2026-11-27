@@ -63,6 +63,15 @@ pub const DEFAULT_SLICE_CEILING: Duration = Duration::from_millis(250);
 pub const DEFAULT_SLICES_PER_PATH: usize = 6;
 /// Evaluations of the full-row refit of the published map.
 const POLISH_EVALUATIONS: u64 = 600;
+/// Count-limit warning (P23): a polished map at the planet cap whose residual correction still
+/// reaches this acceleration somewhere is evidence of a planet the cap leaves out. Measured: at
+/// most 0.015 (the third largest of five) on correct counts at the cap, at least 0.094 with two
+/// or more planets left out (`docs/estimator-experiments.md`).
+pub const COUNT_LIMIT_ACCELERATION: f64 = 0.03;
+/// The warning holds when `COUNT_LIMIT_HITS` of the last `COUNT_LIMIT_WINDOW` polished maps at
+/// the cap exceed `COUNT_LIMIT_ACCELERATION`.
+pub const COUNT_LIMIT_WINDOW: usize = 5;
+pub const COUNT_LIMIT_HITS: usize = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -87,6 +96,42 @@ pub enum SearchLimit {
     /// The search has work left: a slice reached its evaluation limit, or the slices owed after
     /// the latest path have not all run.
     WorkBudget,
+}
+
+/// Whether the planet cap may be below the map's true count (P23). A warning only: the cap is
+/// never raised automatically.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct CountLimit {
+    /// The cap: the known count (`--planets`), else `max_planets`.
+    pub cap: usize,
+    /// The published map holds `cap` planets.
+    pub at_cap: bool,
+    /// Paths of the epoch when the rule (`count_limited`) first held; latched for the map epoch.
+    /// `None`: it has not held (no evidence of more planets than the cap, which is not evidence
+    /// that there are none).
+    pub detected_at_path: Option<usize>,
+    /// Largest residual-correction magnitude of each of the latest polished maps at the cap,
+    /// oldest first (at most `COUNT_LIMIT_WINDOW`); `None` where no correction was applied (its
+    /// gate: the model error or the correction below `GATE_ACCELERATION`), which counts as below
+    /// the threshold.
+    pub recent_magnitudes: Vec<Option<f64>>,
+}
+
+impl CountLimit {
+    pub fn limited(&self) -> bool {
+        self.detected_at_path.is_some()
+    }
+}
+
+/// The count-limit rule on the latest magnitudes of polished maps at the cap.
+fn count_limited(recent: &[Option<f64>]) -> bool {
+    recent
+        .iter()
+        .rev()
+        .take(COUNT_LIMIT_WINDOW)
+        .filter(|m| m.is_some_and(|m| m > COUNT_LIMIT_ACCELERATION))
+        .count()
+        >= COUNT_LIMIT_HITS
 }
 
 /// A completed trajectory, its prepared windowed comparison (`None` when it is too short for a
@@ -210,6 +255,10 @@ pub struct Estimator {
     pending_timings: Vec<(Part, Duration)>,
     /// `rho0` of the latest path's noise.
     last_rho0: Option<f64>,
+    /// Residual-correction magnitudes of the latest polished maps at the cap (`CountLimit`).
+    cap_magnitudes: Vec<Option<f64>>,
+    /// Paths when the count-limit rule first held in this epoch.
+    count_limited_at: Option<usize>,
 }
 
 /// What the estimator holds about its map epoch, for status output (cheap: no fit).
@@ -235,6 +284,8 @@ pub struct EstimatorSummary {
     pub likely_total: usize,
     /// Near cutoff of the latest path's noise (`None` before the first path).
     pub rho0: Option<f64>,
+    /// The count-limit warning as of the latest publication.
+    pub count_limit: CountLimit,
 }
 
 impl Default for Estimator {
@@ -257,6 +308,8 @@ impl Default for Estimator {
             last_report: None,
             pending_timings: Vec::new(),
             last_rho0: None,
+            cap_magnitudes: Vec::new(),
+            count_limited_at: None,
         }
     }
 }
@@ -367,7 +420,7 @@ impl Estimator {
             ));
         }
         let theta = self.search.theta.clone();
-        Some(self.publish(&theta, None))
+        Some(self.publish(&theta, None, false))
     }
 
     /// Sequential replay: one event.
@@ -403,6 +456,7 @@ impl Estimator {
             expected_total: planets as f64 + unseen,
             likely_total: noise::likely_total(planets, self.settings.planets),
             rho0: self.last_rho0,
+            count_limit: self.count_limit(planets),
         }
     }
 
@@ -453,7 +507,7 @@ impl Estimator {
             self.polish_due |= changed;
             if changed {
                 let theta = self.search.theta.clone();
-                return Some(self.publish(&theta, None));
+                return Some(self.publish(&theta, None, false));
             }
             return None;
         }
@@ -491,7 +545,7 @@ impl Estimator {
                 (theta, evidence)
             };
             self.stats.add(Part::Polish, started.elapsed());
-            return Some(self.publish(&theta, evidence));
+            return Some(self.publish(&theta, evidence, true));
         }
         None
     }
@@ -542,7 +596,7 @@ impl Estimator {
         self.polish_due = true;
         self.limit = Some(SearchLimit::WorkBudget);
         let theta = self.search.theta.clone();
-        Some(self.publish(&theta, None))
+        Some(self.publish(&theta, None, false))
     }
 
     /// Planets of the maintained map (the search's, not the polished published one, so that a
@@ -573,8 +627,25 @@ impl Estimator {
         };
     }
 
+    /// The count-limit state for a map of `planets` planets.
+    fn count_limit(&self, planets: usize) -> CountLimit {
+        CountLimit {
+            cap: self.settings.cap(),
+            at_cap: planets >= self.settings.cap(),
+            detected_at_path: self.count_limited_at,
+            recent_magnitudes: self.cap_magnitudes.clone(),
+        }
+    }
+
     /// The belief of the map `theta`; `evidence` is its exact evidence when that was computed.
-    fn publish(&mut self, theta: &[[f64; 3]], evidence: Option<Evidence>) -> MapBelief {
+    /// A `polished` map at the cap adds its residual-correction magnitude to the count-limit
+    /// window (one sample per polish, so at most one per path between audit adoptions).
+    fn publish(
+        &mut self,
+        theta: &[[f64; 3]],
+        evidence: Option<Evidence>,
+        polished: bool,
+    ) -> MapBelief {
         let started = Instant::now();
         let planets: Vec<_> = theta.iter().map(|th| planet_at(*th)).collect();
         let mut belief = MapBelief::new(PlanetMap { planets }, None);
@@ -647,6 +718,17 @@ impl Estimator {
             Err(gate) => belief.residual_correction_unavailable_reason = Some(gate),
         }
         self.stats.add(Part::ResidualCorrection, started.elapsed());
+        if polished && theta.len() >= self.settings.cap() {
+            self.cap_magnitudes
+                .push(belief.residual_correction.as_ref().map(|c| c.max_magnitude));
+            if self.cap_magnitudes.len() > COUNT_LIMIT_WINDOW {
+                self.cap_magnitudes.remove(0);
+            }
+            if self.count_limited_at.is_none() && count_limited(&self.cap_magnitudes) {
+                self.count_limited_at = Some(self.searched);
+            }
+        }
+        belief.count_limit = Some(self.count_limit(theta.len()));
         self.last_report = Some(self.stats.report(&self.settings.ceilings));
         self.belief = Some(belief.clone());
         belief
