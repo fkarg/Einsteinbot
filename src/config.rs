@@ -21,6 +21,9 @@ pub struct AppConfig {
     /// The known total planet count of the server's maps (its `planets` setting, 1-64), used as
     /// fixed by the estimator; `None`: estimated with a broad prior.
     pub planets: Option<usize>,
+    /// Learn the planet count over the session (P25, `--learn-planets`): start at 24, one up on
+    /// the count-limit warning, one down on the too-high signal. Ignored when `planets` is given.
+    pub learn_planets: bool,
     /// Show the live terminal view when stdout is a terminal (`--no-tui`: plain logging).
     pub tui: bool,
 }
@@ -38,6 +41,7 @@ struct CliOptions {
     clients: Option<String>,
     db_path: Option<PathBuf>,
     planets: Option<String>,
+    learn_planets: Option<bool>,
     tui: Option<bool>,
 }
 
@@ -54,6 +58,7 @@ struct FileOptions {
     clients: Option<usize>,
     db_path: Option<PathBuf>,
     planets: Option<usize>,
+    learn_planets: Option<bool>,
     tui: Option<bool>,
 }
 
@@ -69,6 +74,7 @@ struct EnvOptions {
     clients: Option<String>,
     db_path: Option<PathBuf>,
     planets: Option<String>,
+    learn_planets: Option<String>,
     tui: Option<String>,
 }
 
@@ -117,6 +123,7 @@ impl EnvOptions {
             clients: get("EINSTEINBOT_CLIENTS"),
             db_path: get("EINSTEINBOT_DB_PATH").map(PathBuf::from),
             planets: get("EINSTEINBOT_PLANETS"),
+            learn_planets: get("EINSTEINBOT_LEARN_PLANETS"),
             tui: get("EINSTEINBOT_TUI"),
         })
     }
@@ -220,6 +227,13 @@ fn resolve(cli: CliOptions, env: EnvOptions, file: FileOptions) -> Result<AppCon
             .or(file.db_path)
             .unwrap_or_else(|| PathBuf::from("einsteinbot.sqlite3")),
         planets,
+        learn_planets: if let Some(learn) = cli.learn_planets {
+            learn
+        } else if let Some(value) = env.learn_planets {
+            parse_bool(&value, "EINSTEINBOT_LEARN_PLANETS")?
+        } else {
+            file.learn_planets.unwrap_or(false)
+        },
         tui: if let Some(tui) = cli.tui {
             tui
         } else if let Some(value) = env.tui {
@@ -260,6 +274,7 @@ where
             "--no-oracle-map" => options.oracle_map_for_policy = Some(false),
             "--clients" => options.clients = Some(value(&mut args, &arg)?),
             "--planets" => options.planets = Some(value(&mut args, &arg)?),
+            "--learn-planets" => options.learn_planets = Some(true),
             "--tui" => options.tui = Some(true),
             "--no-tui" => options.tui = Some(false),
             _ => return Err(format!("unknown argument: {arg}\n\n{}", help_text())),
@@ -327,11 +342,12 @@ fn help_text() -> &'static str {
        --clients N         Run N local bot connections (default: 1, max: 16)\n\
        --db-path PATH      SQLite file (default: einsteinbot.sqlite3)\n\
        --planets N         Known planet count of the server's maps (fixed; default: estimated)\n\
+       --learn-planets     Learn the planet count over the session from 24 (ignored with --planets)\n\
        --no-tui            Plain logging instead of the live terminal view\n\
        -h, --help          Show this help\n\
      \n\
      Precedence: command line, environment, TOML config, defaults.\n\
-     Environment: EINSTEINBOT_CONFIG, _HOST, _PORT, _NAME, _RECORD, _DUMMY, _TARGETING, _ORACLE_MAP, _CLIENTS, _DB_PATH, _PLANETS, _TUI.\n"
+     Environment: EINSTEINBOT_CONFIG, _HOST, _PORT, _NAME, _RECORD, _DUMMY, _TARGETING, _ORACLE_MAP, _CLIENTS, _DB_PATH, _PLANETS, _LEARN_PLANETS, _TUI.\n"
 }
 
 #[cfg(test)]
@@ -512,6 +528,27 @@ mod tests {
             panic!("expected parsed options");
         };
         assert!(resolve(cli, EnvOptions::default(), FileOptions::default()).is_err());
+    }
+
+    #[test]
+    fn learning_the_planet_count_is_opt_in_from_any_source() {
+        let resolve_with = |cli: &[&str], env: Option<&str>, file: &str| {
+            let ParsedCli::Options(cli) = parse_args(cli.iter().map(|a| a.to_string())).unwrap()
+            else {
+                panic!("expected parsed options");
+            };
+            let env = EnvOptions {
+                learn_planets: env.map(str::to_owned),
+                ..EnvOptions::default()
+            };
+            resolve(cli, env, toml::from_str(file).unwrap())
+                .unwrap()
+                .learn_planets
+        };
+        assert!(!resolve_with(&[], None, ""));
+        assert!(resolve_with(&["--learn-planets"], Some("false"), ""));
+        assert!(resolve_with(&[], Some("1"), "learn_planets = false\n"));
+        assert!(resolve_with(&[], None, "learn_planets = true\n"));
     }
 
     #[test]

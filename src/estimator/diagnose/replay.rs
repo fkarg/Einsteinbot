@@ -11,7 +11,8 @@
 //!
 //! Environment (besides those of `diagnose.rs`): `NAME` (the `cfg=` label), `SLICES`,
 //! `SLICE_EVALS`, `CEIL_MS` (slice wall ceiling, 0 for none; default the production 250),
-//! `AUDIT`, `SCHEDULE`, `PLANETS` (known total count; absent: the prior), `CAP` (`max_planets`).
+//! `AUDIT`, `SCHEDULE`, `PLANETS` (known total count; absent: the prior), `CAP` (`max_planets`), `LEARN`
+//! (the dynamic planet count of P25 from that start; `count=` on `UPD` lines).
 //! `UPD` lines carry the published belief's residual-correction state (`gate`: `on:<max>` or the
 //! reason) and the count-limit warning (`cap`, `limited`: the path it was first raised at, P23).
 use super::*;
@@ -56,6 +57,12 @@ fn replay_deterministic(case: &Case, settings: Settings) {
     let audit = settings.audit_enabled;
     let mut estimator = Estimator::default();
     estimator.settings = settings;
+    // `LEARN=n`: the dynamic planet count (P25) starting from `n`.
+    if let Some(start) = env_list("LEARN", "-").first() {
+        estimator.settings.learn_planets = true;
+        estimator.settings.planets = Some(*start);
+        estimator.learner = Some(super::count::Learner::new(*start));
+    }
     let never = AtomicBool::new(false);
     // P25 measurement: path coverage (hidden fractions) and the tick distance of missed planets.
     let mut coverage = super::count::Coverage::new(WorldParameters::default());
@@ -113,7 +120,7 @@ fn replay_deterministic(case: &Case, settings: Settings) {
             }
         );
         println!(
-            "UPD world={id} cfg={name} n={n} k={} evals={evals} publish_ms={publish_ms:.1} wall_ms={wall_ms:.1} noise_ms={noise_ms:.1} s100={:.3} l={:.0} white={:.1e} cap={} limited={} gate={gate}",
+            "UPD world={id} cfg={name} n={n} k={} evals={evals} publish_ms={publish_ms:.1} wall_ms={wall_ms:.1} noise_ms={noise_ms:.1} s100={:.3} l={:.0} white={:.1e} cap={} limited={} count={} gate={gate}",
             belief_theta(&estimator).len(),
             estimator.model.scale * 100.0,
             estimator.model.length,
@@ -121,6 +128,10 @@ fn replay_deterministic(case: &Case, settings: Settings) {
             limit.is_some_and(|l| l.at_cap),
             limit
                 .and_then(|l| l.detected_at_path)
+                .map_or("-".into(), |n| n.to_string()),
+            estimator
+                .settings
+                .planets
                 .map_or("-".into(), |n| n.to_string()),
         );
         if audit {
