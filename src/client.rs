@@ -342,7 +342,7 @@ fn run_session(
                         bot_state.own_id(),
                         bot_state.player_positions(),
                     );
-                    bot_state.observe(&event);
+                    bot_state.observe_at(&event, now_ms);
                     if let Some(source) = boundary {
                         // Shots, coverage and the belief of the old map no longer apply.
                         bot_state.start_new_map();
@@ -650,6 +650,7 @@ fn target_commands(
 ) -> ClientResult<Option<[ClientCommand; 2]>> {
     let mut state = bot_state.clone();
     state.set_map_belief(map_belief.cloned());
+    state.set_clock_ms(now_unix_ms()?);
     let started = Instant::now();
     let choice = policy.choose_while_running(&state, energy, running);
     if !running.load(Ordering::SeqCst) {
@@ -670,6 +671,8 @@ fn target_commands(
                 "uncertainty_available": choice.uncertainty_available,
                 "covered_fraction": choice.covered_fraction,
                 "contact_before_target": choice.contact_before_target,
+                "victim_doom": choice.victim_doom,
+                "doomed_hits_skipped": choice.doomed_hits_skipped,
             })
         });
         log.lock()
