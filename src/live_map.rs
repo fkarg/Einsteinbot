@@ -1,5 +1,5 @@
 //! Background map fitting; socket workers only enqueue observations and read beliefs.
-use crate::estimator::Estimator;
+use crate::estimator::{Estimator, UpdateReport};
 use crate::protocol::ServerEvent;
 use crate::strategy::MapBelief;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,13 +13,23 @@ pub(crate) struct WorkItem {
     event: ServerEvent,
 }
 
+/// Whether an event is an observed path (the unit of map lag the inspector reports).
+fn is_path(event: &ServerEvent) -> bool {
+    matches!(event, ServerEvent::ShotFin { .. })
+}
+
 #[derive(Default)]
 struct Published {
     epoch: u64,
     submitted: u64,
     processed: u64,
     belief: Option<MapBelief>,
+    /// Work and timings of the estimator update that published `belief` (`None` when the fit
+    /// function does not report, as in tests).
+    report: Option<UpdateReport>,
     pending: usize,
+    /// Queued or in-progress paths (`ShotFin`) that `belief` has not seen yet.
+    pending_paths: usize,
     fit_cancel: Arc<AtomicBool>,
 }
 
@@ -35,6 +45,7 @@ pub(crate) struct MapProgress {
     pub submitted: u64,
     pub processed: u64,
     pub pending: usize,
+    pub pending_paths: usize,
 }
 
 impl LiveMap {
@@ -85,6 +96,7 @@ impl LiveMap {
                             let mut state = worker_state.lock().unwrap();
                             if let (true, Some(belief)) = (state.epoch == epoch, belief) {
                                 state.belief = Some(belief);
+                                state.report = estimator.last_report().cloned();
                             }
                             continue;
                         }
@@ -124,9 +136,11 @@ impl LiveMap {
                 let mut state = worker_state.lock().unwrap();
                 if state.epoch == epoch {
                     state.pending -= 1;
+                    state.pending_paths -= usize::from(is_path(&event));
                     state.processed = watermark;
                     if let Some(belief) = belief {
                         state.belief = Some(belief);
+                        state.report = estimator.last_report().cloned();
                     }
                 }
             }
@@ -142,7 +156,9 @@ impl LiveMap {
         state.submitted = 0;
         state.processed = 0;
         state.belief = None;
+        state.report = None;
         state.pending = 0;
+        state.pending_paths = 0;
     }
 
     pub(crate) fn observe(&self, event: &ServerEvent) -> Result<u64, mpsc::SendError<WorkItem>> {
@@ -150,6 +166,7 @@ impl LiveMap {
         // producers can enqueue watermark 2 before 1 and make `processed` regress.
         let mut state = self.published.lock().unwrap();
         state.pending += 1;
+        state.pending_paths += usize::from(is_path(event));
         state.submitted += 1;
         let (epoch, watermark) = (state.epoch, state.submitted);
         match self.sender.send(WorkItem {
@@ -160,6 +177,9 @@ impl LiveMap {
             Ok(()) => Ok(watermark),
             Err(error) => {
                 state.pending = state.pending.saturating_sub(1);
+                state.pending_paths = state
+                    .pending_paths
+                    .saturating_sub(usize::from(is_path(event)));
                 state.submitted = state.submitted.saturating_sub(1);
                 Err(error)
             }
@@ -173,26 +193,27 @@ impl LiveMap {
         (state.pending > 0, state.belief.clone())
     }
 
-    pub(crate) fn snapshot_with_progress(&self) -> (MapProgress, Option<MapBelief>) {
+    /// Progress, the latest belief and the report of the update that published it, under one lock.
+    pub(crate) fn snapshot_with_progress(
+        &self,
+    ) -> (MapProgress, Option<MapBelief>, Option<UpdateReport>) {
         let state = self.published.lock().unwrap();
-        (
-            MapProgress {
-                epoch: state.epoch,
-                submitted: state.submitted,
-                processed: state.processed,
-                pending: state.pending,
-            },
-            state.belief.clone(),
-        )
+        (state.progress(), state.belief.clone(), state.report.clone())
     }
 
     pub(crate) fn progress(&self) -> MapProgress {
-        let state = self.published.lock().unwrap();
+        self.published.lock().unwrap().progress()
+    }
+}
+
+impl Published {
+    fn progress(&self) -> MapProgress {
         MapProgress {
-            epoch: state.epoch,
-            submitted: state.submitted,
-            processed: state.processed,
-            pending: state.pending,
+            epoch: self.epoch,
+            submitted: self.submitted,
+            processed: self.processed,
+            pending: self.pending,
+            pending_paths: self.pending_paths,
         }
     }
 }
@@ -260,6 +281,7 @@ mod tests {
                 submitted: 2,
                 processed: 0,
                 pending: 2,
+                pending_paths: 0,
             }
         );
         release_tx.send(()).unwrap();
@@ -366,6 +388,66 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn pending_paths_count_queued_shots_and_the_report_travels_with_its_belief() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (feed, worker) = LiveMap::spawn_with(move |estimator, event, cancelled| {
+            if matches!(event, ServerEvent::PlayerLeave { .. }) {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            }
+            estimator.observe(event, cancelled)
+        });
+        let shot = ServerEvent::ShotFin {
+            player_id: 1,
+            angle: 0.0,
+            velocity: 2.0,
+            points: (95..=100)
+                .map(|x| crate::protocol::Point {
+                    x: x as f32,
+                    y: 100.0,
+                })
+                .collect(),
+        };
+        feed.observe(&ServerEvent::PlayerPosition {
+            player_id: 1,
+            x: 95.0,
+            y: 100.0,
+        })
+        .unwrap();
+        feed.observe(&ServerEvent::PlayerLeave { player_id: 9 })
+            .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        feed.observe(&shot).unwrap();
+        feed.observe(&shot).unwrap();
+        let progress = feed.progress();
+        assert_eq!((progress.pending, progress.pending_paths), (3, 2));
+        release_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while feed.progress().pending > 0 {
+            assert!(std::time::Instant::now() < deadline);
+            thread::yield_now();
+        }
+        let (progress, belief, report) = feed.snapshot_with_progress();
+        assert_eq!(progress.pending_paths, 0);
+        assert!(belief.is_some());
+        // The recorded shape of `map_update_report` (contract open request 7).
+        let report =
+            serde_json::to_value(report.expect("a fitted path reports its update")).unwrap();
+        assert!(report["evaluations"].is_u64());
+        assert!(report["violations"].as_array().unwrap().is_empty());
+        let part = &report["parts"].as_array().unwrap()[0];
+        assert!(part["part"].is_string());
+        assert!(part["calls"].is_u64());
+        assert!(part["total_ms"].is_f64());
+        assert!(part["longest_ms"].is_f64());
+        feed.reset();
+        assert!(feed.snapshot_with_progress().2.is_none());
+        drop(feed);
+        worker.join().unwrap();
     }
 
     #[test]

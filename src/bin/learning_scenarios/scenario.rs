@@ -1,4 +1,5 @@
 use super::*;
+use einsteinbot::estimator::UpdateReport;
 use einsteinbot::event_store::{EventLog, ScenarioCaptureMetadata};
 use einsteinbot::protocol::{RecordedEvent, ServerEvent};
 use einsteinbot::strategy::{BotState, MapBelief};
@@ -45,6 +46,7 @@ impl ScenarioCapture {
         scenario: &Scenario,
         state: &BotState,
         belief: Option<&MapBelief>,
+        update_report: Option<&UpdateReport>,
         choice: Option<einsteinbot::strategy::ShotChoice>,
         stage: &str,
         observations_seen: usize,
@@ -77,6 +79,8 @@ impl ScenarioCapture {
                     "map_source": "online",
                     "fit_ms": fit_ms,
                     "map_belief": belief_json,
+                    "map_update_report": update_report,
+                    "map_pending_paths": 0,
                     "bot_state": state.diagnostic_snapshot(),
                     "scenario": scenario.diagnostic_metadata(stage),
                     "choice": choice_json,

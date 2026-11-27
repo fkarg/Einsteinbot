@@ -104,7 +104,7 @@
       </div>
       <details class="explain"><summary>Help</summary>
         <ul>
-          <li><b>Gravity belief</b> is the field the bot simulates with: the gravity of the fitted planets. <b>Observation coverage</b> shows how much of the modelled planet field the fit's paths resolve (0–1, a heuristic that cannot see planets missing from the map). <b>Fit uncertainty</b> comes from the fit covariance; when it is missing the reason and fit size are shown. <b>Belief error</b> is belief minus truth and exists only when the capture has a truth map.</li>
+          <li><b>Gravity belief</b> is the field the bot simulates with: the gravity of the fitted planets. <b>Fit uncertainty</b> comes from the fit covariance; when it is missing the reason and fit size are shown. <b>Belief error</b> is belief minus truth and exists only when the capture has a truth map.</li>
           <li><b>Truth</b> is the planet list the server discloses when it runs with <code>sendplanets 1</code>. It is diagnosis only and never an estimator input. <b>Direction arrows</b> point along the layer's vector (angles: 0° right, 90° down); for Belief error they point to where the belief pulls extra. Belief error colours are on a log scale. Hover shows a compact probe; click pins the full one. Dimmed layers say why they are unavailable.</li>
           <li>Dark cells have no value for the layer (not zero gravity). Uncertainty comes from the fit covariance and ignores omitted planets and model error.</li>
           <li>Truth planets are the game's own map, for diagnosis only. A truth planet is a <b>close match</b> when an estimate lies within 10 units and 5 units of radius; <b>center off</b> / <b>size off</b> exceed one threshold; <b>missing</b> has no estimate within 80 units. Pairs are one-to-one, closest first.</li>
@@ -112,7 +112,8 @@
           <li>Contacts are path endpoints the estimator accepted as surface hits, not every collision.</li>
           <li><b>Shot review</b> re-simulates the decision's chosen shot under the recorded belief and compares it with the shot that actually followed. Outcomes are read off the observed endpoint and are inferences, not server reports. The green timeline line is each decision's belief scored against the next 5 observed shots (median path error), which needs no truth map. Repairs change one planet of the belief to the truth one and re-simulate: a sensitivity, not proof of cause.</li>
           <li>Faded dots are where a player stood before it moved. Scenario shots are labelled from what the scenario generator recorded: <b>training</b> shots build the baseline information, the <b>trial</b> shot is the policy's shot (muted versus bold lines).</li>
-          <li>“Map events pending” in the decision panel means the snapshot may lag the latest observations.</li>
+          <li><b>Belief lag</b>: the estimator fits paths in the background (the live server produces several per second), so a decision can read a belief that has not seen the newest paths yet. “Lagged N paths” counts paths queued or being fitted when the decision read the belief; ≈ marks older captures where it is inferred from the recorded inputs. The pink timeline strip shows it per decision.</li>
+          <li><b>Estimator update</b> lists the work of the update that published the belief (the latest path's local refit plus the search slices and full-row refit after it): calls and milliseconds per part. Orange rows exceeded their part ceiling; a time-cut search slice is reported as the search state.</li>
         </ul>
       </details>
     </section>
@@ -152,6 +153,7 @@
       </div>
       <h2>Captured belief</h2>
       <div id="metrics" class="metrics"></div>
+      <h2>Estimator update</h2><div id="updateReport" class="review"></div>
       <div id="disclosedPanel"><h2>Truth planets</h2><div id="disclosedList"></div></div>
       <h2>Estimated planets</h2><div id="planetList"></div>
     </aside>
