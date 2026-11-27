@@ -112,16 +112,16 @@ The bot assumes the NewtonWars physics, taken from the source; the server does n
 ```math
 a(p) = \sum_j m_j \frac{c_j - p}{\lVert c_j - p\rVert^3}.
 ```
-The engine integrates with velocity Verlet at $n = 25$ substeps of length $h$ per tick. The protocol reports positions once per tick, as f32. So the unknowns are the planet parameters $\theta = (x_j, y_j, r_j)_{j=1..K}$ and their number $K$; everything else is fixed.
+The engine integrates with velocity Verlet at $n = 25$ substeps of length $h$ per tick. The protocol reports positions once per tick, as f32 (32-bit floats, so rounded). So the unknowns are the planet parameters $\theta = (x_j, y_j, r_j)_{j=1..K}$, with $c_j = (x_j, y_j)$, and their number $K$; everything else is fixed.
 
 #### 2. Rows: compare fields, not simulated paths
 
-Velocity Verlet has the exact identity $x_{m+1} - 2x_m + x_{m-1} = h^2 a(x_m)$ for substep positions. Summing it over one tick gives, for the observed tick positions $X_s$,
+Velocity Verlet has the exact identity $x_{m+1} - 2x_m + x_{m-1} = h^2 a(x_m)$, where $x_m$ is the position after substep $m$. Tick $s$ ends at substep $ns$, so the reported tick position is $X_s = x_{ns}$. Summing the identity over one tick gives
 
 ```math
 X_{s+1} - 2X_s + X_{s-1} = h^2 \sum_{\lvert i\rvert < n} \bigl(n - \lvert i\rvert\bigr)\, a\bigl(x_{ns+i}\bigr).
 ```
-In words: the observed second difference of a tick equals a triangle-weighted sum of the field at the substep positions around it.
+In words: the observed second difference of a tick equals a triangle-weighted sum of the field at the 49 substep positions $x_{ns+i}$ around it.
 
 ```text
 weight n-|i|               25
@@ -134,33 +134,33 @@ weight n-|i|               25
    ticks    X(s-1)          X(s)           X(s+1)
 ```
 
-Each such equation is one row. The bot evaluates the right side on the model field at points on the observed path, using a cubic Hermite interpolant between ticks ([`src/estimator/window.rs`](src/estimator/window.rs)). This has three useful consequences:
+Each such equation is one row. The server does not report the substep positions, so the bot estimates them with a cubic Hermite interpolant through the observed ticks and evaluates the right side on the belief's field there ([`src/estimator/window.rs`](src/estimator/window.rs)). This has three useful consequences:
 
 - A row depends only on the field within one tick of the path, so an error early in a path does not spread to later rows.
-- The residual is a smooth function of $\theta$ with analytic Jacobians.
-- Every observed tick is evidence.
+- The residual (left side minus right side) is a smooth function of $\theta$, and its derivatives (the Jacobian $J$) have closed forms.
+- Every observed tick is data.
 
 #### 3. Likelihood: what the residuals really are
 
-A row residual has three parts, and the bot models each one ([`src/estimator/noise.rs`](src/estimator/noise.rs)).
+The *likelihood* says how probable the observed residuals are under a map. It needs a model of the residuals that even the true map would leave. A row residual has four parts, and the bot models each one ([`src/estimator/noise.rs`](src/estimator/noise.rs)).
 
 | Part | Cause | Model |
 |---|---|---|
-| Rounding | positions are f32 | uniform error per tick, sd $\mathrm{ulp}/\sqrt{12}$; neighbouring rows share ticks, so the floor is banded-correlated and whitened exactly |
+| Rounding | positions are f32 | uniform error per tick, sd $\mathrm{ulp}/\sqrt{12}$ (ulp: the spacing of f32 values at that coordinate); neighbouring rows share ticks, so this floor is correlated over a few neighbouring rows, and the bot accounts for that exactly |
 | Interpolation | the Hermite interpolant is inexact near planets | per-row variance estimated from the observed ticks alone |
 | Unseen planets | planets not found yet | a correlated Gaussian process along each path (below) |
 | White excess | position noise beyond rounding | one white sd, near zero on exact f32 captures |
 
-Without the interpolation term, the *true* map has a chi-square $10^3$ to $10^5$ times its degrees of freedom on a near pass.
+The bot *whitens* the residuals: it transforms them so that their modelled noise is independent with unit variance, which makes $\chi^2$ a plain sum of squares. Without the interpolation term, the *true* map has a $\chi^2$/row of $10^3$ to $10^5$ on paths that pass close to a planet.
 
-**Why unseen planets need a correlated model.** The field of unseen planets is smooth along a path, so its residuals are strongly correlated. With the earlier relative-noise likelihood, a map missing 4 planets had whitened residuals with lag-1 autocorrelation 0.85-0.97 along each path, and chi-square per row of $10^3$ to $2.7\times10^4$ (brainstorm, observed). Treating such rows as independent counts $N$ rows as $N$ votes. An AR(1) series with correlation $\rho$ carries only about
+**Why unseen planets need a correlated model.** The field of unseen planets is smooth along a path, so its residuals are strongly correlated. With the bot's earlier likelihood (independent noise proportional to the observed acceleration), a map missing 4 planets had whitened residuals whose correlation between neighbouring rows (lag-1 autocorrelation) was 0.85-0.97 along each path, and $\chi^2$/row of $10^3$ to $2.7\times10^4$ (measured). Treating such rows as independent counts $N$ rows as $N$ votes. A series in which each value has correlation $\rho$ with the next (an AR(1) process) carries only about
 
 ```math
 N_\text{eff} \approx N\,\frac{1-\rho}{1+\rho}
 ```
 independent ones, about $N/19$ at $\rho = 0.9$. The overconfident likelihood then pays for almost any extra planet that soaks up the correlated residual, and the search grows spurious planets.
 
-**The unseen-planet process.** Suppose the unseen planets form a Poisson field of point masses, with centres in the admissible region $U$: inside the battlefield, clear of the found planets and of every observed tick. Campbell's theorem then gives a field variance at distance $d$ from $U$ that falls as $1/d^2$, and by scaling the correlation length grows in proportion to $d$. So along each path, per axis, the model error is a Matérn-3/2 process in arc length with
+**The unseen-planet process.** Suppose the unseen planets are point masses scattered independently and uniformly (a Poisson field) over the region $U$ where an unseen planet's centre could still be: inside the battlefield, clear of the found planets and of every observed tick. Campbell's theorem (the variance of a sum over a Poisson field) then gives a field variance at distance $d$ from $U$ that falls as $1/d^2$, and by scaling the correlation length grows in proportion to $d$. So along each path, per axis, the bot models this *model error* as a Matérn-3/2 process in arc length: a smooth Gaussian process whose correlation at separation $t$ is $(1 + \sqrt{3}t/\ell)e^{-\sqrt{3}t/\ell}$. Its sd and correlation length $\ell$ at row centre $c$ are
 
 ```math
 \mathrm{sd}(c) = s\,\frac{100}{\max(d_U(c), \rho_0)}, \qquad \ell(c) = l\,\frac{\max(d_U(c), \rho_0)}{100}, \qquad \rho_0 = \sqrt{\frac{\lvert U\rvert}{\pi N_u}}.
@@ -176,36 +176,40 @@ independent ones, about $N/19$ at $\rho = 0.9$. The overconfident likelihood the
            ρ0                                  ρ0
 ```
 
-Here $d_U(c)$ is the distance of row centre $c$ to $U$, and $N_u$ is the expected number of unseen planets. $\rho_0$ is the radius that holds one unseen planet on average. The process stands only for the *distant* population: a single planet nearer than $\rho_0$ leaves a local signature that a planet birth must explain, not background noise.
+- $d_U(c)$ is the distance of row centre $c$ to $U$, and $\lvert U\rvert$ is the area of $U$.
+- $N_u$ is the expected number of unseen planets (see below), so $\rho_0$ is the radius that holds one unseen planet on average.
+- $s$ and $l$ are the sd and the correlation length at distance 100. They are estimated from the data (below).
+
+The process stands only for the *distant* population: a single planet nearer than $\rho_0$ leaves a local signature that a planet birth must explain, not background noise.
 
 <details>
 <summary>How the noise scalars are estimated, and the calibration evidence</summary>
 
-- **Effect of the $\rho_0$ cutoff.** Adding it raised dev recall at 8 paths from 62 to 103 (summed over 14 worlds) and removed nearly all early spurious planets (P13 follow-up, [`docs/estimator-experiments.md`](docs/estimator-experiments.md)).
-- **Estimating $s$, $l$ and the white sd.** They are estimated by type-II maximum a posteriori with a weak log-normal hyperprior on *prequential* residuals: each of the last 8 paths' residuals against the map as it was just before that path was fitted. A new path is fitted under scalars estimated from earlier paths only, so its own signature cannot be absorbed as noise.
-- **Exact whitening in linear time.** The rounding floor and the process form one linear-Gaussian state-space model per path and axis. A Kalman filter therefore whitens residuals and Jacobian columns exactly in $O(\text{rows})$, with gains that do not depend on the data.
-- **Calibration with maps held fixed** (P13, observed on 2 synthetic worlds and 1 live capture, 32 paths). The true maps give chi-square per row 0.82-0.84 and lag-1 autocorrelation about -0.07. Maps missing 4 planets, scored on rows farther than $\rho_0$ from a missing planet (nearer rows are left to births by design), give chi-square per row 0.89-0.98 and lag-1 -0.01, 0.26 and 0.04.
-- **Expected unseen count $N_u$.** It is $N - K$ when the planet count $N$ is given (`--planets`). Otherwise it is the mean of $N - K$ under a discrete Gaussian prior on $N$ (centre 24, sd 4, conditioned on $N \ge K$). That prior is a choice, not calibrated.
+- **Effect of the $\rho_0$ cutoff.** Adding it raised recall after 8 paths, summed over the 14 dev worlds, from 62 to 103 and removed nearly all early spurious planets (P13 follow-up in [`docs/estimator-experiments.md`](docs/estimator-experiments.md)).
+- **Estimating $s$, $l$ and the white sd** (the excess-noise row of the table). They maximize the probability of the residuals given these scalars, times a weak log-normal prior on the scalars (a type-II maximum a posteriori estimate). The residuals are *prequential*: each of the last 8 paths' residuals against the map as it was just before that path was fitted. A new path is fitted under scalars estimated from earlier paths only, so its own signature cannot be absorbed as noise.
+- **Exact whitening in linear time.** The rounding floor and the process form one linear-Gaussian state-space model (a linear recursion along the path) per path and axis. A Kalman filter therefore whitens residuals and Jacobian columns exactly in $O(\text{rows})$, with gains that do not depend on the data.
+- **Calibration with maps held fixed** (P13, observed on 2 synthetic worlds and 1 live capture, 32 paths). The true maps give $\chi^2$/row 0.82-0.84 and lag-1 autocorrelation about -0.07. Maps missing 4 planets, scored on rows farther than $\rho_0$ from a missing planet (nearer rows are left to births by design), give $\chi^2$/row 0.89-0.98 and lag-1 -0.01, 0.26 and 0.04.
+- **Expected unseen count $N_u$.** It is $N - K$ when the planet count $N$ is given (`--planets`). Otherwise it is the mean of $N - K$ under a prior on $N$: a Gaussian on the integers with centre 24 (the NewtonWars default count) and sd 4, conditioned on $N \ge K$. That prior is a choice, not calibrated.
 
 </details>
 
 #### 4. Model selection: how many planets
 
-A map with $K$ planets is scored by its Laplace-approximated evidence ([`src/estimator/fit.rs`](src/estimator/fit.rs)):
+A map with $K$ planets is scored by its evidence $Z_K$: the probability of the rows under $K$ planets, averaged over all planet parameters under their prior. The Laplace approximation computes it from the best fit $\hat\theta$ and the curvature there ([`src/estimator/fit.rs`](src/estimator/fit.rs)):
 
 ```math
 \log Z_K \approx \underbrace{-\tfrac12 \chi^2(\hat\theta)}_{\text{fit}} \;\underbrace{-\;\tfrac12 \log\det\!\big(I + S^{1/2} J^\top J\, S^{1/2}\big)}_{\text{Occam factor}} \;\underbrace{-\;K \ln 20}_{\text{prior odds}}.
 ```
-- $J$ is the whitened Jacobian at the fit.
-- $S$ is a Gaussian prior as wide as a uniform one over the battlefield and radii 20-40.
+- $\chi^2(\hat\theta)$ is the whitened sum of squared residuals at the best fit, and $J$ the whitened Jacobian there.
+- $S$ is the covariance of a Gaussian prior on the parameters, as wide as a uniform prior over the battlefield and radii 20-40; $I$ is the identity.
 - The Occam factor makes a planet pay for the prior volume it gives up: the more tightly the data pin a planet down, the more it costs.
-- The $1/20$ prior odds per planet are a heuristic. A Poisson(24) count prior made weakly constrained planets free and grew five planets in a corner of a flat test world (P13).
+- The $1/20$ prior odds per planet are a heuristic. A Poisson(24) prior on the count instead made weakly constrained planets free and grew five planets in a corner of a test world without planets.
 
-Within one comparison the noise is frozen, computed once from the maintained map. Every compared map then has the same noise log-determinant, so evidence differences need only $\chi^2$ and the Occam factor. The evidence ranks maps; it is not a calibrated probability.
+The noise scalars are computed once from the estimator's current map and held fixed while maps are compared. Every compared map then has the same noise log-determinant, so evidence differences need only $\chi^2$ and the Occam factor. The evidence ranks maps; it is not a calibrated probability.
 
 #### 5. Search and solver
 
-Planets are born only from trajectory evidence ([`src/estimator/search.rs`](src/estimator/search.rs)). One birth works like this:
+A planet is born only from path data ([`src/estimator/search.rs`](src/estimator/search.rs)). One birth works like this:
 
 1. **Seed.** Place a candidate where the unexplained mean acceleration of the rows is most significant. The residual points at the missing mass, and $|a| = m/d^2$ gives its distance for a few trial radii.
 2. **Fit alone.** Fit the candidate against what the current planets leave unexplained.
@@ -213,9 +217,9 @@ Planets are born only from trajectory evidence ([`src/estimator/search.rs`](src/
 4. **Adopt on evidence.** Keep the best one if the evidence rises.
 5. **Death trial.** Drop a weak planet, refit, and compare.
 
-Surface contacts enter the fits as gated constraints but never create a planet. An observed tick inside a planet disk is penalized.
+A shot that ends on a planet's surface adds a constraint that the surface is there, but only if it agrees with a fitted planet; it never creates a planet. An observed tick inside a planet disk is penalized.
 
-Maps obey the generator's geometry (NewtonWars `initPlanets`). Every centre lies at least its radius inside the battlefield; the fit's coordinates enforce that. No two planets overlap, because the generator redraws a planet until it touches no other. The fit penalizes any overlap from touching on and never steps to an overlap of 5 units or more. Seeds, candidates and adopted maps that overlap that much are rejected; the 5 units allow for estimation error.
+Maps obey the geometry of the NewtonWars map generator (`initPlanets`). Every centre lies at least its radius inside the battlefield; the fit's coordinates enforce that. No two planets overlap, because the generator redraws a planet until it touches no other. The fit penalizes any overlap from touching on and never steps to an overlap of 5 units or more. Seeds, candidates and adopted maps that overlap that much are rejected; the 5 units allow for estimation error.
 
 **Scheduling.** The search is resumable. For each new path:
 
@@ -234,21 +238,21 @@ sequenceDiagram
     E->>T: publish map with covariance
 ```
 
-- Evaluation counts, not wall time, bound the work, so a replay is deterministic unless a ceiling cuts.
-- Fits use thinned rows: at most 1000, two per 14-unit cell.
+- One *evaluation* computes the residuals for one trial map. Evaluation counts, not wall time, bound the work, so a replay is deterministic unless a 250 ms ceiling cuts a slice.
+- The search fits *thinned* rows: at most 1000, two per 14-unit cell. The *full-row refit* (also called the *polish*) refits the published map on all rows and also gives the parameter covariance, the belief's uncertainty.
 
-**Solver.** Every fit is Levenberg-Marquardt in logistic coordinates: a port of Moré's MINPACK trust region ([`src/estimator/lm.rs`](src/estimator/lm.rs)). Its QR factor is built from per-path-group Householder triangles in parallel and pivoted only on the stacked triangles. That is the pivoted QR of the full Jacobian ($J = Q_1R_1 \Rightarrow JP = Q_1R_1P$) without forming the full Jacobian or the normal equations.
+**Solver.** Every fit is Levenberg-Marquardt, the standard method for nonlinear least squares, in logistic coordinates that keep each centre and radius in its allowed range. It is a port of Moré's MINPACK trust region ([`src/estimator/lm.rs`](src/estimator/lm.rs)). Each step needs a pivoted QR factorization $JP = QR$ of the whitened Jacobian ($P$ a column permutation, $Q$ orthogonal, $R$ upper triangular). The solver reduces each group of paths to a small triangle in parallel (Householder QR); stacked, these give $J = Q_1R_1$, and only $R_1$ is then pivoted and factored. Since $JP = Q_1R_1P$, that is the pivoted QR of the full Jacobian without ever forming it or the normal equations $J^\top J$.
 
 #### 6. Aiming on an imperfect map
 
-**Residual correction.** While the map is incomplete, the model-error process is not just noise. Given a path's residuals, a Kalman filter plus Rauch-Tung-Striebel smoother gives the exact posterior mean of the unexplained field along that path ([`src/estimator/residual.rs`](src/estimator/residual.rs)). Targeting adds that correction to the planet field near observed paths. Spreading it off the paths (Matérn-3/2 decay at the process length on a 15-unit raster, zero near planets) is a heuristic, not a 2-D posterior. When the process sd is below $2\times10^{-4}$, as on a complete map, the correction is neither built nor applied.
+**Residual correction.** While the map is incomplete, the model-error process of section 3 is not just noise. Given a path's residuals, a Kalman filter (forward) plus a Rauch-Tung-Striebel smoother (backward) gives the exact posterior mean of the unexplained field along that path ([`src/estimator/residual.rs`](src/estimator/residual.rs)). Targeting adds that correction to the planet field near observed paths. Spreading it off the paths (Matérn-3/2 decay at the correlation length $\ell$ on a 15-unit grid, zero near planets) is a heuristic, not a 2-D posterior. When the largest process sd, $100s/\max(\rho_0, 20)$, is below $2\times10^{-4}$ (about one unit of drift over 100 ticks), as on a complete map, the correction is neither built nor applied.
 
-**Shot search** ([`src/strategy.rs`](src/strategy.rs)). The bot simulates every legal integer velocity up to the available energy and the server limit, at angles in 8-12° steps refined to 1°. It checks planet and player collisions at substeps, for up to 180 ticks. Predicted hits rank by
+**Shot search** ([`src/strategy.rs`](src/strategy.rs)). The bot simulates every integer launch speed that its energy and the server's speed limit allow, at angles in 8-12° steps refined to 1°. It checks planet and player collisions at substeps, for up to 180 ticks. Predicted hits rank by
 
 ```math
 \text{score} = \text{flight ticks} + 5 \times \text{predicted miss distance},
 ```
-then by lower velocity.
+then by lower speed, which costs less energy.
 
 **Why short flights win.** Map error grows along the path. On capture 55, the bot's shots replayed on the true map hit in:
 
@@ -259,19 +263,19 @@ then by lower velocity.
 | 60-100 | 3 of 20 |
 | 100 or more | 1 of 32 |
 
-**Doomed targets** ([`src/in_flight.rs`](src/in_flight.rs)). Every shot in flight, from every player, is simulated on the current map to predict who dies and when. A predicted hit is skipped if its victim is predicted to die before our shot lands with probability at least 0.15 (kill chances by flight time: 0.75 under 60 ticks, 0.45, 0.3, 0.15 beyond; heuristic, overconfident on long flights). If our shot lands first, it still counts.
+**Doomed targets** ([`src/in_flight.rs`](src/in_flight.rs)). Every shot in flight, from every player, is simulated on the current map to predict who dies and when. A predicted hit is skipped if its victim is predicted to die before our shot lands with probability at least 0.15 (kill chance of each predicted hit by its flight time: 0.75 under 60 ticks, 0.45 under 80, 0.3 under 100, 0.15 beyond; heuristic, overconfident on long flights). If our shot lands first, it still counts.
 
-**Waiting.** Without a predicted hit the bot waits until it has 15 energy rather than spend small shots that almost never hit. Before each decision it waits for the map to be quiet for 300 ms, at most 500 ms, and otherwise aims with the latest published belief.
+**Waiting.** Without a predicted hit the bot waits until it has 15 energy rather than spend small shots that almost never hit. Before each decision it waits until the estimator has finished its queued work and published nothing new for 300 ms, but at most 500 ms; then it aims with the latest published belief.
 
 #### 7. Map changes and round ends
 
 The server does not announce a new map unless it runs with `sendplanets 1`. At a new map it moves every player in one step. The bot treats these as a map boundary ([`src/map_change.rs`](src/map_change.rs)):
 
-- an uninterrupted run of position events that moves every known player (at least two);
-- a lone player's move that is not a self-kill;
-- any later `Planets` message.
+- an uninterrupted run of player-position messages that moves every known player (at least two);
+- a lone player's move, unless a shot just ended at its old position (a self-kill);
+- any later `Planets` message (the true planets, sent only with `sendplanets 1`).
 
-At a boundary it resets its map, shot history and capture.
+At a boundary it resets its map and shot history and starts a new capture.
 
 During the end card no shot finishes. So once at least 3 shots have begun and none of anyone's shots has finished for 1.5 s, the bot stops sending shot commands.
 
