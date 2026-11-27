@@ -50,8 +50,11 @@ use std::time::{Duration, Instant};
 use window::PathData;
 use work::{Stats, cores};
 
-/// Default cap on the number of planets in a map.
-pub const DEFAULT_MAX_PLANETS: usize = 24;
+/// Default cap on the number of planets in a map when the count is not known: the top of the
+/// count prior's plausible range (24 + 2 sd). Raised from 24 once overlapping planets were
+/// excluded (P21): with them excluded, caps 24, 32 and 64 gave the same maps on 24-planet replays,
+/// and 32 finds 26-planet worlds without `--planets` (`docs/estimator-experiments.md`).
+pub const DEFAULT_MAX_PLANETS: usize = 32;
 /// Default evaluations of one search slice.
 pub const DEFAULT_SLICE_EVALUATIONS: u64 = 300;
 /// Default wall-clock ceiling of one search slice.
