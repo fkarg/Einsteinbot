@@ -39,7 +39,10 @@ pub struct MapBelief {
     /// of every planet in `map` (a model mismatch, or planets this slice does not model). With an
     /// empty map this is all of them.
     pub unmatched_contacts: usize,
-    /// Coordinate RMSE of `map` against the regular samples of every path fitted.
+    /// Coordinate RMSE of `map` against the regular samples of every path fitted. The live
+    /// estimator no longer computes it (P18: it re-simulated every path on each publication and
+    /// is misleading under chaotic divergence); `None` is unavailable. Offline tools compute it
+    /// with `estimator::position_rmse`.
     pub model_position_rmse: Option<f64>,
     /// Set when the planet-count search stopped at its cap or time budget rather than by running
     /// out of proposals.

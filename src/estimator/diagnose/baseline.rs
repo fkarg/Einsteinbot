@@ -58,6 +58,7 @@ fn diagnose_baseline() {
                         crate::estimator::noise::ModelError::PRIOR,
                         &[],
                         &case.shots,
+                        Some(24),
                     );
                     let theta = from_scratch(&case.shots, &noise, 32, cores(), &never)
                         .expect("not cancelled");

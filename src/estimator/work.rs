@@ -47,7 +47,7 @@ pub enum Part {
     Deaths,
     /// Full-row refit and covariance of the published map (phase).
     Polish,
-    /// Diagnostics of a published belief (position RMSE, contact bookkeeping; phase).
+    /// Diagnostics of a published belief (contact bookkeeping; phase).
     Diagnostics,
     /// The residual correction of a published belief (`residual.rs`; phase).
     ResidualCorrection,

@@ -1,16 +1,27 @@
 //! Background map fitting; socket workers only enqueue observations and read beliefs.
-use crate::estimator::{Estimator, UpdateReport};
-use crate::protocol::ServerEvent;
+use crate::estimator::{Estimator, Settings, UpdateReport};
+use crate::game_stats::{MapRecord, RECENT_MAPS, Settled};
+use crate::protocol::{Planet, ServerEvent};
 use crate::strategy::MapBelief;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-pub(crate) struct WorkItem {
-    epoch: u64,
-    watermark: u64,
-    event: ServerEvent,
+pub(crate) enum WorkItem {
+    Event {
+        epoch: u64,
+        watermark: u64,
+        event: ServerEvent,
+        arrived: Instant,
+    },
+    /// Settle the current and the retired estimators for up to `per_map` each, send each result
+    /// to `reply` as it is ready, then stop the worker.
+    Settle {
+        per_map: Duration,
+        reply: mpsc::Sender<Settled>,
+    },
 }
 
 /// Whether an event is an observed path (the unit of map lag the inspector reports).
@@ -31,6 +42,35 @@ struct Published {
     /// Queued or in-progress paths (`ShotFin`) that `belief` has not seen yet.
     pending_paths: usize,
     fit_cancel: Arc<AtomicBool>,
+    /// The recent map epochs, the current one last (for the stop-time statistics).
+    maps: VecDeque<MapRecord>,
+}
+
+impl Published {
+    /// The record of the current epoch.
+    fn current(&mut self) -> &mut MapRecord {
+        if self.maps.back().is_none_or(|m| m.epoch != self.epoch) {
+            self.maps.push_back(MapRecord {
+                epoch: self.epoch,
+                ..MapRecord::default()
+            });
+            if self.maps.len() > RECENT_MAPS {
+                self.maps.pop_front();
+            }
+        }
+        self.maps.back_mut().expect("just ensured")
+    }
+
+    /// Publish `belief` of the current epoch with its update report and estimator summary.
+    fn publish(&mut self, belief: MapBelief, estimator: &Estimator) {
+        let report = estimator.last_report().cloned();
+        let record = self.current();
+        record.belief = Some(belief.clone());
+        record.report = report.clone();
+        record.summary = Some(estimator.summary());
+        self.belief = Some(belief);
+        self.report = report;
+    }
 }
 
 #[derive(Clone)]
@@ -48,8 +88,31 @@ pub(crate) struct MapProgress {
     pub pending_paths: usize,
 }
 
+/// Run `estimator`'s pending work (and any path ingested by a cancelled update) for up to
+/// `per_map`, each slice cut at the time left.
+fn settle(estimator: &mut Estimator, epoch: u64, per_map: Duration) -> Settled {
+    let started = Instant::now();
+    let deadline = started + per_map;
+    let never = AtomicBool::new(false);
+    let ceiling = estimator.settings.slice_ceiling;
+    estimator.observe_batch(&[], &never);
+    while estimator.search_pending() && Instant::now() < deadline {
+        let left = deadline.saturating_duration_since(Instant::now());
+        estimator.settings.slice_ceiling = Some(ceiling.map_or(left, |c| c.min(left)));
+        estimator.step(&never);
+    }
+    estimator.settings.slice_ceiling = ceiling;
+    Settled {
+        epoch,
+        belief: estimator.belief().cloned(),
+        summary: estimator.summary(),
+        observations: estimator.observations(),
+        settle_ms: started.elapsed().as_secs_f64() * 1e3,
+    }
+}
+
 impl LiveMap {
-    pub(crate) fn spawn(enabled: bool) -> (Self, Option<JoinHandle<()>>) {
+    pub(crate) fn spawn(enabled: bool, settings: Settings) -> (Self, Option<JoinHandle<()>>) {
         if !enabled {
             let (sender, _) = mpsc::channel();
             return (
@@ -60,12 +123,14 @@ impl LiveMap {
                 None,
             );
         }
-        let (feed, worker) =
-            Self::spawn_with(|estimator, event, cancelled| estimator.observe(event, cancelled));
+        let (feed, worker) = Self::spawn_with(settings, |estimator, event, cancelled| {
+            estimator.observe(event, cancelled)
+        });
         (feed, Some(worker))
     }
 
     pub(crate) fn spawn_with(
+        settings: Settings,
         mut fit: impl FnMut(&mut Estimator, &ServerEvent, &AtomicBool) -> Option<MapBelief>
         + Send
         + 'static,
@@ -75,8 +140,21 @@ impl LiveMap {
         let worker_state = Arc::clone(&published);
         let worker = thread::spawn(move || {
             // Without the background audit (`Settings::audit_enabled`, off since P13).
-            let mut estimator = Estimator::default();
+            let mut estimator = Estimator::new(settings.clone());
             let mut estimator_epoch = 0;
+            // Estimators of the previous epochs, newest last, kept for the stop-time settle.
+            let mut retired: VecDeque<(u64, Estimator)> = VecDeque::new();
+            let new_epoch = |estimator: &mut Estimator,
+                             estimator_epoch: &mut u64,
+                             retired: &mut VecDeque<(u64, Estimator)>,
+                             epoch| {
+                let old = std::mem::replace(estimator, Estimator::new(settings.clone()));
+                retired.push_back((*estimator_epoch, old));
+                if retired.len() >= RECENT_MAPS {
+                    retired.pop_front();
+                }
+                *estimator_epoch = epoch;
+            };
             loop {
                 // With search work left, events still go first; the work runs while none waits.
                 let item = if estimator.search_pending() {
@@ -88,15 +166,18 @@ impl LiveMap {
                                 (state.epoch, Arc::clone(&state.fit_cancel))
                             };
                             if estimator_epoch != epoch {
-                                estimator = Estimator::default();
-                                estimator_epoch = epoch;
+                                new_epoch(
+                                    &mut estimator,
+                                    &mut estimator_epoch,
+                                    &mut retired,
+                                    epoch,
+                                );
                                 continue;
                             }
                             let belief = estimator.step(&cancelled);
                             let mut state = worker_state.lock().unwrap();
                             if let (true, Some(belief)) = (state.epoch == epoch, belief) {
-                                state.belief = Some(belief);
-                                state.report = estimator.last_report().cloned();
+                                state.publish(belief, &estimator);
                             }
                             continue;
                         }
@@ -114,11 +195,27 @@ impl LiveMap {
                 } else {
                     break;
                 };
-                let WorkItem {
-                    epoch,
-                    watermark,
-                    event,
-                } = item;
+                let (epoch, watermark, event, arrived) = match item {
+                    WorkItem::Event {
+                        epoch,
+                        watermark,
+                        event,
+                        arrived,
+                    } => (epoch, watermark, event, arrived),
+                    WorkItem::Settle { per_map, reply } => {
+                        // Newest map first, maps without paths left out; a dropped receiver
+                        // only ends the reporting.
+                        let maps = std::iter::once((estimator_epoch, &mut estimator))
+                            .chain(retired.iter_mut().rev().map(|(e, est)| (*e, est)))
+                            .filter(|(_, estimator)| estimator.summary().paths > 0);
+                        for (epoch, estimator) in maps {
+                            if reply.send(settle(estimator, epoch, per_map)).is_err() {
+                                break;
+                            }
+                        }
+                        break;
+                    }
+                };
                 let cancelled = {
                     let state = worker_state.lock().unwrap();
                     if state.epoch != epoch {
@@ -129,8 +226,7 @@ impl LiveMap {
                 if estimator_epoch != epoch {
                     // The canonical connection sends a complete player snapshot
                     // after reset; old queued leave events may have been discarded.
-                    estimator = Estimator::default();
-                    estimator_epoch = epoch;
+                    new_epoch(&mut estimator, &mut estimator_epoch, &mut retired, epoch);
                 }
                 let belief = fit(&mut estimator, &event, &cancelled);
                 let mut state = worker_state.lock().unwrap();
@@ -139,8 +235,13 @@ impl LiveMap {
                     state.pending_paths -= usize::from(is_path(&event));
                     state.processed = watermark;
                     if let Some(belief) = belief {
-                        state.belief = Some(belief);
-                        state.report = estimator.last_report().cloned();
+                        state.publish(belief, &estimator);
+                        if is_path(&event) {
+                            state
+                                .current()
+                                .lag
+                                .add(arrived.elapsed().as_secs_f64() * 1e3);
+                        }
                     }
                 }
             }
@@ -148,6 +249,7 @@ impl LiveMap {
         (Self { published, sender }, worker)
     }
 
+    /// A new map epoch.
     pub(crate) fn reset(&self) {
         let mut state = self.published.lock().unwrap();
         state.fit_cancel.store(true, Ordering::SeqCst);
@@ -159,6 +261,17 @@ impl LiveMap {
         state.report = None;
         state.pending = 0;
         state.pending_paths = 0;
+        state.current();
+    }
+
+    /// The disclosed planets of the current map epoch (statistics only, never estimator input).
+    pub(crate) fn set_truth(&self, planets: Vec<Planet>) {
+        self.published.lock().unwrap().current().truth = Some(planets);
+    }
+
+    /// The capture recording the current map epoch.
+    pub(crate) fn set_capture(&self, capture: i64) {
+        self.published.lock().unwrap().current().capture = Some(capture);
     }
 
     pub(crate) fn observe(&self, event: &ServerEvent) -> Result<u64, mpsc::SendError<WorkItem>> {
@@ -169,10 +282,11 @@ impl LiveMap {
         state.pending_paths += usize::from(is_path(event));
         state.submitted += 1;
         let (epoch, watermark) = (state.epoch, state.submitted);
-        match self.sender.send(WorkItem {
+        match self.sender.send(WorkItem::Event {
             epoch,
             watermark,
             event: event.clone(),
+            arrived: Instant::now(),
         }) {
             Ok(()) => Ok(watermark),
             Err(error) => {
@@ -184,6 +298,23 @@ impl LiveMap {
                 Err(error)
             }
         }
+    }
+
+    /// The records of the recent map epochs as they are now, the current one with its queue.
+    pub(crate) fn maps(&self) -> Vec<MapRecord> {
+        let mut state = self.published.lock().unwrap();
+        let pending_paths = state.pending_paths;
+        state.current().pending_paths = pending_paths;
+        state.maps.iter().cloned().collect()
+    }
+
+    /// Ask the worker to settle each recent map for up to `per_map` after the work queued now,
+    /// then stop. The results arrive on the returned channel, newest map first; it closes when
+    /// the worker is done (at once without a worker).
+    pub(crate) fn settle(&self, per_map: Duration) -> mpsc::Receiver<Settled> {
+        let (reply, results) = mpsc::channel();
+        let _ = self.sender.send(WorkItem::Settle { per_map, reply });
+        results
     }
 
     /// Read readiness and its corresponding belief under one lock.
@@ -229,7 +360,7 @@ mod tests {
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let mut fits = 0;
-        let (feed, worker) = LiveMap::spawn_with(move |_, _, _| {
+        let (feed, worker) = LiveMap::spawn_with(Settings::default(), move |_, _, _| {
             fits += 1;
             if fits == 2 {
                 started_tx.send(()).unwrap();
@@ -262,7 +393,7 @@ mod tests {
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let mut fits = 0;
-        let (feed, worker) = LiveMap::spawn_with(move |_, _, _| {
+        let (feed, worker) = LiveMap::spawn_with(Settings::default(), move |_, _, _| {
             fits += 1;
             if fits == 1 {
                 started_tx.send(()).unwrap();
@@ -299,7 +430,7 @@ mod tests {
     fn reset_cancels_active_fit_and_does_not_leave_pending_evidence() {
         let (started_tx, started_rx) = mpsc::channel();
         let (cancelled_tx, cancelled_rx) = mpsc::channel();
-        let (feed, worker) = LiveMap::spawn_with(move |_, _, cancelled| {
+        let (feed, worker) = LiveMap::spawn_with(Settings::default(), move |_, _, cancelled| {
             started_tx.send(()).unwrap();
             while !cancelled.load(Ordering::SeqCst) {
                 thread::yield_now();
@@ -324,18 +455,19 @@ mod tests {
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
-        let (feed, worker) = LiveMap::spawn_with(move |estimator, event, cancelled| {
-            if matches!(event, ServerEvent::PlayerLeave { player_id: 99 }) {
-                started_tx.send(()).unwrap();
-                release_rx.recv().unwrap();
-                return None;
-            }
-            let result = estimator.observe(event, cancelled);
-            if matches!(event, ServerEvent::ShotFin { .. }) {
-                done_tx.send(()).unwrap();
-            }
-            result
-        });
+        let (feed, worker) =
+            LiveMap::spawn_with(Settings::default(), move |estimator, event, cancelled| {
+                if matches!(event, ServerEvent::PlayerLeave { player_id: 99 }) {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    return None;
+                }
+                let result = estimator.observe(event, cancelled);
+                if matches!(event, ServerEvent::ShotFin { .. }) {
+                    done_tx.send(()).unwrap();
+                }
+                result
+            });
         feed.observe(&ServerEvent::PlayerPosition {
             player_id: 1,
             x: 10.0,
@@ -394,13 +526,14 @@ mod tests {
     fn pending_paths_count_queued_shots_and_the_report_travels_with_its_belief() {
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        let (feed, worker) = LiveMap::spawn_with(move |estimator, event, cancelled| {
-            if matches!(event, ServerEvent::PlayerLeave { .. }) {
-                started_tx.send(()).unwrap();
-                release_rx.recv().unwrap();
-            }
-            estimator.observe(event, cancelled)
-        });
+        let (feed, worker) =
+            LiveMap::spawn_with(Settings::default(), move |estimator, event, cancelled| {
+                if matches!(event, ServerEvent::PlayerLeave { .. }) {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                }
+                estimator.observe(event, cancelled)
+            });
         let shot = ServerEvent::ShotFin {
             player_id: 1,
             angle: 0.0,
@@ -451,13 +584,56 @@ mod tests {
     }
 
     #[test]
+    fn settle_reports_the_recent_maps_newest_first_and_stops_the_worker() {
+        let (feed, worker) = LiveMap::spawn(true, Settings::default());
+        let worker = worker.unwrap();
+        let shot = |y: f32| ServerEvent::ShotFin {
+            player_id: 1,
+            angle: 0.0,
+            velocity: 2.0,
+            points: (95..=100)
+                .map(|x| crate::protocol::Point { x: x as f32, y })
+                .collect(),
+        };
+        feed.observe(&shot(100.0)).unwrap();
+        // A reset discards the old epoch's queue: let the first path be fitted.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while feed.progress().processed < 1 {
+            assert!(std::time::Instant::now() < deadline);
+            thread::yield_now();
+        }
+        let truth = vec![Planet {
+            x: 500.0,
+            y: 500.0,
+            radius: 30.0,
+            mass: 2700.0,
+        }];
+        feed.reset();
+        feed.set_truth(truth.clone());
+        feed.set_capture(7);
+        feed.observe(&shot(200.0)).unwrap();
+        feed.observe(&shot(300.0)).unwrap();
+        let settled: Vec<Settled> = feed.settle(Duration::from_millis(200)).iter().collect();
+        let epochs: Vec<(u64, usize)> =
+            settled.iter().map(|s| (s.epoch, s.summary.paths)).collect();
+        assert_eq!(epochs, vec![(1, 2), (0, 1)]);
+        let maps = feed.maps();
+        assert_eq!(maps.iter().map(|m| m.epoch).collect::<Vec<_>>(), vec![0, 1]);
+        assert_eq!(maps[1].truth.as_ref(), Some(&truth));
+        assert_eq!((maps[0].capture, maps[1].capture), (None, Some(7)));
+        assert_eq!(maps[1].lag.paths, 2);
+        assert!(maps[1].summary.is_some());
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn shutdown_discards_queued_fits_and_joins_active_fit() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let calls = Arc::new(AtomicUsize::new(0));
         let worker_calls = Arc::clone(&calls);
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        let (feed, worker) = LiveMap::spawn_with(move |_, _, _| {
+        let (feed, worker) = LiveMap::spawn_with(Settings::default(), move |_, _, _| {
             worker_calls.fetch_add(1, Ordering::SeqCst);
             started_tx.send(()).unwrap();
             release_rx.recv().unwrap();
@@ -488,7 +664,7 @@ mod tests {
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let (processed_tx, processed_rx) = mpsc::channel();
-        let (feed, worker) = LiveMap::spawn_with(move |_, _, _| {
+        let (feed, worker) = LiveMap::spawn_with(Settings::default(), move |_, _, _| {
             started_tx.send(()).unwrap();
             release_rx.recv().unwrap();
             Some(MapBelief::new(PlanetMap { planets: vec![] }, None))

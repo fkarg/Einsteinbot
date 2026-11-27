@@ -26,6 +26,8 @@ use super::Shot;
 use super::window::PathData;
 use crate::protocol::Planet;
 use crate::simulation::WorldParameters;
+use std::cell::RefCell;
+use std::collections::HashMap;
 
 /// Prior (and starting) model-error scalars; `diagnose_matern_model_error` estimated
 /// `scale` 0.056-0.10 and `length` 500-900, and the Campbell prior for 4 unseen planets gives
@@ -71,10 +73,117 @@ impl ModelError {
     }
 }
 
+/// The raster of candidate centres with the battlefield inside `CLEARANCE` free and every
+/// observed tick's `CLEARANCE` disk stamped out. Ticks only accumulate within a map epoch, so the
+/// estimator extends one mask path by path (`cover`) instead of stamping every tick of every path
+/// for each operation; stamping is order-independent, so the result is the same.
+#[derive(Clone, Debug)]
+pub(super) struct TickMask {
+    nx: usize,
+    ny: usize,
+    /// Raster nodes before the first battlefield node, per axis.
+    offset: [usize; 2],
+    free: Vec<bool>,
+    /// Paths whose ticks are stamped (the first ones of the slice given to `cover`).
+    paths: usize,
+}
+
+impl TickMask {
+    pub fn new(world: WorldParameters) -> Self {
+        // Battlefield nodes `ORIGIN + SPACING * k` below `extent - CLEARANCE`, plus the margin.
+        let count =
+            |extent: f64| ((extent - CLEARANCE - ORIGIN) / SPACING).ceil().max(0.0) as usize;
+        let inside = [
+            count(world.battlefield_width),
+            count(world.battlefield_height),
+        ];
+        let pad = ((world.margin + ORIGIN) / SPACING).ceil() as usize;
+        let (nx, ny) = (inside[0] + 2 * pad, inside[1] + 2 * pad);
+        let mut free = vec![false; nx * ny];
+        for j in pad..pad + inside[1] {
+            free[j * nx + pad..j * nx + pad + inside[0]].fill(true);
+        }
+        Self {
+            nx,
+            ny,
+            offset: [pad, pad],
+            free,
+            paths: 0,
+        }
+    }
+
+    /// The mask of the ticks of the paths `shots`.
+    pub fn of(shots: &[Shot]) -> Self {
+        let mut mask = Self::new(WorldParameters::default());
+        mask.cover(shots);
+        mask
+    }
+
+    /// Make the mask that of the paths `shots`: stamp the ticks of the paths not stamped yet (a
+    /// mask that already covers more paths than `shots` is rebuilt).
+    pub fn cover(&mut self, shots: &[Shot]) {
+        if self.paths > shots.len() {
+            *self = Self::of(shots);
+            return;
+        }
+        for path in shots[self.paths..]
+            .iter()
+            .filter_map(|shot| shot.path.as_ref())
+        {
+            for t in &path.ticks {
+                stamp(
+                    &mut self.free,
+                    self.nx,
+                    self.ny,
+                    self.offset,
+                    t[0],
+                    t[1],
+                    CLEARANCE,
+                );
+            }
+        }
+        self.paths = shots.len();
+    }
+
+    #[cfg(test)]
+    fn stamp_ticks<'a>(&mut self, ticks: impl Iterator<Item = &'a [f64; 2]>) {
+        for t in ticks {
+            stamp(
+                &mut self.free,
+                self.nx,
+                self.ny,
+                self.offset,
+                t[0],
+                t[1],
+                CLEARANCE,
+            );
+        }
+    }
+}
+
+/// Mark the raster nodes within `radius` of `(x, y)` as not free.
+fn stamp(free: &mut [bool], nx: usize, ny: usize, offset: [usize; 2], x: f64, y: f64, radius: f64) {
+    let position = |k: usize, axis: usize| ORIGIN + SPACING * (k as f64 - offset[axis] as f64);
+    let range = |c: f64, axis: usize, n: usize| {
+        let node = |v: f64| (v - ORIGIN) / SPACING + offset[axis] as f64;
+        let lo = node(c - radius).ceil().clamp(0.0, n as f64) as usize;
+        let hi = (node(c + radius).floor() + 1.0).clamp(0.0, n as f64) as usize;
+        (lo, hi)
+    };
+    let ((i0, i1), (j0, j1)) = (range(x, 0, nx), range(y, 1, ny));
+    for j in j0..j1 {
+        for i in i0..i1 {
+            if (position(i, 0) - x).hypot(position(j, 1) - y) <= radius {
+                free[j * nx + i] = false;
+            }
+        }
+    }
+}
+
 /// The admissible region `U` of unseen planet centres on a `SPACING` raster: inside the
 /// battlefield by `CLEARANCE`, farther than `radius + CLEARANCE` from every found planet and
-/// farther than `CLEARANCE` from every observed tick. Distances come from an exact Euclidean
-/// distance transform with nearest-node tracking.
+/// farther than `CLEARANCE` from every observed tick (`TickMask`). Distances come from an exact
+/// Euclidean distance transform with nearest-node tracking.
 #[derive(Clone, Debug)]
 pub(super) struct Admissible {
     nx: usize,
@@ -88,47 +197,11 @@ pub(super) struct Admissible {
 }
 
 impl Admissible {
-    pub fn new<'a>(
-        planets: &[Planet],
-        ticks: impl Iterator<Item = &'a [f64; 2]>,
-        world: WorldParameters,
-    ) -> Self {
-        // Battlefield nodes `ORIGIN + SPACING * k` below `extent - CLEARANCE`, plus the margin.
-        let count =
-            |extent: f64| ((extent - CLEARANCE - ORIGIN) / SPACING).ceil().max(0.0) as usize;
-        let inside = [
-            count(world.battlefield_width),
-            count(world.battlefield_height),
-        ];
-        let pad = ((world.margin + ORIGIN) / SPACING).ceil() as usize;
-        let offset = [pad, pad];
-        let (nx, ny) = (inside[0] + 2 * pad, inside[1] + 2 * pad);
-        let mut free = vec![false; nx * ny];
-        for j in pad..pad + inside[1] {
-            free[j * nx + pad..j * nx + pad + inside[0]].fill(true);
-        }
-        let position = |k: usize, axis: usize| ORIGIN + SPACING * (k as f64 - offset[axis] as f64);
-        let mut stamp = |x: f64, y: f64, radius: f64| {
-            let range = |c: f64, axis: usize, n: usize| {
-                let node = |v: f64| (v - ORIGIN) / SPACING + offset[axis] as f64;
-                let lo = node(c - radius).ceil().clamp(0.0, n as f64) as usize;
-                let hi = (node(c + radius).floor() + 1.0).clamp(0.0, n as f64) as usize;
-                (lo, hi)
-            };
-            let ((i0, i1), (j0, j1)) = (range(x, 0, nx), range(y, 1, ny));
-            for j in j0..j1 {
-                for i in i0..i1 {
-                    if (position(i, 0) - x).hypot(position(j, 1) - y) <= radius {
-                        free[j * nx + i] = false;
-                    }
-                }
-            }
-        };
+    pub fn new(planets: &[Planet], mask: &TickMask) -> Self {
+        let (nx, ny, offset) = (mask.nx, mask.ny, mask.offset);
+        let mut free = mask.free.clone();
         for p in planets {
-            stamp(p.x, p.y, p.radius + CLEARANCE);
-        }
-        for t in ticks {
-            stamp(t[0], t[1], CLEARANCE);
+            stamp(&mut free, nx, ny, offset, p.x, p.y, p.radius + CLEARANCE);
         }
         Self {
             nx,
@@ -241,11 +314,45 @@ fn nearest_free(free: &[bool], nx: usize, ny: usize) -> Vec<u32> {
     nearest
 }
 
-/// Expected number of planets (the local generator's default; the server does not send it).
-const PLANETS_EXPECTED: f64 = 24.0;
-/// The maintained map's unseen planets are `PLANETS_EXPECTED - K`, never fewer than this (a
-/// complete map keeps a small allowance for planets beyond the default count).
+/// Prior on the total planet count when it is not known: a discrete Gaussian on
+/// `1..=PRIOR_PLANETS_MAX` (the server's range) centred on the server default 24 with sd 4. A
+/// broad choice, not calibrated: live servers may be configured with any count.
+const PRIOR_PLANETS_CENTRE: f64 = 24.0;
+const PRIOR_PLANETS_SD: f64 = 4.0;
+const PRIOR_PLANETS_MAX: usize = 64;
+/// Unseen planets are never fewer than this (a complete map keeps a small allowance for wrong or
+/// missing planets).
 const MIN_UNSEEN: f64 = 0.5;
+
+/// The most probable total planet count with `found` planets: the known `total`, else the mode
+/// of the prior given `N >= found`.
+pub(super) fn likely_total(found: usize, total: Option<usize>) -> usize {
+    total.unwrap_or_else(|| {
+        found
+            .max(PRIOR_PLANETS_CENTRE as usize)
+            .min(PRIOR_PLANETS_MAX)
+    })
+}
+
+/// Expected number of unseen planets of a map with `found` planets. With a known `total`,
+/// `total - found`; otherwise the prior mean of `N - found` given `N >= found` (the map's planets
+/// are a lower bound on the count). Never below `MIN_UNSEEN`.
+pub(super) fn unseen(found: usize, total: Option<usize>) -> f64 {
+    let expected = match total {
+        Some(total) => total.saturating_sub(found) as f64,
+        None => {
+            let (mut weight, mut excess) = (0.0, 0.0);
+            for n in found.max(1)..=PRIOR_PLANETS_MAX {
+                let w =
+                    (-0.5 * ((n as f64 - PRIOR_PLANETS_CENTRE) / PRIOR_PLANETS_SD).powi(2)).exp();
+                weight += w;
+                excess += w * (n - found) as f64;
+            }
+            if weight > 0.0 { excess / weight } else { 0.0 }
+        }
+    };
+    expected.max(MIN_UNSEEN)
+}
 
 /// The noise of one operation: the model-error scalars, the admissible region they are shaped by,
 /// and the near cutoff `rho0`.
@@ -259,24 +366,39 @@ const MIN_UNSEEN: f64 = 0.5;
 pub(super) struct Noise {
     pub model: ModelError,
     pub admissible: Admissible,
+    /// The known total planet count (`None`: the prior).
+    pub total: Option<usize>,
     pub rho0: f64,
 }
 
 impl Noise {
-    /// The noise for the map `planets` (the maintained one) and the paths `shots`.
-    pub fn new(model: ModelError, planets: &[Planet], shots: &[Shot]) -> Self {
-        let ticks = shots
-            .iter()
-            .filter_map(|shot| shot.path.as_ref())
-            .flat_map(|path| path.ticks.iter());
-        let admissible = Admissible::new(planets, ticks, WorldParameters::default());
-        let unseen = (PLANETS_EXPECTED - planets.len() as f64).max(MIN_UNSEEN);
+    /// The noise for the map `planets` (the maintained one) and the paths `shots`; `total` is the
+    /// known planet count (`None`: the prior).
+    pub fn new(
+        model: ModelError,
+        planets: &[Planet],
+        shots: &[Shot],
+        total: Option<usize>,
+    ) -> Self {
+        Self::with_mask(model, planets, &TickMask::of(shots), total)
+    }
+
+    /// As `new`, with the paths' ticks already stamped in `mask`.
+    pub fn with_mask(
+        model: ModelError,
+        planets: &[Planet],
+        mask: &TickMask,
+        total: Option<usize>,
+    ) -> Self {
+        let admissible = Admissible::new(planets, mask);
+        let unseen = unseen(planets.len(), total);
         // An empty `U` (every candidate centre excluded) gives `rho0 = 0` and an infinite distance
         // everywhere: no process (sd 0, infinite length), so the gains carry the floor alone.
         let rho0 = (admissible.area / (std::f64::consts::PI * unseen)).sqrt();
         Self {
             model,
             admissible,
+            total,
             rho0,
         }
     }
@@ -485,6 +607,10 @@ pub(super) struct Series {
     /// that planet's parameter error (or by a wrong planet), not by the field of unseen planets,
     /// so the estimate treats them as missing.
     missing: Vec<bool>,
+    /// `log_likelihood` by the bits of the model it was evaluated at. A series stays in the
+    /// window for several paths, and every estimate's pattern search starts from the prior with
+    /// the same steps, so it revisits many models; the cached value is the same computation.
+    cache: RefCell<HashMap<[u64; 3], f64>>,
 }
 
 impl Series {
@@ -512,15 +638,23 @@ impl Series {
             distance: (0..rows).map(|r| noise.distance(path.center(r))).collect(),
             raw,
             missing,
+            cache: Default::default(),
         }
     }
 
     /// Gaussian log-likelihood of the residuals under `model` (without the `2 pi` constant).
     pub fn log_likelihood(&self, model: ModelError) -> f64 {
-        self.innovations(model)
+        let key = [model.scale, model.length, model.white].map(f64::to_bits);
+        if let Some(value) = self.cache.borrow().get(&key) {
+            return *value;
+        }
+        let value = self
+            .innovations(model)
             .into_iter()
             .map(|(v, log_det)| -0.5 * (v.iter().map(|x| x * x).sum::<f64>() + log_det))
-            .sum()
+            .sum();
+        self.cache.borrow_mut().insert(key, value);
+        value
     }
 
     /// Normalized innovations of each axis under `model` (0 at missing rows) and their
@@ -547,6 +681,7 @@ impl Series {
         for (m, extra) in self.missing.iter_mut().zip(missing) {
             *m |= *extra;
         }
+        self.cache.borrow_mut().clear();
     }
 
     #[cfg(test)]
@@ -812,6 +947,7 @@ mod tests {
             distance: vec![f64::INFINITY; n],
             raw,
             missing: vec![false; n],
+            cache: Default::default(),
         };
         let injected = 2e-3;
         let noisy = series([0, 1].map(|_| (0..n).map(|_| injected * gaussian()).collect()));
@@ -921,6 +1057,50 @@ mod tests {
         }
     }
 
+    /// Extending the tick mask path by path gives the mask of all the paths at once, and a mask
+    /// that covers more paths than asked for is rebuilt.
+    /// A known count fixes the unseen planets; the prior gives the mean excess over the planets
+    /// found, about 24 for an empty map and a few planets once 24 are found.
+    #[test]
+    fn unseen_planets_from_a_known_count_or_the_prior() {
+        assert_eq!(unseen(20, Some(26)), 6.0);
+        assert_eq!(unseen(26, Some(26)), MIN_UNSEEN);
+        assert!((unseen(0, None) - 24.0).abs() < 0.01);
+        let complete = unseen(24, None);
+        assert!((2.5..3.5).contains(&complete), "{complete}");
+        assert!(unseen(30, None) < complete);
+        assert_eq!((likely_total(10, None), likely_total(27, None)), (24, 27));
+        assert_eq!(likely_total(10, Some(22)), 22);
+    }
+
+    #[test]
+    fn tick_mask_extended_path_by_path_equals_the_mask_of_all_paths() {
+        let shot = |dx: f32, dy: f32| {
+            let points: Vec<Point> = (0..60)
+                .map(|i| Point {
+                    x: 300.0 + dx * i as f32,
+                    y: 400.0 + dy * i as f32 + 0.01 * (i * i) as f32,
+                })
+                .collect();
+            let obs = crate::simulation::ShotObservation {
+                player_id: 1,
+                angle_degrees: 0.0,
+                velocity: 3.0,
+                points,
+            };
+            Shot::new(obs, None, WorldParameters::default())
+        };
+        let shots = [shot(4.0, 1.0), shot(-2.0, 5.0), shot(6.0, -3.0)];
+        let mut mask = TickMask::new(WorldParameters::default());
+        for n in 1..=shots.len() {
+            mask.cover(&shots[..n]);
+        }
+        assert_eq!(mask.free, TickMask::of(&shots).free);
+        assert!(mask.free != TickMask::of(&shots[..1]).free);
+        mask.cover(&shots[..1]);
+        assert_eq!(mask.free, TickMask::of(&shots[..1]).free);
+    }
+
     /// The distance transform gives the brute-force distance to the nearest admissible node.
     #[test]
     fn admissible_distance_matches_brute_force() {
@@ -938,7 +1118,9 @@ mod tests {
             })
             .chain((0..300).map(|i| [-200.0 + 3.0 * i as f64, 1300.0 - 2.5 * i as f64]))
             .collect();
-        let admissible = Admissible::new(&planets, ticks.iter(), world);
+        let mut mask = TickMask::new(world);
+        mask.stamp_ticks(ticks.iter());
+        let admissible = Admissible::new(&planets, &mask);
         let mut nodes = Vec::new();
         let mut y = ORIGIN;
         while y < world.battlefield_height - CLEARANCE {
@@ -986,12 +1168,11 @@ mod tests {
         assert!(worst < 1e-9, "worst difference {worst}");
         let empty = Admissible::new(
             &[],
-            std::iter::empty(),
-            WorldParameters {
+            &TickMask::new(WorldParameters {
                 battlefield_width: 30.0,
                 battlefield_height: 30.0,
                 ..world
-            },
+            }),
         );
         assert_eq!(empty.distance([10.0, 10.0]), f64::INFINITY);
     }

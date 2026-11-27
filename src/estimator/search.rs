@@ -752,7 +752,7 @@ mod tests {
     #[test]
     fn a_new_path_keeps_pending_work() {
         let (cancelled, stats) = (AtomicBool::new(false), Stats::default());
-        let noise = Noise::new(ModelError::PRIOR, &[], &shots());
+        let noise = Noise::new(ModelError::PRIOR, &[], &shots(), Some(24));
         let shots = shots();
         let mut search = Search::new();
         search.add_path(&shots[0], &slice(&cancelled, &stats, &noise, 20));
@@ -771,7 +771,7 @@ mod tests {
     #[test]
     fn slices_grow_the_map_until_idle() {
         let (cancelled, stats) = (AtomicBool::new(false), Stats::default());
-        let noise = Noise::new(ModelError::PRIOR, &[], &shots());
+        let noise = Noise::new(ModelError::PRIOR, &[], &shots(), Some(24));
         let mut search = Search::new();
         for shot in &shots() {
             search.add_path(shot, &slice(&cancelled, &stats, &noise, 300));
