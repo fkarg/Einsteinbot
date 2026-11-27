@@ -1,93 +1,244 @@
 # Einsteinbot
 
-Rust client and eventual information-gathering bot for [NewtonWars](https://github.com/Draradech/NewtonWars).
+Einsteinbot is a Rust bot for [NewtonWars](https://github.com/Draradech/NewtonWars), a multiplayer game where you shoot through a field of planets whose gravity bends every shot. The server never tells the bot where the planets are. The bot works out the planets from the paths of every shot it sees, keeps one best-estimate map, and aims by simulating candidate shots on that map.
 
-The server does not tell the bot where the planets are. The bot learns them from the paths of every shot it sees, keeps one best-estimate map, and aims by simulating candidate shots on that map. The two sections below explain why that works and how well it works today; the sections after them are operation and tooling.
+![Map inspector: the bot's gravity belief on live capture 57, every path of the map coloured by outcome, one glyph per true planet](docs/images/viewer-57-latest.jpg)
+*The bot's gravity belief after 363 paths on one live map (capture 57, four bots): 19 of 24 planets found, 5 missing, 1 extra estimate. Paths are coloured by outcome (red: hit a player, orange: hit a planet, white: left the field).*
+
+## Quick start
+
+You need a Rust toolchain and the NewtonWars source checked out next to this repository at `../NewtonWars`.
+
+1. **Start a local server** (macOS build; skip this if one is already running on port 3490):
+
+   ```sh
+   cd ../NewtonWars
+   ./build-mac.sh
+   ./nw fullscreen 0 sendplanets 1 throttle 16
+   ```
+
+   `sendplanets 1` makes the server disclose the true planets. The bot never uses them to fit its map; the tools use them to score it.
+
+2. **Run the bot** with targeting on:
+
+   ```sh
+   cargo run -- --target                 # one bot
+   cargo run -- --clients 3 --target     # three bots on one local server
+   ```
+
+   Without `--target` the bot only watches. It records everything it sees to `einsteinbot.sqlite3`. Press Ctrl+C once to stop and print a per-map report.
+
+3. **Inspect what it believed**:
+
+   ```sh
+   cargo run --bin map_viewer -- --db-path einsteinbot.sqlite3
+   ```
+
+   Then open <http://127.0.0.1:8765>.
+
+All options, the recording format and the offline tools are in [docs/usage.md](docs/usage.md). The inspector is documented in [docs/map-inspector.md](docs/map-inspector.md).
 
 ## How it works
 
-### The model the bot fits
+### Overview
 
-The bot assumes the NewtonWars physics (from the source, not disclosed by the server): planet $j$ with centre $c_j$ and radius $r_j$ has mass $m_j = r_j^3/10$, and a shot at $p$ accelerates with
+```mermaid
+flowchart LR
+    A[Observed shot paths] --> B[Curvature rows<br/>one per tick]
+    B --> C[Likelihood<br/>rounding + interpolation<br/>+ unseen planets]
+    C --> D[Planet search<br/>births and deaths<br/>ranked by evidence]
+    D --> E[Belief: one map<br/>plus residual correction]
+    E --> F[Simulate candidate shots]
+    F --> G[Fire the best predicted hit]
+    G -. new path .-> A
+```
+
+1. **Watch the shots.** Every shot by every player is reported as a list of positions, one per game tick. A shot bends towards each planet, so its path carries information about the planets near it.
+2. **Read the curvature.** At each tick the bot measures how much the path bends. That bend is the gravity at that point, up to known factors. Each tick becomes one equation, called a *row*. The bot never has to simulate a whole shot to fit the map.
+3. **Say how wrong a row can be.** A row can be off for three reasons: the positions are rounded, the bot interpolates between ticks, and planets it has not found yet still pull on the shot. The bot models all three. The last one matters most: without it, the search invents planets to soak up the pull of distant ones.
+4. **Search for planets.** The bot adds a planet where the rows point to missing mass, removes one that no longer earns its place, and keeps a change only if it makes the data more probable after paying a penalty for every extra planet. The search runs in small resumable slices in the background, so a new map is published right after every new path.
+5. **Aim on the belief.** The bot simulates every legal shot on its current map, plus a correction for pull it can see along observed paths but has not explained yet. It prefers short flights, because map errors grow along a path.
+6. **Notice new maps.** The server starts a new map without saying so. The bot recognises the moment when every player is moved at once, and starts a fresh map.
+
+### The math, step by step
+
+#### 1. The physics model
+
+The bot assumes the NewtonWars physics, taken from the source; the server does not disclose it. Planet $j$ has centre $c_j$, radius $r_j$ and mass $m_j = r_j^3/10$. A shot at position $p$ accelerates with
 
 $$a(p) = \sum_j m_j \frac{c_j - p}{\lVert c_j - p\rVert^3}.$$
 
-The engine integrates with velocity Verlet at $n = 25$ substeps of length $h$ per tick, and the protocol reports positions once per tick as f32. So the unknowns are $\theta = (x_j, y_j, r_j)_{j=1..K}$ and the number $K$; everything else is fixed.
+The engine integrates with velocity Verlet at $n = 25$ substeps of length $h$ per tick. The protocol reports positions once per tick, as f32. So the unknowns are the planet parameters $\theta = (x_j, y_j, r_j)_{j=1..K}$ and their number $K$; everything else is fixed.
 
-### Observation model: compare fields, not simulated paths
+#### 2. Rows: compare fields, not simulated paths
 
-Velocity Verlet has the exact identity $x_{m+1} - 2x_m + x_{m-1} = h^2 a(x_m)$ for substep positions. Summing it over a tick gives, for the observed tick positions $X_s$,
+Velocity Verlet has the exact identity $x_{m+1} - 2x_m + x_{m-1} = h^2 a(x_m)$ for substep positions. Summing it over one tick gives, for the observed tick positions $X_s$,
 
 $$X_{s+1} - 2X_s + X_{s-1} = h^2 \sum_{|i|<n} (n - |i|)\, a\big(x_{ns+i}\big).$$
 
-Each such equation is one *row*: the observed second difference against the same triangle-weighted kernel applied to the model field at points on the observed path (a cubic Hermite interpolant between ticks). The fit never simulates a shot. A row depends only on the field within one tick of the path, so an error early in a path does not propagate to later rows, the residual is a smooth function of $\theta$ with analytic Jacobians, and every observed tick is evidence ([`src/estimator/window.rs`](src/estimator/window.rs)).
+In words: the observed second difference of a tick equals a triangle-weighted sum of the field at the substep positions around it.
 
-### Likelihood: what the residuals really are
+```text
+weight n-|i|               25
+                          /\
+                        /    \
+                      /        \
+                    /            \
+                1 /                \ 1
+   substeps   x(ns-24) .... x(ns) .... x(ns+24)
+   ticks    X(s-1)          X(s)           X(s+1)
+```
 
-A row residual has three parts, and the bot models each one ([`src/estimator/noise.rs`](src/estimator/noise.rs)):
+Each such equation is one row. The bot evaluates the right side on the model field at points on the observed path, using a cubic Hermite interpolant between ticks ([`src/estimator/window.rs`](src/estimator/window.rs)). This has three useful consequences:
 
-1. **Rounding.** Positions are f32, so each tick carries uniform rounding error with sd $\mathrm{ulp}/\sqrt{12}$. Neighbouring rows share ticks, so this floor is correlated (banded), and it is whitened exactly.
-2. **Interpolation.** The Hermite interpolant is inexact near planets; a per-row variance is estimated from the observed ticks alone. Without it the *true* map has a chi-square $10^3$ to $10^5$ times its degrees of freedom on a near pass.
-3. **Planets not found yet.** This is the part that decides whether the search works. The field of the unseen planets is smooth along a path, so its residuals are strongly correlated: with the earlier relative-noise likelihood, a map missing 4 planets had whitened residuals with lag-1 autocorrelation 0.85-0.97 along each path and chi-square per row of $10^3$ to $2.7\times10^4$ (brainstorm, observed). Treating such rows as independent makes $N$ rows count as $N$ votes, while an AR(1) series with correlation $\rho$ carries only about $N(1-\rho)/(1+\rho)$ independent ones (about $N/19$ at $\rho = 0.9$). The overconfident likelihood then pays for almost any extra planet that soaks up the correlated residual: spurious planets.
+- A row depends only on the field within one tick of the path, so an error early in a path does not spread to later rows.
+- The residual is a smooth function of $\theta$ with analytic Jacobians.
+- Every observed tick is evidence.
 
-The bot therefore models the unseen field explicitly. If unseen planets form a Poisson field of point masses whose centres lie in the admissible region $U$ (inside the battlefield, clear of the found planets and of every observed tick), Campbell's theorem gives a field variance at distance $d$ from $U$ that falls as $1/d^2$, and by scaling its correlation length grows $\propto d$. So along each path, per axis, the model error is a Matérn-3/2 process in arc length with
+#### 3. Likelihood: what the residuals really are
 
-$$\mathrm{sd}(c) = s\,\frac{100}{\max(d_U(c), \rho_0)}, \qquad \ell(c) = l\,\frac{\max(d_U(c), \rho_0)}{100}, \qquad \rho_0 = \sqrt{\frac{|U|}{\pi N_u}},$$
+A row residual has three parts, and the bot models each one ([`src/estimator/noise.rs`](src/estimator/noise.rs)).
 
-where $d_U(c)$ is the distance of row centre $c$ to $U$ and $N_u$ the expected number of unseen planets. $\rho_0$ is the radius that holds one unseen planet on average: the process stands only for the *distant* population, and a single planet nearer than that is a localized signature that a planet birth must explain, not background. Adding this cutoff raised dev recall at 8 paths from 62 to 103 (summed over 14 worlds) and removed nearly all early spurious planets (P13 follow-up, `docs/estimator-experiments.md`). A white excess term (near zero on exact f32 captures) covers position noise beyond rounding.
+| Part | Cause | Model |
+|---|---|---|
+| Rounding | positions are f32 | uniform error per tick, sd $\mathrm{ulp}/\sqrt{12}$; neighbouring rows share ticks, so the floor is banded-correlated and whitened exactly |
+| Interpolation | the Hermite interpolant is inexact near planets | per-row variance estimated from the observed ticks alone |
+| Unseen planets | planets not found yet | a correlated Gaussian process along each path (below) |
+| White excess | position noise beyond rounding | one white sd, near zero on exact f32 captures |
 
-The scalars $s, l$ (and the white sd) are estimated by type-II maximum a posteriori with a weak log-normal hyperprior on *prequential* residuals: each of the last 8 paths' residuals against the map as it was just before that path was fitted. A new path is fitted under scalars estimated from the earlier paths only, so its own signature cannot be absorbed as noise. Rounding floor and process form one linear-Gaussian state-space model per path and axis, so a Kalman filter whitens residuals and Jacobian columns exactly in $O(\text{rows})$, with gains that do not depend on the data. Calibration check with the maps held fixed (P13, observed on 2 synthetic worlds and 1 live capture, 32 paths): the true maps give chi-square per row 0.82-0.84 and lag-1 about -0.07. For maps missing 4 planets, scored on the rows farther than $\rho_0$ from a missing planet (the nearer rows are left to births by design), chi-square per row is 0.89-0.98 and lag-1 is -0.01, 0.26 and 0.04.
+Without the interpolation term, the *true* map has a chi-square $10^3$ to $10^5$ times its degrees of freedom on a near pass.
 
-$N_u$ is $N - K$ when the planet count $N$ is given (`--planets`), otherwise the mean of $N - K$ under a discrete Gaussian prior on $N$ (centre 24, sd 4, conditioned on $N \ge K$). That prior is a choice, not calibrated.
+**Why unseen planets need a correlated model.** The field of unseen planets is smooth along a path, so its residuals are strongly correlated. With the earlier relative-noise likelihood, a map missing 4 planets had whitened residuals with lag-1 autocorrelation 0.85-0.97 along each path, and chi-square per row of $10^3$ to $2.7\times10^4$ (brainstorm, observed). Treating such rows as independent counts $N$ rows as $N$ votes. An AR(1) series with correlation $\rho$ carries only about
 
-### Model selection: how many planets
+$$N_\text{eff} \approx N\,\frac{1-\rho}{1+\rho}$$
 
-A map with $K$ planets is scored by its Laplace-approximated evidence
+independent ones, about $N/19$ at $\rho = 0.9$. The overconfident likelihood then pays for almost any extra planet that soaks up the correlated residual, and the search grows spurious planets.
 
-$$\log Z_K \approx -\tfrac12 \chi^2(\hat\theta) \;-\; \tfrac12 \log\det\!\big(I + S^{1/2} J^\top J\, S^{1/2}\big) \;-\; K \ln 20,$$
+**The unseen-planet process.** Suppose the unseen planets form a Poisson field of point masses, with centres in the admissible region $U$: inside the battlefield, clear of the found planets and of every observed tick. Campbell's theorem then gives a field variance at distance $d$ from $U$ that falls as $1/d^2$, and by scaling the correlation length grows in proportion to $d$. So along each path, per axis, the model error is a Matérn-3/2 process in arc length with
 
-where $J$ is the whitened Jacobian at the fit and $S$ a Gaussian prior as wide as a uniform one over the battlefield and radii 20-40 ([`src/estimator/fit.rs`](src/estimator/fit.rs)). The middle term is the Occam factor: a planet whose parameters the data pin down tightly pays for the prior volume it gives up. The $1/20$ prior odds per planet are a heuristic; a Poisson(24) count prior made weakly constrained planets free and grew five planets in a corner of a flat test world (P13). Within one comparison the noise is frozen (computed once from the maintained map), so every compared map has the same log-determinant and evidence differences need only $\chi^2$ and Occam. The evidence is used to rank maps, not as a calibrated probability.
+$$\mathrm{sd}(c) = s\,\frac{100}{\max(d_U(c), \rho_0)}, \qquad \ell(c) = l\,\frac{\max(d_U(c), \rho_0)}{100}, \qquad \rho_0 = \sqrt{\frac{|U|}{\pi N_u}}.$$
 
-### Search and solver
+```text
+ sd(c)                               ℓ(c)
+   |________                           |                 /
+   |        \    falls as 1/d          |   grows as d  /
+   |         `.                        |             /
+   |           `-.__                   |___________/
+   |                ``--..___          |
+   +--------+-----------------> d_U    +--------+-----------> d_U
+           ρ0                                  ρ0
+```
 
-Planets are born only from trajectory evidence ([`src/estimator/search.rs`](src/estimator/search.rs)). A birth seeds a planet where the unexplained mean acceleration of the rows is most significant (the residual points at the missing mass and $|a| = m/d^2$ gives its distance for a few radii), fits it alone against what the current planets leave over, refits the best seeds jointly with all planets, and adopts one if the evidence rises; a death trial (drop a weak planet, refit, compare) follows each birth. Surface contacts enter the fits as gated constraints but never create a planet, and an observed tick inside a planet disk is penalized.
+Here $d_U(c)$ is the distance of row centre $c$ to $U$, and $N_u$ is the expected number of unseen planets. $\rho_0$ is the radius that holds one unseen planet on average. The process stands only for the *distant* population: a single planet nearer than $\rho_0$ leaves a local signature that a planet birth must explain, not background noise.
 
-The search is resumable: each new path gets a local refit of the planets within 100 units and the map is published at once; then up to 6 slices of 300 evaluations (each with a 250 ms wall ceiling) continue the pending births in the background, and a full-row refit of the published map supplies the covariance. Evaluation counts, not wall time, bound the work, so a replay is deterministic unless a ceiling cuts. Fits use thinned rows (at most 1000, two per 14-unit cell). Every fit is Levenberg-Marquardt in logistic coordinates: a port of Moré's MINPACK trust region whose QR factor is built from per-path-group Householder triangles in parallel and pivoted only on the stacked triangles. That is the pivoted QR of the full Jacobian ($J = Q_1R_1 \Rightarrow JP = Q_1R_1P$) without forming it or the normal equations ([`src/estimator/lm.rs`](src/estimator/lm.rs)).
+<details>
+<summary>How the noise scalars are estimated, and the calibration evidence</summary>
 
-### Aiming on an imperfect map
+- **Effect of the $\rho_0$ cutoff.** Adding it raised dev recall at 8 paths from 62 to 103 (summed over 14 worlds) and removed nearly all early spurious planets (P13 follow-up, [`docs/estimator-experiments.md`](docs/estimator-experiments.md)).
+- **Estimating $s$, $l$ and the white sd.** They are estimated by type-II maximum a posteriori with a weak log-normal hyperprior on *prequential* residuals: each of the last 8 paths' residuals against the map as it was just before that path was fitted. A new path is fitted under scalars estimated from earlier paths only, so its own signature cannot be absorbed as noise.
+- **Exact whitening in linear time.** The rounding floor and the process form one linear-Gaussian state-space model per path and axis. A Kalman filter therefore whitens residuals and Jacobian columns exactly in $O(\text{rows})$, with gains that do not depend on the data.
+- **Calibration with maps held fixed** (P13, observed on 2 synthetic worlds and 1 live capture, 32 paths). The true maps give chi-square per row 0.82-0.84 and lag-1 autocorrelation about -0.07. Maps missing 4 planets, scored on rows farther than $\rho_0$ from a missing planet (nearer rows are left to births by design), give chi-square per row 0.89-0.98 and lag-1 -0.01, 0.26 and 0.04.
+- **Expected unseen count $N_u$.** It is $N - K$ when the planet count $N$ is given (`--planets`). Otherwise it is the mean of $N - K$ under a discrete Gaussian prior on $N$ (centre 24, sd 4, conditioned on $N \ge K$). That prior is a choice, not calibrated.
 
-While the map is incomplete the model-error process is not just noise: given a path's residuals, a Kalman filter plus Rauch-Tung-Striebel smoother gives the exact posterior mean of the unexplained field along that path ([`src/estimator/residual.rs`](src/estimator/residual.rs)). Targeting adds that correction to the planet field near observed paths. Spreading it off the paths (Matérn-3/2 decay at the process length on a 15-unit raster, zero near planets) is a heuristic, not a 2-D posterior. When the process sd is below $2\times10^{-4}$, as on a complete map, the correction is neither built nor applied.
+</details>
 
-Targeting ([`src/strategy.rs`](src/strategy.rs)) simulates candidate shots on this belief: every legal integer velocity up to the available energy and server limit, angles in 8-12° steps refined to 1°, with planet and player collisions checked at substeps, for up to 180 ticks. Predicted hits rank by
+#### 4. Model selection: how many planets
+
+A map with $K$ planets is scored by its Laplace-approximated evidence ([`src/estimator/fit.rs`](src/estimator/fit.rs)):
+
+$$\log Z_K \approx \underbrace{-\tfrac12 \chi^2(\hat\theta)}_{\text{fit}} \;\underbrace{-\;\tfrac12 \log\det\!\big(I + S^{1/2} J^\top J\, S^{1/2}\big)}_{\text{Occam factor}} \;\underbrace{-\;K \ln 20}_{\text{prior odds}}.$$
+
+- $J$ is the whitened Jacobian at the fit.
+- $S$ is a Gaussian prior as wide as a uniform one over the battlefield and radii 20-40.
+- The Occam factor makes a planet pay for the prior volume it gives up: the more tightly the data pin a planet down, the more it costs.
+- The $1/20$ prior odds per planet are a heuristic. A Poisson(24) count prior made weakly constrained planets free and grew five planets in a corner of a flat test world (P13).
+
+Within one comparison the noise is frozen, computed once from the maintained map. Every compared map then has the same noise log-determinant, so evidence differences need only $\chi^2$ and the Occam factor. The evidence ranks maps; it is not a calibrated probability.
+
+#### 5. Search and solver
+
+Planets are born only from trajectory evidence ([`src/estimator/search.rs`](src/estimator/search.rs)). One birth works like this:
+
+1. **Seed.** Place a candidate where the unexplained mean acceleration of the rows is most significant. The residual points at the missing mass, and $|a| = m/d^2$ gives its distance for a few trial radii.
+2. **Fit alone.** Fit the candidate against what the current planets leave unexplained.
+3. **Refit jointly.** Refit the best seeds together with all planets.
+4. **Adopt on evidence.** Keep the best one if the evidence rises.
+5. **Death trial.** Drop a weak planet, refit, and compare.
+
+Surface contacts enter the fits as gated constraints but never create a planet. An observed tick inside a planet disk is penalized.
+
+**Scheduling.** The search is resumable. For each new path:
+
+```mermaid
+sequenceDiagram
+    participant G as Game
+    participant E as Estimator
+    participant T as Targeting
+    G->>E: completed path
+    E->>E: local refit of planets within 100 units
+    E->>T: publish map at once
+    loop up to 6 slices of 300 evaluations, 250 ms ceiling each
+        E->>E: continue pending births and deaths
+    end
+    E->>E: full-row refit of the published map
+    E->>T: publish map with covariance
+```
+
+- Evaluation counts, not wall time, bound the work, so a replay is deterministic unless a ceiling cuts.
+- Fits use thinned rows: at most 1000, two per 14-unit cell.
+
+**Solver.** Every fit is Levenberg-Marquardt in logistic coordinates: a port of Moré's MINPACK trust region ([`src/estimator/lm.rs`](src/estimator/lm.rs)). Its QR factor is built from per-path-group Householder triangles in parallel and pivoted only on the stacked triangles. That is the pivoted QR of the full Jacobian ($J = Q_1R_1 \Rightarrow JP = Q_1R_1P$) without forming the full Jacobian or the normal equations.
+
+#### 6. Aiming on an imperfect map
+
+**Residual correction.** While the map is incomplete, the model-error process is not just noise. Given a path's residuals, a Kalman filter plus Rauch-Tung-Striebel smoother gives the exact posterior mean of the unexplained field along that path ([`src/estimator/residual.rs`](src/estimator/residual.rs)). Targeting adds that correction to the planet field near observed paths. Spreading it off the paths (Matérn-3/2 decay at the process length on a 15-unit raster, zero near planets) is a heuristic, not a 2-D posterior. When the process sd is below $2\times10^{-4}$, as on a complete map, the correction is neither built nor applied.
+
+**Shot search** ([`src/strategy.rs`](src/strategy.rs)). The bot simulates every legal integer velocity up to the available energy and the server limit, at angles in 8-12° steps refined to 1°. It checks planet and player collisions at substeps, for up to 180 ticks. Predicted hits rank by
 
 $$\text{score} = \text{flight ticks} + 5 \times \text{predicted miss distance},$$
 
-then lower velocity. Short flights win because map error grows along the path: on capture 55, the bot's shots, replayed on the true map, hit in 5 of 7 cases with flights under 30 ticks, 9 of 17 at 30-60 ticks, 3 of 20 at 60-100 and 1 of 32 at 100 or more. Without a predicted hit the bot waits until it has 15 energy rather than spend small shots that almost never hit. Before a decision it waits for the map to be quiet for 300 ms, at most 500 ms, and otherwise aims with the latest published belief.
+then by lower velocity.
 
-### Map changes and round ends
+**Why short flights win.** Map error grows along the path. On capture 55, the bot's shots replayed on the true map hit in:
 
-The server does not announce a new map unless it runs with `sendplanets 1`. At a new map it repositions every player in one step, so the bot treats an uninterrupted run of position events that moves every known player (at least two) as a map boundary (plus a lone player's reposition that is not a self-kill, and any later `Planets` message), and resets its map, shot history and capture. During the end card no trajectory finishes, so once at least 3 shots have begun and none of anyone's shots has finished for 1.5 s, the bot stops sending shot commands ([`src/map_change.rs`](src/map_change.rs)).
+| flight time (ticks) | true hits |
+|---|---|
+| under 30 | 5 of 7 |
+| 30-60 | 9 of 17 |
+| 60-100 | 3 of 20 |
+| 100 or more | 1 of 32 |
+
+**Waiting.** Without a predicted hit the bot waits until it has 15 energy rather than spend small shots that almost never hit. Before each decision it waits for the map to be quiet for 300 ms, at most 500 ms, and otherwise aims with the latest published belief.
+
+#### 7. Map changes and round ends
+
+The server does not announce a new map unless it runs with `sendplanets 1`. At a new map it moves every player in one step. The bot treats these as a map boundary ([`src/map_change.rs`](src/map_change.rs)):
+
+- an uninterrupted run of position events that moves every known player (at least two);
+- a lone player's move that is not a self-kill;
+- any later `Planets` message.
+
+At a boundary it resets its map, shot history and capture.
+
+During the end card no shot finishes. So once at least 3 shots have begun and none of anyone's shots has finished for 1.5 s, the bot stops sending shot commands.
+
+More detail on the estimator, targeting and their settings is in [docs/usage.md](docs/usage.md#how-the-estimator-and-targeting-behave-at-run-time).
 
 ## How well it works
 
-Numbers as of 2026-11-27 (main at 58abdf9); each item names the change (P-number) it measured. Each comes from the experiment logs in [`docs/estimator-experiments.md`](docs/estimator-experiments.md) and the landing notes in [`docs/brainstorms/2026-11-13-newtonwars-bot.md`](docs/brainstorms/2026-11-13-newtonwars-bot.md). Unless stated otherwise each cell is **one run**; truth maps are used only for scoring. "Recall" counts true planets with an estimate within 2 units; "spurious" counts estimates with no true planet within 15 units. Captures 54 (second map) and 55 are the same game seen from two connections, so they count as one independent game.
+**Provenance.** Numbers as of 2026-11-27, main at 58abdf9. Each item names the change (P-number) it measured. They come from the experiment logs in [`docs/estimator-experiments.md`](docs/estimator-experiments.md) and the landing notes in [`docs/brainstorms/2026-11-13-newtonwars-bot.md`](docs/brainstorms/2026-11-13-newtonwars-bot.md).
 
-### What it looks like
+**How to read them.**
 
-The map inspector on live capture 57 (four bots, 363 paths on one map; recorded by build fa9ffa1c, before the P15 targeting changes):
+- Unless stated otherwise each cell is **one run**.
+- Truth maps are used only for scoring.
+- *Recall* counts true planets with an estimate within 2 units.
+- *Spurious* counts estimates with no true planet within 15 units.
+- Captures 54 (second map) and 55 are the same game seen from two connections, so they count as one independent game.
 
-![Gravity belief with all paths of the map coloured by outcome (red: hit a player, orange: planet surface, white: left the field) and the planet glyph row (fill: centre error, ring: radius error, dashed: missing, diamond: extra estimate)](docs/images/viewer-57-latest.jpg)
-*Gravity belief, every path of the map coloured by outcome, and one glyph per true planet: 19 found, 5 missing, 1 extra estimate at this point.*
+### Estimator: planets found
 
-![Belief error layer: magnitude of the difference between the estimated and the true gravity field](docs/images/viewer-57-error.jpg)
-*Belief error: where the estimated field differs from the truth, dominated by the missing planets.*
-
-![One decision with its shot review: predicted versus observed path](docs/images/viewer-57-d937.jpg)
-*Decision #937: the bot predicted a hit on player 6 (dashed path, simulated on its map); the observed shot (white) leaves that prediction after 19 samples and ends on a planet surface. Six true planets were still missing at this point (dashed red rings, several near the launch). Showing this delta to reality is what the inspector is for.*
-
-### Estimator
-
-P13 (the likelihood above) against the previous estimator (main 16adc7f, relative noise), deterministic replays, no audit, totals over 14 dev worlds (8 synthetic, 6 live captures) and, once, over 13 held-out worlds (8 synthetic, 5 live). Cells are recall / spurious.
+P13 (the likelihood above) against the previous estimator (main 16adc7f, relative noise). Deterministic replays, no audit. Totals over 14 dev worlds (8 synthetic, 6 live captures) and, once, over 13 held-out worlds (8 synthetic, 5 live). Cells are recall / spurious.
 
 | set | 8 paths | 16 paths | 32 paths | 60 paths | CPU |
 |---|---|---|---|---|---|
@@ -96,176 +247,78 @@ P13 (the likelihood above) against the previous estimator (main 16adc7f, relativ
 | held-out, before | 30 / 65 | 173 / 49 | 246 / 19 | 272 / 7 | 3221 s |
 | held-out, P13 | 97 / 1 | 159 / 0 | 238 / 0 | 283 / 2 | 466 s |
 
-Spurious planets almost disappear and CPU falls 4.6-6.9 times; recall is much higher at 8 paths and equal or higher at 60, but lower at 16-32 paths (see limitations). Two later changes moved the dev totals slightly in one run each: a white excess-noise term (32 paths 276 → 283 recall) and the review fixes (60 paths 321 recall, 6 spurious; CPU 716 s on a shared machine). P12b's parallel QR solver kept the maps (dev recall at 60 paths 300 vs 299 in its own baseline run) and cut CPU 711 → 301 s.
+- Spurious planets almost disappear and CPU falls 4.6-6.9 times.
+- Recall is much higher at 8 paths and equal or higher at 60, but lower at 16-32 paths (see limitations).
+- Later changes, one run each on the dev set: a white excess-noise term moved 32-path recall 276 → 283. The review fixes gave 60-path recall 321 with 6 spurious, CPU 716 s on a shared machine.
+- P12b's parallel QR solver kept the maps (dev recall at 60 paths 300 vs 299 in its own baseline run) and cut CPU 711 → 301 s.
 
-**Real time.** Capture 55, first map, replayed at its recorded rate of a path every 110 ms (about 9 paths/s, 545 paths, 10 threads on a Mac): P13 found all 24 planets within 2 units after 128 paths (14 s) with none spurious, while the previous estimator was still at 18 planets (16 within 2 units) after all 545 paths, because it fell behind. After P18 the publish lag (a path's arrival to the publication of a map that includes it) is median 62-71 ms, p90 134-142 ms and worst 216-317 ms over two runs (before: 99-101 / 183-184 / 462-600 ms), with at most 1-2 paths queued. Capture 55 is one game; the remaining worst lag comes from paths that arrive while a slice or full-row refit runs.
+![Belief error layer: magnitude of the difference between the estimated and the true gravity field](docs/images/viewer-57-error.jpg)
+*Belief error on capture 57: where the estimated field differs from the truth. The missing planets dominate it.*
 
-**Planet count.** On the dev set, fixing $N = 24$ beats the default prior (24 ± 4) around 32 paths: explored-field RMSE 0.0046 vs 0.0202 (geometric means over 14 worlds), and is still somewhat better at 60 paths (1.1e-4 vs 1.7e-4). A fixed count that is too low stops at that count; on 26-planet synthetic worlds only `--planets 26` finds the last two planets under the default cap of 24.
+### Estimator: keeping up in real time
+
+Capture 55, first map, replayed at its recorded rate of one path every 110 ms (about 9 paths/s, 545 paths, 10 threads on a Mac):
+
+| | result |
+|---|---|
+| P13 | all 24 planets within 2 units after 128 paths (14 s), none spurious |
+| previous estimator | 18 planets (16 within 2 units) after all 545 paths, because it fell behind |
+
+Publish lag is the time from a path's arrival to the publication of a map that includes it. Two runs each:
+
+| | median | p90 | worst |
+|---|---|---|---|
+| before P18 | 99-101 ms | 183-184 ms | 462-600 ms |
+| after P18 | 62-71 ms | 134-142 ms | 216-317 ms |
+
+At most 1-2 paths are queued. Capture 55 is one game. The remaining worst lag comes from paths that arrive while a slice or full-row refit runs.
+
+### Estimator: known versus estimated planet count
+
+On the dev set, fixing $N = 24$ beats the default prior (24 ± 4) around 32 paths: explored-field RMSE 0.0046 vs 0.0202 (geometric means over 14 worlds). It is still somewhat better at 60 paths (1.1e-4 vs 1.7e-4). A fixed count that is too low stops at that count: on 26-planet synthetic worlds only `--planets 26` finds the last two planets under the default cap of 24.
 
 ### Targeting
 
-Measured by replaying recorded decisions with the recorded belief, flying the chosen shot on the true map:
+Measured by replaying recorded decisions with the recorded belief and flying the chosen shot on the true map.
 
-- **P15** (rank hits by flight time, wait for energy, 500 ms map wait): true hits 15 → 37 (capture 53), 49 → 91 (54) and 22 → 47 (55); true hits per 100 energy 11-48% higher. That is 2 independent games, and the ranking was picked among about 9 variants on the same captures, so selection bias is possible.
-- **P17** (residual correction): true hits 79 → 84, 143 → 153, 97 → 104, 42 → 47 and 109 → 141 on five recorded maps of captures 53-57 (4 independent games), with the estimator settled at each decision. The gain is almost all in the first half of each map; deduplicated by victim position it is small but in the same direction. Cost: 2-6% estimator time and about 10 ms per decision. The spreading was designed on the same captures.
+| change | what | true hits, before → after | independent games |
+|---|---|---|---|
+| P15 | rank hits by flight time, wait for energy, 500 ms map wait | 15 → 37 (capture 53), 49 → 91 (54), 22 → 47 (55); hits per 100 energy 11-48% higher | 2 |
+| P17 | residual correction | 79 → 84, 143 → 153, 97 → 104, 42 → 47, 109 → 141 on five recorded maps of captures 53-57, estimator settled at each decision | 4 |
 
-Both replays hold the game still while the bot waits, so they overstate waiting. **Live**, one run on a shared local server with different opponents: hits per decision 0.154 after P15 vs 0.114 in capture 55; indicative only.
+Caveats:
 
-**Map changes** (P19, recorded captures with `Planets` hidden): 294 of 294 later map boundaries detected with no false detection; 11 of 11 end cards caught, median 2.4 s after the last finished shot, with 13 false pauses (6.7 s in total) in captures 36-57.
+- P15's ranking was picked among about 9 variants on the same captures, so selection bias is possible.
+- P17's gain is almost all in the first half of each map. Deduplicated by victim position it is small but in the same direction. It costs 2-6% estimator time and about 10 ms per decision. The spreading was designed on the same captures.
+- Both replays hold the game still while the bot waits, so they overstate the value of waiting.
+- **Live**, one run on a shared local server with different opponents: 0.154 hits per decision after P15, against 0.114 in capture 55. Indicative only.
+
+![One decision with its shot review: predicted versus observed path](docs/images/viewer-57-d937.jpg)
+*Decision #937 on capture 57: the bot predicted a hit on player 6 (dashed path, simulated on its map). The observed shot (white) leaves that prediction after 19 samples and ends on a planet surface. Six true planets were still missing at this point (dashed red rings, several near the launch). The inspector exists to show this gap between prediction and reality.*
+
+### Map changes
+
+P19, on recorded captures with `Planets` hidden:
+
+- 294 of 294 later map boundaries detected, with no false detection.
+- 11 of 11 end cards caught, median 2.4 s after the last finished shot.
+- 13 false pauses (6.7 s in total) in captures 36-57.
 
 ### Known limitations
 
-- Recall dips at 16-32 paths, mostly on synthetic worlds the old estimator had already completed: the model-error scale estimate then sits at its bound and absorbs part of the missing planets' signal. At about 9 paths/s this window passes in 2-4 s.
-- The default cap is 24 planets. Raising it let one true planet split into three concentric ones on capture 55; servers with more than 24 planets need `--planets N`.
-- The uncertainty-probe branch never fired in capture 55: covariance is usually `not_computed` at decision time because the full-row refit lags the latest path.
-- The evidence prior (1/20 per planet), the planet-count prior, the interpolation variance and the hyperprior are heuristics. Most cells above are one run, and live worlds vary by several planets between runs of similar configurations.
+- Recall dips at 16-32 paths, mostly on synthetic worlds the old estimator had already completed. The model-error scale estimate then sits at its bound and absorbs part of the missing planets' signal. At about 9 paths/s this window passes in 2-4 s.
+- The default cap is 24 planets. Raising it let one true planet split into three concentric ones on capture 55. Servers with more than 24 planets need `--planets N`.
+- The uncertainty-probe branch never fired in capture 55. Covariance is usually `not_computed` at decision time, because the full-row refit lags the latest path.
+- The evidence prior (1/20 per planet), the planet-count prior, the interpolation variance and the hyperprior are heuristics.
+- Most cells above are one run, and live worlds vary by several planets between runs of similar configurations.
+- Bit-for-bit parity of the bot's simulator with the engine is not established; an audit on two captures matched most shots closely but had individual errors up to 13.46 units ([details](docs/map-inspector.md#simulator-parity-with-the-engine)).
 
-## Development builds
+## Further documentation
 
-The Cargo `dev` profile uses `opt-level = 1` for Einsteinbot and `opt-level = 2` for dependencies. This is a modest optimization intended to make local CPU-heavy fitting less sluggish without applying maximum optimization across the dependency graph; we have not benchmarked it against the previous profile yet. Debug information and incremental compilation keep Cargo's defaults. Cargo notes that higher optimization can improve runtime at the cost of compile time, and recommends measuring levels for the project rather than assuming level 3 wins ([profile reference](https://doc.rust-lang.org/cargo/reference/profiles.html)).
-
-Use the normal dev profile (`cargo run ...`) for local bot sessions, map inspection, and scenario tools. Use `cargo check` for quick type and borrow checking and `cargo test` for behavior checks. `cargo check` skips final code generation, so it is quicker but does not report every code-generation error ([command reference](https://doc.rust-lang.org/cargo/commands/cargo-check.html)). Use `--release` only when comparing optimized runtime or measuring performance.
-
-We have not added a faster linker or reduced debug information. This checkout runs on macOS, and neither build timing nor debugger needs have been measured well enough to justify those tradeoffs. If build latency becomes a problem, first separate clean-build, incremental-build, and link time. Reduced debug info (for example `debug = "line-tables-only"`) is a candidate if debug-info generation dominates, but it removes variable-level debugger detail. A platform-specific linker is worth trying only if linking is a measured bottleneck; don't add Linux-only `mold` settings to this macOS project. Keep `opt-level = 3` for a benchmarked case, not as a blanket dev default.
-
-## Diagnostic client
-
-Each bot session opens one TCP connection. By default, one invocation starts one session; `--clients N` starts a local manager with N sessions. It reads the server's text welcome prompt, enters bot protocol 8, prints parsed game events, and requests energy once per second. By default it is passive; `--dummy` enables small randomized shots when reported energy is at least 2.
-
-```sh
-cargo run -- --name Einstein
-```
-
-```sh
-cargo run -- --dummy
-```
-
-By default the client connects to `127.0.0.1:3490`, chooses a random name from a curated list of well-known scientists (excluding Newton), and records parsed events to `einsteinbot.sqlite3`. To disable recording:
-
-```sh
-cargo run -- --no-record
-```
-
-The database stores one capture per map. Each parsed shared world event is recorded once, and each bot's own events and semantic commands are tagged by bot name. Events get a sequence number (per capture) and a timestamp. Raw TCP bytes are not stored. For a different database file, use `--db-path PATH`.
-
-At each map change the client closes the current capture and opens the next one. All captures of one invocation share `session.id` in their metadata and number their maps in `session.map_index` (0 is the map in progress when the bot connected). A capture that starts at a map change replays on its own: it begins with the known state as events (the game mode, each bot's `own_id`, and the new map's player positions received up to the boundary; `initial_state.events` counts them) and records the bots' latest energies in `initial_state.energies`; the new map's `Planets`, when disclosed, follows. The metadata's `map` object records how the map started (`started_by`: `connect` or `boundary`, with `boundary_source`) and ended (`ended_by`: `boundary` or `disconnect`), its start and end times and its completed paths. `map.duration_ms` is set only for a map observed from one boundary to the next; otherwise it is null and `duration_unavailable_reason` says why (`joined_mid_map`, `disconnected_before_map_end`). A capture with fewer than 3 completed paths (`MIN_COMPLETED_PATHS`, any player, debris included) is deleted when it closes, for example after joining on the end card, where the server simulates nothing. Captures recorded before 2026-11-27 hold a whole connection, possibly several maps; tools still split those at each `Planets` message.
-
-Map changes are detected from the event stream (`src/map_change.rs`), also without `Planets` (servers without `sendplanets 1`): NewtonWars repositions every player in one server step at a new map, so an uninterrupted run of position events that moves every known player (at least two) is a boundary; a lone player's reposition is one unless a shot just ended at its old position (a self-kill); a `Planets` message after the connection's first one is one too. On the 57 recorded captures this found all 294 later `Planets` boundaries without reading `Planets`, with no false detection. Each boundary resets the bots' targeting state and, on the first connection, the live map fit and the capture.
-
-During the end card (board mode) the server stops simulating, so no trajectory finishes; shots still launch and energy still grows. A bot assumes board mode once at least 3 shots began (kill debris excluded) and no shot of any player finished for 1.5 s since the oldest of them, and then sends no commands except energy requests until a shot finishes or the next map starts. On the recorded captures it caught all 11 round ends with a board phase, at most 4.7 s after the last finished shot (median 2.4 s); during play it paused falsely 13 times in captures 36-57 (6.7 s in total), much more in the slow early games of captures 2-21 (71 times, 331 s). Each bot records its board-mode changes as `board_mode` rows in the `diagnostics` table (`active`, `reason`).
-
-Capture metadata includes the Git revision embedded when the binary was built and `source_changes`, which records whether `src`, `Cargo.toml`, `Cargo.lock`, or `build.rs` had tracked or untracked changes at build time. Unrelated files are excluded; either value can be null when Git was unavailable. This identifies the build, not the checkout at execution time.
-
-The `diagnostics` table records each targeting decision with the same per-capture sequence counter as protocol events. Its JSON includes energy, the bot's player and shot history, spatial coverage, the complete map belief and covariance used, whether a fit was pending, search duration, and the selected choice (or null when the policy falls back). To reconstruct ordering, join or union `diagnostics` and `events` by capture ID and sequence. Existing captures have no such rows.
-
-Custom names must be printable ASCII and at most 15 bytes, matching the NewtonWars server limit.
-
-Options can come from a TOML file, environment variables, and command-line arguments. Later sources override earlier ones in this order: config file, environment, command line. `--clients N` starts a local manager with N concurrent loopback connections (maximum 16); multiple clients are rejected for non-loopback hosts because NewtonWars blocks same-IP remote duplicates. The clients use the same targeting policy with 8°, 10°, and 12° angle-step variants. For example:
-
-```toml
-# einsteinbot.toml
-host = "127.0.0.1"
-port = 3490
-name = "Einstein"
-record = true
-db_path = "einsteinbot.sqlite3"
-dummy = false
-targeting = false
-oracle_map_for_policy = false
-clients = 1
-# planets = 24   # known planet count of the server's maps; omit to estimate
-```
-
-```sh
-cargo run -- --config einsteinbot.toml
-```
-
-Set individual values with `EINSTEINBOT_HOST`, `EINSTEINBOT_PORT`, `EINSTEINBOT_NAME`, `EINSTEINBOT_RECORD`, `EINSTEINBOT_DUMMY`, `EINSTEINBOT_TARGETING`, `EINSTEINBOT_ORACLE_MAP`, `EINSTEINBOT_CLIENTS`, `EINSTEINBOT_DB_PATH`, and `EINSTEINBOT_PLANETS`. Set `EINSTEINBOT_CONFIG` to choose a config file through the environment. Recording defaults to on; set `record = false` or `EINSTEINBOT_RECORD=false`, or pass `--no-record` to disable it. Dummy actions default to off; set `dummy = true`, `EINSTEINBOT_DUMMY=true`, or pass `--dummy` to enable them.
-
-**Planet count.** NewtonWars generates `planets` planets per map (server option, 1-64, default 24) and never sends the number. If you know it, pass `--planets N` (`planets = N`, `EINSTEINBOT_PLANETS`): the estimator then uses it as fixed, so `N - K` planets are still unseen with `K` found, and it never fits more than `N`. Without it, the unseen count is the mean excess over `K` of a broad prior on the total (a discrete Gaussian centred on 24 with sd 4 over 1-64, conditioned on at least `K` planets; about 2.9 unseen once 24 are found), and the cap is `DEFAULT_MAX_PLANETS` (24). The prior is a choice, not calibrated. Measured on replays (P18, `docs/estimator-experiments.md`): a wrong fixed count costs planets when it is too low (the cap) and little when it is too high; a server with more than 24 planets needs `--planets`.
-
-**Stopping.** The first Ctrl+C stops every session (no new shots; the connections close) and prints, per recent map (the last three map boundaries detected in this run, each with its capture id when recording), what is in memory at once: the estimator state (planets `K`, paths, search state, the model-error scalars, the unseen count and `rho0`, the expected total), the covariance or why it is unavailable with each planet's centre sd, the residual correction state, the map lag (queued paths and publish lag), the last update's work, and each bot's shots, hits (an own shot ending within 4.1 units of another player) and energy spent (the sum of the shots' velocities). Then each recent map's estimator gets up to 1 s to finish its pending work, and its settled state is printed as soon as it is ready, newest map first, with the post-match planet count (found and expected total) and, when the server disclosed the planets, recall within 2 and 15 units, mean centre and radius error, spurious planets and the gravity-field RMSE in explored and unexplored cells. Then the client exits. A second Ctrl+C exits at once (printing the in-memory part first if it is not out yet); the SQLite capture is then left without its end time. Statistics go to stderr. A game that goes away (the server closes or drops a connection, for example `Broken pipe`) counts as the first Ctrl+C: the run stops with the same report and exits normally; a Ctrl+C after that exits at once.
-
-The dummy chooses an integer velocity between 2 and `min(8, floor(energy))` and an integer angle from -180 through 180, at most one shot per energy response. Every outbound command, including connection setup and energy requests, passes through a client-side token bucket capped at 16 wire bytes per second with at most 512 bytes of burst. The upstream server starts each connection with a 512-byte allowance and replenishes one byte every three game-loop iterations. That is nominally 20 bytes per second at 60 loops per second; its actual limit changes with loop pace. NewtonWars exempts local connections from enforcement, but this client applies its stricter cap locally too.
-
-Targeting is opt-in with `--target` or `targeting = true`. It scans legal integer velocities up to the available energy and the server speed limit, using 8°, 10°, or 12° angle steps and refining promising angles to 1°. The simulator checks planet and player collisions at physics substeps using the latest known player positions. It ranks predicted hits by flight time to impact, shorter first, with the predicted impact offset as a small penalty (5 ticks per unit) and lower velocity as the tie-breaker: map error grows along the path, so short flights hit far more often than central long ones. Replaying the decisions of captures 53-55 against the true maps (truth used for scoring only), this ranking raised true hits per shot from 0.10-0.21 to 0.15-0.28. Player positions are snapshots and can move before impact; a nominal hit is not a calibrated hit probability. Without a predicted hit (and no information shot), the bot waits for energy: it fires its best approach shot only once it has at least 15 energy (`APPROACH_MIN_ENERGY`) and otherwise skips that energy report. Cheap approach shots almost never hit (capture 55: 5 of 58 on the true map), and by about 15 energy the policy nearly always finds a predicted hit. If it sees no opponent, it does not fire. An information bonus is considered only when no predicted hit is available and the average field uncertainty along the path clears a threshold. This bonus uses full fitted parameter covariance to propagate local physical-field variance, but remains an uncertainty-exposure proxy, not a full posterior information-gain calculation. Because missing covariance currently makes this signal unavailable, the policy has no uncertainty-derived information score in those cases; absence of covariance does not mean there is little to learn. Completed trajectories from all players populate a 20-unit spatial coverage grid, reset at each map boundary. The policy discounts probes by their fraction of new cells and adds up to 40 world units of miss-distance penalty to covered non-hit approaches. Predicted hits still take priority. This is a diversity heuristic, not evidence of higher hit probability. `TargetChoice` logs include covariance availability, covered fraction, and whether a known contact is near the predicted route. The settled policy rule is that possible contacts do not veto shots, since impacts can provide useful observations; however, current ranking still deprioritizes paths passing near a recorded contact point, so the implementation does not yet fully match that rule. Missing covariance is reported as unavailable and cannot trigger the uncertainty branch.
-
-Targeting simulates against the physical planet map plus a residual correction (`src/estimator/residual.rs`): along every observed path, the unexplained field (what the published planets do not account for) is estimated as the posterior mean of the estimator's model-error process, and the simulation adds it near those paths, strongest on them and fading with distance at the process's correlation length, never inside a planet. It lets aiming learn from observed paths where the map is still wrong or incomplete. When the model error is negligible (for example a complete map) the correction is neither built nor applied; the belief records why (`residual_correction_unavailable_reason`) and the model scalars needed to rebuild it from a capture (`residual_model`).
-
-The canonical connection feeds player positions and completed trajectories to a background planet estimator (`src/estimator/`). Its default belief is a flat world with no planets. Estimation compares the model's gravity field with the field implied by the observed paths: for every tick the observed second difference of the f32 positions is compared with the engine's exact discrete kernel (velocity Verlet, 25 substeps) applied to the model field along the observed path (Hermite-interpolated between ticks), whitened by the exact rounding covariance plus an interpolation-error variance estimated from the observed ticks, plus a model-error process for planets not found yet (a Matern-3/2 process along each path standing for the distant unseen planets: its size falls and its correlation length grows with the distance to where an unseen planet could be, but never below the typical distance to the nearest one, so a near pass is left for a planet birth; its two scalars are estimated from the residuals of the previous 8 paths, each against the maintained map just before that path's refit, plus a white excess-noise term (near zero for exact f32 captures) that also uses the current path, all frozen within each fit comparison); no dynamics are simulated in the fit. K planets (x, y, radius; mass tied to radius cubed) are fitted jointly by Levenberg-Marquardt with analytic Jacobians (the QR of the tall Jacobian is reduced per group of paths in parallel, `src/estimator/lm.rs`), and K is grown on an approximate evidence (Laplace/Occam plus a 20:1 prior against each planet, so flat is favoured). The map is maintained incrementally: each new path first gets a local refit of the planets within 100 units of it, and that map is published at once; bounded search slices then continue the planet search on a thinned row set (at most 1000 rows, 2 per 14-unit cell, strongest observed acceleration first). A slice (300 evaluations, 250 ms wall ceiling, up to 6 per path, run on the estimator thread whenever no event waits) seeds candidate planets where the unexplained acceleration is most significant, fits them alone against the current map, refits the best joint partials and adopts the best if the evidence rises; the pending work survives new paths and later slices, and a death trial follows each birth. The published map additionally gets a refit on all rows under the same likelihood, which also yields the covariance. When enabled (`Settings::audit_enabled`; off by default and in the live map since P13), at 8 paths and then every 16, a background audit rebuilds the map from scratch (births on thinned rows, then births and deaths on all rows) and the maintained map is replaced only if the rebuild has higher evidence on all rows. The belief holds one map and no alternatives. K is capped (`--planets N` when given, else `DEFAULT_MAX_PLANETS`); `MapBelief::search_limit` reports the cap, an unfinished search (`work_budget`) or a slice cut by its wall ceiling (`time_budget`). Surface contacts (terminal points not explained by a known player, the margin or the trail limit) add a gated surface constraint to the joint fit; a contact never creates a planet, and a contact that disagrees with the fitted planets is counted as `unmatched_contacts`. It uses no disclosed planet values as fit input. Evidence for the design and its measured recall are in `docs/estimator-experiments.md`.
-
-Contact classification and planet fitting assume NewtonWars source defaults, including player radius 4, the 2,000-sample trail limit and generated planet radii 20–40; the interpolation-error scale, the model-error hyperprior, contact gate and prior are heuristics, listed in `src/estimator/`. The server does not disclose all of these settings. Covariance is a local approximation for the published map and is unavailable, with a recorded reason (`no_planets`, `under_identified`, `not_computed`; the covariance comes with the full-row refit, so a map published right after a path reports `not_computed` until it), for a flat map or when the data leave the planets' parameters undetermined or a planet sits at a bound; it does not describe missing planets. Every detected map boundary (see the recording section) clears prior evidence; replays of captures from before 2026-11-27 still use `Planets` messages as epoch boundaries. Before each decision a bot waits for submitted map work to finish and the map to be quiet for 300 ms, but at most 500 ms; then it aims with the latest published belief (`map_wait_fallback=true` in the decision diagnostics). The bot continues firing with the latest published belief while fitting proceeds, using a flat field before the first fit; a map reset clears the old belief. Candidate refits within a slice run in parallel, while observations and fits stay ordered; the audit runs on its own thread with half of the threads and never delays publication. At about 9 paths per second (capture 55 replayed in real time, P18) the serial work per path (model-error estimate, local refit, publication with the residual correction) stays below the 110 ms arrival period, so paths no longer queue up; a path that arrives while a search slice or the full-row refit runs waits for it (each is cut at 250 ms), which sets the worst publish lag (about 220-320 ms there). `map_updating=true` in `TargetChoice` means the shot used a belief that may lag behind the most recent observations. `--oracle-map` explicitly uses disclosed planets for local target simulation. `--dummy` takes precedence if combined with `--target`.
-
-
-## Mapping library prototype
-
-The `map` module computes NewtonWars planet acceleration and its first and second spatial derivatives. The `simulation` module reproduces the source's 25-substep velocity-Verlet path and exposes position and reconstructed-acceleration residuals. The `estimator` module's evaluation helpers (`shot_observations`, `position_rmse`, `shot_position_rmse`) score a map against recorded paths. The former `estimate` binary explored the removed v1 fitter and was deleted; use `field_scorecard` and `targeting_report --fit-planets` instead.
-
-## Local NewtonWars server
-
-The client does not start a server. From the NewtonWars checkout, the macOS source build is:
-
-```sh
-cd ../NewtonWars
-./build-mac.sh
-./nw fullscreen 0 sendplanets 1 throttle 16
-```
-
-The `sendplanets 1` option is required if the server should disclose planet positions. If a local server is already running, connect to it without starting another copy. Local NewtonWars connections may be run side by side; use `cargo run -- --clients 3 --target` to launch three parameter variants under one manager.
-
-With recording enabled, the manager writes one capture per map for the whole run. The first connection writes shared world events once and rolls the capture over at each map boundary it detects; every connection writes its own identity/energy events and outbound commands tagged by bot name into the current capture (events another connection sends around the boundary can land on either side of it). Older databases are upgraded by adding a nullable `bot_name` column; single-client events remain untagged as before.
-
-
-## Offline learning scenarios
-
-Run `cargo run --bin learning_scenarios` to compare flat, learned, and oracle-map targeting on deterministic synthetic worlds. The ladder covers flat controls, single-planet flybys and contacts, repeated contacts, partly learned two-planet fields, and established multi-planet shots. Each training path is checked for its intended termination; each target has a collision-checked witness. Reports include actual shot outcome, held-out path error, inferred planet error, and fit/search time. The command also writes inspectable SQLite captures to `learning-scenarios.sqlite3`, once per scenario and clean git revision. Open them with `cargo run --bin map_viewer -- --db-path learning-scenarios.sqlite3`. Use `--db-path PATH` to choose another capture database or `--no-captures` to print results without recording. Captures from uncommitted source are skipped so each recorded version has an unambiguous git revision.
-
-For a causal replay of an existing SQLite capture, run `cargo run --bin capture_learning_scenarios -- --capture-id 29 --checkpoints 0,1,4,8 --holdout 2`. It fits only completed shots at each checkpoint and scores shots launched afterward. `--benchmark-targeting` also times one targeting decision on a reconstructed checkpoint. These are synchronous offline replays, not the beliefs actually published during the recorded game.
-
-The oracle generates and scores synthetic paths; it is never passed to the online estimator. These cases share the bot's physics simulator, so they diagnose learning and targeting separately but cannot independently validate the simulator against the server. A single successful impact fixture does not imply every first shot identifies a planet.
-
-The scenario tools are not yet an autonomous code-optimization loop. That planned loop needs engine-checked fixtures, a fixed multi-seed scorecard, and a machine-readable result for each candidate revision. It should make one focused code change at a time, score it against frozen selection cases, and confirm any apparent improvement on untouched cases before keeping it. Core gates should include held-out trajectory error, planet/contact recovery, targeting outcomes and energy, and fitter latency/map age; a change should not win by improving one metric while breaking the others. The report set and thresholds must stay fixed while candidates are tuned. Existing synthetic scenarios currently test estimator/simulator consistency; they do not establish engine parity or real-game hit rate.
-
-## Targeting capture diagnostics
-
-Analyze recorded paths without changing the database or running the expensive fitter:
-
-```sh
-cargo run --bin targeting_report -- --capture-id 21
-cargo run --bin targeting_report -- --capture-id 21 --compare-policy
-cargo run --bin targeting_report -- --capture-id 20 --fit-planets
-```
-
-The report separates map epochs and prints exact repeats, spatial overlap, short paths, and oracle trajectory RMSE when disclosed planets exist. Coverage measures distinct cells crossed by segments, excluding the launch cell and untimed final observation. All completed paths include debris. `--compare-policy` compares the coverage penalty against zero on the same recorded histories using oracle maps strictly for diagnostics. It reports overlap and nominal miss distance; it does not simulate new observations, reproduce live fitting, or establish hit rates. Bot angle profiles are assigned in first-identity order, which may differ from actual connection order.
-
-`--fit-planets` replays observations sequentially and compares each new trajectory with the prior estimated map and a flat field. `--batch-shots N` is a diagnostic experiment that fits after N new trajectories; live estimation still fits sequentially. Batching can change associations as well as reduce computation, and comparisons must account for shots that were scored against different prior maps. Disclosed planet maps score the results and mark epochs only; they are never estimator inputs. These predictions are diagnostics, not hit rates.
-
-## Local map and targeting inspector
-
-Run a read-only local viewer over the recorded captures:
-
-```sh
-cargo run --bin map_viewer -- --db-path einsteinbot.sqlite3
-```
-
-Then visit `http://127.0.0.1:8765`. The viewer binds only to loopback and opens the SQLite database read-only. The page script is `web/map_viewer.js`, served by the binary alongside `web/map_viewer.html`.
-
-**Captures.** The page opens on a table of every capture in the database (live runs and synthetic scenarios), sortable by any column, with the final decision's estimated planets, disclosed planets, missing planets, median center error and planet-search state, plus global metrics over the rows shown (totals and medians; there is deliberately no single combined score). Error columns need a disclosed map. Click a row to open that capture at its latest state; the Captures button returns to the table. Only each capture's last recorded decision (highest sequence across bots) is read to build it.
-
-**Time.** One scrubber spans every event and targeting decision in the selected capture. Decision ticks are colored by bot, shot ends and map resets have their own marks, and two trend panels above them, each with its own axis, plot map quality (estimated planets and missing truth planets) and prediction (the next-5-shot median path error, log axis) at each decision. The fit trajectory RMSE is no longer shown: whole-path chaotic divergence makes it large even on a perfect map. Click or drag to scrub; ←/→ step events, Shift+←/→ step decisions (limited to the selected bot), Home/End jump to the first event or the latest state. A decision shows the belief published at that decision; any other event shows the latest decision snapshot recorded by then, together with the event history through that point. Captures save snapshots at decisions, not each intermediate fitter publication. The estimator publishes several beliefs per path (first right after the path, without covariance, then the refit with covariance), so consecutive decisions on the same paths can differ; each decision is one timeline entry showing the belief it read. Player positions and shots in flight come from the event stream up to the selected point, so they are current between decisions; the belief is only as recent as its snapshot, and paths that ended after it are drawn dashed and counted in the label. The estimator fits paths in the background, and the live server can produce several paths per second, so a decision can read a belief that has not seen the newest paths: the decision label, the Captured belief panel and a pink timeline strip show “lagged N paths” (paths queued for or being fitted by the estimator when the decision read its belief; recorded as `map_pending_paths`, and for older captures inferred from the recorded estimator inputs and marked ≈). The viewer reads recorded state and evaluates it with the library; it does not refit the estimator.
-
-**Layers.** Layers are grouped by question. *What the bot believed:* Gravity belief (the fitted planets' gravity, the field its simulator uses). *How sure it was:* Fit uncertainty (propagated from the fit covariance; when it is missing, the recorded reason is on hover, for example `not_computed` for a belief published right after a path). *Versus truth:* Belief error (|belief − truth gravity|, enabled only when the capture contains a `Planets` message). All three use perceptual sequential colour maps (viridis; magma for the error) on a log scale between the 2nd and 99.5th percentile of the visible samples. Layers without data are dimmed and say why on hover. When the current decision has no covariance, Fit uncertainty carries forward the latest earlier one from the same map epoch (one `Planets` message), faded under a banner naming the source decision; it is evaluated on that decision's planets. “Truth” is the planet list the server discloses with `sendplanets 1`; it is for diagnosis only and never an estimator input. Estimated planets are white outlines; truth planets are thin outlines coloured close / off / missing (dashed), and a matched truth planet whose centre is more than 0.5 units off gets an orange vector from its centre towards the estimate, exaggerated by the factor shown in the legend. Trajectories show every path of the current map epoch, coloured by the outcome inferred from its endpoint (hit a player, planet surface, left the field, unknown), older paths fainter, the selected bot's paths thicker and on top, the decision's own shot bold, and paths newer than the belief dashed; the server thins each path to the points needed within 0.5 world units. Other overlays: contacts, opt-in “Spawn samples” (places players were observed to appear in the current map epoch; samples, not a complete set) and opt-in “Path residuals” (observed path curvature minus the fitted planets' gravity; computed only while enabled). Players are always drawn. The field is sampled at about one sample per three screen pixels (coarse at full view, finer when zoomed) and sent as binary float channels; the colour layer is cached as an image, so panning, hovering and selection redraw only the overlays. Scroll to zoom about the cursor, Shift-drag to pan, double-click or “Full map” to reset.
-
-**Timeline strips and estimator work.** Under the event ticks, each decision shows its belief lag (pink: one path behind dim, two or more bright), the fit covariance (gold: recorded, dim: not computed yet) and a mini stacked column of the estimator update's phase wall time (square-root height, coloured by phase; a red cap marks a part that exceeded its ceiling, an orange cap a search slice cut by its wall ceiling). The Estimator update panel draws the update that published the selected belief (`map_update_report`: the latest path's local refit plus the search slices and full-row refit after it) as two bars on one millisecond scale: phases (wall time) and leaf parts (CPU time summed over threads, nested inside the phases), with red outlines for exceeded ceilings and a hatched end for a time cut; numbers are on hover. Captures before 2026-11-27 do not record it.
-
-**Inspection.** Hover for a summary of the object under the cursor (a trajectory shows its inferred outcome); click a planet, player, contact, trajectory or empty point to pin it in the Selection panel. Only drawn layers can be selected. The Captured belief panel starts with three status pills (belief lag, planet-search state, covariance availability; explanations on hover) and a row of planet glyphs sized from the capture itself, never a fixed count: with a truth map, one glyph per truth planet in truth order (fill colour = centre error, ring colour = radius error, on a log ramp from teal through yellow at the match tolerance of 10 / 5 units to red at 80 / 40 units; a dashed red ring for a missing planet), then a violet diamond per estimate that matches no truth planet; without one, one glyph per estimated planet. Hover a glyph for its numbers and position σ, click it to select the planet. The sidebar can be resized by dragging its left edge. Grid spacing is only a display sampling interval; the physical gravity model is evaluated continuously.
-
-**Shot review.** Selecting a decision re-simulates its chosen shot under the recorded belief and lines it up with the shot that actually followed (the first later shot by the same player with the same velocity and angle). The panel lists the observed path and each model's path (fitted planets only, and the disclosed map when there is one) with RMSE over the shared timed samples, the first sample where each leaves the observed path by more than 10 units, and how each ends; ★ marks the model the bot used (always the fitted planets), and checkboxes toggle the paths on the map. The observed outcome (ended at a player, on a planet surface, left the battlefield) is inferred from the endpoint, not reported by the server. With a disclosed map, “Test repairs” changes one planet of the belief to the disclosed one, re-simulates, and ranks the changes by how much the path improves: a model sensitivity, not proof of cause. The green line in the timeline strip scores each decision's belief against the next five observed shots (median path error), which needs no disclosed map; “Worst predicted” jumps to the decision with the highest value. Beliefs are evaluated as recorded; the viewer does not refit the estimator.
-
-**Scenario captures.** Shots in synthetic scenarios are labelled from what the scenario generator recorded: the training launches in the capture metadata (`scenario.params.training_paths`) mark the baseline observations (“training 1…N”, drawn muted), and the shot after the `target` decision is the policy's “trial” shot (bold); older captures fall back to the decision stage names. Labels are derived when a capture is opened, so they persist when scenarios are regenerated. The captures table shows each scenario once (its latest revision); “scenario history” lists every revision, and the capture selector marks older ones. Players are identified by id only in the protocol; our bots' names are shown beside their ids (from the decisions they recorded), and a player that moved leaves faded dots at its last three earlier positions (no trails).
-
-**Degrade the disclosed map.** With a disclosed map, a decision can start from perfect information, damage the map one way (drop a planet near the path, move or resize the nearest one, add a planet that is not there, or jitter every planet) and ask what the bot's current policy would do on the damaged map. Each rung flies the chosen shot on the true map with the decision's player positions and reports whether it hits, plus how the perfect-information shot itself would fare if the damaged map were the real world. This measures how precisely a map must be known before hits survive; it uses the policy as of the current code, not the one that recorded the decision.
-
-The shot controls run the Rust simulator from the decision's captured launch and player state. When disclosed planets are available, the comparison button replays the recorded shot against them and reruns the current targeting policy on that map and captured bot state. This is a counterfactual using today's code, not the policy version that made the recorded choice. Captures without a `Planets` message cannot provide it. The degradation experiment and these controls sit behind the Experiments disclosure of a decision.
-
-Rust's gravity equation, velocity-Verlet step, 25 substeps per tick, launch direction, and sampled paths follow the NewtonWars source. We have not established bit-for-bit engine parity with a lockstep test. The viewer's timed-path audit on captures 41 and 42 matched 122 and 141 shots respectively; radial position-error p95 was 0.0069 and 0.0166 world units. The largest individual errors were 13.46 and 3.46 units, so inspect the worst-path overlay rather than treating the aggregate as proof. The audit uses the exact disclosed map for the selected epoch and excludes terminal samples whose substep time is not in the protocol. Player collisions and moving targets remain separate targeting concerns.
+| Document | Contents |
+|---|---|
+| [docs/usage.md](docs/usage.md) | options, config file, recording format, stopping report, run-time behaviour of the estimator and targeting, offline tools, build profiles |
+| [docs/map-inspector.md](docs/map-inspector.md) | the map and targeting inspector |
+| [docs/estimator-evaluation.md](docs/estimator-evaluation.md) | how estimator quality is measured |
+| [docs/estimator-experiments.md](docs/estimator-experiments.md) | experiment logs behind the numbers above |
+| [docs/brainstorms/2026-11-13-newtonwars-bot.md](docs/brainstorms/2026-11-13-newtonwars-bot.md) | design state, decisions and open questions |

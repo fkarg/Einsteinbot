@@ -8,7 +8,7 @@ Last edited by: estimator session, 2026-11-27 (P19 one capture per map; P17 resi
 
 | Area | Owner | Files |
 | --- | --- | --- |
-| Inspector UI | viewer | `web/map_viewer.*`, `src/bin/map_viewer.rs`, README "Local map and targeting inspector" |
+| Inspector UI | viewer | `web/map_viewer.*`, `src/bin/map_viewer.rs`, `docs/map-inspector.md` (moved out of the README 2026-11-27) |
 | Viewer design state | viewer | `docs/brainstorms/2026-11-21-map-viewer-ux.md` |
 | Estimation, simulation, targeting, recording | estimator | `src/{strategy,live_map,estimator/,simulation,map,client,event_store,…}.rs`, `docs/brainstorms/2026-11-13-newtonwars-bot.md` |
 | Scenario corpus (`learning_scenarios`, `capture_learning_scenarios`) | **shared** — see claims | `src/bin/learning_scenarios.rs`, `src/bin/capture_learning_scenarios.rs` |
