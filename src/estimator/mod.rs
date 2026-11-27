@@ -37,7 +37,8 @@ mod work;
 pub use count::{CountChange, CountPosterior, CountPrior, LearnedCount};
 pub use eval::{position_rmse, shot_observations, shot_position_rmse};
 pub use fog::{
-    Fog, FogModel, FogSummary, PathInformation, fog as unseen_fog, timeline as fog_timeline,
+    Fog, FogModel, FogSummary, PathInformation, fog as unseen_fog, information as fog_information,
+    timeline as fog_timeline,
 };
 pub use residual::{GATE_ACCELERATION, ResidualCorrection, ResidualGate, ResidualModel};
 pub use work::{CeilingViolation, Part, PartCeilings, PartReport, UpdateReport};
