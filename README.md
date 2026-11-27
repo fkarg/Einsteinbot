@@ -83,7 +83,7 @@ The map inspector on live capture 57 (four bots, 363 paths on one map; recorded 
 *Belief error: where the estimated field differs from the truth, dominated by the missing planets.*
 
 ![One decision with its shot review: predicted versus observed path](docs/images/viewer-57-d937.jpg)
-*One decision: the predicted hit (dashed) diverges from the observed path near a missing planet, which is the "delta to reality" the inspector is built to show.*
+*Decision #937: the bot predicted a hit on player 6 (dashed path, simulated on its map); the observed shot (white) leaves that prediction after 19 samples and ends on a planet surface. Six true planets were still missing at this point (dashed red rings, several near the launch). Showing this delta to reality is what the inspector is for.*
 
 ### Estimator
 
