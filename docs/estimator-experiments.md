@@ -182,3 +182,54 @@ noise: this changes the row set and growth continues on each objective, whereas 
 fixed map. Evidence limits: synthetic generator only (24 planets, 60 long paths); live results
 are mixed; 8-path and noisy data are not solved; the cascade parameters were tuned on the dev
 worlds (7001-7008), though held-out recall was 97% growth-only and 6 of 8 full.
+
+### E9c results (2026-11-27, branch `e9c`, builds on the E9 branch; harness `src/estimator/diagnose/polish.rs`, ignored test `diagnose_polish`)
+
+Question: make a relative allowance part of the likelihood after the thinned search stage, and make the final exact polish drift-safe. Production unchanged. Stage 1 is the E9 cascade (cap 28000 evaluations, run once per world); every polish program then starts from that same map with a fresh counter (budget 12000 evaluations at 60 paths, 8000 at 16/8 paths, evaluations counted on full rows; thinned steps are weighted by node ratio in the "equiv" column). Truth only scores. Machine: jolly, taskset 24-29 (6 threads); results do not depend on thread count by construction (evaluation budgets) but were not re-run at another thread count. Program syntax is in the harness header. Programs: A `0gd` = E9 (exact refit, exact growth, exact deaths); B `0.005gd+0.001gd+0` = relative schedule on full rows (refit, growth and deaths with that level's evidence), then exact refit; C guard `...G3C1.5` = accept the exact refit only if its exact chi2 falls and (no start planet moves 3 units or the result has chi2/row <= 1.5), else keep the relative map; D `0.001gd+0` = one relative level then exact refit only (the "skip exact growth and deaths when K is complete" form); E `0.001gd+0gd` = D plus exact growth/deaths; F = schedule + guard + exact growth/deaths (`...C1.5+0gd`). Chi2 ratio is under the exact likelihood relative to the true map. Evaluations below are polish evaluations (full-row equivalents); add about 2.2-3k for stage 1 (equiv) or 23-28k raw evaluations.
+
+Observed, complete stage-1 maps (synthetic dev 7001-7008, 60 paths, exact noise): every program ends 24/24, 0 spurious, ratio 0.994-0.996, position error < 0.01. Only the cost differs: mean polish evaluations A 6980 (range 860-12004), B 1550, D 820, E 8000, exact refit alone (`0G3`) 10-110 (but it keeps a stage-1 extra planet, 7001: K 25). The exact refit of a complete map costs 10-15 evaluations; A's cost is exact growth and deaths proving nothing is left.
+
+Held-out synthetic 7101-7108, 60 paths (programs A, D, C):
+
+| world | stage 1 rec2 | A rec2 / ratio / evals | D rec2 / evals | C rec2 / ratio / evals |
+|---|---|---|---|---|
+| 7101-7106 | 24 (7102: 23) | 24 / 0.994-0.998 / 6.1-12.0k | 24 / 0.45-0.8k | 24 / 0.995 / 0.95-1.6k |
+| 7107 | 21 | 2 (15 spurious) / 1e11 / 12.0k | 3 / 4e9 / 12.5k | 22 (3 spurious, K 27) / 4.6e9 / 12.6k |
+| 7108 | 22 | 18 / 4e6 / 11.3k | 19 / 4e6 / 3.3k | 22 / 5e7 / 6.3k |
+
+Recall(2) >= 90%: A 6 of 8, C 8 of 8. The combined target (recall and ratio <= 1.2): A 6 of 8, C 6 of 8 (7107 and 7108 have ratio far above 1.2: the maps still miss 1-3 planets, and the exact likelihood punishes that). Mean polish evaluations: A 9380, D 2430, C 3280.
+
+Incomplete stage-1 maps, dev, recall(2) of 24 (stage 1 / A / D / C / F):
+
+| case | stage 1 | A | D | C | F |
+|---|---|---|---|---|---|
+| syn 16 paths 7001 | 24 | 24 | 24 | 24 | n/a |
+| syn 16 paths 7002 | 15 | 15 (6 spurious) | 24 | 24 | 24 |
+| syn 16 paths 7003 | 8 | 7 | 7 | 11 | 6 |
+| syn 16 paths 7004 | 17 | 10 | 9 | 17 | 9 |
+| syn 8 paths 7001-7004 | 10, 8, 1, 11 | 6, 9, 1, 6 | 9, 8, 3, 6 | 12, 18, 4, 11 | not run |
+| syn noise 0.1, 60 paths 7001-7003 | 16, 22, 16 | 14, 5, 17 | 15, 24, 24 | 19, 24, 24 | not run |
+| live 33 | 18 | 10 | 12 | 18 | 13 |
+| live 39 | 21 | 22 | not run | 22 | 22 |
+| live 40 | 18 | 21 (ratio 1.01, 4 spurious) | not run | 20 (ratio 460) | 20 (ratio 1.35) |
+| live 41 | 17 | 10 | not run | 20 | 14 |
+| live 45 | 12 | 10 | not run | 16 | 11 |
+| live 48 | 22 | 24 (ratio 0.99) | not run | 24 (ratio 0.99) | not run |
+
+Held-out live and few-path (recall(2); C = schedule + guard): live 34 (2 paths of data): stage 1 2, A/D/C 2. Live 35, 43: all 24, ratio 0.99; C costs 1.1-1.8k against A 1.4-4.9k. Live 37: stage 1 21, A 22 (ratio 0.99), D 18, C 21 (ratio 1e6), F 18. Live 42: stage 1 20, A 17, D 17, C 21 (ratio 2e7), F 17. Synthetic 16 paths 7101-7104: stage 1 19, 8, 16, 24; A 13, 6, 6, 24; D 15, 5, 6, 24; C 19, 9, 15, 24; F 15, 6, 7, not run.
+
+Other observations:
+- The exact polish of an incomplete map is the drift (observed: A loses recall in 10 of the 18 incomplete dev and held-out cases above; 7107 from 21 to 2). The guard (C) never ended below stage 1 recall except live 40 (-2) and live 37 (0). Where the exact refit explains the data (live 48, chi2/row <= 1.5) the C override accepts it, so C costs 1.6k there against A 5.6k.
+- The cause of most gains in B and C is the relative-level growth and deaths on full rows, not the guard alone: D alone recovers 7002/16 paths and noise-0.1 worlds completely (24/24), C adds more on the others. The exact growth after a guarded polish (F) is worse than C everywhere it was tried (held-out 7107: 5 against 22; live 33, 41, 45, 37, 42 all lower), so exact growth and deaths are what drifts, not the exact refit.
+- A chi2-gated skip (`S`) is not usable: the stage-1 map has exact chi2/row of 400 to 10000 even when it has all 24 planets within 0.1 units (the relative-0.005 cascade positions are off by a small fraction of a unit but the exact likelihood is razor sharp), so an exact chi2 test cannot tell a complete map from an incomplete one. "Complete" is recognised by relative-level growth and deaths changing nothing (D/B cost 0.5-1.5k) and then the exact refit shrinking chi2 to about 1 (guard override).
+- Evidence behaviour: with the relative allowance as the evidence (B, D) K ended at 24 on all complete synthetic worlds (the stage-1 K 25 of 7001 was removed by relative-level deaths; the exact refit alone kept it). On incomplete maps K overshoots with spurious planets (7107: K 27 with 3 spurious; live 33: K 26 with 6) because the relative term lets neighbours absorb a missing planet's pull; the exact evidence (A, E) stopped at K 23-25 as well but with more spurious (A on 7107: 15).
+- Explored/unexplored field RMSE (acceleration units, 20-unit grid, explored = within 30 units of a path row) follows recall: complete maps 1e-6 / 1e-6, 7107 under C 2e-2 / 5e-1 against A 15 / 176. It is reported in every `RESULT` line.
+- Few paths (8): C improves recall(2) over A in all four worlds (12/18/4/11 against 6/9/1/6) but is still far from the target; 16 paths: 2 of 4 worlds complete under C against 1 of 4 under A.
+- Not done: relative sd above 0.005 on full rows as a permanent likelihood, because the cascade already runs those levels on thinned rows; a thinned relative polish (`t4000:` steps) was tried on live 33, 41, 45 and recovered about the same recall as full rows (21, 15, 19 against 20, 16, 18) at 70-80% of the cost, not enough to change the verdict.
+- Data loss: the raw output files of the dev 60-path synthetic, 8/16-path, noise and first live runs were deleted by an rsync `--delete`; the numbers above for those were read from the run consoles before that, the held-out and later runs have their output on jolly (`/tmp/E9c-out`). All runs are reproducible from the commands below.
+
+Verdict: adopt the relative-level polish as an opt-in, narrow form: relative-level growth and deaths on full rows (0.005, 0.001), then a guarded exact refit, and no exact growth/deaths on a map that the relative levels have not completed. It makes the E9 pipeline strictly safer (recall(2) >= stage 1 in 31 of 33 cases tried, including live) and cuts the polish cost on complete maps from about 7-9k to 1.5-3k full-row evaluations. It does not meet the adoption target: held-out synthetic recall(2) >= 90% is 8 of 8 (A: 6 of 8) but the ratio <= 1.2 part stays at 6 of 8, live held-out 37 and 42 stay at ratio 1e6-1e7 (live truth is degenerate), and 8-path and noisy worlds stay far below target. Missing-planet completeness is the open problem, not the polish: the guard only stops losing planets, nothing here finds a stage-1 planet the cascade missed except through relative growth (which found several, e.g. 7002 with 16 paths, noise 0.1). Inconclusive on the exact-evidence question (A/E against B/D): equal results on complete maps, exact growth worse on incomplete ones.
+
+Production search if all of this were adopted: (1) cascade growth on thinned rows (500/1000/2000 rows, relative sd 0.1/0.02/0.005), about 2.2-3k full-row-equivalent evaluations (23-28k raw); (2) refit the map on full rows at relative sd 0.005, grow and delete on that evidence, repeat at 0.001, about 0.8-2.2k on complete maps and up to the 8-12k allowance on incomplete ones; (3) exact refit (10-100 evaluations), accepted if the exact chi2 falls and (no start planet moves 3 units or chi2/row <= 1.5), else keep the relative map; (4) no exact growth or deaths. Expected cost: about 3.5-6k full-row equivalents on a complete map, up to about 15k on an incomplete one, against 9-15k for E9 as it was. Limits: dev and held-out worlds are the synthetic generator (24 planets, 60 or 16/8 long paths at speed 8) and ten live captures, one run per cell, thresholds (3 units, 1.5) not tuned beyond one revision (the C override was added after the dev live results; the held-out was run once with it, the F hybrid was tried on dev and then held-out cases once); the relative term uses the observed acceleration, which is noisy at noise 0.1.
+
+Reproduction: `cargo test --release --lib diagnose_polish -- --ignored --nocapture --test-threads=1` with `PATHS`, `SEEDS`, `LIVE` (`-` for none), `NOISE`, `STAGE1`, `POLISH_BUDGET` and `POLISH` (comma-separated programs) as in the harness header, run in a directory with `einsteinbot.sqlite3` (the P4 capture subset in `/tmp/einsteinbot-p4`). Example for the held-out synthetic table: `PATHS=60 SEEDS=7101,7102,7103,7104,7105,7106,7107,7108 LIVE=- POLISH=0gd,0.001gd+0,0.005gd+0.001gd+0G3C1.5 POLISH_BUDGET=12000`.

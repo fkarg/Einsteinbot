@@ -15,19 +15,19 @@ use crate::estimator::search::{Mode, deaths, refit};
 use crate::estimator::work::{cores, par_map};
 
 #[derive(Clone, Copy, Debug)]
-struct Variant {
+pub(super) struct Variant {
     /// Thinning: cell size, rows per cell, row cap, prefer strongly accelerated rows.
-    thin: Option<(f64, usize, usize, bool)>,
-    relative: f64,
+    pub thin: Option<(f64, usize, usize, bool)>,
+    pub relative: f64,
     /// Re-thin after every growth round by the residual of the current map (strength = whitened
     /// residual magnitude under the exact noise) instead of the observed acceleration.
-    resid: bool,
+    pub resid: bool,
     /// After the search-stage growth stalls, keep adding planets with the found ones frozen as
     /// fixed field, re-thinning by the raw residual of the frozen map each round.
-    frozen: bool,
+    pub frozen: bool,
 }
 
-fn parse(spec: &str) -> Variant {
+pub(super) fn parse(spec: &str) -> Variant {
     let p: Vec<&str> = spec.split(':').collect();
     let thin = |p: &[&str]| {
         (
@@ -70,7 +70,7 @@ fn parse(spec: &str) -> Variant {
 
 /// The shots of the search stage: relative noise term and/or thinned rows.
 /// `strengths[s][r]` replaces the observed acceleration as the row preference when given.
-fn search_shots(
+pub(super) fn search_shots(
     case: &Case,
     variant: Variant,
     noise: f64,
@@ -147,7 +147,13 @@ fn work_done(run: &Run) -> bool {
         .is_some_and(|m| run.stats.evaluations() >= m)
 }
 
-fn grow(joint: &Fit, shots: &[Shot], modes: &mut Vec<Mode>, run: &Run, world: WorldParameters) {
+pub(super) fn grow(
+    joint: &Fit,
+    shots: &[Shot],
+    modes: &mut Vec<Mode>,
+    run: &Run,
+    world: WorldParameters,
+) {
     let never = AtomicBool::new(false);
     loop {
         let parent = best(modes).clone();
@@ -278,7 +284,7 @@ fn grow_frozen(
     frozen
 }
 
-fn prune(joint: &Fit, modes: &mut Vec<Mode>, run: &Run) {
+pub(super) fn prune(joint: &Fit, modes: &mut Vec<Mode>, run: &Run) {
     let mut parent = best(modes).clone();
     for _ in 0..6 {
         if parent.planets.is_empty() || work_done(run) {
@@ -293,15 +299,15 @@ fn prune(joint: &Fit, modes: &mut Vec<Mode>, run: &Run) {
     }
 }
 
-struct Score {
-    k: usize,
-    recall2: usize,
-    recall15: usize,
-    spurious: usize,
-    ratio: f64,
+pub(super) struct Score {
+    pub k: usize,
+    pub recall2: usize,
+    pub recall15: usize,
+    pub spurious: usize,
+    pub ratio: f64,
 }
 
-fn score(theta: &[[f64; 3]], truth: &[[f64; 3]], exact: &Fit, rows: usize) -> Score {
+pub(super) fn score(theta: &[[f64; 3]], truth: &[[f64; 3]], exact: &Fit, rows: usize) -> Score {
     let near = |t: &[f64; 3], limit: f64| {
         truth
             .iter()
