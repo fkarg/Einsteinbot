@@ -163,7 +163,7 @@ pub struct BotState {
     #[serde(default)]
     round_clock: RoundClock,
     /// Every player's inferred energy and round score (`players`).
-    #[serde(default, alias = "energy")]
+    #[serde(default)]
     players: PlayerLedger,
 }
 
