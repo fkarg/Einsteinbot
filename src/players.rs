@@ -26,6 +26,8 @@ pub const ENERGY_LIMIT: f64 = 200.0;
 pub const DEFAULT_ENERGY_RATE: f64 = 2.5;
 /// A shot ending this close to a player's old position killed them (as `map_change`).
 const KILL_RADIUS: f32 = 12.0;
+/// Upstream default `debrisSpeed`.
+const DEBRIS_SPEED: f64 = 3.0;
 
 #[derive(Clone, Debug, Default, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct PlayerLedger {
@@ -98,9 +100,13 @@ impl PlayerLedger {
     }
 
     /// A shot began. The server fires only with at least the velocity in energy, which corrects an
-    /// underestimate. Debris of a kill begins as the victim's shots just before the respawn
-    /// resets them.
-    pub fn shot_begin(&mut self, player: u32, velocity: f64, now_ms: i64) {
+    /// underestimate. Debris of a kill is free: it begins as the victim's shots (velocity
+    /// `DEBRIS_SPEED`, a random fractional angle) between the killing shot's end and the
+    /// victim's respawn, and must not lower the energy the killer gains.
+    pub fn shot_begin(&mut self, player: u32, angle_degrees: f64, velocity: f64, now_ms: i64) {
+        if velocity == DEBRIS_SPEED && angle_degrees.fract() != 0.0 {
+            return;
+        }
         if let Some(energy) = self.energy(player, now_ms) {
             self.known
                 .insert(player, (energy.max(velocity) - velocity, now_ms));
@@ -130,7 +136,7 @@ impl PlayerLedger {
         let Some(old) = old else {
             if self.seen_boundary {
                 self.known.insert(player, (SPAWN_ENERGY, now_ms));
-                self.score.insert(player, (0, 0));
+                self.score.entry(player).or_insert((0, 0));
             }
             return;
         };
@@ -216,14 +222,16 @@ mod tests {
         assert_eq!(tracker.energy(3, 12_000), Some(25.0));
 
         // A shot proves its shooter had at least the velocity in energy.
-        tracker.shot_begin(1, 30.0, 10_000);
+        tracker.shot_begin(1, 0.0, 30.0, 10_000);
         assert_eq!(tracker.energy(1, 10_000), Some(0.0));
 
         // Player 3 shoots with velocity 15, then player 2 kills player 3 (the shot ends at
         // player 3, who respawns): 2 gains half of 3's energy, 3 restarts at 20.
-        tracker.shot_begin(3, 15.0, 12_000);
+        tracker.shot_begin(3, 0.0, 15.0, 12_000);
         assert_eq!(tracker.energy(3, 12_000), Some(10.0));
         tracker.shot_finished(2, Some(&at(503.0, 100.0)));
+        // The victim's free debris begins before its respawn.
+        tracker.shot_begin(3, 123.456, DEBRIS_SPEED, 12_000);
         tracker.repositioned(3, Some(&at(500.0, 100.0)), 12_000);
         assert_eq!(tracker.energy(3, 12_000), Some(20.0));
         assert_eq!(tracker.energy(2, 12_000), Some(30.0));

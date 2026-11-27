@@ -245,7 +245,8 @@ impl BotState {
                 // Every connection receives every ShotBegin broadcast. Shots take seconds to
                 // finish, so in-flight own shots must already count as known outcomes.
                 if let Some(now_ms) = now_ms {
-                    self.players.shot_begin(*player_id, *velocity, now_ms);
+                    self.players
+                        .shot_begin(*player_id, *angle, *velocity, now_ms);
                 }
                 let ordinal = self.begin_counts.entry(*player_id).or_insert(0);
                 *ordinal += 1;
