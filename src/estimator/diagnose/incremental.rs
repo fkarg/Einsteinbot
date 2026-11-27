@@ -150,12 +150,12 @@ fn limits<'a>(max: Option<u64>, ceilings: &'a PartCeilings, seconds: u64) -> Lim
 }
 
 pub(super) struct Metrics {
-    pub text: String,
-    pub k: usize,
-    pub rec2: usize,
-    pub spur: usize,
-    pub ratio: f64,
-    pub explored: f64,
+    pub(super) text: String,
+    k: usize,
+    rec2: usize,
+    spur: usize,
+    ratio: f64,
+    explored: f64,
 }
 
 /// Quality of `theta` against the exact likelihood and the truth on the first `n` paths.
@@ -188,10 +188,10 @@ pub(super) fn quality(case: &Case, n: usize, theta: &[[f64; 3]]) -> Metrics {
 }
 
 pub(super) struct Rebuilt {
-    pub theta: Vec<[f64; 3]>,
-    evals: u64,
-    equiv: f64,
-    wall: f64,
+    pub(super) theta: Vec<[f64; 3]>,
+    pub(super) evals: u64,
+    pub(super) equiv: f64,
+    pub(super) wall: f64,
 }
 
 /// From scratch on the first `n` paths: the E9 cascade (cap 28000 evaluations) and the E9c
