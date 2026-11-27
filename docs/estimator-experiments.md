@@ -561,3 +561,30 @@ Thinned row set of 1000 rows (at most 2 per 14-unit cell, strongest first; 2000 
 Reproduction (from the worktree, with `einsteinbot.sqlite3` present; `CACHE` holds from-scratch rebuilds so audits reuse them):
 `cargo test --release --lib diagnose_rebuild -- --ignored --nocapture --test-threads=1` with `CACHE=/tmp/P6cache THREADS=2 PATHS=60 SEEDS=7001 LIVE=-` (also `COUNTS=4,8,...`) fills the cache and prints the from-scratch rows.
 `cargo test --release --lib diagnose_incremental -- --ignored --nocapture --test-threads=1` with `CONFIGS="lv=0.02/0.005:rf=300:ev=1500:lr=100:dl=30:dn=4:cap=1000:probe=8"`, `PLANETS=1` for the Q4 lines, `PROD=1` for the production update, `THREADS=8`, `SEEDS`/`KS`/`LIVE`/`PATHS` as in the other harnesses (`audit=16`, `audit=8` instead of `probe=8` for the adopting runs; held-out `SEEDS=7101,...,7108`, `LIVE=34,35,37,42,43`). Tables: `python3 -I scripts/p6_tables.py {cost,latency,quality,audit,support} FILES [--worlds synthetic|live]`.
+
+### P8 results (2026-11-27, branch `p8`, built on `p6`; harness `src/estimator/diagnose/baseline.rs` (ignored test `diagnose_baseline`) plus `diagnose_incremental` for B*; tables from `scripts/p8_tables.py`)
+
+Question: baseline evidence for the staged replacement decision, on real captures: (a) flat (K = 0), (b) the current production search (default `Estimator`), (c) the from-scratch cascade (E9 thinned relative-noise cascade, then the E9c guarded polish, the P6 "rebuild"), (d) P6's B* incremental at the capture's last path. Truth (the oracle map each capture discloses) only scores. Production, estimator and fit code are unchanged.
+
+#### Stage 1: pilot on dev captures 33, 40, 45 (observed)
+
+Setup. Every capture: the first map epoch, at most 61 paths (`PATHS=60`, as in P6), exact noise in the scoring likelihood. (b) is fed path by path through `Estimator::observe` (default settings: noise level 0.1, 24-planet cap) with a deterministic limit of 2000 residual-plus-Jacobian evaluations per update (`max_evaluations`; the wall-clock budget is lifted to 24 h; contacts are not fed, as in the other diagnosis harnesses); the last published belief is scored. The limit of 2000 is my choice: the P6 production run used 250-440 evaluations in its 5 s budget at K = 24, so 2000 gives the production search about five times its live budget; every update used the limit in these runs (about 120k evaluations per capture). (c) runs once on all paths (stage-1 cap 28000 evaluations, polish budget 12000). (d) is the P6 configuration B*. Machine: jolly, 8 threads for (a)-(c) and 2 for (d), three captures at a time next to other jobs (load 11-16); results do not depend on thread count by construction, wall times are indicative only.
+
+| capture | paths | method | K | rec2 | rec15 | spur | chi2 ratio | field expl/flat | unexpl/flat | whole/flat | evals | wall s |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 33 | 61 | flat | 0 | 0/24 | 0/24 | 0 | 9.83e+11 | 1 | 1 | 1 |  |  |
+| 33 | 61 | prod | 24 | 2/24 | 7/24 | 17 | 5.02e+10 | 2.75 | 29.2 | 18.9 | 122609 | 1274 |
+| 33 | 61 | cascade | 26 | 18/24 | 20/24 | 6 | 3.75e+07 | 0.17 | 1.28 | 0.834 | 41162 | 118 |
+| 33 | 61 | B* | 23 | 22/24 | 22/24 | 1 | 4.67e+07 | 1.62e-03 | 2.94 | 1.9 |  |  |
+| 40 | 61 | flat | 0 | 0/24 | 0/24 | 0 | 1.42e+12 | 1 | 1 | 1 |  |  |
+| 40 | 61 | prod | 22 | 19/24 | 21/24 | 1 | 3.70e+03 | 7.96e-03 | 2.42 | 1.76 | 120366 | 699 |
+| 40 | 61 | cascade | 23 | 20/24 | 22/24 | 1 | 459 | 1.18e-04 | 1.26 | 0.913 | 28456 | 95 |
+| 40 | 61 | B* | 22 | 19/24 | 21/24 | 1 | 2.06e+06 | 2.53e-03 | 34.7 | 25.2 |  |  |
+| 45 | 61 | flat | 0 | 0/24 | 0/24 | 0 | 8.33e+11 | 1 | 1 | 1 |  |  |
+| 45 | 61 | prod | 22 | 14/24 | 18/24 | 3 | 1.44e+07 | 0.0353 | 5.51 | 4.0 | 111391 | 459 |
+| 45 | 61 | cascade | 22 | 16/24 | 19/24 | 2 | 1.48e+07 | 0.199 | 2.48 | 1.81 | 40519 | 72 |
+| 45 | 61 | B* | 22 | 21/24 | 21/24 | 1 | 8.52e+06 | 2.40e-03 | 3.61 | 2.62 |  |  |
+
+Sanity checks (observed). The cascade reproduces the E9c C numbers where they overlap: capture 40 recall(2) 20 with chi2 ratio 460 (E9c: 20, 460), capture 45 recall(2) 16 (E9c: 16), capture 33 recall(2) 18 (E9c: 18); B* at 61 paths matches P6's live dev picture (21-22 of 24 on 33 and 45). The cascade is better than flat in the explored area on all three (0.17, 1e-4, 0.2 of the flat error). It is not better than flat in the unexplored area (1.26-2.5x flat) or whole field on 45: a published map with a few wrong or missing planets is worse than flat away from the data, as found in P6. The production search is worse than flat even in the explored area on capture 33 (2.75x flat, 17 spurious planets, recall(2) 2 of 24) although it spent 122k evaluations.
+
+Stage-2 estimate (written before the launch). Pilot cost per capture with all 61 paths: (a)-(c) 530-1390 s at 8 threads (prod 460-1270 s dominates, the cascade 70-120 s), (d) 1-5 minutes at 2 threads. The production search is mostly single-threaded (it used about 2.4 cores of 8). Stage 2 is 29 captures (14 with 61 paths, the others fewer); run as a queue of 8 captures at a time at 4 threads each (32 threads on jolly, P7 using up to 16 more); expected about 29 x 15 min / 8 = 1 to 1.5 hours wall, longer if jolly stays loaded. Launched 11:50 UTC.
