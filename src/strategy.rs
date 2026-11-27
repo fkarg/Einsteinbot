@@ -359,7 +359,10 @@ pub const APPROACH_MIN_ENERGY: f64 = 15.0;
 /// Hit ranking weight of one unit of predicted impact offset, in flight ticks.
 const MISS_DISTANCE_TICKS: f64 = 5.0;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// Loadable from JSON (`devtool eval --config`): missing keys take the defaults, unknown keys are
+/// errors.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct TargetingSettings {
     pub angle_step_degrees: u16,
     pub max_simulation_ticks: usize,
@@ -372,6 +375,10 @@ pub struct TargetingSettings {
     /// A predicted hit whose victim an in-flight shot kills first with at least this chance is
     /// skipped (`in_flight::doom_probability`); above 1 disables doomed-target avoidance.
     pub doom_threshold: f64,
+    /// Hit ranking: flight ticks plus this many ticks per unit of predicted impact offset.
+    pub miss_distance_ticks: f64,
+    /// Below this energy a shot without a predicted hit is not fired.
+    pub approach_min_energy: f64,
 }
 
 impl Default for TargetingSettings {
@@ -384,6 +391,8 @@ impl Default for TargetingSettings {
             information_weight: 1.0,
             coverage_penalty: 40.0,
             doom_threshold: 0.15,
+            miss_distance_ticks: MISS_DISTANCE_TICKS,
+            approach_min_energy: APPROACH_MIN_ENERGY,
         }
     }
 }
@@ -668,7 +677,7 @@ impl TargetingPolicy {
             .filter(|candidate| candidate.predicted_hit)
             .copied()
             .collect::<Vec<_>>();
-        hits.sort_by(compare_hit_quality);
+        hits.sort_by(|a, b| compare_hit_quality(a, b, self.settings.miss_distance_ticks));
         // Doomed-target avoidance: a hit on a player another in-flight shot (ours included)
         // kills first is wasted, so skip such hits unless ours lands first (the race rule).
         if let (Some(now_ms), false) = (state.clock_ms, hits.is_empty()) {
@@ -787,7 +796,7 @@ impl TargetingPolicy {
 
         // A cheap shot without a predicted hit rarely hits (capture 55: 5 of 58 at a median
         // energy of 3.6); saving energy until a hit is predicted pays off more.
-        if energy < APPROACH_MIN_ENERGY {
+        if energy < self.settings.approach_min_energy {
             return None;
         }
         pool.into_iter().min_by(|left, right| {
@@ -864,12 +873,16 @@ fn contact_before_target(planet: &crate::protocol::Planet, points: &[Point], pas
         .is_some_and(|entry| entry < passage)
 }
 
-fn compare_hit_quality(left: &ShotChoice, right: &ShotChoice) -> Ordering {
+fn compare_hit_quality(
+    left: &ShotChoice,
+    right: &ShotChoice,
+    miss_distance_ticks: f64,
+) -> Ordering {
     // Map error grows along the path, so shorter flights hit far more often than central but
     // long ones (capture 55: 5 of 7 under 30 ticks, 1 of 32 over 100). Rank by flight time,
     // with the impact offset as a small penalty; save energy only on equal scores.
     let score = |choice: &ShotChoice| {
-        choice.flight_ticks as f64 + MISS_DISTANCE_TICKS * choice.miss_distance
+        choice.flight_ticks as f64 + miss_distance_ticks * choice.miss_distance
     };
     score(left)
         .total_cmp(&score(right))
@@ -1057,7 +1070,7 @@ mod tests {
             ..test_choice()
         };
         assert_eq!(
-            compare_hit_quality(&grazing_short, &central_long),
+            compare_hit_quality(&grazing_short, &central_long, MISS_DISTANCE_TICKS),
             Ordering::Less
         );
 
@@ -1067,7 +1080,7 @@ mod tests {
             ..grazing_short
         };
         assert_eq!(
-            compare_hit_quality(&central_short, &grazing_short),
+            compare_hit_quality(&central_short, &grazing_short, MISS_DISTANCE_TICKS),
             Ordering::Less
         );
         assert_eq!(
@@ -1076,7 +1089,8 @@ mod tests {
                     velocity: 4,
                     ..central_short
                 },
-                &central_short
+                &central_short,
+                MISS_DISTANCE_TICKS
             ),
             Ordering::Less
         );

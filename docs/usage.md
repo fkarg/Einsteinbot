@@ -323,39 +323,32 @@ Compares flat, learned and oracle-map targeting on deterministic synthetic world
 - It writes inspectable SQLite captures to `learning-scenarios.sqlite3`, once per scenario and clean git revision. Captures from uncommitted source are skipped, so each recorded version has an unambiguous git revision. Open them with `cargo run --bin map_viewer -- --db-path learning-scenarios.sqlite3`.
 - `--db-path PATH` chooses another capture database; `--no-captures` prints results without recording.
 
-### Causal replay of a capture
+### devtool
+
+`devtool` collects the offline evaluation and diagnosis tools (P14; it replaces `field_scorecard`, `targeting_report`, `capture_learning_scenarios` and the `diagnose_replay`/`diagnose_baseline` test harnesses). Truth (disclosed or generated planets) only scores; it never reaches the estimator or the policy's belief. `cargo run --bin devtool -- <subcommand> --help` lists each subcommand's options.
 
 ```sh
-cargo run --bin capture_learning_scenarios -- --capture-id 29 --checkpoints 0,1,4,8 --holdout 2
+cargo run --release --bin devtool -- eval --world synth:7001:24 --paths 60 --out metrics.json
+cargo run --release --bin devtool -- eval --world capture:59 --config tuned.json --mode targeting --belief recorded
+cargo run --release --bin devtool -- degrade --worlds synth:7001:24,capture:60 --situations 16
+cargo run --release --bin devtool -- games --from 53
 ```
 
-Fits only completed shots at each checkpoint and scores shots launched afterward. `--benchmark-targeting` also times one targeting decision on a reconstructed checkpoint. These are synchronous offline replays, not the beliefs actually published during the recorded game.
-
-**Limits of the scenario tools.** The oracle generates and scores synthetic paths; it is never passed to the online estimator. The cases share the bot's physics simulator, so they diagnose learning and targeting separately but cannot independently validate the simulator against the server. A single successful impact fixture does not imply every first shot identifies a planet. Existing synthetic scenarios test estimator/simulator consistency; they do not establish engine parity or real-game hit rate.
-
-**Planned optimization loop (not built).** The scenario tools are not yet an autonomous code-optimization loop. That loop needs engine-checked fixtures, a fixed multi-seed scorecard, and a machine-readable result for each candidate revision. It should make one focused code change at a time, score it against frozen selection cases, and confirm any apparent improvement on untouched cases before keeping it. Core gates should include held-out trajectory error, planet/contact recovery, targeting outcomes and energy, and fitter latency/map age; a change should not win by improving one metric while breaking the others. The report set and thresholds must stay fixed while candidates are tuned.
-
-### Targeting capture diagnostics
-
-Analyze recorded paths without changing the database or running the expensive fitter:
-
-```sh
-cargo run --bin targeting_report -- --capture-id 21
-cargo run --bin targeting_report -- --capture-id 21 --compare-policy
-cargo run --bin targeting_report -- --capture-id 20 --fit-planets
-```
-
-- The report separates map epochs and prints exact repeats, spatial overlap, short paths, and oracle trajectory RMSE when disclosed planets exist.
-- Coverage measures distinct cells crossed by segments, excluding the launch cell and the untimed final observation. All completed paths include debris.
-- `--compare-policy` compares the coverage penalty against zero on the same recorded histories, using oracle maps strictly for diagnostics. It reports overlap and nominal miss distance; it does not simulate new observations, reproduce live fitting, or establish hit rates. Bot angle profiles are assigned in first-identity order, which may differ from actual connection order.
-- `--fit-planets` replays observations sequentially and compares each new trajectory with the prior estimated map and a flat field. `--batch-shots N` is a diagnostic that fits after N new trajectories; live estimation still fits sequentially. Batching can change associations as well as reduce computation, so comparisons must account for shots scored against different prior maps. Disclosed planet maps score the results and mark epochs only; they are never estimator inputs. These predictions are diagnostics, not hit rates.
+- **`eval`** runs one configuration on one world at one fidelity (`--paths N`) and writes a metrics JSON. Worlds: `synth:SEED[:K]` (the W7 generator, K = 24 by default), `w1:SEED[:DISTANCE]` (W1: three planets plus one more at least DISTANCE from them that no path touches), `capture:ID[:MAP]` (a recorded map; MAP counts maps with different planets within the capture).
+  - Deterministic: slices are never cut by the wall clock (the config's `slice_ceiling_ms` is ignored) and no audit runs. Beliefs do not depend on `--threads` (checked on synthetic worlds at 8-24 paths).
+  - Estimator metrics at each checkpoint: recall within 2 and 15 units, spurious planets (no true planet within 15), chi2 of the exact likelihood relative to the truth's, field RMSE explored/unexplored/whole (`field_score`, flat-map references in `*_flat`), prequential path RMSE (each new path against the map before it), the P23 count-limit flag, and work (evaluations, CPU seconds, slowest update).
+  - Targeting (`--mode targeting|both`): on captures it replays the recorded decisions (P20 method: recorded bot state, waits advance with the recorded game, energy +2.55/s up to 52); beliefs are the recorded ones (`--belief recorded`) or this configuration's estimator replay (`--belief refit`); a true hit whose victim the recorded game killed first is `wasted`. On synthetic worlds it scores `--situations` generated decisions (shooter, three opponents, energy 10-52) at every checkpoint. Reports true hits, wasted, hits per 100 energy, predicted-hit rate and the overconfidence gap.
+  - `--config cfg.json` sets estimator settings (`estimator`, incl. `estimator.search` constants) and targeting constants (`targeting`); missing keys take the defaults, unknown keys are errors. Results are cached in `target/devtool-cache` by (git revision, config hash, world, fidelity, mode); builds from uncommitted source are not cached.
+- **`degrade`** runs the D1-D6 degradation ladders: the belief is the true map with one controlled error (D1 drop planets, D2 displace the planet nearest the shot, D3 resize it, D4 add a phantom, D5 targets moved after the decision, D6 jitter every planet); the chosen shot flies on the true map. Per rung: hit rate, predicted-hit rate, overconfidence gap, perfect-map hits lost, median miss distance.
+- **`games`** lists the independent games of a database: maps with the same planets that share a recorded path are one game (for example capture 54's maps are captures 53 and 55).
+- **`capture-report`** (formerly `targeting_report`) analyzes recorded paths without fitting: exact repeats, spatial overlap, short paths, oracle path RMSE; `--compare-policy` compares the coverage penalty against zero on the same histories.
+- **`schedule`** replays a world under live timing (one path every `--period-ms`, slices in between) and reports the publish lag. Not deterministic.
 
 ### Library modules
 
 - `map` computes NewtonWars planet acceleration and its first and second spatial derivatives.
 - `simulation` reproduces the source's 25-substep velocity-Verlet path and exposes position and reconstructed-acceleration residuals.
 - The `estimator` module's evaluation helpers (`shot_observations`, `position_rmse`, `shot_position_rmse`) score a map against recorded paths.
-- The former `estimate` binary explored the removed v1 fitter and was deleted; use `field_scorecard` and `targeting_report --fit-planets` instead.
 
 ## Development builds
 

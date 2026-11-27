@@ -11,7 +11,7 @@ Last edited by: estimator session, 2026-11-27 (P23 count-limit warning; P19 one 
 | Inspector UI | viewer | `web/map_viewer.*`, `src/bin/map_viewer.rs`, `docs/map-inspector.md` (moved out of the README 2026-11-27) |
 | Viewer design state | viewer | `docs/brainstorms/2026-11-21-map-viewer-ux.md` |
 | Estimation, simulation, targeting, recording | estimator | `src/{strategy,live_map,estimator/,simulation,map,client,event_store,…}.rs`, `docs/brainstorms/2026-11-13-newtonwars-bot.md` |
-| Scenario corpus (`learning_scenarios`, `capture_learning_scenarios`) | **shared** — see claims | `src/bin/learning_scenarios.rs`, `src/bin/capture_learning_scenarios.rs` |
+| Scenario corpus (`learning_scenarios`) | **shared** — see claims | `src/bin/learning_scenarios.rs` (`capture_learning_scenarios` folded into `devtool eval`, P14) |
 | This file, `AGENTS.md`, `README.md` outside the viewer section | shared — see claims | |
 
 ## 2. Protocol

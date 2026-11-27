@@ -29,11 +29,13 @@ mod rebuild;
 mod residual;
 mod rows;
 mod search;
+mod tuning;
 mod window;
 mod work;
 
-pub use eval::{position_rmse, shot_observations, shot_position_rmse};
+pub use eval::{exact_chi2, position_rmse, shot_observations, shot_position_rmse, synthetic_world};
 pub use residual::{GATE_ACCELERATION, ResidualCorrection, ResidualGate, ResidualModel};
+pub use tuning::SearchTuning;
 pub use work::{CeilingViolation, Part, PartCeilings, PartReport, UpdateReport};
 
 use crate::map::PlanetMap;
@@ -155,8 +157,10 @@ impl Shot {
     }
 }
 
-/// Limits and switches of an estimator.
-#[derive(Clone, Debug)]
+/// Limits and switches of an estimator. Loadable from JSON (`devtool eval --config`): missing keys
+/// take the defaults, unknown keys are errors; `threads` and `ceilings` are not configurable there.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Settings {
     /// Maximum number of planets in a map when the count is not known (`planets` is `None`).
     pub max_planets: usize,
@@ -172,16 +176,21 @@ pub struct Settings {
     /// noise and the search use the maintained map.
     pub slice_evaluations: u64,
     /// Wall-clock ceiling of a slice (`None`: no ceiling); the best map so far is kept when it is hit.
+    #[serde(rename = "slice_ceiling_ms", with = "tuning::optional_ms")]
     pub slice_ceiling: Option<Duration>,
     /// Slices owed after each new path.
     pub slices_per_path: usize,
     /// Threads of the live search; the audit uses half of them.
+    #[serde(skip)]
     pub threads: usize,
     /// Run the background audit. Off by default, because an adopted audit depends on timing; the
     /// live map leaves it off too (P13: no measured benefit at 2.2 times the CPU).
     pub audit_enabled: bool,
     /// Wall-clock ceilings per part of the update; exceeded ones are listed in `last_report`.
+    #[serde(skip)]
     pub ceilings: PartCeilings,
+    /// Constants of the live planet search.
+    pub search: SearchTuning,
 }
 
 impl Default for Settings {
@@ -195,6 +204,7 @@ impl Default for Settings {
             threads: cores(),
             audit_enabled: false,
             ceilings: PartCeilings::default(),
+            search: SearchTuning::default(),
         }
     }
 }
@@ -217,6 +227,7 @@ impl Settings {
             deadline: Instant::now() + self.slice_ceiling.unwrap_or(Duration::from_secs(24 * 3600)),
             threads: self.threads,
             max_planets: self.cap(),
+            tuning: &self.search,
             cancelled,
             stats,
         }
