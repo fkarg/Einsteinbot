@@ -608,11 +608,11 @@ impl Estimator {
             .with_stats(&self.stats);
             let theta = self.search.theta.clone();
             // Cut by a waiting path or by the wall ceiling: nothing is published and the refit
-            // stays due. A cut also restarts the starvation count, so a refit that cannot finish
-            // within the ceiling (heavy load) does not shut the search slices out.
+            // stays due (the starvation count keeps running). After a ceiling cut it waits for
+            // the next path, so a refit that cannot finish within the ceiling (heavy load) is
+            // tried once per path and the slices still get the time in between.
             let cut = |estimator: &mut Self| {
                 estimator.polish_due = true;
-                estimator.paths_since_polish = 0;
                 estimator.stats.add(Part::Polish, started.elapsed());
             };
             let past = |deadline: Option<Instant>| deadline.is_some_and(|d| Instant::now() >= d);
