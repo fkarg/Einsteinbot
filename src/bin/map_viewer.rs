@@ -19,6 +19,8 @@ use std::path::PathBuf;
 mod degrade;
 #[path = "map_viewer/fog.rs"]
 mod fog;
+#[path = "map_viewer/postmortem.rs"]
+mod postmortem;
 #[path = "map_viewer/review.rs"]
 mod review;
 #[path = "map_viewer/scenario.rs"]
@@ -109,6 +111,7 @@ fn handle(mut stream: TcpStream, db_path: &PathBuf) -> Result<(), Box<dyn Error>
         "/api/predictive" => review::predictive_error(db_path, &parameters),
         "/api/fog-timeline" => fog::fog_timeline_request(db_path, &parameters),
         "/api/fog-path" => fog::fog_path_request(db_path, &parameters),
+        "/api/postmortem" => postmortem::postmortem_request(db_path, &parameters),
         "/api/decisions" => {
             required_id(&parameters, "id").and_then(|id| list_decisions(db_path, id))
         }

@@ -59,6 +59,9 @@
     .overview { padding:12px 16px; display:flex; flex-direction:column; gap:10px; max-width:1500px; } .overview .table th { cursor:pointer; user-select:none; } .overview .table th:nth-child(-n+3), .overview .table td:nth-child(-n+3) { text-align:left; }
     .review table { margin-top:6px; } .review .table th,.review .table td { white-space:normal; } .review td.sw { width:14px; padding:0 4px 0 0; } .review .off { color:#6e7d91; } .review button { margin-top:6px; }
     .infobar { display:flex; height:12px; background:#111a27; border-radius:3px; overflow:hidden; margin:4px 0 2px; } .infobar div { height:100%; } .infolegend { font:10px ui-monospace,monospace; color:#8799af; }
+    .cause-legend { display:flex; flex-wrap:wrap; gap:2px 12px; font:10px ui-monospace,monospace; color:#8799af; } .cause-legend span { display:inline-flex; align-items:center; gap:4px; cursor:help; } .cause-legend svg { width:11px; height:11px; }
+    .pm { border:1px solid #263244; border-radius:6px; padding:9px; font-size:12px; color:#b6c5d8; } .pm .head { display:flex; gap:8px; align-items:flex-start; } .pm .head svg { width:16px; height:16px; flex:none; margin-top:1px; } .pm .head b { color:#e7edf6; font-weight:600; }
+    .alt { display:grid; grid-template-columns:1fr; gap:1px; margin:6px 0 2px; font:11px ui-monospace,monospace; color:#9fb0c5; } .alt .bar { height:9px; border-radius:2px; background:#4f9bff; } .alt .bar.doomed { background:transparent; border:1px dashed #4f9bff; } .alt .row { margin-bottom:4px; } .alt .chosen { color:#ffe27a; }
     .scrubbar { display:flex; gap:6px; align-items:center; flex-wrap:wrap; } .scrubbar button { padding:3px 9px; }
     #scrub { width:100%; height:236px; background:#080d13; border:1px solid #263244; border-radius:5px; cursor:ew-resize; touch-action:none; }
     .table { width:100%; border-collapse:collapse; font:11px/1.4 ui-monospace,monospace; color:#b6c5d8; }
@@ -92,6 +95,7 @@
         <span id="decisionLabel"></span>
       </div>
       <canvas id="scrub" aria-label="Capture timeline"></canvas>
+      <div id="causeLegend" class="cause-legend"></div>
       <div class="toolbar">
         <div class="layergroups" role="group" aria-label="Map layer">
           <div class="lg"><small>What the bot believed</small><div class="layers"><button type="button" class="layer" data-layer="gravity" title="The gravity of the bot's fitted planets (the field its simulator uses)">Gravity belief</button></div></div>
@@ -137,6 +141,8 @@
       <h2>Estimator update</h2><div id="updateReport" class="review"></div>
       <h2>Selection</h2><div id="selection" class="metrics">Hover the map for a summary; click a planet, player, contact or trajectory to pin it.</div>
       <div id="decisionPanel" hidden>
+        <h2>Why it turned out this way</h2>
+        <div id="postmortem" class="pm"></div>
         <h2>Decision</h2>
         <div id="choice" class="metrics"></div>
         <h2>Shot review</h2>
