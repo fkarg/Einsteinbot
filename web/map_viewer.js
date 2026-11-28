@@ -70,6 +70,7 @@
     const el=$('postmortem');el.replaceChildren();const seq=selected(),r=postmortems.get(seq),dt=pmDetail?.sequence===seq?pmDetail:null;
     if(!r){el.textContent=postmortems.size?'Not analysed.':'Loading…';return;}
     const head=document.createElement('div');head.className='head';const k=CAUSES[r.class]||CAUSES.unknown;head.append(glyphSvg(causeShape(r),k.color));const text=document.createElement('div');const b=document.createElement('b');b.textContent=k.label;text.append(b,document.createElement('br'),causeText(r));head.append(text);el.append(head);
+    if(r.class==='map_error'||r.class==='early_blind'){const n=document.createElement('div');n.className='note';n.textContent='The kind is read off the true planet nearest the point where predicted and true paths part (estimate 10+ units off: missing; 2-10: off; else small errors amplified). Nearest is not proof of cause: a farther planet can bend a path.';el.append(n);}
     if(dt?.fog_risk_at_part!=null){const n=document.createElement('div');n.className='note';n.textContent=`Fog where the paths part: ${fmt(100*dt.fog_risk_at_part,0)}% chance of an unseen planet within 100. ${dt.predicted?.with_correction?'Prediction includes the residual correction the bot applied.':'No residual correction was applied.'}`;el.append(n);}
     const alts=Array.isArray(r.alternatives)?r.alternatives:null;
     if(alts?.length){const box=document.createElement('div');box.className='alt';const max=Math.max(...alts.map(a=>a.score||0),1e-9),chosen=currentDecision().choice||{};

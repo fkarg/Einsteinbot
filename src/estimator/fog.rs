@@ -125,14 +125,39 @@ impl Fog {
     /// The fog of the map `planets` over `coverage` (already covering the map's paths).
     pub(super) fn build(planets: &[Planet], coverage: &mut Coverage, model: FogModel) -> Self {
         let (centres, columns) = coverage.centre_distances();
-        let free = |u: [f64; 2]| {
-            planets
-                .iter()
-                .all(|p| (p.x - u[0]).hypot(p.y - u[1]) > p.radius + CLEARANCE)
+        let origin = centres.first().map_or([0.0, 0.0], |c| c.0);
+        // Centres overlapping a found planet, stamped disk by disk on the centre rectangle.
+        let mut free = vec![true; centres.len()];
+        let rows = if columns == 0 {
+            0
+        } else {
+            centres.len() / columns
         };
+        for p in planets {
+            let reach = p.radius + CLEARANCE;
+            let span = |c: f64, o: f64, n: usize| {
+                let lo = ((c - reach - o) / SPACING).ceil().max(0.0) as usize;
+                let hi = ((c + reach - o) / SPACING).floor().min(n as f64 - 1.0);
+                (lo, if hi < 0.0 { None } else { Some(hi as usize) })
+            };
+            let ((i0, i1), (j0, j1)) = (span(p.x, origin[0], columns), span(p.y, origin[1], rows));
+            let (Some(i1), Some(j1)) = (i1, j1) else {
+                continue;
+            };
+            for j in j0..=j1 {
+                for i in i0..=i1 {
+                    let k = j * columns + i;
+                    let u = centres[k].0;
+                    if (p.x - u[0]).hypot(p.y - u[1]) <= reach {
+                        free[k] = false;
+                    }
+                }
+            }
+        }
         let mut weight: Vec<f64> = centres
             .iter()
-            .map(|&(u, d)| if free(u) { miss_probability(d) } else { 0.0 })
+            .zip(&free)
+            .map(|(&(_, d), &free)| if free { miss_probability(d) } else { 0.0 })
             .collect();
         let total: f64 = weight.iter().sum();
         let miss_fraction = if centres.is_empty() {
@@ -150,10 +175,7 @@ impl Fog {
         if total <= 0.0 {
             // Nowhere a planet could still hide: if the count still needs one (a count-limit
             // floor), it could be at any free centre.
-            weight = centres
-                .iter()
-                .map(|&(u, _)| if free(u) { 1.0 } else { 0.0 })
-                .collect();
+            weight = free.iter().map(|&f| if f { 1.0 } else { 0.0 }).collect();
         }
         let sum: f64 = weight.iter().sum();
         let probability: Vec<f64> = weight
@@ -165,7 +187,6 @@ impl Fog {
             .filter(|p| **p > 0.0)
             .map(|p| -p * p.log2())
             .sum();
-        let origin = centres.first().map_or([0.0, 0.0], |c| c.0);
         Self {
             model,
             posterior,

@@ -269,7 +269,21 @@ fn fog_calibration() {
                 let (model, source) = model_of(belief);
                 let mut coverage = Coverage::new(world);
                 coverage.cover_observations(&observations);
+                let started = std::time::Instant::now();
                 let fog = Fog::build(&planets, &mut coverage, model);
+                let build_ms = started.elapsed().as_secs_f64() * 1e3;
+                // The live estimator extends its coverage by the newest path only.
+                let mut extend = Coverage::new(world);
+                if fitted > 1 {
+                    extend.cover_observations(&observations[..fitted - 1]);
+                    extend.centre_distances();
+                }
+                let started = std::time::Instant::now();
+                extend.cover_observations(&observations);
+                let live = Fog::build(&planets, &mut extend, model);
+                let live_ms = started.elapsed().as_secs_f64() * 1e3;
+                assert_eq!(live.summary(), fog.summary());
+                println!("COST paths={fitted} build_ms={build_ms:.3} live_ms={live_ms:.3}");
                 let missed = missing(&epoch.truth, &planets);
                 // Variants of the unseen count: the prior's mean excess alone (P18), and the
                 // binomial with P25's hidden fraction at 200 units.

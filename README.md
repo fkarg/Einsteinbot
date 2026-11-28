@@ -48,6 +48,7 @@ The rest of this README uses these words in a fixed sense.
 - **Belief**: the bot's current estimate of the map, one list of planets (centre and radius). The estimator **publishes** a new belief after every path; targeting aims with the latest one.
 - **Row, residual**: each tick of a path gives one equation, a *row*, that compares the observed bend of the path with the bend the belief predicts there. The *residual* is observed minus predicted.
 - **Unseen planets**: true planets the belief does not contain yet.
+- **Fog of war**: where unseen planets could still be: per place, the chance that an unseen planet's centre lies within 100 units ([fog of war](#estimator-fog-of-war)).
 - **Birth, death**: the search adding a planet to the belief or removing one.
 - **Evidence**: the score that decides how many planets the belief has: how well the map explains the rows, minus a penalty per planet ([section 4](#4-model-selection-how-many-planets)).
 - **Cap**: the most planets the belief may hold: $N$ if you pass a known planet count with `--planets N`, otherwise 32.
@@ -96,7 +97,8 @@ Each item says what the bot does, why it helps, and what it measured. The math b
 | **Pays for every extra planet** | Adds or removes a planet only when the evidence rises, which includes a penalty per planet. | Planets come from evidence, not from the search's appetite. | Same recall as before at the end of a map, with fewer spurious planets. |
 | **Only proposes possible maps** | Never lets two estimated planets overlap or a planet cross the edge, exactly as the server's map generator requires. | A planet the generator could not produce is wrong by construction; it was splitting one real planet into three. | The split is gone; the default cap rose to 32 without new spurious planets; CPU on one capture 476 s → 39 s. |
 | **Notices when its planet cap is too low** | When the map is at its planet cap (`--planets N`, else 32) and the unexplained pull along the paths is still planet-sized, it warns that the map may have more planets than that (in the report printed on Ctrl+C, the live terminal view and the inspector). It never raises the cap itself. | A wrong `--planets` silently costs the missing planets; the warning tells you to raise it. | Raised in 26 of 26 replays whose cap was 1-4 below the true count, a median of 2 paths after reaching the cap; never in 20 replays with the right count at the cap. |
-| **Can learn the planet count** (opt-in, `--learn-planets`) | Starts at 24 and adjusts by one: up when the count-limit warning fires, down when the map looks complete below the count and the missing planets would all have to hide where no shot has been. The learned count carries over to the next maps. | A server's count is fixed but never sent; the bot finds it without `--planets`. | Count too high: lowered in 30 of 33 replays. Started at 26 on 15 held-out 24-planet maps: reached 24 in 14. 26-planet worlds started at 24: reached 26 in 6 of 7 (one stopped at 27). |
+| **Can learn the planet count** (opt-in, `--learn-planets`) | Starts at 24 (or at `--planets N`) and adjusts by one: up when the count-limit warning fires, down when the map looks complete below the count and the missing planets would all have to hide where no shot has been. The learned count and a prior on it carry over to the next maps; the prior narrows by one per full map (`--no-carry-planets` turns this off). | A server's count is fixed but never sent; the bot finds it without `--planets`. | Count too high: lowered in 30 of 33 replays. Started at 26 on 15 held-out 24-planet maps: reached 24 in 14. 26-planet worlds started at 24: reached 26 in 6 of 7 (one stopped at 27). |
+| **Maps its own ignorance** (fog of war) | For every place, the chance that a planet it has not found yet lies within 100 units, from a posterior on how many planets are still unseen and where paths would still have missed them. Where every planet is accounted for, the fog is gone, even where no shot flew. | Shows where the map can still surprise a shot, and what each path taught (bits). | Held out on 15 recorded maps: predicted 0.15 / 0.25 / 0.31, observed 0.14 / 0.25 / 0.30 (reliability bins). |
 | **Aims with what it can't explain yet** | Adds the still-unexplained pull seen along observed paths to its shot simulation; switches off once the map is complete. | Early in a map, paths near earlier shots are bent by planets the map lacks. | +5 to +32 true hits per replayed game, almost all early in the map. |
 | **Prefers short shots** | Ranks predicted hits by flight time first, miss distance second. | Map errors grow along a path; long shots rarely hit. | The ranking alone: true hits 15 → 23, 49 → 61, 22 → 46 on replayed games. |
 | **Doesn't shoot the doomed** | Simulates every shot in flight (all players, its own included) and skips targets that will die before its shot lands, unless its shot wins the race. | In busy games many shots hit where a player *was*. | Capture 58: true hits 252 → 315, wasted hits 112 → 62. |
@@ -280,7 +282,7 @@ More detail on the estimator, targeting and their settings is in [docs/usage.md]
 
 ## How well it works
 
-**Provenance.** Numbers as of 2026-11-27, main at 58abdf9. Each item names the change (P-number) it measured. They come from the experiment logs in [`docs/estimator-experiments.md`](docs/estimator-experiments.md) and the landing notes in [`docs/brainstorms/2026-11-13-newtonwars-bot.md`](docs/brainstorms/2026-11-13-newtonwars-bot.md).
+**Provenance.** Numbers as of 2026-11-27, main at 58abdf9; the fog of war as of 2026-11-28 (branch p26). Each item names the change (P-number) it measured. They come from the experiment logs in [`docs/estimator-experiments.md`](docs/estimator-experiments.md) and the landing notes in [`docs/brainstorms/2026-11-13-newtonwars-bot.md`](docs/brainstorms/2026-11-13-newtonwars-bot.md).
 
 **How to read them.**
 
@@ -329,6 +331,19 @@ At most 1-2 paths are queued. Capture 55 is one game. The remaining worst lag co
 
 On real games the default count prior (24 ± 4) and a known fixed count give the same maps within noise. The bot also warns when the map may hold more planets than its cap, and `--learn-planets` adjusts the count across maps. Details and numbers: [planet count](docs/estimator-experiments.md#planet-count-in-the-readme-until-2026-11-28).
 
+### Estimator: fog of war
+
+The fog (P26) spreads the unseen planets over the places where paths would still have missed them: a possible centre $d$ units from the nearest observed tick is missed with probability $P_\text{miss}(d)$, a logistic fitted to how often true planets were still missing from recorded beliefs at that distance (it includes the estimator's own search lag). How many are unseen comes from a posterior on the total count $N$: the count prior times $\binom{N}{K} f^{N-K}$ for $K$ found, with $f$ the average miss probability raised to the power 1.5 (paths bend toward planets and end on them, so space no path visited holds fewer planets than its share). The fog at a place is $1 - \mathrm{E}[(1 - \pi_{100})^{N-K}]$, $\pi_{100}$ being one unseen planet's chance to lie within 100 units. It is a heuristic with measured calibration, not a derived posterior.
+
+Calibration against truth on recorded beliefs (cells of a 15-unit grid off every planet; a cell counts as "observed" when a truth planet missing from the belief has its centre within 100 units). Design: captures 58 (four maps), 60, 67 and 69, 45 decisions; held out: 15 other recorded maps (captures 53, 55-57, 59, 61-64, 66, 68, 70, 71, 73, 76), 103 decisions, run once:
+
+| set | predicted / observed, by bin | Brier (climatology) | unseen count: bias, 90% interval coverage |
+|---|---|---|---|
+| design | 0.02/0.01, 0.15/0.12, 0.25/0.25, 0.31/0.34 | 0.0675 (0.0806) | -0.06, 0.98 |
+| held out | 0.02/0.03, 0.15/0.14, 0.25/0.25, 0.31/0.30 | 0.0677 (0.0759) | -0.94, 0.86 |
+
+The exponent 1.5 was chosen on the design set; held out, the prior alone (no coverage evidence) had a better log score for the unseen count (-2.14 against -2.31) but worse fog reliability (Brier 0.0706). The pull of the unseen planets (root mean square, for hover) covers the missing planets' true field within twice its value on 93% of held-out cells but only 67% within 100 units of a missing planet: their pull is heavy-tailed. Details: [P26 results](docs/estimator-experiments.md#p26-results).
+
 ### Targeting
 
 Measured by replaying each recorded decision with the belief the bot had at that moment, then flying the chosen shot on the true map.
@@ -364,6 +379,7 @@ Detection of map boundaries and end cards (P19, section 7), tested on recorded c
 - The default cap is 32 planets. Servers with more than 32 planets need `--planets N` or `--learn-planets`; the count-limit warning says so once the map is at the cap (tested up to 28 planets). A misplaced planet at a correct cap could also raise it; no such case was seen.
 - The uncertainty probe (a shot aimed to learn where the belief is uncertain, considered only when no hit is predicted) never fired in capture 55. The belief's covariance is usually not available yet at decision time, because the full-row refit lags the latest path.
 - The evidence prior (1/20 per planet), the planet-count prior, the interpolation variance and the prior on the noise scalars are heuristics.
+- The fog of war and its count posterior are heuristics with measured calibration on 24-planet maps only; held out they under-predict the unseen count by about one planet, and the pull near a missing planet is often larger than shown.
 - Most cells above are one run, and live worlds vary by several planets between runs of similar configurations.
 - Bit-for-bit parity of the bot's simulator with the engine is not established; an audit on two captures matched most shots closely but had individual errors up to 13.46 units ([details](docs/map-inspector.md#simulator-parity-with-the-engine)).
 
