@@ -21,9 +21,13 @@ pub struct AppConfig {
     /// The known total planet count of the server's maps (its `planets` setting, 1-64), used as
     /// fixed by the estimator; `None`: estimated with a broad prior.
     pub planets: Option<usize>,
-    /// Learn the planet count over the session (P25, `--learn-planets`): start at 24, one up on
-    /// the count-limit warning, one down on the too-high signal. Ignored when `planets` is given.
+    /// Learn the planet count over the session (P25, `--learn-planets`): start at 24 (or at
+    /// `planets` when given, P26), one up on the count-limit warning, one down on the too-high
+    /// signal.
     pub learn_planets: bool,
+    /// With `learn_planets`, carry the learned count and its prior to the next map (P26;
+    /// `--no-carry-planets` for servers whose count varies between maps).
+    pub carry_planets: bool,
     /// Show the live terminal view when stdout is a terminal (`--no-tui`: plain logging).
     pub tui: bool,
 }
@@ -42,6 +46,7 @@ struct CliOptions {
     db_path: Option<PathBuf>,
     planets: Option<String>,
     learn_planets: Option<bool>,
+    carry_planets: Option<bool>,
     tui: Option<bool>,
 }
 
@@ -59,6 +64,7 @@ struct FileOptions {
     db_path: Option<PathBuf>,
     planets: Option<usize>,
     learn_planets: Option<bool>,
+    carry_planets: Option<bool>,
     tui: Option<bool>,
 }
 
@@ -75,6 +81,7 @@ struct EnvOptions {
     db_path: Option<PathBuf>,
     planets: Option<String>,
     learn_planets: Option<String>,
+    carry_planets: Option<String>,
     tui: Option<String>,
 }
 
@@ -124,6 +131,7 @@ impl EnvOptions {
             db_path: get("EINSTEINBOT_DB_PATH").map(PathBuf::from),
             planets: get("EINSTEINBOT_PLANETS"),
             learn_planets: get("EINSTEINBOT_LEARN_PLANETS"),
+            carry_planets: get("EINSTEINBOT_CARRY_PLANETS"),
             tui: get("EINSTEINBOT_TUI"),
         })
     }
@@ -234,6 +242,13 @@ fn resolve(cli: CliOptions, env: EnvOptions, file: FileOptions) -> Result<AppCon
         } else {
             file.learn_planets.unwrap_or(false)
         },
+        carry_planets: if let Some(carry) = cli.carry_planets {
+            carry
+        } else if let Some(value) = env.carry_planets {
+            parse_bool(&value, "EINSTEINBOT_CARRY_PLANETS")?
+        } else {
+            file.carry_planets.unwrap_or(true)
+        },
         tui: if let Some(tui) = cli.tui {
             tui
         } else if let Some(value) = env.tui {
@@ -275,6 +290,7 @@ where
             "--clients" => options.clients = Some(value(&mut args, &arg)?),
             "--planets" => options.planets = Some(value(&mut args, &arg)?),
             "--learn-planets" => options.learn_planets = Some(true),
+            "--no-carry-planets" => options.carry_planets = Some(false),
             "--tui" => options.tui = Some(true),
             "--no-tui" => options.tui = Some(false),
             _ => return Err(format!("unknown argument: {arg}\n\n{}", help_text())),
@@ -342,12 +358,13 @@ fn help_text() -> &'static str {
        --clients N         Run N local bot connections (default: 1, max: 16)\n\
        --db-path PATH      SQLite file (default: einsteinbot.sqlite3)\n\
        --planets N         Known planet count of the server's maps (fixed; default: estimated)\n\
-       --learn-planets     Learn the planet count over the session from 24 (ignored with --planets)\n\
+       --learn-planets     Learn the planet count over the session from 24 (or from --planets N)\n\
+       --no-carry-planets  With --learn-planets, start every map afresh (servers whose count varies)\n\
        --no-tui            Plain logging instead of the live terminal view\n\
        -h, --help          Show this help\n\
      \n\
      Precedence: command line, environment, TOML config, defaults.\n\
-     Environment: EINSTEINBOT_CONFIG, _HOST, _PORT, _NAME, _RECORD, _DUMMY, _TARGETING, _ORACLE_MAP, _CLIENTS, _DB_PATH, _PLANETS, _LEARN_PLANETS, _TUI.\n"
+     Environment: EINSTEINBOT_CONFIG, _HOST, _PORT, _NAME, _RECORD, _DUMMY, _TARGETING, _ORACLE_MAP, _CLIENTS, _DB_PATH, _PLANETS, _LEARN_PLANETS, _CARRY_PLANETS, _TUI.\n"
 }
 
 #[cfg(test)]
@@ -549,6 +566,27 @@ mod tests {
         assert!(resolve_with(&["--learn-planets"], Some("false"), ""));
         assert!(resolve_with(&[], Some("1"), "learn_planets = false\n"));
         assert!(resolve_with(&[], None, "learn_planets = true\n"));
+    }
+
+    #[test]
+    fn carrying_the_learned_count_is_on_unless_switched_off() {
+        let resolve_with = |args: &[&str], env: Option<&str>, file: &str| {
+            let ParsedCli::Options(cli) = parse_args(args.iter().map(|a| a.to_string())).unwrap()
+            else {
+                panic!("expected run options");
+            };
+            let env = EnvOptions {
+                carry_planets: env.map(str::to_owned),
+                ..EnvOptions::default()
+            };
+            resolve(cli, env, toml::from_str(file).unwrap())
+                .unwrap()
+                .carry_planets
+        };
+        assert!(resolve_with(&[], None, ""));
+        assert!(!resolve_with(&["--no-carry-planets"], Some("true"), ""));
+        assert!(!resolve_with(&[], Some("0"), "carry_planets = true\n"));
+        assert!(!resolve_with(&[], None, "carry_planets = false\n"));
     }
 
     #[test]

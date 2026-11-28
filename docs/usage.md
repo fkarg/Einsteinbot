@@ -73,7 +73,8 @@ targeting = true
 oracle_map_for_policy = false
 clients = 1
 # planets = 24   # known planet count of the server's maps; omit to estimate
-# learn_planets = true   # learn the count over the session (ignored with planets)
+# learn_planets = true   # learn the count over the session (from planets when given)
+# carry_planets = false  # with learn_planets: start every map afresh (servers whose count varies)
 ```
 
 ```sh
@@ -94,6 +95,7 @@ cargo run -- --config einsteinbot.toml
 | clients | `--clients N` | `EINSTEINBOT_CLIENTS` | 1 |
 | planet count | `--planets N` | `EINSTEINBOT_PLANETS` | estimated |
 | learn planet count | `--learn-planets` | `EINSTEINBOT_LEARN_PLANETS` | off |
+| carry the learned count to the next map | `--no-carry-planets` | `EINSTEINBOT_CARRY_PLANETS` | on |
 | live view | `--tui`, `--no-tui` | `EINSTEINBOT_TUI` | on when stdout is a terminal |
 
 `cargo run -- --help` prints the same list.
@@ -105,14 +107,18 @@ For example, `record = false`, `EINSTEINBOT_RECORD=false` or `--no-record` all d
 NewtonWars generates `planets` planets per map (server option, 1-64, default 24) and never sends the number.
 
 - **If you know it**, pass `--planets N` (`planets = N`, `EINSTEINBOT_PLANETS`). The estimator then uses it as fixed: with $K$ planets found, $N - K$ are still unseen, and it never fits more than $N$.
-- **To learn it over the session**, pass `--learn-planets` (see below).
+- **To learn it over the session**, pass `--learn-planets` (see below). With `--planets N --learn-planets` the learning starts from `N` instead of 24.
 - **Without either**, the unseen count is the mean excess over $K$ of a broad prior on the total: a discrete Gaussian centred on 24 with sd 4 over 1-64, conditioned on at least $K$ planets. That is about 2.9 unseen once 24 are found. The cap is `DEFAULT_MAX_PLANETS` (32, the top of the prior's plausible range). The prior is a choice, not calibrated.
 
 Measured on replays (P18, P21, [estimator-experiments.md](estimator-experiments.md)): a wrong fixed count costs planets when it is too low (the cap) and little when it is too high. A server with more than 32 planets needs `--planets`.
 
 **Count-limit warning (P23).** When the map holds as many planets as the cap allows and still leaves a planet-sized unexplained pull, the estimator flags the map as *count limited*: the residual correction (the smoothed unexplained pull along the observed paths) exceeds 0.03 acceleration units on 3 of the last 5 fully refit maps at the cap. The flag stays for the rest of the map. It is a warning only: the cap is never raised automatically; restart with a larger `--planets` if you see it. On replays it was raised 2 paths after reaching the cap (median) whenever 1-4 planets were left out, and never in 20 replays with the right count at the cap. It uses the correction the estimator computes anyway, so it costs nothing measurable. A map below its cap is never flagged, and no flag is not proof that the count is right (a planet no path passes near leaves no pull), and a misplaced planet at a correct cap could in principle raise it (not seen).
 
-**Learning the count (P25, `--learn-planets`).** The estimator works with a fixed count $N$, as with `--planets`, starting at 24. When the count-limit warning comes up, $N$ goes up by one, the warning starts over and the same map continues with the larger cap. When the map looks complete below $N$, $N$ goes down by one (the *too-high signal*, below). The learned $N$ carries over to the next maps of the session, since a server's count does not change. The stop report prints it on a `count` line (`learned 25 (start 24): 24→25 map 0 path 48`), and the live view shows `N 25 learned`. `--planets N` wins: with it the count stays exactly `N` and `--learn-planets` is ignored. The default without either flag is unchanged (the prior above).
+**Learning the count (P25, `--learn-planets`).** The estimator works with a fixed count $N$, as with `--planets`, starting at 24. When the count-limit warning comes up, $N$ goes up by one, the warning starts over and the same map continues with the larger cap. When the map looks complete below $N$, $N$ goes down by one (the *too-high signal*, below). The learned $N$ carries over to the next maps of the session, since a server's count does not change. The stop report prints it on a `count` line (`learned 25 (start 24): 24→25 map 0 path 48`), and the live view shows `N 25 learned`. `--planets N` alone keeps the count exactly `N`; `--planets N --learn-planets` starts learning from `N` (P26). The default without either flag is unchanged (the prior above).
+
+**Count prior across maps (P26).** The learning mode also keeps a prior on the count: 24 ± 4 in the first map (or `N` ± 4 with `--planets N`). After each map it is re-centred on the count in use and, if the map had at least 32 paths, made one narrower (4, 3, 2, 1, then 0.5 and no narrower, so the evidence of a map can still move it). Within a map the *count posterior* is this prior times the likelihood of the $K$ planets found, $\binom{N}{K} f^{N-K}$ with $f$ the average chance that a planet would still be missing (below) raised to the power 1.5 (paths bend toward planets and end on them, so space no path has visited holds fewer planets than its share; 1.5 calibrated best, see [estimator-experiments.md](estimator-experiments.md#p26-results)), restricted to counts the signals allow (at least the highest count a raise reached; at most the count a too-high signal lowered to in this map). The posterior drives the fog of war and is shown in the inspector; the count the estimator fits with still moves only by the two signals above, because the posterior alone cannot tell planets no path has reached from planets the search has not found yet. `--no-carry-planets` (`carry_planets = false`, `EINSTEINBOT_CARRY_PLANETS=false`) starts every map from the starting count and prior, for servers whose count changes between maps. Without `--learn-planets` the fog uses the 24 ± 4 prior (or the known count) in every map.
+
+**Fog of war (P26).** Every published belief carries a fog: for each place, the chance that a planet the map does not hold yet has its centre within 100 units (`MapBelief::unseen_risk_at`), and the root mean square pull such planets could add there (`unseen_pull_at`). The unseen planets are the count posterior's $N - K$, each placed where the paths so far would still have missed it: a possible centre $d$ units from the nearest observed tick would be missed with probability $P_{\text{miss}}(d - 30)$, a logistic (centre 38, scale 8) fitted to how often true planets were still missing from recorded maps at that gap. Where every planet is accounted for (a known count, all found) the fog is zero everywhere, flown over or not. The belief records `fog_model` (prior and bounds) and `paths_fitted`, so a recorded decision rebuilds the same fog; the cost is one distance transform when a path was added and one pass over about 18,000 possible centres per publication (1.5-1.8 ms measured on jolly, counted in the `diagnostics` part of the update report). Targeting does not use the fog yet.
 
 The too-high signal fires on a fully refit map with $K < N$ planets when all of these hold:
 

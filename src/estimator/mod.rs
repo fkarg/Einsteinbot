@@ -26,6 +26,7 @@ mod contacts;
 mod count;
 mod eval;
 mod fit;
+mod fog;
 mod lm;
 mod noise;
 mod rebuild;
@@ -35,8 +36,12 @@ mod search;
 mod window;
 mod work;
 
-pub use count::{CountChange, LearnedCount};
+pub use count::{CountChange, CountPosterior, CountPrior, LearnedCount};
 pub use eval::{position_rmse, shot_observations, shot_position_rmse};
+pub use fog::{
+    Fog, FogModel, FogSummary, PathInformation, fog as unseen_fog, information as fog_information,
+    timeline as fog_timeline,
+};
 pub use residual::{GATE_ACCELERATION, ResidualCorrection, ResidualGate, ResidualModel};
 pub use work::{CeilingViolation, Part, PartCeilings, PartReport, UpdateReport};
 
@@ -191,8 +196,12 @@ pub struct Settings {
     pub planets: Option<usize>,
     /// Dynamic planet count (P25, `count.rs`): without `planets`, fix the count at
     /// `count::LEARN_START`, raise it by one on the count-limit warning and lower it by one on the
-    /// too-high signal; `Estimator::carry_count` takes it to the next map. Ignored with `planets`.
+    /// too-high signal; `Estimator::carry_count` takes it to the next map. With `planets` it
+    /// starts from that count (P26).
     pub learn_planets: bool,
+    /// With `learn_planets`, carry the count and its prior to the next map (P26; off for servers
+    /// whose count varies between maps).
+    pub carry_planets: bool,
     /// Evaluations of one search slice (checked between batches of refits, so a slice may exceed
     /// it a little). Deterministic: the same paths and limits give the same belief whatever the
     /// load, as long as `slice_ceiling` does not cut a slice and no audit is adopted. The polish
@@ -218,6 +227,7 @@ impl Default for Settings {
             max_planets: DEFAULT_MAX_PLANETS,
             planets: None,
             learn_planets: false,
+            carry_planets: true,
             slice_evaluations: DEFAULT_SLICE_EVALUATIONS,
             slice_ceiling: Some(DEFAULT_SLICE_CEILING),
             slices_per_path: DEFAULT_SLICES_PER_PATH,
@@ -297,6 +307,8 @@ pub struct Estimator {
     count_limited_at: Option<usize>,
     /// The dynamic planet count (`Settings::learn_planets`), which sets `settings.planets`.
     learner: Option<count::Learner>,
+    /// Ticks of the paths given to the search, for the fog of war (`fog.rs`).
+    fog_coverage: count::Coverage,
 }
 
 /// What the estimator holds about its map epoch, for status output (cheap: no fit).
@@ -353,6 +365,7 @@ impl Default for Estimator {
             cap_magnitudes: Vec::new(),
             count_limited_at: None,
             learner: None,
+            fog_coverage: count::Coverage::new(WorldParameters::default()),
         }
     }
 }
@@ -724,6 +737,9 @@ impl Estimator {
             learner: self.learner.as_ref().map(count::Learner::next_map),
             ..Self::default()
         };
+        if let Some(learner) = &self.learner {
+            self.settings.planets = Some(learner.learned.planets);
+        }
     }
 
     /// The count-limit state for a map of `planets` planets.
@@ -829,6 +845,10 @@ impl Estimator {
             let magnitude = belief.residual_correction.as_ref().map(|c| c.max_magnitude);
             self.learn(&belief.map.planets, magnitude);
         }
+        let started = Instant::now();
+        let fog = self.fog(&belief.map.planets);
+        belief.set_fog(fog, self.searched);
+        self.stats.add(Part::Diagnostics, started.elapsed());
         self.last_report = Some(self.stats.report(&self.settings.ceilings));
         self.belief = Some(belief.clone());
         belief
