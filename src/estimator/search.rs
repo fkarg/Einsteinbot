@@ -120,7 +120,7 @@ fn distance(a: &[f64; 3], b: &[f64; 3]) -> f64 {
 }
 
 pub(super) fn mode_at(joint: &Fit, theta: &[[f64; 3]]) -> Option<Mode> {
-    let Evidence { log_evidence, .. } = joint.evidence(theta)?;
+    let Evidence { log_evidence, .. } = joint.evidence(theta, 1)?;
     Some(Mode {
         planets: theta.iter().map(|th| planet_at(*th)).collect(),
         log_evidence,
@@ -346,10 +346,20 @@ pub(super) struct Slice<'a> {
     pub threads: usize,
     pub max_planets: usize,
     pub cancelled: &'a AtomicBool,
+    /// Set when new work (a path) is waiting: the slice stops as at its deadline and keeps its
+    /// state for the next one. Nothing sets it in deterministic replays.
+    pub preempt: &'a AtomicBool,
     pub stats: &'a Stats,
     /// The noise of every fit of the slice.
     pub noise: &'a Noise,
     pub tuning: &'a SearchTuning,
+}
+
+impl Slice<'_> {
+    /// Whether the slice must stop now (deadline passed or pre-empted), keeping its best points.
+    fn cut(&self) -> bool {
+        Instant::now() >= self.deadline || self.preempt.load(Ordering::Relaxed)
+    }
 }
 
 /// The live map and its pending birth work.
@@ -467,7 +477,7 @@ impl Search {
         let shots = self.thin(slice.noise, slice.tuning.row_cap);
         while !self.idle()
             && stats.evaluations() - first < slice.evaluations
-            && Instant::now() < slice.deadline
+            && !slice.cut()
             && !cancelled.load(Ordering::Relaxed)
         {
             if self.theta.len() >= slice.max_planets && !self.deaths_due && self.partials.is_empty()
@@ -483,7 +493,7 @@ impl Search {
                 continue;
             }
             let joint = Fit::new(&shots, world, cancelled, true, vec![])
-                .with_deadline(slice.deadline)
+                .with_cut(slice.deadline, slice.preempt)
                 .with_stats(stats);
             let left = slice.evaluations - (stats.evaluations() - first);
             if self.deaths_due && self.partials.is_empty() {
@@ -553,7 +563,7 @@ impl Search {
                     false,
                     self.theta.iter().map(|t| planet_at(*t)).collect(),
                 )
-                .with_deadline(slice.deadline)
+                .with_cut(slice.deadline, slice.preempt)
                 .with_stats(stats)
             };
             // Candidates not fitted on the current rows and map: alone against the field of the map.
@@ -573,11 +583,14 @@ impl Search {
                         alone.refine(&[self.candidates[i].theta], &budget)
                     })
                 });
+                // An alone fit cut by the deadline or a pre-emption has not settled: it keeps its
+                // point and resumes from there in the next slice.
+                let settled = !slice.cut();
                 for (&i, fit) in todo.iter().zip(fitted) {
                     self.candidates[i] = match fit {
                         Some((t, chi2)) => Candidate {
                             theta: t[0],
-                            chi2: Some(chi2),
+                            chi2: settled.then_some(chi2),
                         },
                         None => Candidate {
                             theta: self.candidates[i].theta,
@@ -652,20 +665,24 @@ impl Search {
                     par_map(&todo, slice.threads, |&i| {
                         let counter = Stats::default();
                         let out = Fit::new(&shots, world, cancelled, true, vec![])
-                            .with_deadline(slice.deadline)
+                            .with_cut(slice.deadline, slice.preempt)
                             .with_stats(&counter)
                             .refine(&self.partials[i].theta, &budget);
                         (out, counter)
                     })
                 });
+                // A pre-empted round is not counted: at 9 paths per second every arrival would
+                // otherwise use up one of `MAX_ROUNDS` and settle refits far from converged.
+                let preempted = slice.preempt.load(Ordering::Relaxed);
                 for (&i, (out, counter)) in todo.iter().zip(fits) {
                     let p = &mut self.partials[i];
-                    p.rounds += 1;
+                    p.rounds += usize::from(!preempted);
                     if let Some((t, _)) = out {
                         p.theta = t;
                     }
-                    // A refit cut by the slice deadline has not settled: it resumes in the next slice.
-                    p.done = (counter.evaluations() < each && Instant::now() < slice.deadline)
+                    // A refit cut by the slice deadline or a pre-emption has not settled: it
+                    // resumes in the next slice.
+                    p.done = (counter.evaluations() < each && !slice.cut())
                         || p.rounds >= slice.tuning.max_rounds;
                     stats.absorb(&counter);
                 }
@@ -771,6 +788,7 @@ mod tests {
             threads: 2,
             max_planets: 24,
             cancelled,
+            preempt: cancelled,
             stats,
             noise,
             tuning: Box::leak(Box::default()),

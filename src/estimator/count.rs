@@ -1,4 +1,6 @@
-//! Path coverage of the battlefield, for the too-high planet-count signal (P25).
+//! Path coverage of the battlefield, for the too-high planet-count signal (P25), and the count
+//! prior and posterior of the dynamic count and the fog of war (P26, `CountPrior`,
+//! `CountPosterior`; `fog.rs`).
 //!
 //! A planet no path passes near leaves no pull the estimator could find, so with the count fixed
 //! at `N` and `K < N` planets found, the other `N - K` must hide where no path has been. The
@@ -7,9 +9,10 @@
 //! cover the map. `Coverage` keeps the distance from every centre of a 10-unit raster to the
 //! nearest observed tick, extended path by path like `noise::TickMask`.
 use super::Shot;
+use super::fog::FogModel;
 use super::noise::nearest_free;
 use crate::protocol::Planet;
-use crate::simulation::WorldParameters;
+use crate::simulation::{ShotObservation, WorldParameters};
 
 /// Raster spacing (world units).
 const SPACING: f64 = 10.0;
@@ -84,6 +87,59 @@ impl Coverage {
         self.paths = shots.len();
     }
 
+    /// Make the coverage that of every point of `observations` (P26's fog covers launch to end,
+    /// including paths too short for a fit; `cover` stamps the fitted ticks only). A coverage of
+    /// more paths than given is rebuilt.
+    pub fn cover_observations(&mut self, observations: &[ShotObservation]) {
+        if self.paths > observations.len() {
+            *self = Self::new(WorldParameters::default());
+        }
+        for obs in &observations[self.paths..] {
+            self.add_points(&obs.points);
+        }
+    }
+
+    /// Paths covered so far.
+    pub fn covered(&self) -> usize {
+        self.paths
+    }
+
+    /// Cover one more path's points.
+    pub fn add_points(&mut self, points: &[crate::protocol::Point]) {
+        for p in points {
+            self.stamp([f64::from(p.x), f64::from(p.y)]);
+        }
+        self.paths += 1;
+    }
+
+    fn stamp(&mut self, t: [f64; 2]) {
+        let i = ((t[0] + PAD) / SPACING).round();
+        let j = ((t[1] + PAD) / SPACING).round();
+        if (0.0..self.nx as f64).contains(&i) && (0.0..self.ny as f64).contains(&j) {
+            let k = j as usize * self.nx + i as usize;
+            if !self.occupied[k] {
+                self.occupied[k] = true;
+                self.distance = None;
+            }
+        }
+    }
+
+    /// Every candidate centre (row-major over a rectangle of the raster) with its distance to the
+    /// nearest observed tick, and the rectangle's columns.
+    pub fn centre_distances(&mut self) -> (Vec<([f64; 2], f64)>, usize) {
+        let nx = self.nx;
+        let centres = std::mem::take(&mut self.centres);
+        let distance = self.distances();
+        let out: Vec<_> = centres
+            .iter()
+            .map(|&k| (node(k % nx, k / nx), distance[k]))
+            .collect();
+        let first_row = centres.first().map_or(0, |k| k / nx);
+        let columns = centres.iter().take_while(|k| *k / nx == first_row).count();
+        self.centres = centres;
+        (out, columns)
+    }
+
     fn distances(&mut self) -> &[f64] {
         let (nx, ny) = (self.nx, self.ny);
         let occupied = &self.occupied;
@@ -139,6 +195,155 @@ fn node(i: usize, j: usize) -> [f64; 2] {
     [i as f64 * SPACING - PAD, j as f64 * SPACING - PAD]
 }
 
+/// Largest total count considered (the server's range, as the noise prior's).
+pub const COUNT_MAX: usize = 64;
+/// Spread of the starting count prior (the noise prior's, P18).
+pub const PRIOR_SD: f64 = 4.0;
+/// The carried prior never gets narrower than this (P26), so the binomial evidence of a map can
+/// still move the posterior and a too-high or count-limit signal still has room to act.
+pub const MIN_SD: f64 = 0.5;
+/// A map narrows the carried prior (by one per map) only with at least this many paths: a map cut
+/// short says little about the count.
+pub const CARRY_MIN_PATHS: usize = 32;
+
+/// Prior on the total planet count `N` of a map: a discrete Gaussian on `1..=COUNT_MAX`; `sd` 0
+/// is a known count (`--planets N`).
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CountPrior {
+    pub centre: f64,
+    pub sd: f64,
+}
+
+impl CountPrior {
+    /// The default without `--planets`: centre 24, sd 4 (P18).
+    pub const DEFAULT: Self = Self {
+        centre: LEARN_START as f64,
+        sd: PRIOR_SD,
+    };
+
+    pub fn known(count: usize) -> Self {
+        Self {
+            centre: count as f64,
+            sd: 0.0,
+        }
+    }
+
+    fn log_weight(&self, n: usize) -> f64 {
+        if self.sd <= 0.0 {
+            if n as f64 == self.centre.round() {
+                0.0
+            } else {
+                f64::NEG_INFINITY
+            }
+        } else {
+            -0.5 * ((n as f64 - self.centre) / self.sd).powi(2)
+        }
+    }
+}
+
+/// Posterior over the total planet count `N` of a map (P26): the prior times the likelihood of
+/// `K` planets found when each of `N` uniformly placed planets is missed with probability `f`,
+/// `C(N, K) (1 - f)^K f^(N - K)` (P25's), restricted to `lower..=upper` (the evidence of the
+/// count-limit and too-high signals). `f` is the average probability that a planet centred at a
+/// possible centre would still be missing from the map (`fog::detectability`).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CountPosterior {
+    /// Planets found (`K`).
+    pub found: usize,
+    /// `probabilities[i]` is `P(N = found + i)`.
+    pub probabilities: Vec<f64>,
+}
+
+impl CountPosterior {
+    pub fn new(prior: CountPrior, found: usize, miss: f64, lower: usize, upper: usize) -> Self {
+        let lower = lower.max(found).max(1);
+        let upper = upper.min(COUNT_MAX).max(lower);
+        let miss = miss.clamp(0.0, 1.0);
+        let mut log_choose = 0.0;
+        let mut logs = Vec::with_capacity(upper - found + 1);
+        for n in found..=upper {
+            if n > found {
+                log_choose += (n as f64 / (n - found) as f64).ln();
+            }
+            let unseen = (n - found) as f64;
+            let log_miss = if unseen == 0.0 {
+                0.0
+            } else {
+                unseen * miss.ln()
+            };
+            logs.push(if n < lower {
+                f64::NEG_INFINITY
+            } else {
+                prior.log_weight(n) + log_choose + log_miss
+            });
+        }
+        let top = logs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let probabilities = if top.is_finite() {
+            let weights: Vec<f64> = logs.iter().map(|l| (l - top).exp()).collect();
+            let sum: f64 = weights.iter().sum();
+            weights.iter().map(|w| w / sum).collect()
+        } else {
+            // The prior excludes every count the evidence allows (a known count below `K`, or
+            // nothing missable): the smallest allowed count.
+            let mut p = vec![0.0; upper - found + 1];
+            p[lower - found] = 1.0;
+            p
+        };
+        Self {
+            found,
+            probabilities,
+        }
+    }
+
+    /// Expected unseen planets `E[N - K]`.
+    pub fn expected_unseen(&self) -> f64 {
+        self.probabilities
+            .iter()
+            .enumerate()
+            .map(|(i, p)| i as f64 * p)
+            .sum()
+    }
+
+    pub fn mean(&self) -> f64 {
+        self.found as f64 + self.expected_unseen()
+    }
+
+    pub fn sd(&self) -> f64 {
+        let mean = self.expected_unseen();
+        self.probabilities
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (i as f64 - mean).powi(2) * p)
+            .sum::<f64>()
+            .sqrt()
+    }
+
+    /// The most probable total count.
+    pub fn mode(&self) -> usize {
+        let (i, _) = self
+            .probabilities
+            .iter()
+            .enumerate()
+            .fold(
+                (0, -1.0),
+                |best, (i, &p)| if p > best.1 { (i, p) } else { best },
+            );
+        self.found + i
+    }
+
+    /// `E[z^(N - K)]`: the probability that none of the unseen planets is in a region holding a
+    /// single unseen planet with probability `1 - z`.
+    pub fn generating(&self, z: f64) -> f64 {
+        let mut power = 1.0;
+        let mut sum = 0.0;
+        for p in &self.probabilities {
+            sum += p * power;
+            power *= z;
+        }
+        sum
+    }
+}
+
 /// Count the dynamic mode starts from (the server default).
 pub const LEARN_START: usize = 24;
 /// Too-high signal (P25). With the count fixed at `N` and `K < N` planets found, the `N - K`
@@ -160,12 +365,16 @@ pub const TOO_HIGH_PLATEAU: usize = 8;
 
 /// The planet count of the dynamic mode (`Settings::learn_planets`): fixed at `planets` within a
 /// map, raised by one when the count-limit warning (P23) holds and lowered by one on the too-high
-/// signal; carried across the maps of a session.
+/// signal; carried across the maps of a session together with the count prior (P26).
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct LearnedCount {
     /// The count in use.
     pub planets: usize,
     pub start: usize,
+    /// The count prior of the current map (P26): centred on `start` with sd `PRIOR_SD` in the
+    /// first map; after each map re-centred on the count in use and, when the map had at least
+    /// `CARRY_MIN_PATHS` paths, one narrower, never below `MIN_SD`.
+    pub prior: CountPrior,
     /// The count is never lowered below this: the highest count a raise reached (a raise is
     /// evidence of more planets than the count before it), so it cannot oscillate.
     pub floor: usize,
@@ -202,6 +411,12 @@ pub(super) struct Observation {
 pub(super) struct Learner {
     pub learned: LearnedCount,
     map: usize,
+    /// Carry the count and its prior to the next map (`Settings::carry_planets`).
+    carry: bool,
+    /// The highest count this map's evidence allows (a too-high signal lowers it).
+    pub upper: usize,
+    /// Paths of the latest polished map.
+    paths: usize,
     pub coverage: Coverage,
     /// Magnitudes of the latest polished maps (at most `TOO_HIGH_WINDOW`).
     recent: Vec<Option<f64>>,
@@ -211,15 +426,28 @@ pub(super) struct Learner {
 }
 
 impl Learner {
+    /// A learner from `start` that carries its count to the next maps.
+    #[cfg(test)]
     pub fn new(start: usize) -> Self {
+        Self::starting(start, true)
+    }
+
+    fn starting(start: usize, carry: bool) -> Self {
         Self {
             learned: LearnedCount {
                 planets: start,
                 start,
+                prior: CountPrior {
+                    centre: start as f64,
+                    sd: PRIOR_SD,
+                },
                 floor: 1,
                 changes: Vec::new(),
             },
             map: 0,
+            carry,
+            upper: COUNT_MAX,
+            paths: 0,
             coverage: Coverage::new(WorldParameters::default()),
             recent: Vec::new(),
             last_found: None,
@@ -227,16 +455,31 @@ impl Learner {
         }
     }
 
-    /// The learner of the next map: the learned count, a fresh signal.
+    /// The learner of the next map: the learned count, a fresh signal, the prior re-centred on
+    /// the count in use and narrowed by one when this map had `CARRY_MIN_PATHS` paths. Without
+    /// carry-over the next map starts afresh.
     pub fn next_map(&self) -> Self {
-        let mut next = Self::new(self.learned.start);
-        next.learned = self.learned.clone();
+        let mut next = Self::starting(self.learned.start, self.carry);
         next.map = self.map + 1;
+        if !self.carry {
+            return next;
+        }
+        next.learned = self.learned.clone();
+        let sd = if self.paths >= CARRY_MIN_PATHS {
+            (self.learned.prior.sd - 1.0).max(MIN_SD)
+        } else {
+            self.learned.prior.sd
+        };
+        next.learned.prior = CountPrior {
+            centre: self.learned.planets as f64,
+            sd,
+        };
         next
     }
 
     /// One polished map; the new count when it changes. After a change the signals start over.
     pub fn observe(&mut self, o: Observation) -> Option<usize> {
+        self.paths = o.paths;
         self.unchanged = if self.last_found == Some(o.found) {
             self.unchanged + 1
         } else {
@@ -260,6 +503,8 @@ impl Learner {
         };
         if to > n {
             self.learned.floor = self.learned.floor.max(to);
+        } else {
+            self.upper = to;
         }
         self.learned.changes.push(CountChange {
             from: n,
@@ -287,22 +532,39 @@ pub(super) fn too_high(planets: usize, found: usize, hidden: f64, recent: &[Opti
 }
 
 impl super::Estimator {
-    /// Start the dynamic count when `learn_planets` is on and no count is given (`--planets`
-    /// wins: it stays exactly as given).
+    /// Start the dynamic count when `learn_planets` is on, from the given count (`--planets N
+    /// --learn-planets`) or `LEARN_START`. Without `learn_planets` a given count stays exactly
+    /// as given.
     pub(super) fn start_learning(&mut self) {
-        if self.settings.learn_planets && self.settings.planets.is_none() {
-            let learner = Learner::new(LEARN_START);
+        if self.settings.learn_planets {
+            let start = self.settings.planets.unwrap_or(LEARN_START);
+            let learner = Learner::starting(start, self.settings.carry_planets);
             self.settings.planets = Some(learner.learned.planets);
             self.learner = Some(learner);
         }
     }
 
-    /// Continue the dynamic count of `previous`, the estimator of the map before this one.
+    /// Continue the dynamic count of `previous`, the estimator of the map before this one (a
+    /// fresh start without `Settings::carry_planets`).
     pub fn carry_count(&mut self, previous: &super::Estimator) {
         if let (Some(_), Some(learner)) = (&self.learner, &previous.learner) {
             let next = learner.next_map();
             self.settings.planets = Some(next.learned.planets);
             self.learner = Some(next);
+        }
+    }
+
+    /// What the fog of the current map is built with: the dynamic count's prior and the bounds its
+    /// signals set, else the known count, else the 24 +- 4 prior.
+    pub(super) fn fog_model(&self) -> FogModel {
+        match (&self.learner, self.settings.planets) {
+            (Some(learner), _) => FogModel {
+                prior: learner.learned.prior,
+                lower: learner.learned.floor,
+                upper: learner.upper,
+            },
+            (None, Some(count)) => FogModel::known(count),
+            (None, None) => FogModel::DEFAULT,
         }
     }
 
@@ -417,14 +679,30 @@ mod tests {
     }
 
     #[test]
-    fn a_given_planet_count_wins_over_the_dynamic_mode() {
+    fn a_given_count_is_fixed_alone_and_the_starting_point_with_the_dynamic_mode() {
         let fixed = Estimator::new(Settings {
             planets: Some(20),
-            learn_planets: true,
             ..Settings::default()
         });
         assert_eq!(fixed.settings.planets, Some(20));
         assert_eq!(fixed.summary().learned, None);
+        assert_eq!(fixed.fog_model(), FogModel::known(20));
+        let from_given = Estimator::new(Settings {
+            planets: Some(20),
+            learn_planets: true,
+            ..Settings::default()
+        });
+        assert_eq!(from_given.settings.planets, Some(20));
+        let learned = from_given.summary().learned.unwrap();
+        assert_eq!((learned.start, learned.planets), (20, 20));
+        assert_eq!(
+            learned.prior,
+            CountPrior {
+                centre: 20.0,
+                sd: PRIOR_SD
+            }
+        );
+        assert_eq!(Estimator::default().fog_model(), FogModel::DEFAULT);
         let learning = Estimator::new(Settings {
             learn_planets: true,
             ..Settings::default()
@@ -459,6 +737,100 @@ mod tests {
         let mut plain = Estimator::default();
         plain.carry_count(&estimator);
         assert_eq!(plain.settings.planets, None);
+    }
+
+    #[test]
+    fn the_posterior_is_the_prior_times_the_binomial_within_the_signal_bounds() {
+        let prior = CountPrior::DEFAULT;
+        // Nothing found, nothing covered: the prior itself (mean 24).
+        let open = CountPosterior::new(prior, 0, 1.0, 1, COUNT_MAX);
+        assert!((open.mean() - 24.0).abs() < 0.01, "{}", open.mean());
+        assert!((open.sd() - 4.0).abs() < 0.05, "{}", open.sd());
+        // 24 found on a fully covered map: certain.
+        let done = CountPosterior::new(prior, 24, 0.0, 1, COUNT_MAX);
+        assert_eq!((done.expected_unseen(), done.mode()), (0.0, 24));
+        assert_eq!(done.generating(0.3), 1.0);
+        // The likelihood ratio of N + 1 over N is (N + 1) f / (N + 1 - K) (P25's rule).
+        let f = 0.02;
+        let some = CountPosterior::new(prior, 22, f, 1, COUNT_MAX);
+        let ratio = some.probabilities[3] / some.probabilities[2];
+        let expected = 25.0 * f / 3.0 * (prior.log_weight(25) - prior.log_weight(24)).exp();
+        assert!((ratio - expected).abs() < 1e-9 * expected);
+        // More coverage, fewer unseen planets.
+        let wider = CountPosterior::new(prior, 22, 0.2, 1, COUNT_MAX);
+        assert!(wider.expected_unseen() > some.expected_unseen());
+        // Signal bounds: a count-limit floor and a too-high ceiling.
+        let floored = CountPosterior::new(prior, 22, f, 25, COUNT_MAX);
+        assert_eq!(floored.mode(), 25);
+        assert!(floored.expected_unseen() >= 3.0);
+        let capped = CountPosterior::new(prior, 22, 0.5, 1, 23);
+        assert!(capped.mean() <= 23.0 + 1e-12);
+        // A known count: exactly N - K; one below K leaves nothing unseen.
+        let known = CountPosterior::new(CountPrior::known(26), 20, 0.3, 1, COUNT_MAX);
+        assert_eq!((known.expected_unseen(), known.sd()), (6.0, 0.0));
+        let below = CountPosterior::new(CountPrior::known(18), 20, 0.3, 1, COUNT_MAX);
+        assert_eq!(below.expected_unseen(), 0.0);
+    }
+
+    #[test]
+    fn the_prior_carries_recentred_and_narrows_per_full_map_down_to_the_floor() {
+        let mut learner = Learner::new(26);
+        let mut o = observation(24, false, 1e-3, 0.5);
+        o.paths = CARRY_MIN_PATHS;
+        learner.observe(o);
+        learner.learned.planets = 25;
+        let next = learner.next_map();
+        assert_eq!(
+            next.learned.prior,
+            CountPrior {
+                centre: 25.0,
+                sd: PRIOR_SD - 1.0
+            }
+        );
+        assert_eq!(next.upper, COUNT_MAX);
+        // A short map does not narrow it.
+        let mut short = next.clone();
+        let mut o = observation(10, false, 1e-3, 0.5);
+        o.paths = CARRY_MIN_PATHS - 1;
+        short.observe(o);
+        assert_eq!(short.next_map().learned.prior.sd, PRIOR_SD - 1.0);
+        // Full maps narrow it by one each, never below `MIN_SD`.
+        let mut full = next;
+        for _ in 0..10 {
+            let mut o = observation(24, false, 1e-3, 0.5);
+            o.paths = 100;
+            full.observe(o);
+            full = full.next_map();
+        }
+        assert_eq!(full.learned.prior.sd, MIN_SD);
+        assert_eq!(full.learned.prior.centre, 25.0);
+        // A too-high signal caps this map's posterior at the lowered count.
+        let mut lowering = Learner::new(24);
+        quiet(&mut lowering, TOO_HIGH_PLATEAU + 1);
+        assert_eq!(lowering.upper, 23);
+        assert_eq!(lowering.next_map().upper, COUNT_MAX);
+    }
+
+    #[test]
+    fn without_carry_over_every_map_starts_afresh() {
+        let mut estimator = Estimator::new(Settings {
+            learn_planets: true,
+            carry_planets: false,
+            ..Settings::default()
+        });
+        estimator.count_limited_at = Some(30);
+        estimator.learn(&[], Some(0.5));
+        assert_eq!(estimator.settings.planets, Some(LEARN_START + 1));
+        let mut next = Estimator::new(Settings {
+            learn_planets: true,
+            carry_planets: false,
+            ..Settings::default()
+        });
+        next.carry_count(&estimator);
+        assert_eq!(next.settings.planets, Some(LEARN_START));
+        let learned = next.summary().learned.unwrap();
+        assert!(learned.changes.is_empty());
+        assert_eq!(learned.prior, CountPrior::DEFAULT);
     }
 
     #[test]

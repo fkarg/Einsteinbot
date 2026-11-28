@@ -1,10 +1,13 @@
 use crate::coverage::path_cells;
 use crate::estimator::{ResidualCorrection, ResidualGate, ResidualModel};
 use crate::in_flight::{
-    DEFAULT_STEP_RATE, FIRE_LATENCY_MS, InFlightShot, SHOT_SLOTS, doom_probability, predict_kills,
+    DEFAULT_STEP_RATE, FIRE_LATENCY_MS, InFlightShot, PredictedKill, SHOT_SLOTS, doom_probability,
+    predict_kills,
 };
 use crate::map::{PlanetMap, Vec2};
+use crate::players::{PlayerLedger, SPAWN_ENERGY};
 use crate::protocol::{Point, ServerEvent};
+use crate::round_clock::RoundClock;
 use crate::simulation::{
     ShotObservation, Termination, WorldParameters, simulate_corrected_targeting_shot,
 };
@@ -36,9 +39,11 @@ pub struct MapBelief {
     pub parameter_covariance: Option<DMatrix<f64>>,
     /// Why `parameter_covariance` is unavailable. Unavailable is never zero uncertainty.
     pub covariance_unavailable_reason: Option<crate::estimator::CovarianceUnavailableReason>,
+    /// Per planet of `map`, whether the data determine it (empty without a covariance).
+    pub planet_identifiability: Vec<crate::estimator::Identifiability>,
     /// Terminal points classified as possible planet surface contacts.
     pub contact_points: Vec<Point>,
-    /// Possible contacts farther than the full-strength contact range (15 units) from the surface
+    /// Possible contacts farther than 15 units from the surface
     /// of every planet in `map` (a model mismatch, or planets this slice does not model). With an
     /// empty map this is all of them.
     pub unmatched_contacts: usize,
@@ -62,6 +67,14 @@ pub struct MapBelief {
     /// Whether the planet cap is likely below the true count (P23); `None`: not assessed (the
     /// belief did not come from the estimator).
     pub count_limit: Option<crate::estimator::CountLimit>,
+    /// Fog of war (P26, `estimator::Fog`): where unseen planets could be. `None`: not computed
+    /// (the belief did not come from the estimator).
+    pub fog: Option<std::sync::Arc<crate::estimator::Fog>>,
+    /// What `fog` was built with; with `map` and the first `paths_fitted` paths of the epoch it
+    /// rebuilds it (`estimator::unseen_fog`).
+    pub fog_model: Option<crate::estimator::FogModel>,
+    /// Paths of the map epoch the estimator had fitted when it published this belief.
+    pub paths_fitted: Option<usize>,
 }
 
 impl MapBelief {
@@ -75,6 +88,7 @@ impl MapBelief {
             alternatives: Vec::new(),
             parameter_covariance,
             covariance_unavailable_reason,
+            planet_identifiability: Vec::new(),
             contact_points: Vec::new(),
             unmatched_contacts: 0,
             model_position_rmse: None,
@@ -83,7 +97,29 @@ impl MapBelief {
             residual_correction_unavailable_reason: Some(ResidualGate::NotComputed),
             residual_model: None,
             count_limit: None,
+            fog: None,
+            fog_model: None,
+            paths_fitted: None,
         }
+    }
+
+    /// Attach the fog of war of the paths the belief had fitted.
+    pub fn set_fog(&mut self, fog: crate::estimator::Fog, paths_fitted: usize) {
+        self.fog_model = Some(fog.model);
+        self.paths_fitted = Some(paths_fitted);
+        self.fog = Some(std::sync::Arc::new(fog));
+    }
+
+    /// Probability that an unseen planet's centre lies within 100 units of `position`; `None`
+    /// when no fog was computed.
+    pub fn unseen_risk_at(&self, position: Vec2) -> Option<f64> {
+        self.fog.as_ref().map(|fog| fog.risk_at(position))
+    }
+
+    /// Root mean square pull of the unseen planets at `position` (acceleration units); `None`
+    /// when no fog was computed.
+    pub fn unseen_pull_at(&self, position: Vec2) -> Option<f64> {
+        self.fog.as_ref().map(|fog| fog.pull_at(position))
     }
 
     /// The residual correction at `position` (acceleration units); `None` when unavailable
@@ -106,6 +142,7 @@ impl MapBelief {
                     .collect::<Vec<_>>()
             }),
             "covariance_unavailable_reason": self.covariance_unavailable_reason,
+            "planet_identifiability": self.planet_identifiability,
             "map_weight": self.map_weight,
             "alternatives": self.alternatives.iter().map(|alternative| serde_json::json!({
                 "planets": alternative.map.planets,
@@ -122,15 +159,10 @@ impl MapBelief {
             "residual_correction_unavailable_reason": self.residual_correction_unavailable_reason,
             "residual_model": self.residual_model,
             "count_limit": self.count_limit,
+            "fog_model": self.fog_model,
+            "paths_fitted": self.paths_fitted,
+            "fog": self.fog.as_ref().map(|fog| fog.summary()),
         })
-    }
-
-    fn field_uncertainty(&self, position: Vec2) -> Option<f64> {
-        let parameters = self.parameter_covariance.as_ref()?;
-        self.map
-            .acceleration_covariance(position, parameters)
-            .ok()
-            .map(|covariance| (covariance.xx + covariance.yy).max(0.0).sqrt())
     }
 }
 
@@ -164,6 +196,12 @@ pub struct BotState {
     /// Shots begun per player (slot reuse, `in_flight::SHOT_SLOTS`).
     #[serde(default)]
     begin_counts: BTreeMap<u32, u64>,
+    /// Playing time left in the round (`round_clock`).
+    #[serde(default)]
+    round_clock: RoundClock,
+    /// Every player's inferred energy and round score (`players`).
+    #[serde(default)]
+    players: PlayerLedger,
 }
 
 impl BotState {
@@ -177,6 +215,13 @@ impl BotState {
     /// Forget everything tied to the previous map (shots, coverage, belief, spawn sightings).
     /// Called at every detected map boundary; a `Planets` message calls it too.
     pub fn start_new_map(&mut self) {
+        // The connection's first `Planets` (handshake) precedes every position: no boundary.
+        let boundary = !self.player_positions.is_empty();
+        self.round_clock.new_map(self.clock_ms.filter(|_| boundary));
+        if let Some(now_ms) = self.clock_ms.filter(|_| boundary) {
+            self.players
+                .new_map(self.player_positions.keys().copied(), now_ms);
+        }
         self.known_shots.clear();
         self.covered_cells.clear();
         self.map_belief = None;
@@ -209,6 +254,12 @@ impl BotState {
             ServerEvent::OwnId { player_id } => self.own_id = Some(*player_id),
             ServerEvent::PlayerPosition { player_id, x, y } => {
                 let position = Point { x: *x, y: *y };
+                let old = self.player_positions.get(player_id).cloned();
+                if let Some(now_ms) = now_ms
+                    && old.as_ref() != Some(&position)
+                {
+                    self.players.repositioned(*player_id, old.as_ref(), now_ms);
+                }
                 if !self.observed_spawn_locations.contains(&position) {
                     self.observed_spawn_locations.push(position.clone());
                 }
@@ -216,6 +267,7 @@ impl BotState {
             }
             ServerEvent::PlayerLeave { player_id } => {
                 self.player_positions.remove(player_id);
+                self.players.player_left(*player_id);
                 self.in_flight.retain(|shot| shot.player_id != *player_id);
             }
             ServerEvent::ShotBegin {
@@ -225,6 +277,10 @@ impl BotState {
             } => {
                 // Every connection receives every ShotBegin broadcast. Shots take seconds to
                 // finish, so in-flight own shots must already count as known outcomes.
+                if let Some(now_ms) = now_ms {
+                    self.players
+                        .shot_begin(*player_id, *angle, *velocity, now_ms);
+                }
                 let ordinal = self.begin_counts.entry(*player_id).or_insert(0);
                 *ordinal += 1;
                 let ordinal = *ordinal;
@@ -257,6 +313,10 @@ impl BotState {
                         self.measure_step_rate(points.len(), now_ms - begun_ms);
                     }
                 }
+                self.players.shot_finished(*player_id, points.last());
+                if let Some(now_ms) = now_ms {
+                    self.round_clock.shot_finished(now_ms);
+                }
                 // Every connection receives every ShotFin broadcast, so each bot sees all
                 // completed trajectories and remembers their exact inputs and launch point.
                 self.covered_cells
@@ -267,6 +327,11 @@ impl BotState {
                         velocity: *velocity,
                         angle_degrees: *angle,
                     });
+                }
+            }
+            ServerEvent::OwnEnergy { player_id, energy } => {
+                if let Some(now_ms) = now_ms {
+                    self.players.own_energy(*player_id, *energy, now_ms);
                 }
             }
             _ => {}
@@ -328,6 +393,8 @@ impl BotState {
             "clock_ms": self.clock_ms,
             "step_rate": self.step_rate,
             "begin_counts": self.begin_counts,
+            "round_clock": self.round_clock,
+            "players": self.players,
         })
     }
 
@@ -352,12 +419,40 @@ impl BotState {
     pub fn set_map_belief(&mut self, map_belief: Option<MapBelief>) {
         self.map_belief = map_belief;
     }
+
+    /// Estimated playing time left in the round at `now_ms` (`round_clock`).
+    pub fn round_time_left_ms(&self, now_ms: i64) -> Option<i64> {
+        self.round_clock.time_left_ms(now_ms)
+    }
+
+    /// Restore a round length measured on an earlier map (offline replays of one-map captures).
+    pub fn set_round_play_ms(&mut self, play_ms: Option<i64>) {
+        self.round_clock.set_play_ms(play_ms);
+    }
+
+    /// The inferred energy of `player` at `now_ms`, `None` when unknown (`players`).
+    pub fn player_energy(&self, player: u32, now_ms: i64) -> Option<f64> {
+        self.players.energy(player, now_ms)
+    }
+
+    /// The inferred bounty on killing `player` (`players`), `None` when unknown.
+    pub fn player_bounty(&self, player: u32) -> Option<u32> {
+        self.players.bounty(player)
+    }
 }
 
 /// Below this energy a shot without a predicted hit is not fired; the bot waits for energy.
 pub const APPROACH_MIN_ENERGY: f64 = 15.0;
 /// Hit ranking weight of one unit of predicted impact offset, in flight ticks.
 const MISS_DISTANCE_TICKS: f64 = 5.0;
+/// How far ahead an in-flight shot predicted to kill us counts as a threat (`Decision::own_doom`):
+/// about the next decision (energy poll 1 s plus the map wait).
+const THREAT_HORIZON_MS: f64 = 1_500.0;
+/// Alternative hits recorded per decision (`Decision::top_hits`).
+const RECORDED_HITS: usize = 5;
+/// Flight ticks over which a predicted hit's chance falls by a factor e (the recalibrated
+/// `in_flight::kill_probability`: 0.72 below 40 ticks, 0.25 at 80-99).
+const HIT_TICKS_PER_EFOLD: f64 = 55.0;
 
 /// Loadable from JSON (`devtool eval --config`): missing keys take the defaults, unknown keys are
 /// errors.
@@ -367,18 +462,23 @@ pub struct TargetingSettings {
     pub angle_step_degrees: u16,
     pub max_simulation_ticks: usize,
     pub target_radius: f64,
-    /// Average acceleration standard deviation required before probing is considered.
+    /// New coverage cells (`coverage::CELL_SIZE`) a probe's predicted path must cross to be
+    /// fired when no hit is predicted (`ShotReason::Information`); infinite disables probes.
     pub information_threshold: f64,
-    pub information_weight: f64,
     /// Maximum approach-distance penalty for retracing observed space (world units).
     pub coverage_penalty: f64,
     /// A predicted hit whose victim an in-flight shot kills first with at least this chance is
-    /// skipped (`in_flight::doom_probability`); above 1 disables doomed-target avoidance.
+    /// skipped (`in_flight::doom_probability`); above 1 disables doomed-target avoidance. Just
+    /// below the lowest `kill_probability` (0.05), so any predicted kill dooms its victim: P24
+    /// replays lost 16 true hits (5 held out) when kills more than 100 ticks away no longer did.
     pub doom_threshold: f64,
-    /// Hit ranking: flight ticks plus this many ticks per unit of predicted impact offset.
-    pub miss_distance_ticks: f64,
-    /// Below this energy a shot without a predicted hit is not fired.
-    pub approach_min_energy: f64,
+    /// Kills a unit of energy gained is worth when ranking hits (the killer gains half the
+    /// victim's energy); 0 ranks hits by flight and offset only.
+    pub energy_value: f64,
+    /// Weight of the victim's inferred bounty (extra score points) when ranking hits; 0 off.
+    /// At 1 a kill on the round leader counts as the two points it scores (P24 replays: score
+    /// +2% on captures 53 and 55-68, +5% held out on 69-71).
+    pub bounty_value: f64,
 }
 
 impl Default for TargetingSettings {
@@ -387,12 +487,11 @@ impl Default for TargetingSettings {
             angle_step_degrees: 10,
             max_simulation_ticks: 180,
             target_radius: 4.0,
-            information_threshold: 0.05,
-            information_weight: 1.0,
+            information_threshold: f64::INFINITY,
             coverage_penalty: 40.0,
-            doom_threshold: 0.15,
-            miss_distance_ticks: MISS_DISTANCE_TICKS,
-            approach_min_energy: APPROACH_MIN_ENERGY,
+            doom_threshold: 0.04,
+            energy_value: 0.0,
+            bounty_value: 1.0,
         }
     }
 }
@@ -424,6 +523,85 @@ pub struct ShotChoice {
     pub victim_doom: Option<f64>,
     /// Predicted hits skipped because their victim was doomed.
     pub doomed_hits_skipped: usize,
+    /// The predicted victim's inferred energy at our impact (`players`); `None` when
+    /// unknown or not a hit.
+    pub victim_energy: Option<f64>,
+    /// The predicted victim's inferred bounty (`players`); `None` when unknown or not a hit.
+    pub victim_bounty: Option<u32>,
+}
+
+/// Why the policy fired nothing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitReason {
+    /// Our position or every target is unknown.
+    NoTarget,
+    /// Below 2 energy, or below `APPROACH_MIN_ENERGY` without a predicted hit.
+    LowEnergy,
+    /// Every predicted hit's victim is killed first by a shot in flight.
+    AllHitsDoomed,
+    NoCandidate,
+    Cancelled,
+}
+
+/// A targeting decision: the shot, or why there is none, and the context it was made in.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Decision {
+    pub choice: Option<ShotChoice>,
+    pub wait_reason: Option<WaitReason>,
+    /// Estimated playing time left (`round_clock`); `None` until a full map was observed.
+    pub round_time_left_ms: Option<i64>,
+    /// Chance an in-flight shot kills us within `THREAT_HORIZON_MS`; `None` without a clock.
+    pub own_doom: Option<f64>,
+    /// Ranked candidates (unknown outcomes first) and predicted hits among them.
+    pub candidates: usize,
+    pub hits: usize,
+    /// The best predicted hits in ranking order, before doomed ones are skipped.
+    pub top_hits: Vec<HitSummary>,
+}
+
+/// One considered hit, for the decision record.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct HitSummary {
+    pub velocity: i32,
+    pub angle_degrees: i32,
+    pub victim: u32,
+    pub flight_ticks: usize,
+    pub miss_distance: f64,
+    /// `hit_score`, lower is better.
+    pub score: f64,
+    pub victim_doom: Option<f64>,
+    pub victim_energy: Option<f64>,
+    pub victim_bounty: Option<u32>,
+    /// In-flight shots predicted to kill the victim before this hit would land.
+    pub doomed_by: Vec<PredictedKill>,
+}
+
+impl Decision {
+    fn waiting(self, reason: WaitReason) -> Self {
+        Self {
+            wait_reason: Some(reason),
+            ..self
+        }
+    }
+
+    fn firing(self, choice: ShotChoice) -> Self {
+        Self {
+            choice: Some(choice),
+            ..self
+        }
+    }
+
+    pub fn diagnostic_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "wait_reason": self.wait_reason,
+            "round_time_left_ms": self.round_time_left_ms,
+            "own_doom": self.own_doom,
+            "candidates": self.candidates,
+            "hits": self.hits,
+            "top_hits": self.top_hits,
+        })
+    }
 }
 
 pub struct TargetingPolicy {
@@ -446,15 +624,19 @@ impl TargetingPolicy {
     }
 
     pub fn choose(&self, state: &BotState, energy: f64) -> Option<ShotChoice> {
+        self.decide(state, energy).choice
+    }
+
+    pub fn decide(&self, state: &BotState, energy: f64) -> Decision {
         self.choose_with_check(state, energy, || true)
     }
 
-    pub fn choose_while_running(
+    pub fn decide_while_running(
         &self,
         state: &BotState,
         energy: f64,
         running: &std::sync::atomic::AtomicBool,
-    ) -> Option<ShotChoice> {
+    ) -> Decision {
         self.choose_with_check(state, energy, || {
             running.load(std::sync::atomic::Ordering::Relaxed)
         })
@@ -465,17 +647,25 @@ impl TargetingPolicy {
         state: &BotState,
         energy: f64,
         mut running: impl FnMut() -> bool,
-    ) -> Option<ShotChoice> {
-        let own_id = state.own_id?;
-        let start = state.player_positions.get(&own_id)?;
+    ) -> Decision {
+        let mut decision = Decision::default();
+        let (Some(own_id), Some(start)) = (
+            state.own_id,
+            state.own_id.and_then(|id| state.player_positions.get(&id)),
+        ) else {
+            return decision.waiting(WaitReason::NoTarget);
+        };
         let targets = state
             .player_positions
             .iter()
             .filter(|(player_id, _)| **player_id != own_id)
             .map(|(_, position)| Vec2::new(f64::from(position.x), f64::from(position.y)))
             .collect::<Vec<_>>();
-        if targets.is_empty() || !energy.is_finite() || energy < 2.0 {
-            return None;
+        if targets.is_empty() {
+            return decision.waiting(WaitReason::NoTarget);
+        }
+        if !energy.is_finite() || energy < 2.0 {
+            return decision.waiting(WaitReason::LowEnergy);
         }
 
         let max_velocity = energy.floor().min(50.0) as i32;
@@ -504,6 +694,30 @@ impl TargetingPolicy {
             .iter()
             .map(|(&id, position)| (id, Vec2::new(f64::from(position.x), f64::from(position.y))))
             .collect::<Vec<_>>();
+        // Every in-flight shot's predicted kill (ours included): doomed targets, and the threat
+        // to us.
+        let kills = match state.clock_ms {
+            Some(now_ms) if !state.in_flight.is_empty() => predict_kills(
+                map,
+                correction,
+                &state.in_flight,
+                &players,
+                now_ms,
+                state.step_rate(),
+                self.world,
+                self.settings.max_simulation_ticks,
+                self.settings.target_radius,
+            ),
+            _ => Vec::new(),
+        };
+        if let Some(now_ms) = state.clock_ms {
+            decision.own_doom = Some(doom_probability(
+                &kills,
+                own_id,
+                now_ms as f64 + THREAT_HORIZON_MS,
+            ));
+            decision.round_time_left_ms = state.round_time_left_ms(now_ms);
+        }
         let evaluate = |velocity: i32, angle: i32| -> Option<ShotChoice> {
             let shot = ShotObservation {
                 player_id: own_id,
@@ -549,10 +763,11 @@ impl TargetingPolicy {
                 .min_by(|left, right| left.0.total_cmp(&right.0))
                 .unwrap();
             let cells = path_cells(&trajectory.points);
+            let covered = cells.intersection(&state.covered_cells).count();
             let covered_fraction = if cells.is_empty() {
                 1.0
             } else {
-                cells.intersection(&state.covered_cells).count() as f64 / cells.len() as f64
+                covered as f64 / cells.len() as f64
             };
             let predicted_hit =
                 matches!(trajectory.termination, Termination::PlayerCollision(id) if id != own_id);
@@ -582,7 +797,9 @@ impl TargetingPolicy {
                 velocity,
                 angle_degrees: angle,
                 miss_distance,
-                information_score: 0.0,
+                // Expected information, cheaply: the cells of unobserved space the predicted
+                // path crosses (the field there is constrained by no observed path yet).
+                information_score: (cells.len() - covered) as f64,
                 uncertainty_available: covariance_available,
                 covered_fraction,
                 contact_before_target,
@@ -595,6 +812,8 @@ impl TargetingPolicy {
                 flight_ticks: trajectory.points.len(),
                 victim_doom: None,
                 doomed_hits_skipped: 0,
+                victim_energy: None,
+                victim_bounty: None,
             })
         };
         let mut candidates = Vec::new();
@@ -605,7 +824,7 @@ impl TargetingPolicy {
             }
             for angle in angles {
                 if !running() {
-                    return None;
+                    return decision.waiting(WaitReason::Cancelled);
                 }
                 if let Some(candidate) = evaluate(velocity, angle) {
                     candidates.push(candidate);
@@ -643,7 +862,7 @@ impl TargetingPolicy {
                 ..(seed.angle_degrees + angle_step as i32)
             {
                 if !running() {
-                    return None;
+                    return decision.waiting(WaitReason::Cancelled);
                 }
                 let angle = (angle + 180).rem_euclid(360) - 180;
                 if sampled.insert((seed.velocity, angle)) {
@@ -654,7 +873,7 @@ impl TargetingPolicy {
             }
         }
         if candidates.is_empty() {
-            return None;
+            return decision.waiting(WaitReason::NoCandidate);
         }
 
         // Deliberately repeating an already-observed shot supplies no new field information,
@@ -672,44 +891,71 @@ impl TargetingPolicy {
             pool = candidates.clone();
         }
 
+        let ms_per_tick = 1000.0 / state.step_rate();
+        let impact_ms = |choice: &ShotChoice, now_ms: i64| {
+            now_ms as f64 + FIRE_LATENCY_MS + choice.flight_ticks as f64 * ms_per_tick
+        };
         let mut hits = pool
             .iter()
             .filter(|candidate| candidate.predicted_hit)
             .copied()
             .collect::<Vec<_>>();
-        hits.sort_by(|a, b| compare_hit_quality(a, b, self.settings.miss_distance_ticks));
+        if let Some(now_ms) = state.clock_ms {
+            for hit in &mut hits {
+                hit.victim_energy = state
+                    .player_energy(hit.predicted_victim.unwrap(), impact_ms(hit, now_ms) as i64);
+            }
+        }
+        for hit in &mut hits {
+            hit.victim_bounty = state.player_bounty(hit.predicted_victim.unwrap());
+        }
+        let values = (self.settings.energy_value, self.settings.bounty_value);
+        hits.sort_by(|left, right| compare_hit_quality(left, right, values));
+        decision.candidates = pool.len();
+        decision.hits = hits.len();
         // Doomed-target avoidance: a hit on a player another in-flight shot (ours included)
         // kills first is wasted, so skip such hits unless ours lands first (the race rule).
         if let (Some(now_ms), false) = (state.clock_ms, hits.is_empty()) {
-            let kills = predict_kills(
-                map,
-                correction,
-                &state.in_flight,
-                &players,
-                now_ms,
-                state.step_rate(),
-                self.world,
-                self.settings.max_simulation_ticks,
-                self.settings.target_radius,
-            );
-            let ms_per_tick = 1000.0 / state.step_rate();
             for hit in &mut hits {
-                let our_impact_ms =
-                    now_ms as f64 + FIRE_LATENCY_MS + hit.flight_ticks as f64 * ms_per_tick;
                 hit.victim_doom = Some(doom_probability(
                     &kills,
                     hit.predicted_victim.unwrap(),
-                    our_impact_ms,
+                    impact_ms(hit, now_ms),
                 ));
             }
             let skipped = hits
                 .iter()
                 .filter(|hit| hit.victim_doom.unwrap() >= self.settings.doom_threshold)
                 .count();
+            decision.top_hits = hits
+                .iter()
+                .take(RECORDED_HITS)
+                .map(|hit| {
+                    let victim = hit.predicted_victim.unwrap();
+                    let impact = impact_ms(hit, now_ms);
+                    HitSummary {
+                        velocity: hit.velocity,
+                        angle_degrees: hit.angle_degrees,
+                        victim,
+                        flight_ticks: hit.flight_ticks,
+                        miss_distance: hit.miss_distance,
+                        score: hit_score(hit, values),
+                        victim_doom: hit.victim_doom,
+                        victim_energy: hit.victim_energy,
+                        victim_bounty: hit.victim_bounty,
+                        doomed_by: kills
+                            .iter()
+                            .filter(|kill| kill.victim == victim && kill.impact_ms < impact)
+                            .copied()
+                            .collect(),
+                    }
+                })
+                .collect();
             if skipped == hits.len() {
                 // Every predicted hit is doomed: wait for the targets to respawn rather than
-                // spend the energy on a shot that lands on nobody.
-                return None;
+                // spend the energy on a shot that lands on nobody (P24: doomed hits fired
+                // anyway were all wasted in replays, 17 of 17).
+                return decision.waiting(WaitReason::AllHitsDoomed);
             }
             hits.retain(|hit| hit.victim_doom.unwrap() < self.settings.doom_threshold);
             for hit in &mut hits {
@@ -717,89 +963,37 @@ impl TargetingPolicy {
             }
         }
         if let Some(best_hit) = hits.first().copied() {
-            return Some(ShotChoice {
+            return decision.firing(ShotChoice {
                 reason: ShotReason::Hit,
                 ..best_hit
             });
         }
 
-        for candidate in pool.iter_mut() {
-            if !running() {
-                return None;
-            }
-            if !candidate.uncertainty_available || candidate.miss_distance >= 1.0e9 {
-                continue;
-            }
-            candidate.uncertainty_available = false;
-            candidate.information_score = state
-                .map_belief
-                .as_ref()
-                .map(|belief| {
-                    let shot = ShotObservation {
-                        player_id: own_id,
-                        angle_degrees: f64::from(candidate.angle_degrees),
-                        velocity: f64::from(candidate.velocity),
-                        points: vec![start.clone()],
-                    };
-                    let trajectory = simulate_corrected_targeting_shot(
-                        &belief.map,
-                        correction,
-                        &shot,
-                        self.world,
-                        self.settings.max_simulation_ticks.max(2),
-                        &players,
-                        self.settings.target_radius,
-                    );
-                    let Ok(trajectory) = trajectory else {
-                        return 0.0;
-                    };
-                    let uncertainty_sum = trajectory.points.iter().try_fold(0.0, |sum, point| {
-                        belief
-                            .field_uncertainty(Vec2::new(f64::from(point.x), f64::from(point.y)))
-                            .map(|uncertainty| sum + uncertainty)
-                    });
-                    let Some(uncertainty_sum) = uncertainty_sum else {
-                        return 0.0;
-                    };
-                    candidate.uncertainty_available = true;
-                    uncertainty_sum / trajectory.points.len().max(1) as f64
-                        * if self.settings.coverage_penalty > 0.0 {
-                            1.0 - candidate.covered_fraction
-                        } else {
-                            1.0
-                        }
-                })
-                .unwrap_or(0.0);
-        }
-
         if let Some(best_information) = pool
             .iter()
             .filter(|candidate| {
-                candidate.uncertainty_available
-                    && !candidate.contact_before_target
+                !candidate.contact_before_target
+                    && candidate.miss_distance < 1.0e9
                     && candidate.information_score >= self.settings.information_threshold
             })
             .max_by(|left, right| {
-                (left.information_score * self.settings.information_weight
-                    / f64::from(left.velocity))
-                .total_cmp(
-                    &(right.information_score * self.settings.information_weight
-                        / f64::from(right.velocity)),
-                )
+                (left.information_score / f64::from(left.velocity))
+                    .total_cmp(&(right.information_score / f64::from(right.velocity)))
             })
         {
-            return Some(ShotChoice {
+            return decision.firing(ShotChoice {
                 reason: ShotReason::Information,
                 ..*best_information
             });
         }
 
         // A cheap shot without a predicted hit rarely hits (capture 55: 5 of 58 at a median
-        // energy of 3.6); saving energy until a hit is predicted pays off more.
-        if energy < self.settings.approach_min_energy {
-            return None;
+        // energy of 3.6); saving energy until a hit is predicted pays off more (also when
+        // our death or the round end is near: P24 replays found no gain in firing anyway).
+        if energy < APPROACH_MIN_ENERGY {
+            return decision.waiting(WaitReason::LowEnergy);
         }
-        pool.into_iter().min_by(|left, right| {
+        let approach = pool.into_iter().min_by(|left, right| {
             left.contact_before_target
                 .cmp(&right.contact_before_target)
                 .then_with(|| {
@@ -810,7 +1004,11 @@ impl TargetingPolicy {
                         )
                 })
                 .then_with(|| left.velocity.cmp(&right.velocity))
-        })
+        });
+        match approach {
+            Some(choice) => decision.firing(choice),
+            None => decision.waiting(WaitReason::NoCandidate),
+        }
     }
 }
 
@@ -873,19 +1071,23 @@ fn contact_before_target(planet: &crate::protocol::Planet, points: &[Point], pas
         .is_some_and(|entry| entry < passage)
 }
 
-fn compare_hit_quality(
-    left: &ShotChoice,
-    right: &ShotChoice,
-    miss_distance_ticks: f64,
-) -> Ordering {
-    // Map error grows along the path, so shorter flights hit far more often than central but
-    // long ones (capture 55: 5 of 7 under 30 ticks, 1 of 32 over 100). Rank by flight time,
-    // with the impact offset as a small penalty; save energy only on equal scores.
-    let score = |choice: &ShotChoice| {
-        choice.flight_ticks as f64 + miss_distance_ticks * choice.miss_distance
-    };
-    score(left)
-        .total_cmp(&score(right))
+/// Hit ranking score, lower is better. Map error grows along the path, so shorter flights hit
+/// far more often than central but long ones (capture 55: 5 of 7 under 30 ticks, 1 of 32 over
+/// 100): flight time, with the impact offset as a small penalty. The score reads as
+/// -HIT_TICKS_PER_EFOLD * ln(hit chance), so a kill worth (1 + energy_value * gain) kills (the
+/// killer gains half the victim's energy) earns HIT_TICKS_PER_EFOLD * ln(that); likewise a
+/// kill worth (1 + bounty_value * bounty) points. `values` is (energy_value, bounty_value).
+fn hit_score(choice: &ShotChoice, (energy_value, bounty_value): (f64, f64)) -> f64 {
+    let gain = choice.victim_energy.unwrap_or(SPAWN_ENERGY) / 2.0;
+    let bounty = f64::from(choice.victim_bounty.unwrap_or(0));
+    choice.flight_ticks as f64 + MISS_DISTANCE_TICKS * choice.miss_distance
+        - HIT_TICKS_PER_EFOLD * ((energy_value * gain).ln_1p() + (bounty_value * bounty).ln_1p())
+}
+
+/// Rank by `hit_score`; save energy only on equal scores.
+fn compare_hit_quality(left: &ShotChoice, right: &ShotChoice, values: (f64, f64)) -> Ordering {
+    hit_score(left, values)
+        .total_cmp(&hit_score(right, values))
         .then_with(|| left.velocity.cmp(&right.velocity))
 }
 
@@ -907,30 +1109,6 @@ mod tests {
             y: 100.0,
         });
         state
-    }
-
-    #[test]
-    fn gravity_uncertainty_propagates_parameter_correlations() {
-        let map = PlanetMap {
-            planets: vec![crate::protocol::Planet {
-                x: 0.0,
-                y: 0.0,
-                radius: 1.0,
-                mass: 8.0,
-            }],
-        };
-        let mut parameter_covariance = DMatrix::zeros(3, 3);
-        // Perfectly correlated center-x and mass errors reinforce at (2, 0).
-        parameter_covariance[(0, 0)] = 1.0;
-        parameter_covariance[(2, 2)] = 64.0;
-        parameter_covariance[(0, 2)] = 8.0;
-        parameter_covariance[(2, 0)] = 8.0;
-        let belief = MapBelief::new(map, Some(parameter_covariance));
-
-        let uncertainty = belief
-            .field_uncertainty(Vec2::new(2.0, 0.0))
-            .expect("matching covariance");
-        assert!((uncertainty - 4.0).abs() < 1e-12);
     }
 
     #[test]
@@ -1070,7 +1248,7 @@ mod tests {
             ..test_choice()
         };
         assert_eq!(
-            compare_hit_quality(&grazing_short, &central_long, MISS_DISTANCE_TICKS),
+            compare_hit_quality(&grazing_short, &central_long, (0.0, 0.0)),
             Ordering::Less
         );
 
@@ -1080,7 +1258,7 @@ mod tests {
             ..grazing_short
         };
         assert_eq!(
-            compare_hit_quality(&central_short, &grazing_short, MISS_DISTANCE_TICKS),
+            compare_hit_quality(&central_short, &grazing_short, (0.0, 0.0)),
             Ordering::Less
         );
         assert_eq!(
@@ -1090,7 +1268,7 @@ mod tests {
                     ..central_short
                 },
                 &central_short,
-                MISS_DISTANCE_TICKS
+                (0.0, 0.0)
             ),
             Ordering::Less
         );
@@ -1111,6 +1289,8 @@ mod tests {
             flight_ticks: 30,
             victim_doom: None,
             doomed_hits_skipped: 0,
+            victim_energy: None,
+            victim_bounty: None,
         }
     }
 
@@ -1156,7 +1336,8 @@ mod tests {
             calls += 1;
             calls < 10
         });
-        assert!(choice.is_none());
+        assert_eq!(choice.choice, None);
+        assert_eq!(choice.wait_reason, Some(WaitReason::Cancelled));
         assert_eq!(calls, 10);
     }
 
@@ -1404,6 +1585,19 @@ mod tests {
         assert_eq!(next.predicted_victim, Some(2));
         assert_eq!(next.victim_doom, Some(0.0));
         assert!(next.doomed_hits_skipped > 0);
+        // The decision records the alternatives, and which in-flight shot dooms player 3.
+        let decision = policy.decide(&state, 8.0);
+        assert!(decision.hits >= decision.top_hits.len() && decision.candidates >= decision.hits);
+        let doomed = decision
+            .top_hits
+            .iter()
+            .find(|hit| hit.victim == 3)
+            .expect("the doomed hit is among the best");
+        assert_eq!(
+            (doomed.doomed_by[0].shooter, doomed.doomed_by[0].begun_ms),
+            (1, 0)
+        );
+        assert!(doomed.victim_doom.unwrap() >= 0.15);
 
         // Avoidance off: the doomed nearer target is chosen again.
         let off = TargetingPolicy::new(TargetingSettings {
@@ -1425,24 +1619,127 @@ mod tests {
             },
             0,
         );
-        // Player 9 shoots straight up at player 2, 4 units per tick: impact after 149 ticks
-        // (about 4.9 s at 30.5 steps per second).
-        begin(&mut state, 9, 90.0, 4.0, 0);
+        // Player 9 shoots straight up at player 2, 7 units per tick: impact after 86 ticks
+        // (about 2.8 s at 30.5 steps per second; a 0.25 kill chance).
+        begin(&mut state, 9, 90.0, 7.0, 0);
         state.set_clock_ms(100);
         // Our 8-unit shot reaches player 2 in about 1.7 s: we win the race.
         let race = policy.choose(&state, 8.0).expect("we land first");
         assert_eq!(race.predicted_victim, Some(2));
         assert_eq!(race.victim_doom, Some(0.0));
 
-        // At 4 s the slow shot lands before ours would: player 2 is doomed, aim at player 9.
-        state.set_clock_ms(4_000);
+        // At 1.5 s the slow shot lands before ours would: player 2 is doomed, aim at player 9.
+        state.set_clock_ms(1_500);
         let late = policy.choose(&state, 8.0).expect("the other target");
         assert_eq!(late.predicted_victim, Some(9));
 
         // Our own fast shot is already on its way to player 9: every target is doomed, wait.
         let angle = -(600.0f64).atan2(400.0).to_degrees();
-        begin(&mut state, 1, angle, 30.0, 3_900);
-        state.set_clock_ms(4_000);
-        assert_eq!(policy.choose(&state, 8.0), None);
+        begin(&mut state, 1, angle, 30.0, 1_400);
+        state.set_clock_ms(1_500);
+        let decision = policy.decide(&state, 8.0);
+        assert_eq!(decision.choice, None);
+        assert_eq!(decision.wait_reason, Some(WaitReason::AllHitsDoomed));
+    }
+
+    #[test]
+    fn decisions_record_the_round_time_left_after_a_full_observed_map() {
+        let mut state = flat_field_state();
+        state.set_clock_ms(1_000);
+        let policy = TargetingPolicy::default();
+        // Joined mid-map: no estimate.
+        assert_eq!(policy.decide(&state, 8.0).round_time_left_ms, None);
+        // A full map observed from its boundary at 0 to its last finished shot at 50 s, then
+        // the next map starts at 60 s.
+        state.observe_at(&ServerEvent::Planets { planets: vec![] }, 0);
+        state.observe_at(&observed_shot((900.0, 900.0), 3.0, 15), 50_000);
+        state.observe_at(&ServerEvent::Planets { planets: vec![] }, 60_000);
+        state.set_clock_ms(100_000);
+        assert_eq!(policy.decide(&state, 8.0).round_time_left_ms, Some(10_000));
+    }
+
+    #[test]
+    fn without_a_predicted_hit_a_probe_crosses_unobserved_space() {
+        // At 2 energy the opponent 400 units away is out of reach: no hit is predicted.
+        let state = flat_field_state();
+        let probing = TargetingPolicy::new(TargetingSettings {
+            information_threshold: 5.0,
+            ..TargetingSettings::default()
+        });
+        let probe = probing.decide(&state, 2.0).choice.expect("a probe");
+        assert_eq!(probe.reason, ShotReason::Information);
+        assert!(probe.information_score >= 5.0);
+        // Off by default: wait for energy instead.
+        assert_eq!(
+            TargetingPolicy::default().decide(&state, 2.0).wait_reason,
+            Some(WaitReason::LowEnergy)
+        );
+        // Space already crossed by observed paths offers nothing new.
+        let mut covered = state.clone();
+        covered.covered_cells = (-30..80)
+            .flat_map(|x| (-30..80).map(move |y| (x, y)))
+            .collect();
+        assert_eq!(
+            probing.decide(&covered, 2.0).wait_reason,
+            Some(WaitReason::LowEnergy)
+        );
+    }
+
+    #[test]
+    fn hit_ranking_can_value_the_round_leaders_bounty() {
+        let mut state = two_target_state();
+        state.observe_at(&ServerEvent::Planets { planets: vec![] }, 1_000);
+        // Player 2 kills player 3, who respawns a little farther away: 2 leads the round.
+        state.observe_at(
+            &ServerEvent::ShotFin {
+                player_id: 2,
+                angle: 0.0,
+                velocity: 5.0,
+                points: vec![Point { x: 300.0, y: 400.0 }, Point { x: 102.0, y: 400.0 }],
+            },
+            1_500,
+        );
+        state.observe_at(
+            &ServerEvent::PlayerPosition {
+                player_id: 3,
+                x: 100.0,
+                y: 450.0,
+            },
+            1_500,
+        );
+        assert_eq!(state.player_bounty(2), Some(1));
+        let plain = TargetingPolicy::new(TargetingSettings {
+            bounty_value: 0.0,
+            ..TargetingSettings::default()
+        })
+        .choose(&state, 8.0)
+        .unwrap();
+        assert_eq!(plain.predicted_victim, Some(3), "player 3 is still nearer");
+        let valued = TargetingPolicy::default().choose(&state, 8.0).unwrap();
+        assert_eq!(
+            (valued.predicted_victim, valued.victim_bounty),
+            (Some(2), Some(1))
+        );
+    }
+
+    #[test]
+    fn hit_ranking_values_the_energy_a_kill_transfers() {
+        let mut state = two_target_state();
+        state.observe_at(&ServerEvent::Planets { planets: vec![] }, 1_000);
+        // Player 3 (nearer) spends most of its energy; player 2 keeps its 20.
+        begin(&mut state, 3, 0.0, 15.0, 1_000);
+        state.set_clock_ms(1_000);
+        assert_eq!(state.player_energy(3, 1_000), Some(5.0));
+        let plain = TargetingPolicy::default().choose(&state, 8.0).unwrap();
+        assert_eq!(plain.predicted_victim, Some(3));
+        let valued = TargetingPolicy::new(TargetingSettings {
+            energy_value: 0.06,
+            ..TargetingSettings::default()
+        })
+        .choose(&state, 8.0)
+        .unwrap();
+        assert_eq!(valued.predicted_victim, Some(2));
+        // 20 plus the regeneration until our impact.
+        assert!((20.0..26.0).contains(&valued.victim_energy.unwrap()));
     }
 }

@@ -14,6 +14,9 @@ plus 2. The default configuration is trial 0 and stays in every comparison.
   held-out: p14_study.py holdout --devtool BIN --db DB --out DIR --config best.json
 
 Held-out worlds are evaluated once, at the end, for the default and the chosen configuration.
+The 2026-11-28 study tuned miss_distance_ticks, approach_min_energy and doom_threshold (default
+0.15) on the build before P24; P24 replaced the first two (no longer settings) and set
+doom_threshold 0.04, so the targeting knobs here are P24's.
 """
 import argparse, concurrent.futures as cf, hashlib, json, os, random, resource, subprocess, sys
 import threading
@@ -30,8 +33,8 @@ DEFAULTS = {
     "search.seed_significance": 4.0, "search.max_seeds": 8, "search.max_candidates": 24,
     "search.joint_refits": 3, "search.death_trials": 2, "search.row_cap": 1000,
     "search.local_radius": 100.0, "search.local_evaluations": 300,
-    "targeting.miss_distance_ticks": 5.0, "targeting.approach_min_energy": 15.0,
-    "targeting.doom_threshold": 0.15,
+    "targeting.doom_threshold": 0.04, "targeting.energy_value": 0.0,
+    "targeting.bounty_value": 1.0,
 }
 
 
@@ -47,9 +50,9 @@ def suggest(trial):
         "search.row_cap": trial.suggest_int("search.row_cap", 600, 2000, log=True),
         "search.local_radius": trial.suggest_float("search.local_radius", 60.0, 160.0),
         "search.local_evaluations": trial.suggest_int("search.local_evaluations", 150, 600, log=True),
-        "targeting.miss_distance_ticks": trial.suggest_float("targeting.miss_distance_ticks", 1.0, 15.0),
-        "targeting.approach_min_energy": trial.suggest_float("targeting.approach_min_energy", 5.0, 30.0),
-        "targeting.doom_threshold": trial.suggest_float("targeting.doom_threshold", 0.05, 0.5),
+        "targeting.doom_threshold": trial.suggest_float("targeting.doom_threshold", 0.01, 0.5),
+        "targeting.energy_value": trial.suggest_float("targeting.energy_value", 0.0, 2.0),
+        "targeting.bounty_value": trial.suggest_float("targeting.bounty_value", 0.0, 3.0),
     }
 
 

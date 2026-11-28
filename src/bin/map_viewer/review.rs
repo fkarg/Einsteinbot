@@ -4,7 +4,8 @@
 //! with the library's physics. Outcomes read off an observed path are inferences from endpoints, not
 //! reasons reported by the server.
 use super::*;
-use einsteinbot::simulation::PredictedTrajectory;
+use einsteinbot::estimator::{self, ResidualCorrection, ResidualModel};
+use einsteinbot::simulation::{PredictedTrajectory, simulate_corrected_targeting_shot};
 use einsteinbot::strategy::MapBelief;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -122,6 +123,50 @@ fn observed_shots(events: Vec<(i64, Value)>) -> Vec<ObservedShot> {
     }
     shots.sort_by_key(|shot| shot.begin_sequence);
     shots
+}
+
+/// The residual correction the decision's targeting used (P17): rebuilt from its belief's planets,
+/// the recorded model scalars and the epoch paths the belief had fitted. `None` when the belief
+/// applied none (gated, not computed, or a capture before P17).
+pub fn used_correction(
+    events: &[(i64, Value)],
+    feed: &[(i64, Option<bool>)],
+    sequence: i64,
+    data: &Value,
+) -> Option<ResidualCorrection> {
+    let belief = &data["map_belief"];
+    if belief["residual_correction"].is_null() {
+        return None;
+    }
+    let model: ResidualModel = serde_json::from_value(belief["residual_model"].clone()).ok()?;
+    let planets: Vec<Planet> = serde_json::from_value(belief["planets"].clone()).ok()?;
+    let paths = super::fog::epoch_paths(events, sequence);
+    let lag = map_lag(data, feed, sequence);
+    let (fitted, _) = super::fog::fitted_count(&paths, sequence, data, &lag);
+    let observations: Vec<ShotObservation> =
+        paths[..fitted].iter().map(|(_, o)| o.clone()).collect();
+    estimator::residual_correction(&PlanetMap { planets }, &observations, Some(model))
+        .1
+        .ok()
+}
+
+/// Simulates `shot` on `map` plus `correction` (the model a recorded decision used).
+fn predict_corrected(
+    map: &PlanetMap,
+    correction: Option<&ResidualCorrection>,
+    shot: &ShotObservation,
+    players: &[(u32, Vec2)],
+    samples: usize,
+) -> Result<PredictedTrajectory, String> {
+    simulate_corrected_targeting_shot(
+        map,
+        correction,
+        shot,
+        WorldParameters::default(),
+        samples.clamp(3, MAX_SAMPLES),
+        players,
+        PLAYER_RADIUS,
+    )
 }
 
 /// Simulates `shot` on `map`, the fitted planets of a recorded belief.
@@ -305,6 +350,7 @@ pub fn shot_review(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Result<
         .rev()
         .find(|(planets_sequence, _)| *planets_sequence < sequence)
         .map(|(_, planets)| planets.clone());
+    let events_all = events.clone();
     let shots = observed_shots(events);
     // The decision's shot began before this bot's next decision and within the same map epoch.
     let next_decision: Option<i64> = connection
@@ -352,15 +398,47 @@ pub fn shot_review(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Result<
     let mut variants = Vec::new();
     let mut divergence = Value::Null;
     if let Some(belief) = &belief {
-        let predicted = predict(&belief.map, &observation, &shot.players, samples)?;
-        variants.push(variant_json(
-            "physical",
-            "Fitted planets only",
-            true,
-            Some(&predicted),
-            &shot.points,
-        ));
-        divergence = divergence_json(&shot.points, &predicted, &belief_planets, actual.as_deref());
+        // The model the bot used: the planets plus the residual correction when one was applied.
+        let feed = feed_events(&connection, capture_id)?;
+        let correction = used_correction(&events_all, &feed, sequence, &data);
+        let physical = predict(&belief.map, &observation, &shot.players, samples)?;
+        let used = match &correction {
+            Some(correction) => {
+                let corrected = predict_corrected(
+                    &belief.map,
+                    Some(correction),
+                    &observation,
+                    &shot.players,
+                    samples,
+                )?;
+                variants.push(variant_json(
+                    "corrected",
+                    "Planets + residual correction",
+                    true,
+                    Some(&corrected),
+                    &shot.points,
+                ));
+                variants.push(variant_json(
+                    "physical",
+                    "Fitted planets only",
+                    false,
+                    Some(&physical),
+                    &shot.points,
+                ));
+                corrected
+            }
+            None => {
+                variants.push(variant_json(
+                    "physical",
+                    "Fitted planets (no correction applied)",
+                    true,
+                    Some(&physical),
+                    &shot.points,
+                ));
+                physical
+            }
+        };
+        divergence = divergence_json(&shot.points, &used, &belief_planets, actual.as_deref());
         if let Some(planets) = &actual {
             let map = PlanetMap {
                 planets: planets.clone(),

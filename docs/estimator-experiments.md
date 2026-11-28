@@ -1515,6 +1515,49 @@ Every final map had the true count of planets except live 61 at 24 (23 found). R
 
 Reproduction: `cargo test --release --lib diagnose_replay -- --ignored --nocapture --test-threads=1` with `THREADS=2 CEIL_MS=0` and `SEEDS=<seed> KS=<k> LIVE=- PATHS=128 CHECKPOINTS=32,64,96,128 PLANETS=<n>` or `LEARN=<start>`, or `SEEDS= LIVE=<capture> EPOCH=<e> PATHS=160 CHECKPOINTS=32,64,96,128,160` with the same; `HID` lines carry `hid=` (f at 60/100/150/200/300) and `miss=`, `UPD` lines `count=`. Analysis scripts: `/tmp/P25scripts/{an,det,margin,dyn,raise,wcheck}.py` (jolly copies in `/tmp/P25w`, logs in `/tmp/P25w/out1` (design) and `/tmp/P25w/out` (held out and dynamic)). Compute: jolly 92 CPU-minutes (76 runs), Mac only unit tests.
 
+### P26 results
+
+2026-11-28, branch `p26` from main 4d69e98; `src/estimator/count.rs` (`CountPrior`, `CountPosterior`, carried prior), `src/estimator/fog.rs` (`Fog`, harness `fog/calibration.rs`, ignored test `fog_calibration`), viewer `src/bin/map_viewer/{fog,postmortem}.rs`.
+
+**Question.** Can the bot keep a whole-map uncertainty ("fog of war") that is uncertainty, not observability (no fog where every planet is accounted for, even unflown), with a posterior on the planet count that carries across maps; and is it calibrated against truth?
+
+**Count posterior.** `P(N) ∝ prior(N) C(N, K) f_eff^(N - K)` on `max(K, lower)..=upper`, `lower` the highest count a count-limit raise reached, `upper` the count a too-high signal lowered to in this map. Prior: 24 ± 4 (or `N` ± 4 with `--planets N --learn-planets`); with `--learn-planets` it is re-centred on the count in use after each map and one sd narrower after a map with at least 32 paths, never below 0.5 (`--no-carry-planets`: fresh each map). `--planets N` alone: a point mass at `N`. It does **not** replace P25's ±1 state machine for the count the estimator fits with: within a map the binomial alone cannot tell planets no path has reached from planets near paths that the search has not found yet, and its mode (at least `K`) would cap births at `K`; the state machine's guards (no pull left, `K` unchanged) carry exactly that. So the count in use, and its convergence on P25's replay sets, is P25's by construction (not re-run); the posterior adds the fog and the carried prior. On the 21 recorded maps observed for at least 64 paths (design and held-out sets below, all 24 planets) the posterior's expected unseen count at the map's last decision, recomputed with the prior at 24 and sd 4 / 3 / 2 / 1 / 0.5, was 0.34 / 0.33 / 0.30 / 0.26 / 0.21 (mean; the beliefs missed 0.43 planets on average), largest 1.50 / 1.38 / 1.14 / 1.89 / 3.33 (the largest at sd 0.5 is a map that ended with 21 of 24 found: a narrow prior then insists on 3 unseen, which was right).
+
+**Detectability and `f`.** `P_miss(d - 30)`, logistic with centre 38 and scale 8 in the gap between the nearest observed tick and a planet surface of mean radius 30, fitted by the design agent on capture 58 (fraction of true planets missing from the belief by that gap: < 10 units 0.007, 10-25 0.11, 25-50 0.44, > 50 about 1; similar on 60/67/69). `f` = mean of `P_miss` over possible centres (10-unit raster inside the battlefield by 20; 0 within 20 of a tick or overlapping a found planet). With `f` itself the posterior kept 2-5 unseen planets on completed maps at 70-130 paths (capture 58 map 1: 4.7 at 73 paths, 2.7 at 133). Paths are not independent of where planets are (they bend toward planets and end on them), so space no path visited holds fewer planets than its share. Variants of the count likelihood were scored on the design set (captures 58 maps 0-3, 60, 67, 69; first decision at 8, 16, 32, 64, 128 and 256 fitted paths and the last of each map; 45 decisions; risk on 15-unit cells off every planet, a cell "observed" when a truth planet missing from the belief (none within 10 units) has its centre within 100):
+
+| variant | log score of the missing count | bias | 90% interval coverage | risk Brier (climatology 0.0806) |
+|---|---|---|---|---|
+| `f` (power 1) | -2.32 | +1.76 | 0.89 | 0.0695 |
+| prior only, `N >= K` (P18 noise) | -2.03 | +1.29 | 1.00 | 0.0697 |
+| P25 hidden fraction at 100 units | -1.74 | +0.28 | 0.98 | 0.0678 |
+| ... at 150 | -1.67 | -1.36 | 0.98 | 0.0679 |
+| ... at 200 | -2.23 | -2.55 | 0.69 | 0.0694 |
+| **`f^1.5` (chosen)** | **-1.59** | **-0.06** | **0.98** | **0.0675** |
+| `f^2` | -1.62 | -1.27 | 0.98 | 0.0677 |
+
+**Held out (run once, after the choice).** Captures 53, 55, 56, 57, 59, 61, 62, 63, 64, 66, 68, 70, 71, 73, 76 (15 recorded maps, all 24 planets; 103 decisions): `f^1.5` log score -2.31, bias -0.94, 90% coverage 0.86; the prior alone -2.14, +0.51, 0.99; reach 100 -2.30, -0.43, 0.88; `f` -2.46, +1.07, 0.84. Risk reliability (predicted / observed / cells per bin):
+
+| set | 0-0.1 | 0.1-0.2 | 0.2-0.3 | 0.3-0.4 | Brier (climatology) |
+|---|---|---|---|---|---|
+| design | 0.018 / 0.012 / 244,830 | 0.148 / 0.124 / 56,792 | 0.252 / 0.251 / 53,457 | 0.313 / 0.344 / 31,146 | 0.0675 (0.0806) |
+| held out | 0.018 / 0.027 / 597,371 | 0.148 / 0.139 / 141,874 | 0.252 / 0.249 / 122,134 | 0.306 / 0.297 / 22,697 | 0.0677 (0.0759) |
+
+Held out, `f^1.5` had the best risk Brier of all variants (prior alone 0.0706, `f` 0.0703, reach 100 0.0684), but the prior alone had the better log score for the count; the count is under-predicted by about one planet and its 90% interval covers 86%. Cells within one decision and decisions within one map are not independent; no uncertainty on these numbers was computed.
+
+**Pull.** `unseen_pull_at` = `sqrt(E[N - K] Σ π(u) E[m²; r < |u - p|] / |u - p|⁴)` over centres within 400 units (radius uniform 20-40, mass `r³/10`). Share of cells whose missing planets' true field is within 1 / 2 times the pull: design 0.93 / 0.98 overall and 0.42 / 0.76 within 100 units of a missing planet; held out 0.87 / 0.93 and 0.38 / 0.67. Heavy tails: the pull is a scale for hover, the risk is what the haze draws.
+
+**Information.** `E[N - K] H(π)` bits (relative to the 10-unit raster); a path's information is its drop, split into a planet found (`E[N - K]` falling while `K` rose) and space ruled out (the rest). Capture 67: 327 bits after the first path, a planet found is 12-14 bits, a path through unexplored space 1-22 bits early and under 1 late. It is an entropy proxy for a diagnostic strip, not a measured value of information.
+
+**Cost.** One distance transform when a path was added and one pass over about 18,000 possible centres with the planets stamped on the raster: 1.5-1.8 ms per publication on jolly (release, loaded host; capture 58 and 69 decisions at 36-673 paths; an earlier per-centre planet check took 3.4-5.9 ms). Counted in the `diagnostics` part of `UpdateReport`.
+
+**Post-mortems (viewer).** Captures 58 (four maps), 60, 67, 69, 1,114 decisions: hit 239 (+2 another player), map error 157 (98 after 8 paths: 42 missing planet, 55 small errors amplified, 1 planet off; 59 early-map blind), we died and our shot vanished 157, target already gone 81, no end recorded 50, not fired 19, timing mismatch 7, launch moved 7, no predicted hit 21, waits 374 (all inferred from energy: these captures predate P24's wait reasons). Same as the design agent's prototype.
+
+**Peer review (Codex gpt-6-luna; the OpenCode peer failed to run).** It did not open the files. Findings: (1) the "posterior" is a heuristic score, not a derived Bayesian posterior: agreed, documented as a heuristic with measured calibration (no decision change); (2) the signal bounds are treated as hard although the signals are not proofs, and the carried prior feeds earlier decisions forward, unquantified: recorded as a limitation (no learn-mode captures with signals exist to measure it); (3) exponent 1.5 chosen on four captures while the prior alone has the better held-out log score: the divergence stands as reported above, kept for its reliability and bias; (4) "no held-out risk calibration supplied": rejected, the held-out reliability was in the brief; (5) the information proxy is not validated as information: agreed, labelled a proxy; (6) post-mortem labels are truth-based attributions with untested boundaries: the card now says that nearest is not proof of cause; the class order is in `postmortem::classify` and its tests.
+
+**Limits.** Real maps only with 24 planets; no learn-mode capture yet (the carried prior and signal bounds are unit-tested only); `P_miss` was fitted on capture 58 and the exponent on the design set; early maps (under 16 paths) under-predict the unseen count when the estimator lags behind coverage; targeting does not use the fog.
+
+Reproduction: `DB=<copy of einsteinbot.sqlite3> CAPTURES=58,60,67,69 cargo test --release --lib fog_calibration -- --ignored --nocapture` (lines `CNT`, `SCORE`, `REL`, `PULL`, `COST`); held out with the captures above. Compute: jolly, about 6 CPU-minutes; the Mac only unit tests and the viewer.
+
 ## Planet count (in the README until 2026-11-28)
 
 Does telling the bot the true count ($N = 24$ via `--planets 24`) help, compared with the default prior on the count (centre 24, sd 4, README "How it works" section 3)? The field error is the *explored-field RMSE*: the root mean square error of the estimated gravity vector against the truth, on the 20-unit grid cells that some earlier path crossed. An empty map (*flat*) scores about 0.63.
@@ -1549,6 +1592,36 @@ Spurious planets and the $\chi^2$ ratio against the true map are in the P18 sect
 | held out: started at 24, right count (the same maps) | 15 | 1 (live 67; raised back 9 paths later) | 91 |
 
 The 3 design misses are maps the estimator never completed (live 57 with spurious planets, 58 map 0 with 32 paths, 58 map 2 with a spurious 25th planet). On completed maps with the count too high the ratio fell to 0.24 or less; with the right count and the other two conditions met it stayed at 3.3 or more (live 58 maps 2 and 3, planets 100-560 units from any path); without the ratio those two would have fired. The held-out false alarm came after 5 gated corrections in a row between corrections of 0.02-0.03; the final window of 8 would not have fired there and changes nothing else on either set (re-analysed offline, so this choice is not held out). Starting from 24: 22-planet worlds reached 22 (4 of 4, by path 58); 26-planet worlds reached 26 and stayed (6 of 7, by path 83); in one (7102) the count-limit warning fired at the right count (correction 0.030-0.037 just after the 26th planet was found) and the count stayed at 27.
+
+### Fixes results (2026-11-28, branch `fixes` from main 5bb1823; `search.rs`, `mod.rs`, `fit.rs`, `live_map.rs`, `tui.rs`; harnesses `diagnose_replay` (`PREEMPT`) and `diagnose_full_event_planet` (`CONTACTS`, `CEIL_MS`, `QUAL` lines))
+
+**Pre-emption (observed; jolly, one process at a time pinned to 10 cores, load 2-5 from the replay itself; capture 55 epoch 0 at 110 ms per path, all 545 paths, no audit; two alternating runs each).** Before = main 5bb1823, after = the pre-emption commit.
+
+| | median lag | p90 | worst | max queued | rec2/spur at n = 16, 32, 64, 128, 545 |
+|---|---|---|---|---|---|
+| before | 70 / 61 ms | 176 / 175 ms | 278 / 293 ms | 2 / 2 | 7/0, 12/2 (11/2), 16/0, 24/0, 24/0 |
+| after | 30 / 31 ms | 81 / 93 ms | 148 / 164 ms | 1 / 1 | 7/0, 10/0, 16/0, 24/0, 24/0 |
+
+Deterministic replay (capture 55 epoch 0, 128 paths, `CEIL_MS=0`, 2 threads): identical `QUAL` lines before and after (nothing sets the flag there). The remaining worst lag is inferred, not traced per path: the serial model-error estimate (`LATE` noise max 97 ms in both builds) and the covariance step of the full-row refit (`SLOW` lines show evidence about 140 ms of a 232 ms polish), which is not pre-empted once started.
+
+**Refit guard and folded evidence (observed; jolly busy at load average 26-50 from other sessions, pinned to 10 cores, so absolute lags are higher than above).** Pre-emption alone starved the full-row refit: up to 272-300 paths between two completed refits (`polishes` and `max_paths_between_polishes` in `TLEND`), against 14-46 without pre-emption. With the guard (a refit goes first, uninterrupted, once 8 paths passed without one) the gap fell to 14-33 paths. Folding the evidence's information from the row-block triangles took the evidence step of slow refits (`SLOW` lines) from a median of 69-111 ms to 27-58 ms; deterministic replays (capture 55 to 128 paths, synthetic 7001 to 60) gave identical `QUAL` lines at the same CPU. Final branch (merged with main f42a6e7) against main f42a6e7, three alternating runs each at load 29-36:
+
+| | median lag | p90 | worst | max queued | paths between refits | rec2/spur at n = 16, 32, 64, 128, 545 |
+|---|---|---|---|---|---|---|
+| main | 98 / 103 / 118 ms | 236 / 249 / 266 ms | 396 / 386 / 476 ms | 3 / 3 / 4 | not counted | 7/0, 10-11/0-1, 16/0, 24/0, 24/0 |
+| fixes | 30 / 49 / 46 ms | 97 / 109 / 122 ms | 278 / 278 / 296 ms | 1 / 1 / 2 | 10 / 12 / 15 | 7/0, 10/1, 16/0, 24/0, 24/0 |
+
+Two small changes after a review were not re-measured: a pre-empted joint refit round no longer counts toward `MAX_ROUNDS`, and a slice that spent its whole budget before the flag was seen counts as spent.
+
+**Contact term (observed; full event path with recorded players, so contacts are classified; `CEIL_MS=0`, 2 threads, deterministic, one run each; captures 33, 40, 55 to 128 paths, 45 to 62 and 48 to 48, their whole first epochs).** Almost every path ends in a contact there (15 of 16 at n = 16). Old = the gated term (full pull to 15 units, tapering to zero at 40); off = no contact rows; new = the robust one-sided surface likelihood (uniform penetration on `[-allowance, 0]` convolved with sd 0.25, mixed with a background of relative density 1e-5, so the cost is bounded at about 23 and monotone; the flat map pays that per contact). rec2 / spurious summed over the five captures:
+
+| | n = 16 | n = 32 | n = 64 or the end | n = 128 (3 captures) |
+|---|---|---|---|---|
+| off | 42 / 0 | 81 / 6 | 104 / 4 | 72 / 0 |
+| old | 46 / 0 | 79 / 5 | 106 / 5 | 72 / 0 |
+| new | 46 / 0 | 80 / 3 | 106 / 6 | 72 / 0 |
+
+Explored field RMSE at n = 32, off / old / new: 33 0.051 / 0.111 / 0.051, 40 0.055 / 0.062 / 0.062, 45 2.9e-4 / 3.1e-4 / 2.9e-4, 48 0.053 / 0.053 / 0.022, 55 0.027 / 0.053 / 0.021. At 128 paths all three find 24/24 with explored RMSE within 10% (chi2 ratio vs truth: 33 24 / 25 / 20, 40 7.1 / 6.6 / 6.9, 55 28 / 8.9 / 25). Reading: the old term was neutral to slightly helpful on recall and hurt the 32-path field on two captures; the new one keeps the recall at 16 and 64 paths and has the lowest field error at 32 on four of five captures. One run each; differences of 1-2 planets are within the spread of search order. The deterministic replays of `diagnose_replay` carry no contacts and are unchanged.
 
 ### P14 results (2026-11-28, branch `p14`; `devtool` (`src/bin/devtool/`), `SearchTuning` (`src/estimator/tuning.rs`), study driver `scripts/p14_study.py`)
 
@@ -1588,7 +1661,7 @@ Reading (inferred from the table): (1) **Mass (radius) errors cost far more hits
 | live captures 59-71, recorded beliefs (targeting knobs only) | 1051 -> 1052 | 6 / 5 / 2 | 1.0 | wasted 225 -> 237 (p 0.22); hits per 100 energy median 5.02 -> 4.84 |
 | live captures 59-71, refit beliefs (first 200 paths of each map; both knob sets) | 581 -> 567 | 6 / 7 / 0 | 0.91 | estimator CPU 1057 -> 1699 s (13 of 13 worse); spurious 1 -> 4; recall within 2 units 307 -> 305 |
 
-**Answer: the tuned configuration does not beat the default where it matters.** On the newest live games it is no better (recorded beliefs: +1 hit, 12 more wasted shots; refit beliefs: -14 hits, -2.4%, not significant) and costs 1.5-1.6 times the estimator CPU with more spurious planets. The only significant gain is on held-out synthetic worlds (+2.4% hits, p 0.024), which the live games do not reproduce. Recommendation: keep the default; do not adopt trial 24.
+**Answer: the tuned configuration does not beat the default where it matters.** On the newest live games it is no better (recorded beliefs: +1 hit, 12 more wasted shots; refit beliefs: -14 hits, -2.4%, not significant) and costs 1.5-1.6 times the estimator CPU with more spurious planets. The only significant gain is on held-out synthetic worlds (+2.4% hits, p 0.024), which the live games do not reproduce. Recommendation: keep the default; do not adopt trial 24. (P24 landed while the study ran: `miss_distance_ticks` and `approach_min_energy` are no longer settings, the doom threshold default is 0.04 and hit ranking has energy and bounty values; the targeting half of this result is about the pre-P24 policy, and `scripts/p14_study.py` now tunes P24's `doom_threshold`, `energy_value` and `bounty_value`.)
 
 **Why the study found little (inferred).** (1) The synthetic worlds dominate the objective (60 of 74 worlds) but are easier than live maps (24 of 24 planets found by 60 long paths), so their signal is early-recall speed, bought with CPU; the CPU constraint (1.5 times on synthetic) let through a configuration that is 1.6 times on live captures. (2) The targeting knobs changed little on recorded decisions: shifting `approach_min_energy` and `doom_threshold` moved hits by under 1% and wasted shots up. (3) 31 trials over 13 dimensions is a short TPE run (16 random start-up trials). (4) The default beliefs replayed without lag score 101 true hits on capture 60 against 94 for the recorded (lagged) beliefs (observed, one capture): the live estimator's lag costs more than any tuned constant moved. Next steps that follow from this and the degradation ladders: weigh live captures (refit beliefs) more in the objective and use a CPU constraint measured on them; tune for mass accuracy and early recall rather than final recall; and treat stale targets and missing far planets, not search constants, as the larger levers.
 

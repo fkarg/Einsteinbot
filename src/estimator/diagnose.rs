@@ -303,12 +303,35 @@ fn diagnose_full_event_planet() {
     if let Some(threads) = env_list("THREADS", "0").first() {
         TEST_THREADS.store(*threads, Ordering::Relaxed);
     }
+    // `CONTACTS=0`: fits without the contact term; `CEIL_MS=0`: no slice wall ceiling
+    // (deterministic). `QUAL` lines score the whole map at each checkpoint.
+    fit::CONTACTS_OFF.store(env_list("CONTACTS", "1")[0] == 0, Ordering::Relaxed);
     let events = EventLog::read_capture("einsteinbot.sqlite3", capture).unwrap();
     let mut estimator = Estimator::default();
+    if env_list("CEIL_MS", "-").first() == Some(&0) {
+        estimator.settings.slice_ceiling = None;
+    }
     let never = AtomicBool::new(false);
     let mut truth: Vec<Planet> = Vec::new();
     let (mut planets_events, mut identical, mut shots) = (0, 0, 0usize);
-    let checkpoints = [16usize, 32, 64, 128];
+    let checkpoints = env_list("CHECKPOINTS", "16,32,64,128");
+    let qual = |estimator: &Estimator, n: usize, truth: &[Planet]| {
+        let case = Case {
+            name: format!("capture {capture}"),
+            truth: truth.to_vec(),
+            shots: (estimator.shots.iter())
+                .map(|s| exact_shot(s.obs.clone()))
+                .collect(),
+        };
+        let contacts = estimator.shots.iter().filter(|s| s.contact.is_some());
+        println!(
+            "QUAL world=live{capture} cfg=contacts{} n={n} contacts={} unmatched={} {}",
+            env_list("CONTACTS", "1")[0],
+            contacts.count(),
+            estimator.belief().map_or(0, |b| b.unmatched_contacts),
+            quality(&case, n, &belief_theta(estimator))
+        );
+    };
     let max_paths = env_list("MAXPATHS", "128")[0];
     let report = |estimator: &Estimator, n: usize, truth: &[Planet]| {
         let t = &truth[index];
@@ -368,6 +391,7 @@ fn diagnose_full_event_planet() {
             shots = estimator.shots.len();
             if checkpoints.contains(&shots) {
                 report(&estimator, shots, &truth);
+                qual(&estimator, shots, &truth);
             }
             if shots >= max_paths {
                 break;
@@ -378,4 +402,50 @@ fn diagnose_full_event_planet() {
         "EPOCH capture={capture} planets_events={planets_events} identical_repeats={identical} paths={shots}"
     );
     report(&estimator, shots, &truth);
+    qual(&estimator, shots, &truth);
+}
+
+/// The scores of `theta` against the truth on the first `n` paths, as the fields of a `QUAL` line
+/// (the metrics of `devtool eval`: recall within 2 and 15 units, spurious, exact chi2 relative to
+/// the truth's, field RMSE explored/unexplored/whole by `field_score`, flat references `*0`).
+fn quality(case: &Case, n: usize, theta: &[[f64; 3]]) -> String {
+    use crate::field_score::{FieldStats, score_field};
+    let obs: Vec<ShotObservation> = case.shots[..n].iter().map(|s| s.obs.clone()).collect();
+    let planets: Vec<Planet> = theta.iter().map(|t| planet_at(*t)).collect();
+    let d = |a: &Planet, b: &Planet| (a.x - b.x).hypot(a.y - b.y);
+    let recall = |limit: f64| {
+        (case.truth.iter())
+            .filter(|t| planets.iter().any(|p| d(p, t) < limit))
+            .count()
+    };
+    let spurious = (planets.iter())
+        .filter(|p| !case.truth.iter().any(|t| d(p, t) < 15.0))
+        .count();
+    let chi2 = |m: &[Planet]| eval::exact_chi2(&obs, m).map(|(c, _)| c);
+    let ratio = chi2(&planets)
+        .zip(chi2(&case.truth))
+        .map_or(f64::NAN, |(a, b)| a / b);
+    let truth = PlanetMap {
+        planets: case.truth.clone(),
+    };
+    let field = |p: Vec<Planet>| {
+        let score = score_field(
+            &truth,
+            &MapBelief::new(PlanetMap { planets: p }, None),
+            &obs,
+            WorldParameters::default(),
+        );
+        let r = |s: &Option<FieldStats>| s.as_ref().and_then(|s| s.vector_rmse).unwrap_or(f64::NAN);
+        score.map_or([f64::NAN; 3], |s| {
+            [r(&s.explored), r(&s.unexplored), r(&s.whole)]
+        })
+    };
+    let ([fe, fu, fw], [fe0, fu0, fw0]) = (field(planets.clone()), field(vec![]));
+    format!(
+        "kt={} k={} rec2={} rec15={} spur={spurious} ratio={ratio:.4e} fe={fe:.4e} fu={fu:.4e} fw={fw:.4e} fe0={fe0:.4e} fu0={fu0:.4e} fw0={fw0:.4e}",
+        case.truth.len(),
+        planets.len(),
+        recall(2.0),
+        recall(15.0),
+    )
 }

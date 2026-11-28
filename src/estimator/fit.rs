@@ -11,13 +11,14 @@
 //! Evidence is `-chi2/2 - Occam(Laplace) - K ln 20`, under the noise the shots carry
 //! (`noise.rs`; the same for every map compared, so the log-determinant is left out). The
 //! weights built from it are heuristic rankings, not calibrated probabilities.
+use super::Identifiability;
 use super::Shot;
 use super::lm::{self, Folder, Reduced, Triangle};
 use super::window::PathData;
 use super::work::{Part, Stats, par_map};
 use crate::protocol::{Planet, Point};
 use crate::simulation::WorldParameters;
-use nalgebra::{DMatrix, DVector, SymmetricEigen};
+use nalgebra::{DMatrix, DVector};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
@@ -31,23 +32,29 @@ const PENALTY_SIGMA: f64 = 0.5;
 /// error while excluding concentric or deeply nested splits. The fit's overlap penalty starts at
 /// touching (the generator's rule itself), so fits are pushed apart well before this bound.
 const OVERLAP_TOLERANCE: f64 = 5.0;
-const MIN_CONTACT_SIGMA: f64 = 0.25;
-/// A contact constrains the planet only near its surface: full weight within `CONTACT_FULL`,
-/// tapering smoothly to nothing at `CONTACT_GATE`. Farther contacts stay unexplained, so a
-/// contact cannot drag the fit. Heuristic: the gate exceeds the trajectory-only position
-/// uncertainty of a hit.
-const CONTACT_GATE: f64 = 40.0;
-/// A contact within this distance of a surface is fully constrained by it.
-pub(super) const CONTACT_FULL: f64 = 15.0;
+/// Slack of a contact's signed surface distance beyond its penetration allowance (f32 positions,
+/// substep geometry), as a Gaussian sd in world units.
+const CONTACT_SIGMA: f64 = 0.25;
+/// Density of a contact that comes from a source the map does not hold (a planet not found yet,
+/// anywhere in the arena) relative to one on a found planet's surface. Order of magnitude only:
+/// the surface band of a planet (circumference about 190 times a band of about 0.5) against the
+/// arena (about 1.6e6 square units), times the odds that the hit planet is not in the map
+/// (assumed about 1). A contact that no surface explains costs `2 ln(1 + 1 / CONTACT_BACKGROUND)`
+/// (about 23) whatever the map, so it neither drags nor repels planets.
+const CONTACT_BACKGROUND: f64 = 1e-5;
+/// Contacts farther than this from the surface of every planet are reported as unmatched (a
+/// coarse "no found planet near it" count for the belief, not part of the likelihood).
+pub(super) const CONTACT_MATCH: f64 = 15.0;
 /// Radius range of the local generator (an assumption about the server, not protocol fact).
 const RADIUS_RANGE: (f64, f64) = (20.0, 40.0);
 /// Mass is tied to the radius cubed, as the local generator does: `mass = 0.1 * radius^3`.
 const MASS_PER_RADIUS_CUBED: f64 = 0.1;
-/// Planets closer than this to a bound (in the units of the bound) are saturated: no covariance.
+/// Planets closer than this to a bound (in the units of the bound) are saturated: their Gaussian
+/// approximation does not hold (`Identifiability::AtBound`).
 const BOUND_MARGIN: f64 = 0.5;
-/// The correlation matrix of the sensitivities must have its smallest eigenvalue above this, or
-/// the parameters are treated as under-identified.
-const MIN_CORRELATION_EIGENVALUE: f64 = 1e-4;
+/// A planet is identified by the data when every posterior sd of its `[x, y, radius]` is at most
+/// this fraction of the prior sd (the data, not the prior, carry at least 75% of the precision).
+const IDENTIFIED_SD_FRACTION: f64 = 0.5;
 const LM_PATIENCE: usize = 40;
 /// An evaluation with fewer planet-times-node terms than this is not split over threads.
 const PARALLEL_MIN_PLANET_NODES: usize = 40_000;
@@ -60,6 +67,10 @@ const REDUCTION_GROUPS: usize = 16;
 /// (Occam term near 0) free, and the flat-world test grows five such planets in a corner
 /// (P13, `docs/estimator-experiments.md`); a planet must be born from trajectory evidence.
 const PLANET_PRIOR_ODDS: f64 = 20.0;
+
+/// Diagnosis switch: fits leave the contact rows out (measures the contact term's effect).
+#[cfg(test)]
+pub(super) static CONTACTS_OFF: AtomicBool = AtomicBool::new(false);
 
 pub(super) fn planet_at(theta: [f64; 3]) -> Planet {
     Planet {
@@ -101,16 +112,43 @@ fn surface_error(theta: &[f64; 3], point: &Point) -> f64 {
     (f64::from(point.x) - theta[0]).hypot(f64::from(point.y) - theta[1]) - theta[2]
 }
 
-/// Normalized residual of a terminal contact whose signed distance outside the planet surface is
-/// `signed`. The projectile stops at the first substep inside the disk, so the true penetration is
-/// roughly uniform in `[-allowance, 0]`: centre there, with the matching standard deviation (never
-/// below `MIN_CONTACT_SIGMA`). The pull tapers to nothing between `CONTACT_FULL` and
-/// `CONTACT_GATE`, so a disagreeing contact is left unexplained instead of dragging the fit.
+/// Complementary error function (Numerical Recipes `erfcc`, relative error below 1.2e-7).
+fn erfc(x: f64) -> f64 {
+    let z = x.abs();
+    let t = 1.0 / (1.0 + 0.5 * z);
+    let poly = -z * z - 1.26551223
+        + t * (1.00002368
+            + t * (0.37409196
+                + t * (0.09678418
+                    + t * (-0.18628806
+                        + t * (0.27886807
+                            + t * (-1.13520398
+                                + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277))))))));
+    let value = t * poly.exp();
+    if x >= 0.0 { value } else { 2.0 - value }
+}
+
+/// Signed residual of a terminal contact whose signed distance outside the nearest planet surface
+/// is `signed`, from its log-likelihood. The projectile stops at the first substep inside the
+/// disk, so on the surface of the planet it hit the distance is uniform in `[-allowance, 0]`, plus
+/// a Gaussian slack `CONTACT_SIGMA` (one-sided: penetration, never a gap). The contact may also
+/// come from a planet the map does not hold (`CONTACT_BACKGROUND`). The residual is
+/// `sqrt(-2 ln)` of that mixture relative to its best value: zero on the allowance, growing with
+/// the distance from it, and flat at `unexplained_contact()` once the background dominates (a
+/// proper robust likelihood: monotone, bounded, no pull from far contacts).
 pub(super) fn contact_residual(signed: f64, allowance: f64) -> f64 {
-    let error = signed + allowance / 2.0;
-    let t = ((error.abs() - CONTACT_FULL) / (CONTACT_GATE - CONTACT_FULL)).clamp(0.0, 1.0);
-    let sigma = (allowance / 12f64.sqrt()).max(MIN_CONTACT_SIGMA);
-    error * (1.0 - t * t * (3.0 - 2.0 * t)) / sigma
+    let normal_cdf = |z: f64| 0.5 * erfc(-z / std::f64::consts::SQRT_2);
+    let on_surface =
+        |s: f64| normal_cdf((s + allowance) / CONTACT_SIGMA) - normal_cdf(s / CONTACT_SIGMA);
+    let relative = (on_surface(signed) / on_surface(-allowance / 2.0)).clamp(0.0, 1.0);
+    let cost = 2.0 * ((1.0 / CONTACT_BACKGROUND).ln_1p() - (relative / CONTACT_BACKGROUND).ln_1p());
+    cost.max(0.0).sqrt().copysign(signed + allowance / 2.0)
+}
+
+/// The residual of a contact that no planet of the map explains (also every contact of the flat
+/// map, so that maps with and without planets are compared on the same contacts).
+pub(super) fn unexplained_contact() -> f64 {
+    (2.0 * (1.0 / CONTACT_BACKGROUND).ln_1p()).sqrt()
 }
 
 /// Acceleration at one observed tick that the model leaves unexplained.
@@ -124,9 +162,11 @@ pub(super) struct Unexplained {
 
 pub(super) struct Evidence {
     pub log_evidence: f64,
-    /// `[x, y, radius]` covariance of all planets, `None` when the data leave the parameters
-    /// under-identified or a planet sits at a bound.
+    /// Posterior `[x, y, radius]` covariance of all planets under the Gaussian prior (`None`
+    /// only without planets).
     pub covariance: Option<DMatrix<f64>>,
+    /// Per planet: whether the data identify it (`covariance` is always defined).
+    pub identifiability: Vec<Identifiability>,
 }
 
 /// Limits of one `refine`: a deterministic evaluation count and an optional wall-clock instant
@@ -152,8 +192,10 @@ pub(super) struct Fit<'a> {
     shots: &'a [Shot],
     world: WorldParameters,
     cancelled: &'a AtomicBool,
-    /// `refine` stops improving (keeping its best point so far) at this instant.
+    /// `refine` stops improving (keeping its best point so far) at this instant, or once this
+    /// flag is set (pre-emption: new work is waiting).
     deadline: Option<Instant>,
+    preempt: Option<&'a AtomicBool>,
     use_contacts: bool,
     /// Planets held fixed; the fitted planets add to their field. Evidence needs this empty.
     fixed: Vec<Planet>,
@@ -188,6 +230,7 @@ impl<'a> Fit<'a> {
             world,
             cancelled,
             deadline: None,
+            preempt: None,
             use_contacts,
             fixed,
             base,
@@ -200,9 +243,22 @@ impl<'a> Fit<'a> {
         self
     }
 
+    #[cfg(test)]
     pub fn with_deadline(mut self, deadline: Instant) -> Self {
         self.deadline = Some(deadline);
         self
+    }
+
+    /// `refine` stops (keeping its best point) at `deadline` or once `preempt` is set.
+    pub fn with_cut(mut self, deadline: Instant, preempt: &'a AtomicBool) -> Self {
+        self.deadline = Some(deadline);
+        self.preempt = Some(preempt);
+        self
+    }
+
+    /// Whether `preempt` (see `with_cut`) is set.
+    pub fn preempted(&self) -> bool {
+        self.preempt.is_some_and(|p| p.load(Ordering::Relaxed))
     }
 
     /// Predicted second difference of every row of one path (per axis): the fixed planets'
@@ -316,14 +372,18 @@ impl<'a> Fit<'a> {
         (res, jacobian)
     }
 
-    /// One gated surface term per contact (none without planets or with contacts off), with
-    /// their Jacobian (column-major) if wanted.
+    /// One surface-likelihood term per contact (none with contacts off; the flat map's are all
+    /// `unexplained_contact()`), with their Jacobian (column-major) if wanted.
     fn contact_rows(
         &self,
         theta: &[[f64; 3]],
         want_jacobian: bool,
     ) -> (Vec<f64>, Option<Vec<f64>>) {
-        let contacts: Vec<_> = if self.use_contacts && !theta.is_empty() {
+        #[cfg(test)]
+        let use_contacts = self.use_contacts && !CONTACTS_OFF.load(Ordering::Relaxed);
+        #[cfg(not(test))]
+        let use_contacts = self.use_contacts;
+        let contacts: Vec<_> = if use_contacts {
             self.shots
                 .iter()
                 .filter_map(|shot| shot.contact.as_ref())
@@ -334,9 +394,13 @@ impl<'a> Fit<'a> {
         let rows = contacts.len();
         let mut res = vec![0.0; rows];
         let mut jacobian = want_jacobian.then(|| vec![0.0; rows * 3 * theta.len()]);
+        if theta.is_empty() {
+            res.fill(unexplained_contact());
+            return (res, jacobian);
+        }
         for (row, contact) in contacts.into_iter().enumerate() {
-            // Each contact constrains only the planet whose surface it is closest to, so
-            // overlapping planets are never double counted.
+            // Each contact is explained by at most the planet whose surface it is closest to
+            // (the mixture's dominant term; planets never overlap), so none is double counted.
             let (j, signed) = theta
                 .iter()
                 .enumerate()
@@ -484,15 +548,23 @@ impl<'a> Fit<'a> {
             .then(|| (DVector::from_vec(res), jacobian))
     }
 
-    /// The pivoted QR of the Jacobian with respect to the logistic coordinates `u` (of `theta`)
-    /// and `Q^T` of the residuals, without forming the full Jacobian: consecutive paths are
-    /// grouped by rows (from the data alone, so the result does not depend on `threads`), each
-    /// group's blocks are folded into one triangle on its own thread, and the triangles and the
-    /// contact and overlap rows are reduced last. `None` if cancelled or a residual is not finite.
-    fn reduce(&self, theta: &[[f64; 3]], u: &DVector<f64>, threads: usize) -> Option<Reduced> {
-        if self.cancelled.load(Ordering::Relaxed) {
-            return None;
-        }
+    /// Rows of every path block with `k` planets.
+    fn path_rows(&self, k: usize) -> usize {
+        self.path_indices()
+            .iter()
+            .map(|&index| 2 * self.shots[index].path.as_ref().expect("a path").row_count() + k)
+            .sum()
+    }
+
+    /// The path blocks' Jacobians (chained to `u` when given, else with respect to `theta`) folded
+    /// into triangles: consecutive paths grouped by rows (from the data alone, so the result does
+    /// not depend on `threads`), each group on its own thread. `None` if a residual is not finite.
+    fn triangles(
+        &self,
+        theta: &[[f64; 3]],
+        u: Option<&DVector<f64>>,
+        threads: usize,
+    ) -> Option<Vec<Triangle>> {
         let (k, n) = (theta.len(), 3 * theta.len());
         let threads = self.evaluation_threads(k, threads);
         let paths = self.path_indices();
@@ -518,17 +590,48 @@ impl<'a> Fit<'a> {
                     return None;
                 }
                 let mut block = block.expect("requested");
-                self.chain(theta, u, &mut block, res.len());
+                if let Some(u) = u {
+                    self.chain(theta, u, &mut block, res.len());
+                }
                 folder.add(&block, &res);
             }
             Some(folder.finish())
         });
-        let triangles: Vec<Triangle> = triangles
-            .into_iter()
-            .collect::<Option<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .collect();
+        Some(
+            triangles
+                .into_iter()
+                .collect::<Option<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect(),
+        )
+    }
+
+    /// `J^T J` with respect to `theta`, from the folded path triangles (`R^T R` each) and the
+    /// global rows, without forming `J`.
+    fn information(&self, theta: &[[f64; 3]], threads: usize) -> Option<DMatrix<f64>> {
+        let n = 3 * theta.len();
+        let mut information = DMatrix::zeros(n, n);
+        for triangle in self.triangles(theta, None, threads)? {
+            let r = DMatrix::from_column_slice(n, n, &triangle.r);
+            information += r.tr_mul(&r);
+        }
+        let (res, block) = self.global_rows(theta, true);
+        let global = DMatrix::from_column_slice(res.len(), n, &block.expect("requested"));
+        information += global.tr_mul(&global);
+        Some(information)
+    }
+
+    /// The pivoted QR of the Jacobian with respect to the logistic coordinates `u` (of `theta`)
+    /// and `Q^T` of the residuals, without forming the full Jacobian: the path blocks folded into
+    /// triangles (`triangles`), then the triangles and the contact and overlap rows reduced last.
+    /// `None` if cancelled or a residual is not finite.
+    fn reduce(&self, theta: &[[f64; 3]], u: &DVector<f64>, threads: usize) -> Option<Reduced> {
+        if self.cancelled.load(Ordering::Relaxed) {
+            return None;
+        }
+        let (n, total) = (3 * theta.len(), self.path_rows(theta.len()));
+        let triangles = self.triangles(theta, Some(u), threads)?;
         let (res, block) = self.global_rows(theta, true);
         if !res.iter().all(|v| v.is_finite()) {
             return None;
@@ -653,30 +756,31 @@ impl<'a> Fit<'a> {
         Some((theta, chi2))
     }
 
-    /// Laplace evidence and covariance at `theta` (all planets free, none fixed).
-    pub fn evidence(&self, theta: &[[f64; 3]]) -> Option<Evidence> {
+    /// Laplace evidence and covariance at `theta` (all planets free, none fixed); one evaluation
+    /// may use `threads`.
+    pub fn evidence(&self, theta: &[[f64; 3]], threads: usize) -> Option<Evidence> {
         let started = Instant::now();
-        let out = self.laplace(theta);
+        let out = self.laplace(theta, threads);
         if let Some(stats) = self.stats {
             stats.add(Part::Evidence, started.elapsed());
         }
         out
     }
 
-    fn laplace(&self, theta: &[[f64; 3]]) -> Option<Evidence> {
+    fn laplace(&self, theta: &[[f64; 3]], threads: usize) -> Option<Evidence> {
         debug_assert!(self.fixed.is_empty());
         let k = theta.len();
-        let (residuals, jacobian) = self.evaluate(theta, true, 1)?;
+        let (residuals, _) = self.evaluate(theta, false, threads)?;
         let chi2 = residuals.norm_squared();
         if k == 0 {
             return Some(Evidence {
                 log_evidence: -0.5 * chi2,
                 covariance: None,
+                identifiability: Vec::new(),
             });
         }
-        let jacobian = jacobian.expect("requested");
         let covariance_started = Instant::now();
-        let information = jacobian.tr_mul(&jacobian);
+        let information = self.information(theta, threads)?;
         // Gaussian prior as wide as a uniform one over the allowed ranges.
         let prior_sd = |i: usize| {
             [
@@ -693,26 +797,45 @@ impl<'a> Fit<'a> {
             .cholesky()
             .map(|c| (0..3 * k).map(|i| c.l()[(i, i)].ln()).sum())?;
         let log_evidence = -0.5 * chi2 - occam - k as f64 * PLANET_PRIOR_ODDS.ln();
-        // No covariance for a mode saturated at a bound (the Gaussian approximation does not hold
-        // there) or with a badly conditioned (diagonal-normalized) information matrix.
-        let scale = DMatrix::from_diagonal(&information.diagonal().map(|d| d.sqrt().recip()));
-        let correlation = &scale * &information * &scale;
-        let well_conditioned = correlation.iter().all(|v| v.is_finite())
-            && SymmetricEigen::new(correlation).eigenvalues.min() > MIN_CORRELATION_EIGENVALUE;
-        let covariance = (well_conditioned && self.in_bounds(theta, BOUND_MARGIN))
-            .then(|| information.clone().try_inverse())
-            .flatten()
-            .map(|inverse| {
-                // Inflate when the residuals exceed what the noise model expects.
-                let dof = (self.data_rows() as f64 - 3.0 * k as f64).max(1.0);
-                inverse * (chi2 / dof).max(1.0)
-            });
+        // The posterior covariance under the same Gaussian prior, `(H / c + S^-2)^-1` with the
+        // likelihood inflated by `c` when the residuals exceed what the noise model expects: always
+        // defined, and close to the prior where the data say little. Per planet, whether the data
+        // or the prior determine it, and whether it sits at a bound (where the Gaussian
+        // approximation does not hold).
+        let dof = (self.data_rows() as f64 - 3.0 * k as f64).max(1.0);
+        let inflation = (chi2 / dof).max(1.0);
+        let posterior = DMatrix::from_fn(3 * k, 3 * k, |i, j| {
+            information[(i, j)] * prior_sd(i) * prior_sd(j) / inflation
+                + if i == j { 1.0 } else { 0.0 }
+        });
+        let covariance = posterior.cholesky().map(|c| c.inverse()).map(|scaled| {
+            DMatrix::from_fn(3 * k, 3 * k, |i, j| {
+                scaled[(i, j)] * prior_sd(i) * prior_sd(j)
+            })
+        });
+        let identifiability = covariance.as_ref().map(|covariance| {
+            (0..k)
+                .map(|j| {
+                    if !self.in_bounds(&theta[j..=j], BOUND_MARGIN) {
+                        Identifiability::AtBound
+                    } else if (0..3).all(|p| {
+                        let i = 3 * j + p;
+                        covariance[(i, i)].sqrt() <= IDENTIFIED_SD_FRACTION * prior_sd(i)
+                    }) {
+                        Identifiability::Identified
+                    } else {
+                        Identifiability::PriorDominated
+                    }
+                })
+                .collect()
+        });
         if let Some(stats) = self.stats {
             stats.add(Part::Covariance, covariance_started.elapsed());
         }
         log_evidence.is_finite().then_some(Evidence {
             log_evidence,
             covariance,
+            identifiability: identifiability.unwrap_or_default(),
         })
     }
 
@@ -760,7 +883,7 @@ impl Lm<'_> {
             .into_iter()
             .chain(self.budget.deadline)
             .any(|d| Instant::now() >= d);
-        if out_of_time || self.used >= self.budget.evaluations {
+        if out_of_time || self.fit.preempted() || self.used >= self.budget.evaluations {
             return false;
         }
         self.used += 1;
@@ -871,6 +994,33 @@ mod tests {
         for threads in [2, 8] {
             let other = fit.reduce(&theta, &u, threads).unwrap().unpivoted();
             assert!(other.0 == r && other.1 == qtb, "{threads} threads");
+        }
+    }
+
+    // The evidence's information is `J^T J` of the full Jacobian with respect to `theta`, folded
+    // in parallel without forming `J`, and the thread count changes nothing.
+    #[test]
+    fn the_folded_information_is_that_of_the_full_jacobian() {
+        let cancelled = AtomicBool::new(false);
+        let shots = three_planets();
+        let fit = Fit::new(&shots, WorldParameters::default(), &cancelled, true, vec![]);
+        let theta = [
+            [505.0, 497.0, 30.5],
+            [1195.0, 703.0, 27.0],
+            [905.0, 255.0, 25.5],
+        ];
+        let jacobian = fit.evaluate(&theta, true, 1).unwrap().1.unwrap();
+        let dense = jacobian.tr_mul(&jacobian);
+        let folded = fit.information(&theta, 1).unwrap();
+        assert!((&folded - &dense).amax() < 1e-10 * dense.amax());
+        let evidence = fit.evidence(&theta, 1).unwrap();
+        for threads in [2, 8] {
+            let other = fit.evidence(&theta, threads).unwrap();
+            assert_eq!(
+                other.log_evidence, evidence.log_evidence,
+                "{threads} threads"
+            );
+            assert_eq!(other.covariance, evidence.covariance, "{threads} threads");
         }
     }
 

@@ -17,6 +17,10 @@ use std::path::PathBuf;
 
 #[path = "map_viewer/degrade.rs"]
 mod degrade;
+#[path = "map_viewer/fog.rs"]
+mod fog;
+#[path = "map_viewer/postmortem.rs"]
+mod postmortem;
 #[path = "map_viewer/review.rs"]
 mod review;
 #[path = "map_viewer/scenario.rs"]
@@ -105,6 +109,9 @@ fn handle(mut stream: TcpStream, db_path: &PathBuf) -> Result<(), Box<dyn Error>
         "/api/degrade" => degrade::degrade(db_path, &parameters),
         "/api/shot-review" => review::shot_review(db_path, &parameters),
         "/api/predictive" => review::predictive_error(db_path, &parameters),
+        "/api/fog-timeline" => fog::fog_timeline_request(db_path, &parameters),
+        "/api/fog-path" => fog::fog_path_request(db_path, &parameters),
+        "/api/postmortem" => postmortem::postmortem_request(db_path, &parameters),
         "/api/decisions" => {
             required_id(&parameters, "id").and_then(|id| list_decisions(db_path, id))
         }
@@ -815,6 +822,14 @@ fn selected_snapshot(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Resul
         ));
     }
     let field_grid = make_field_grid(&data, actual_planets.as_deref(), grid_step, view)?;
+    // The fog of the belief shown, over the paths it had fitted (P26).
+    let fog_grid = diagnostic_sequence
+        .and_then(|belief_sequence| {
+            let feed = feed_events(&connection, capture_id).ok()?;
+            let lag = map_lag(&data, &feed, belief_sequence);
+            fog::decision_fog(&events, belief_sequence, &data, &lag)
+        })
+        .map_or(Value::Null, |(fog, info)| fog::fog_grid(&fog, info));
     let roles = scenario::ShotRoles::load(&connection, capture_id)?;
     let selected_shot = selection.strip_prefix("event:").and_then(|_| {
         events
@@ -906,6 +921,7 @@ fn selected_snapshot(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Resul
         "planet_match": planet_match,
         "world": world_state(&events, data["bot_state"]["own_id"].as_u64()),
         "field_grid": field_grid,
+        "fog_grid": fog_grid,
         "view": {"x":view.x,"y":view.y,"width":view.width,"height":view.height},
     }))
 }
@@ -1170,14 +1186,23 @@ fn simulate_request(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Result
             .unwrap_or(PlanetMap { planets: vec![] }),
         _ => return Err("model must be belief or actual".to_owned()),
     };
+    // The recorded belief as the bot used it: planets plus its residual correction (P17).
+    let correction = if model == "belief" {
+        let events = read_events_before(&connection, capture_id, sequence)?;
+        let feed = feed_events(&connection, capture_id)?;
+        review::used_correction(&events, &feed, sequence, &data)
+    } else {
+        None
+    };
     let shot = ShotObservation {
         player_id: own_id,
         angle_degrees: angle,
         velocity,
         points: vec![start],
     };
-    let result = simulate_targeting_shot(
+    let result = einsteinbot::simulation::simulate_corrected_targeting_shot(
         &map,
+        correction.as_ref(),
         &shot,
         WorldParameters::default(),
         180,
@@ -1187,6 +1212,7 @@ fn simulate_request(path: &PathBuf, parameters: &BTreeMap<&str, &str>) -> Result
     .map_err(|error| error.to_string())?;
     Ok(json!({
         "model": model,
+        "residual_correction_applied": correction.is_some(),
         "points": result.points,
         "termination": termination_name(result.termination),
         "velocity": velocity,
