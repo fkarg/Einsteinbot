@@ -38,9 +38,13 @@ pub struct InFlightShot {
 }
 
 /// A player an in-flight shot is predicted to kill.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
 pub struct PredictedKill {
     pub shooter: u32,
+    /// The in-flight shot (with `shooter`, its identity in `ShotBegin`).
+    pub angle_degrees: f64,
+    pub velocity: f64,
+    pub begun_ms: i64,
     pub victim: u32,
     /// Predicted impact time (unix ms, local clock).
     pub impact_ms: f64,
@@ -51,15 +55,19 @@ pub struct PredictedKill {
 }
 
 /// Chance that a shot our map predicts to hit really kills, by predicted flight ticks: map error
-/// grows along the path. Calibrated on captures 53-57 (in-flight shots predicted to hit on the
-/// recorded belief, outcome from the recorded events; pooled 0-59 ticks 66 of 89, 60-79 17 of
-/// 38, 80-99 9 of 28, 100+ 11 of 67). A heuristic, not a calibrated posterior.
+/// grows along the path. Recalibrated (P24) on captures 53 and 55-68 (54 duplicates 53/55;
+/// 69-71 held out): in-flight shots predicted to hit on the recorded belief, outcome from the
+/// recorded events; pooled 0-39 ticks 268 of 375, 40-59 145 of 253, 60-79 68 of 185, 80-99
+/// 37 of 146, 100-119 12 of 115, 120+ 10 of 191 (held out: 0.78, 0.65, 0.50, 0.35, 0.21,
+/// 0.05). A heuristic, not a calibrated posterior.
 pub fn kill_probability(flight_ticks: usize) -> f64 {
     match flight_ticks {
-        0..=59 => 0.75,
-        60..=79 => 0.45,
-        80..=99 => 0.3,
-        _ => 0.15,
+        0..=39 => 0.72,
+        40..=59 => 0.57,
+        60..=79 => 0.37,
+        80..=99 => 0.25,
+        100..=119 => 0.1,
+        _ => 0.05,
     }
 }
 
@@ -115,6 +123,9 @@ pub fn predict_kills(
                 if impact_ms > now_ms as f64 {
                     return Some(PredictedKill {
                         shooter: shot.player_id,
+                        angle_degrees: shot.angle_degrees,
+                        velocity: shot.velocity,
+                        begun_ms,
                         victim,
                         impact_ms,
                         flight_ticks,
@@ -150,6 +161,9 @@ mod tests {
     fn kill(victim: u32, impact_ms: f64, probability: f64) -> PredictedKill {
         PredictedKill {
             shooter: 7,
+            angle_degrees: 0.0,
+            velocity: 5.0,
+            begun_ms: 0,
             victim,
             impact_ms,
             flight_ticks: 30,

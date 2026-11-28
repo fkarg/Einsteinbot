@@ -102,6 +102,7 @@ Each item says what the bot does, why it helps, and what it measured. The math b
 | **Aims with what it can't explain yet** | Adds the still-unexplained pull seen along observed paths to its shot simulation; switches off once the map is complete. | Early in a map, paths near earlier shots are bent by planets the map lacks. | +5 to +32 true hits per replayed game, almost all early in the map. |
 | **Prefers short shots** | Ranks predicted hits by flight time first, miss distance second. | Map errors grow along a path; long shots rarely hit. | The ranking alone: true hits 15 → 23, 49 → 61, 22 → 46 on replayed games. |
 | **Doesn't shoot the doomed** | Simulates every shot in flight (all players, its own included) and skips targets that will die before its shot lands, unless its shot wins the race. | In busy games many shots hit where a player *was*. | Capture 58: true hits 252 → 315, wasted hits 112 → 62. |
+| **Hunts the leader** | Reconstructs each round's scoreboard from the kills it sees and treats a hit on the round leader, who carries a one-point bounty, as worth two kills. | The server never sends the score to bots, but a kill on the leader scores double. | Replays: points 1,140 → 1,165 (captures 53, 55-68) and 250 → 262 held out (69-71). |
 
 ### The math, step by step
 
@@ -262,7 +263,7 @@ then by lower speed, which costs less energy.
 | 60-100 | 3 of 20 |
 | 100 or more | 1 of 32 |
 
-**Doomed targets** ([`src/in_flight.rs`](src/in_flight.rs)). Every shot in flight, from every player, is simulated on the current map to predict who dies and when. A predicted hit is skipped if its victim is predicted to die before our shot lands with probability at least 0.15 (kill chance of each predicted hit by its flight time: 0.75 under 60 ticks, 0.45 under 80, 0.3 under 100, 0.15 beyond; heuristic, overconfident on long flights). If our shot lands first, it still counts.
+**Doomed targets** ([`src/in_flight.rs`](src/in_flight.rs)). Every shot in flight, from every player, is simulated on the current map to predict who dies and when. Each prediction comes true with a chance that falls with its flight time (P24, measured on 1,265 predictions: 0.72 under 40 ticks, then 0.57, 0.37, 0.25, 0.10, and 0.05 beyond 120). A predicted hit is skipped if any in-flight shot is predicted to kill its victim before our shot lands (threshold 0.04, below every chance). If our shot lands first, it still counts. Skipping only the likelier kills (threshold 0.15 on the measured chances) lost hits in replays, so the threshold acts as a decision rule, not as a calibrated probability.
 
 **Waiting.** Without a predicted hit the bot waits until it has 15 energy rather than spend small shots that almost never hit. Before each decision it waits until the estimator has finished its queued work and published nothing new for 300 ms, but at most 500 ms; then it aims with the latest published belief.
 
@@ -282,7 +283,7 @@ More detail on the estimator, targeting and their settings is in [docs/usage.md]
 
 ## How well it works
 
-**Provenance.** Numbers as of 2026-11-27, main at 58abdf9; the fog of war as of 2026-11-28 (branch p26). Each item names the change (P-number) it measured. They come from the experiment logs in [`docs/estimator-experiments.md`](docs/estimator-experiments.md) and the landing notes in [`docs/brainstorms/2026-11-13-newtonwars-bot.md`](docs/brainstorms/2026-11-13-newtonwars-bot.md).
+**Provenance.** Numbers as of 2026-11-27, main at 58abdf9; the fog of war and P24 rows as of 2026-11-28 (branches p26, p24). Each item names the change (P-number) it measured. They come from the experiment logs in [`docs/estimator-experiments.md`](docs/estimator-experiments.md) and the landing notes in [`docs/brainstorms/2026-11-13-newtonwars-bot.md`](docs/brainstorms/2026-11-13-newtonwars-bot.md).
 
 **How to read them.**
 
@@ -357,12 +358,14 @@ Measured by replaying each recorded decision with the belief the bot had at that
 | P15 | rank hits by flight time, wait for energy, 500 ms map wait | 15 → 37 (capture 53), 49 → 91 (54), 22 → 47 (55); hits per 100 energy 11-48% higher | 2 |
 | P17 | residual correction | 79 → 84, 143 → 153, 97 → 104, 42 → 47, 109 → 141 on five recorded maps of captures 53-57, with the estimator's work finished before each decision | 4 |
 | P20 | skip targets predicted to die first (in-flight shots of all players) | 87 → 93 (53), 95 → 104 (55), 44 → 47 (56), 76 → 78 (57), 252 → 315 (58, four maps; wasted hits 112 → 62, hits per 100 energy 5.1 → 6.1) | 5 |
+| P24 | value the round leader's bounty in the hit ranking | points (kills weighted by the inferred bounty) 1,140 → 1,165 and true hits 995 → 985 on captures 53 and 55-68; held out 69-71: points 250 → 262, hits 205 → 208 | 18 maps (54 skipped as a duplicate), 3 more held out |
 
 Caveats:
 
 - P15's ranking was picked among about 9 variants on the same captures, so selection bias is possible.
 - P17's gain is almost all in the first half of each map. Counting repeated hits on the same victim position once, it is small but in the same direction. It costs 2-6% estimator time and about 10 ms per decision. Its spreading off the paths was designed on the same captures.
-- P20's 0.15 threshold was chosen on the same captures; its kill chances are overconfident beyond 60 ticks of flight. Each decision is replayed separately, not as one continuous game played with the new rule. Cost about 5 ms per decision (worst 53 ms).
+- P20's 0.15 threshold was chosen on the same captures; its kill chances were overconfident beyond 60 ticks of flight (P24 recalibrated them and kept P20's behaviour with a 0.04 threshold). Each decision is replayed separately, not as one continuous game played with the new rule. Cost about 5 ms per decision (worst 53 ms).
+- P24's points use the bounty the bot itself infers (the server does not send it), so they assume upstream's default extra-points mode and correct kill attribution. P24 also measured and left out: spending energy near the round end (true hits 1,001 → 1,001), firing before a predicted own death (1,001 → 982), steeper flight ranking while threatened (979 → 981), valuing a kill's energy (995 → 994), and probing unexplored space without a predicted hit (closed loop: 416 kills against 460 without probes over 61 maps, standard error 0.51 per map). Recalibrating the kill chances alone, at P20's threshold, lost 16 true hits (5 held out), so the threshold now keeps P20's behaviour.
 - The replays hold the game still while the bot waits, so they overstate the value of waiting.
 - **Live**, one run on a shared local server with different opponents: 0.154 hits per decision after P15, against 0.114 in capture 55. Indicative only.
 
@@ -381,7 +384,7 @@ Detection of map boundaries and end cards (P19, section 7), tested on recorded c
 
 - Recall dips at 16-32 paths, mostly on synthetic worlds the old estimator had already completed. The estimated model-error scale $s$ (section 3) then sits at its upper bound and absorbs part of the missing planets' signal. At about 9 paths/s this window passes in 2-4 s.
 - The default cap is 32 planets. Servers with more than 32 planets need `--planets N` or `--learn-planets`; the count-limit warning says so once the map is at the cap (tested up to 28 planets). A misplaced planet at a correct cap could also raise it; no such case was seen.
-- The uncertainty probe (a shot aimed to learn where the belief is uncertain, considered only when no hit is predicted) never fired in capture 55. The belief's covariance was usually not available yet at decision time, because the full-row refit lagged the latest path; since the fixes branch a full-row refit completes at least about every 8 paths (14-33 paths between refits in the contended capture 55 replay) and its covariance covers every planet, so the probe's input exists more often (its effect on targeting is not measured).
+- Information probes are off. The covariance-based probe of earlier builds rarely fired, because the covariance was usually not available yet at decision time (since the fixes branch it exists more often). P24 replaced it with a cheap coverage probe, which cost kills in a closed-loop game.
 - The evidence prior (1/20 per planet), the planet-count prior, the interpolation variance and the prior on the noise scalars are heuristics.
 - The fog of war and its count posterior are heuristics with measured calibration on 24-planet maps only; held out they under-predict the unseen count by about one planet, and the pull near a missing planet is often larger than shown.
 - Most cells above are one run, and live worlds vary by several planets between runs of similar configurations.
