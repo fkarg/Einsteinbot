@@ -36,9 +36,11 @@ pub struct MapBelief {
     pub parameter_covariance: Option<DMatrix<f64>>,
     /// Why `parameter_covariance` is unavailable. Unavailable is never zero uncertainty.
     pub covariance_unavailable_reason: Option<crate::estimator::CovarianceUnavailableReason>,
+    /// Per planet of `map`, whether the data determine it (empty without a covariance).
+    pub planet_identifiability: Vec<crate::estimator::Identifiability>,
     /// Terminal points classified as possible planet surface contacts.
     pub contact_points: Vec<Point>,
-    /// Possible contacts farther than the full-strength contact range (15 units) from the surface
+    /// Possible contacts farther than 15 units from the surface
     /// of every planet in `map` (a model mismatch, or planets this slice does not model). With an
     /// empty map this is all of them.
     pub unmatched_contacts: usize,
@@ -83,6 +85,7 @@ impl MapBelief {
             alternatives: Vec::new(),
             parameter_covariance,
             covariance_unavailable_reason,
+            planet_identifiability: Vec::new(),
             contact_points: Vec::new(),
             unmatched_contacts: 0,
             model_position_rmse: None,
@@ -136,6 +139,7 @@ impl MapBelief {
                     .collect::<Vec<_>>()
             }),
             "covariance_unavailable_reason": self.covariance_unavailable_reason,
+            "planet_identifiability": self.planet_identifiability,
             "map_weight": self.map_weight,
             "alternatives": self.alternatives.iter().map(|alternative| serde_json::json!({
                 "planets": alternative.map.planets,

@@ -12,7 +12,8 @@
 //! Environment (besides those of `diagnose.rs`): `NAME` (the `cfg=` label), `SLICES`,
 //! `SLICE_EVALS`, `CEIL_MS` (slice wall ceiling, 0 for none; default the production 250),
 //! `AUDIT`, `SCHEDULE`, `PLANETS` (known total count; absent: the prior), `CAP` (`max_planets`), `LEARN`
-//! (the dynamic planet count of P25 from that start; `count=` on `UPD` lines).
+//! (the dynamic planet count of P25 from that start; `count=` on `UPD` lines), `PREEMPT` (schedule
+//! mode: `0` lets a slice finish when a path arrives; default `1` pre-empts it).
 //! `UPD` lines carry the published belief's residual-correction state (`gate`: `on:<max>` or the
 //! reason) and the count-limit warning (`cap`, `limited`: the path it was first raised at, P23).
 use super::*;
@@ -204,14 +205,46 @@ fn replay_schedule(case: &Case, settings: Settings, period: u64) {
     };
     let mut lags = Vec::with_capacity(total);
     let mut max_queued = 0;
+    // Completed full-row refits of a map with planets (their belief has a covariance or a
+    // factorization failure; refits of the flat map are not counted), the path count at the last
+    // one, and the most paths that arrived between two of them.
+    let (mut polishes, mut polished_at, mut polish_gap) = (0, 0, 0);
+    let mut polished = |belief: Option<MapBelief>, n: usize| {
+        if belief.is_some_and(|b| {
+            matches!(
+                b.covariance_unavailable_reason,
+                None | Some(CovarianceUnavailableReason::FactorizationFailed)
+            )
+        }) {
+            polishes += 1;
+            polish_gap = polish_gap.max(n - polished_at);
+            polished_at = n;
+        }
+    };
     // Serial per-path phases of `observe` (ms) once the epoch has many paths (n > total / 2).
     let mut late: BTreeMap<Part, Vec<f64>> = BTreeMap::new();
+    // `PREEMPT=0`: slices are not pre-empted when a path arrives (the behaviour before the fix).
+    let preempt = std::sync::Arc::new(AtomicBool::new(false));
+    if env_list("PREEMPT", "1")[0] == 1 {
+        let (preempt, total) = (std::sync::Arc::clone(&preempt), total as u32);
+        std::thread::spawn(move || {
+            for k in 1..total {
+                std::thread::sleep((t0 + period * k).saturating_duration_since(Instant::now()));
+                preempt.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+    }
     for n in 1..=total {
         let arrival = t0 + period * (n as u32 - 1);
-        while Instant::now() < arrival {
+        loop {
+            // Cleared before the clock is read, so the arrival's flag is never lost.
+            preempt.store(false, std::sync::atomic::Ordering::SeqCst);
+            if Instant::now() >= arrival {
+                break;
+            }
             if estimator.search_pending() {
                 let started = Instant::now();
-                estimator.step(&never);
+                polished(estimator.step_until(&never, &preempt), n - 1);
                 slow_step(&estimator, started, &id, n - 1);
                 timeline(&estimator, n - 1, "slice");
             } else {
@@ -245,7 +278,7 @@ fn replay_schedule(case: &Case, settings: Settings, period: u64) {
     // The tail: one more period of slices after the last path.
     let end = t0 + period * total as u32;
     while Instant::now() < end && estimator.search_pending() {
-        estimator.step(&never);
+        polished(estimator.step(&never), total);
         timeline(&estimator, total, "slice");
     }
     let quantile = |values: &mut Vec<f64>, q: f64| {
@@ -257,10 +290,11 @@ fn replay_schedule(case: &Case, settings: Settings, period: u64) {
     };
     let worst_lag = quantile(&mut lags, 1.0);
     println!(
-        "TLEND world={id} cfg={name} period_ms={} worst_publish_lag_ms={worst_lag:.0} p90_lag_ms={:.0} median_lag_ms={:.0} max_queued={max_queued}",
+        "TLEND world={id} cfg={name} period_ms={} worst_publish_lag_ms={worst_lag:.0} p90_lag_ms={:.0} median_lag_ms={:.0} max_queued={max_queued} polishes={polishes} max_paths_between_polishes={}",
         period.as_millis(),
         quantile(&mut lags, 0.9),
         quantile(&mut lags, 0.5),
+        polish_gap.max(total - polished_at),
     );
     for (part, mut ms) in late {
         println!(
