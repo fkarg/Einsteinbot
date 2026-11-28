@@ -432,9 +432,9 @@ pub struct TargetingSettings {
     /// Maximum approach-distance penalty for retracing observed space (world units).
     pub coverage_penalty: f64,
     /// A predicted hit whose victim an in-flight shot kills first with at least this chance is
-    /// skipped (`in_flight::doom_probability`); above 1 disables doomed-target avoidance. At
-    /// 0.05, the lowest `kill_probability`, any predicted kill dooms its victim: P24 replays
-    /// lost 16 true hits (5 held out) when kills more than 100 ticks away no longer did.
+    /// skipped (`in_flight::doom_probability`); above 1 disables doomed-target avoidance. Just
+    /// below the lowest `kill_probability` (0.05), so any predicted kill dooms its victim: P24
+    /// replays lost 16 true hits (5 held out) when kills more than 100 ticks away no longer did.
     pub doom_threshold: f64,
     /// Kills a unit of energy gained is worth when ranking hits (the killer gains half the
     /// victim's energy); 0 ranks hits by flight and offset only.
@@ -453,7 +453,7 @@ impl Default for TargetingSettings {
             target_radius: 4.0,
             information_threshold: f64::INFINITY,
             coverage_penalty: 40.0,
-            doom_threshold: 0.05,
+            doom_threshold: 0.04,
             energy_value: 0.0,
             bounty_value: 1.0,
         }

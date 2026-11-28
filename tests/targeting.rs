@@ -77,42 +77,25 @@ fn never_spends_information_shot_when_a_hit_is_available() {
 }
 
 #[test]
-fn information_shot_requires_uncertainty_above_the_threshold() {
-    let mut uncertain_state = state_with_enemy(1700.0, 1000.0);
-    uncertain_state.set_map_belief(Some(MapBelief::new(
-        PlanetMap {
-            planets: vec![Planet {
-                x: 500.0,
-                y: 500.0,
-                radius: 30.0,
-                mass: 2_700.0,
-            }],
-        },
-        Some(DMatrix::identity(3, 3) * 1e12),
-    )));
-    let policy = TargetingPolicy::new(TargetingSettings {
-        angle_step_degrees: 30,
-        max_simulation_ticks: 20,
-        information_threshold: 0.01,
-        ..TargetingSettings::default()
-    });
+fn information_shot_requires_enough_unobserved_space() {
+    // The enemy is out of reach in 20 ticks: no predicted hit.
+    let state = state_with_enemy(1700.0, 1000.0);
+    let probing = |threshold: f64| {
+        TargetingPolicy::new(TargetingSettings {
+            angle_step_degrees: 30,
+            max_simulation_ticks: 20,
+            information_threshold: threshold,
+            ..TargetingSettings::default()
+        })
+    };
 
-    let exploratory_choice = policy.choose(&uncertain_state, 8.0).unwrap();
+    let exploratory_choice = probing(3.0).choose(&state, 8.0).unwrap();
     assert_eq!(exploratory_choice.reason, ShotReason::Information);
+    assert!(exploratory_choice.information_score >= 3.0);
 
-    uncertain_state.set_map_belief(Some(MapBelief::new(
-        PlanetMap {
-            planets: vec![Planet {
-                x: 500.0,
-                y: 500.0,
-                radius: 30.0,
-                mass: 2_700.0,
-            }],
-        },
-        Some(DMatrix::identity(3, 3) * 1e-12),
-    )));
-    // Without a predicted hit or an information shot, the bot waits for energy.
-    assert_eq!(policy.choose(&uncertain_state, 8.0), None);
+    // No path crosses that many new cells: without a predicted hit or an information shot,
+    // the bot waits for energy.
+    assert_eq!(probing(1.0e6).choose(&state, 8.0), None);
 }
 
 #[test]
