@@ -20,6 +20,7 @@ use super::Shot;
 use super::fit::{Budget, Evidence, Fit, any_overlap, overlapping, planet_at, theta_of};
 use super::noise::{Noise, apply};
 use super::rows::thin_rows;
+use super::tuning::SearchTuning;
 use super::work::{Part, PartCeilings, Stats, par_map};
 use crate::protocol::Planet;
 use crate::simulation::WorldParameters;
@@ -28,33 +29,33 @@ use std::time::Instant;
 
 /// Windows less significant than this (whitened magnitude; about 1.25 on average for a correct
 /// model) never seed a planet.
-const SEED_SIGNIFICANCE: f64 = 4.0;
+pub(super) const SEED_SIGNIFICANCE: f64 = 4.0;
 /// Seeds are at least this far apart (world units).
 const SEED_SEPARATION: f64 = 100.0;
-const MAX_SEEDS: usize = 8;
+pub(super) const MAX_SEEDS: usize = 8;
 const SEED_RADII: [f64; 3] = [20.0, 30.0, 40.0];
 /// Seeds fitted alone that go on to a joint refit.
-const JOINT_REFITS: usize = 3;
+pub(super) const JOINT_REFITS: usize = 3;
 /// Weakest planets tried as deaths per level.
-const DEATH_TRIALS: usize = 2;
+pub(super) const DEATH_TRIALS: usize = 2;
 /// Levels of the death descent of the cascade (planets removed one by one from the best mode).
 pub(super) const DEATH_DEPTH: usize = 6;
 /// Modes closer than this in centre and radius are the same planet.
 const SAME_PLANET: (f64, f64) = (10.0, 3.0);
 
 /// Rows kept by the live search (see `rows.rs`).
-const ROW_CAP: usize = 1000;
+pub(super) const ROW_CAP: usize = 1000;
 /// A new path's local refit frees the planets within this distance of its rows.
-const LOCAL_RADIUS: f64 = 100.0;
+pub(super) const LOCAL_RADIUS: f64 = 100.0;
 /// Evaluations of a local refit.
-const LOCAL_EVALUATIONS: u64 = 300;
+pub(super) const LOCAL_EVALUATIONS: u64 = 300;
 /// Alone fits per batch (a batch is the unit between wall-clock checks).
 const BATCH: usize = 8;
 /// A joint partial that is still improving after this many slices of work counts as finished.
-const MAX_ROUNDS: usize = 6;
+pub(super) const MAX_ROUNDS: usize = 6;
 /// Candidates closer than this (xy) are one hypothesis; the list is bounded.
 const DUPLICATE: f64 = 30.0;
-const MAX_CANDIDATES: usize = 24;
+pub(super) const MAX_CANDIDATES: usize = 24;
 
 #[derive(Clone, Debug)]
 pub(super) struct Mode {
@@ -142,13 +143,18 @@ fn overlaps_any(planet: &[f64; 3], theta: &[[f64; 3]]) -> bool {
 
 /// Seed planets from the largest unexplained windows of the paths under `theta`; a seed that
 /// overlaps a planet of `theta` is dropped.
-fn seeds(joint: &Fit, theta: &[[f64; 3]], world: WorldParameters) -> Vec<[f64; 3]> {
+fn seeds(
+    joint: &Fit,
+    theta: &[[f64; 3]],
+    world: WorldParameters,
+    tuning: &SearchTuning,
+) -> Vec<[f64; 3]> {
     let mut chosen: Vec<[f64; 2]> = Vec::new();
     let mut seeds = Vec::new();
     for window in joint.unexplained(theta) {
         let magnitude = window.acceleration[0].hypot(window.acceleration[1]);
-        if window.significance < SEED_SIGNIFICANCE
-            || chosen.len() >= MAX_SEEDS
+        if window.significance < tuning.seed_significance
+            || chosen.len() >= tuning.max_seeds
             || magnitude <= 0.0
             || chosen.iter().any(|p| {
                 (p[0] - window.position[0]).hypot(p[1] - window.position[1]) < SEED_SEPARATION
@@ -186,7 +192,8 @@ fn births(
     let stats = run.stats;
     let threads = run.limits.threads;
     let theta: Vec<[f64; 3]> = parent.planets.iter().map(theta_of).collect();
-    let seeds = stats.time(Part::Seeding, || seeds(joint, &theta, world));
+    let defaults = SearchTuning::default();
+    let seeds = stats.time(Part::Seeding, || seeds(joint, &theta, world, &defaults));
     if seeds.is_empty() {
         return Vec::new();
     }
@@ -345,6 +352,7 @@ pub(super) struct Slice<'a> {
     pub stats: &'a Stats,
     /// The noise of every fit of the slice.
     pub noise: &'a Noise,
+    pub tuning: &'a SearchTuning,
 }
 
 impl Slice<'_> {
@@ -384,8 +392,8 @@ impl Search {
     }
 
     /// The thinned rows of every path under `noise`.
-    fn thin(&self, noise: &Noise) -> Vec<Shot> {
-        let mut shots = thin_rows(&self.paths, ROW_CAP);
+    fn thin(&self, noise: &Noise, row_cap: usize) -> Vec<Shot> {
+        let mut shots = thin_rows(&self.paths, row_cap);
         apply(&mut shots, noise);
         shots
     }
@@ -421,14 +429,14 @@ impl Search {
             shot.path.as_ref().is_some_and(|p| {
                 (0..p.row_count()).any(|r| {
                     let c = p.center(r);
-                    (t[0] - c[0]).hypot(t[1] - c[1]) < LOCAL_RADIUS
+                    (t[0] - c[0]).hypot(t[1] - c[1]) < slice.tuning.local_radius
                 })
             })
         };
         let (free, fixed): (Vec<[f64; 3]>, Vec<[f64; 3]>) =
             self.theta.iter().partition(|t| near(t));
         if !free.is_empty() && !slice.cancelled.load(Ordering::Relaxed) {
-            let shots = self.thin(slice.noise);
+            let shots = self.thin(slice.noise, slice.tuning.row_cap);
             let local = Fit::new(
                 &shots,
                 WorldParameters::default(),
@@ -438,7 +446,7 @@ impl Search {
             )
             .with_stats(slice.stats);
             let budget = Budget {
-                evaluations: LOCAL_EVALUATIONS,
+                evaluations: slice.tuning.local_evaluations,
                 deadline: None,
                 threads: slice.threads,
             };
@@ -466,7 +474,7 @@ impl Search {
         let first = stats.evaluations();
         let mut changed = false;
         // The paths and the noise do not change within a slice.
-        let shots = self.thin(slice.noise);
+        let shots = self.thin(slice.noise, slice.tuning.row_cap);
         while !self.idle()
             && stats.evaluations() - first < slice.evaluations
             && !slice.cut()
@@ -500,7 +508,7 @@ impl Search {
                 weakest.sort_by(|a, b| a.1.total_cmp(&b.1));
                 self.partials = weakest
                     .iter()
-                    .take(DEATH_TRIALS)
+                    .take(slice.tuning.death_trials)
                     .map(|(i, _)| {
                         let mut theta = self.theta.clone();
                         theta.remove(*i);
@@ -517,7 +525,9 @@ impl Search {
                 continue;
             }
             if !self.seeded && self.partials.is_empty() {
-                let new = stats.time(Part::Seeding, || seeds(&joint, &self.theta, world));
+                let new = stats.time(Part::Seeding, || {
+                    seeds(&joint, &self.theta, world, slice.tuning)
+                });
                 for seed in new {
                     // A seed near a kept candidate is the same hypothesis.
                     if !self
@@ -538,7 +548,7 @@ impl Search {
                         .unwrap_or(f64::NEG_INFINITY)
                         .total_cmp(&b.chi2.unwrap_or(f64::NEG_INFINITY))
                 });
-                self.candidates.truncate(MAX_CANDIDATES);
+                self.candidates.truncate(slice.tuning.max_candidates);
                 self.seeded = true;
                 if self.candidates.is_empty() {
                     self.finish();
@@ -609,7 +619,7 @@ impl Search {
                 ranked.sort_by(|a, b| a.chi2.unwrap().total_cmp(&b.chi2.unwrap()));
                 let mut distinct: Vec<[f64; 3]> = Vec::new();
                 for c in ranked {
-                    if distinct.len() < JOINT_REFITS
+                    if distinct.len() < slice.tuning.joint_refits
                         && !distinct.iter().any(|d| {
                             distance(d, &c.theta) < SAME_PLANET.0
                                 && (d[2] - c.theta[2]).abs() < SAME_PLANET.1
@@ -672,8 +682,8 @@ impl Search {
                     }
                     // A refit cut by the slice deadline or a pre-emption has not settled: it
                     // resumes in the next slice.
-                    p.done =
-                        (counter.evaluations() < each && !slice.cut()) || p.rounds >= MAX_ROUNDS;
+                    p.done = (counter.evaluations() < each && !slice.cut())
+                        || p.rounds >= slice.tuning.max_rounds;
                     stats.absorb(&counter);
                 }
                 continue;
@@ -781,6 +791,7 @@ mod tests {
             preempt: cancelled,
             stats,
             noise,
+            tuning: Box::leak(Box::default()),
         }
     }
 
@@ -809,7 +820,7 @@ mod tests {
             dx * w.acceleration[0] + dy * w.acceleration[1] > 0.0
         });
         assert!(towards_centre);
-        let seeds = seeds(&joint, &map, world);
+        let seeds = seeds(&joint, &map, world, &SearchTuning::default());
         assert!(seeds.iter().all(|s| !overlapping(s, &map[0])), "{seeds:?}");
     }
 

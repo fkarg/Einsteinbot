@@ -1,27 +1,18 @@
 //! Diagnosis harnesses (ignored tests that print; run with
 //! `cargo test --release --lib diagnose -- --ignored --nocapture --test-threads=1`). Truth is used
-//! only to score, never inside the estimator. Synthetic worlds follow the W7 generator (24
-//! non-overlapping planets, long paths at speed 8) with seeds that are not the scorecard cases;
-//! live cases are captures with disclosed planets (the scorecard cases 12/18/44/49 and capture 52
-//! are reserved; `docs/estimator-experiments.md`). The replayed paths carry no contacts.
+//! only to score, never inside the estimator. Synthetic worlds follow the W7 generator
+//! (`eval::synthetic_world`) with seeds that are not the scorecard cases; live cases are captures
+//! with disclosed planets. The replayed paths carry no contacts. The replay and baseline harnesses
+//! moved to `devtool eval` (P14).
 //!
 //! Environment: `SEEDS` (default 7001,7002,7003) and `KS` (default 24) choose the synthetic worlds,
 //! `LIVE` (default 40,36,33) the live captures (`-` for none), `PATHS` (default 8) the number of
-//! paths (live captures get one more), `THREADS` the thread limit, `CHECKPOINTS` the path counts
-//! that are scored (default 4,8,16,32,60 and the last), `MAPS` (any value) prints the missed true
-//! planets and the spurious estimated ones at each checkpoint (`MISS`, `SPUR`).
-//!
-//! Output lines are `TAG key=value ...` (`WORLD`, `UPD`, `QUAL`, `TL`, `TLEND`) for
-//! `scripts/p8_tables.py`, `scripts/p6_tables.py` and `scripts/p7_tables.py`.
-mod baseline;
-mod replay;
-
+//! paths (live captures get one more), `THREADS` the thread limit.
 use super::fit::{Fit, planet_at, theta_of};
 use super::work::TEST_THREADS;
 use super::*;
 use crate::event_store::EventLog;
 use crate::protocol::{Planet, RecordedEvent};
-use crate::simulation::simulate_shot;
 
 struct Case {
     name: String,
@@ -29,63 +20,16 @@ struct Case {
     shots: Vec<Shot>,
 }
 
-fn uniform(state: &mut u64) -> f64 {
-    *state = state
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407);
-    (*state >> 11) as f64 / (1u64 << 53) as f64
-}
-
 fn exact_shot(obs: ShotObservation) -> Shot {
     Shot::new(obs, None, WorldParameters::default())
 }
 
 fn synthetic(seed: u64, k: usize, paths: usize) -> Case {
-    let world = WorldParameters::default();
-    let mut state = seed;
-    let mut truth: Vec<Planet> = Vec::new();
-    while truth.len() < k {
-        let radius = 20.0 + 20.0 * uniform(&mut state);
-        let c = Planet {
-            x: radius + (world.battlefield_width - 2.0 * radius) * uniform(&mut state),
-            y: radius + (world.battlefield_height - 2.0 * radius) * uniform(&mut state),
-            radius,
-            mass: radius.powi(3) / 10.0,
-        };
-        if truth
-            .iter()
-            .all(|p| (p.x - c.x).hypot(p.y - c.y) > p.radius + c.radius)
-        {
-            truth.push(c);
-        }
-    }
-    let map = PlanetMap {
-        planets: truth.clone(),
-    };
-    let mut shots = Vec::new();
-    while shots.len() < paths {
-        let shot = ShotObservation {
-            player_id: 1,
-            angle_degrees: (360.0 * uniform(&mut state)).floor(),
-            velocity: 8.0,
-            points: vec![Point {
-                x: (100.0 + (world.battlefield_width - 200.0) * uniform(&mut state)) as f32,
-                y: (100.0 + (world.battlefield_height - 200.0) * uniform(&mut state)) as f32,
-            }],
-        };
-        let path = simulate_shot(&map, &shot, world, 2000).unwrap();
-        if path.points.len() < 40 {
-            continue;
-        }
-        shots.push(exact_shot(ShotObservation {
-            points: path.points,
-            ..shot
-        }));
-    }
+    let (truth, shots) = eval::synthetic_world(seed, k, paths);
     Case {
         name: format!("synthetic seed {seed} K={k} paths={paths}"),
         truth,
-        shots,
+        shots: shots.into_iter().map(exact_shot).collect(),
     }
 }
 
@@ -172,147 +116,11 @@ fn cases() -> Vec<Case> {
     out
 }
 
-/// A world's name without the path count, as a table key.
-fn world_id(case: &Case) -> String {
-    let name = case.name.split(" paths=").next().unwrap();
-    name.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect()
-}
-
-fn event_of(shot: &Shot) -> ServerEvent {
-    ServerEvent::ShotFin {
-        player_id: shot.obs.player_id,
-        angle: shot.obs.angle_degrees,
-        velocity: shot.obs.velocity,
-        points: shot.obs.points.clone(),
-    }
-}
-
-fn distance(a: &[f64; 3], b: &[f64; 3]) -> f64 {
-    (a[0] - b[0]).hypot(a[1] - b[1])
-}
-
-fn acceleration(theta: &[[f64; 3]], p: [f64; 2]) -> [f64; 2] {
-    let mut a = [0.0; 2];
-    for t in theta {
-        let mass = planet_at(*t).mass;
-        let (dx, dy) = (t[0] - p[0], t[1] - p[1]);
-        let d2 = (dx * dx + dy * dy).max(1e-12);
-        let d = d2.sqrt();
-        a[0] += dx / d * mass / d2;
-        a[1] += dy / d * mass / d2;
-    }
-    a
-}
-
-/// RMS acceleration error of `theta` against `truth` on a 20-unit grid, over grid points within
-/// 30 units of a visited row (explored), the others (unexplored) and all (whole); points inside a
-/// true planet are left out.
-fn field_rmse(shots: &[Shot], theta: &[[f64; 3]], truth: &[[f64; 3]]) -> (f64, f64, f64) {
-    let world = WorldParameters::default();
-    let visited: Vec<[f64; 2]> = shots
-        .iter()
-        .filter_map(|s| s.path.as_ref())
-        .flat_map(|p| (0..p.row_count()).map(|r| p.center(r)))
-        .collect();
-    let mut sums = [(0.0, 0usize); 2];
-    let mut whole = (0.0, 0usize);
-    for i in 0..(world.battlefield_width / 20.0) as usize {
-        for j in 0..(world.battlefield_height / 20.0) as usize {
-            let p = [10.0 + 20.0 * i as f64, 10.0 + 20.0 * j as f64];
-            if truth
-                .iter()
-                .any(|t| (t[0] - p[0]).hypot(t[1] - p[1]) < t[2])
-            {
-                continue;
-            }
-            let explored = visited
-                .iter()
-                .any(|v| (v[0] - p[0]).hypot(v[1] - p[1]) < 30.0);
-            let (a, b) = (acceleration(theta, p), acceleration(truth, p));
-            let e = (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2);
-            let s = &mut sums[usize::from(!explored)];
-            s.0 += e;
-            s.1 += 1;
-            whole.0 += e;
-            whole.1 += 1;
-        }
-    }
-    let rms = |s: (f64, usize)| (s.0 / s.1.max(1) as f64).sqrt();
-    (rms(sums[0]), rms(sums[1]), rms(whole))
-}
-
-/// The scores of `theta` against the truth and the exact likelihood on the first `n` paths, as the
-/// fields of a `QUAL` line.
-fn quality(case: &Case, n: usize, theta: &[[f64; 3]]) -> String {
-    let never = AtomicBool::new(false);
-    let shots = &case.shots[..n];
-    let rows = residual_rows(shots);
-    let truth = theta_of_planets(&case.truth);
-    let exact = Fit::new(shots, WorldParameters::default(), &never, false, vec![]);
-    let chi2_per_row = |t: &[[f64; 3]]| exact.chi2(t).unwrap() / rows as f64;
-    let ratio = chi2_per_row(theta) / chi2_per_row(&truth);
-    let hit = |p: &[f64; 3], limit: f64| theta.iter().any(|t| distance(t, p) < limit);
-    let recall = |limit: f64| truth.iter().filter(|p| hit(p, limit)).count();
-    let spurious = theta
-        .iter()
-        .filter(|t| !truth.iter().any(|p| distance(t, p) < 15.0))
-        .count();
-    if std::env::var("MAPS").is_ok() {
-        for t in &truth {
-            let near = theta
-                .iter()
-                .min_by(|a, b| distance(a, t).total_cmp(&distance(b, t)));
-            if let Some(e) = near.filter(|e| distance(e, t) >= 2.0) {
-                println!(
-                    "MISS n={n} truth={t:.1?} nearest={e:.1?} d={:.1}",
-                    distance(e, t)
-                );
-            }
-        }
-        for t in theta {
-            if !truth.iter().any(|p| distance(t, p) < 15.0) {
-                println!("SPUR n={n} est={t:.1?}");
-            }
-        }
-    }
-    let (fe, fu, fw) = field_rmse(shots, theta, &truth);
-    let (fe0, fu0, fw0) = field_rmse(shots, &[], &truth);
-    format!(
-        "kt={} k={} rec2={} rec15={} spur={spurious} ratio={ratio:.4e} fe={fe:.4e} fu={fu:.4e} fw={fw:.4e} fe0={fe0:.4e} fu0={fu0:.4e} fw0={fw0:.4e}",
-        truth.len(),
-        theta.len(),
-        recall(2.0),
-        recall(15.0),
-    )
-}
-
-fn checkpoints(total: usize) -> Vec<usize> {
-    let mut v: Vec<usize> = env_list("CHECKPOINTS", "4,8,16,32,60")
-        .into_iter()
-        .filter(|&n| n <= total)
-        .collect();
-    if !v.contains(&total) {
-        v.push(total);
-    }
-    v
-}
-
 fn belief_theta(estimator: &Estimator) -> Vec<[f64; 3]> {
     estimator
         .belief()
         .map(|b| theta_of_planets(&b.map.planets))
         .unwrap_or_default()
-}
-
-/// Residual rows (both axes) of the shots.
-fn residual_rows(shots: &[Shot]) -> usize {
-    shots
-        .iter()
-        .filter_map(|shot| shot.path.as_ref())
-        .map(|path| 2 * path.row_count())
-        .sum()
 }
 
 /// P13 check of the production likelihood (`noise.rs`): for the true map and the true map minus
@@ -595,4 +403,49 @@ fn diagnose_full_event_planet() {
     );
     report(&estimator, shots, &truth);
     qual(&estimator, shots, &truth);
+}
+
+/// The scores of `theta` against the truth on the first `n` paths, as the fields of a `QUAL` line
+/// (the metrics of `devtool eval`: recall within 2 and 15 units, spurious, exact chi2 relative to
+/// the truth's, field RMSE explored/unexplored/whole by `field_score`, flat references `*0`).
+fn quality(case: &Case, n: usize, theta: &[[f64; 3]]) -> String {
+    use crate::field_score::{FieldStats, score_field};
+    let obs: Vec<ShotObservation> = case.shots[..n].iter().map(|s| s.obs.clone()).collect();
+    let planets: Vec<Planet> = theta.iter().map(|t| planet_at(*t)).collect();
+    let d = |a: &Planet, b: &Planet| (a.x - b.x).hypot(a.y - b.y);
+    let recall = |limit: f64| {
+        (case.truth.iter())
+            .filter(|t| planets.iter().any(|p| d(p, t) < limit))
+            .count()
+    };
+    let spurious = (planets.iter())
+        .filter(|p| !case.truth.iter().any(|t| d(p, t) < 15.0))
+        .count();
+    let chi2 = |m: &[Planet]| eval::exact_chi2(&obs, m).map(|(c, _)| c);
+    let ratio = chi2(&planets)
+        .zip(chi2(&case.truth))
+        .map_or(f64::NAN, |(a, b)| a / b);
+    let truth = PlanetMap {
+        planets: case.truth.clone(),
+    };
+    let field = |p: Vec<Planet>| {
+        let score = score_field(
+            &truth,
+            &MapBelief::new(PlanetMap { planets: p }, None),
+            &obs,
+            WorldParameters::default(),
+        );
+        let r = |s: &Option<FieldStats>| s.as_ref().and_then(|s| s.vector_rmse).unwrap_or(f64::NAN);
+        score.map_or([f64::NAN; 3], |s| {
+            [r(&s.explored), r(&s.unexplored), r(&s.whole)]
+        })
+    };
+    let ([fe, fu, fw], [fe0, fu0, fw0]) = (field(planets.clone()), field(vec![]));
+    format!(
+        "kt={} k={} rec2={} rec15={} spur={spurious} ratio={ratio:.4e} fe={fe:.4e} fu={fu:.4e} fw={fw:.4e} fe0={fe0:.4e} fu0={fu0:.4e} fw0={fw0:.4e}",
+        case.truth.len(),
+        planets.len(),
+        recall(2.0),
+        recall(15.0),
+    )
 }

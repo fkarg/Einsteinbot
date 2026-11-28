@@ -454,7 +454,10 @@ const RECORDED_HITS: usize = 5;
 /// `in_flight::kill_probability`: 0.72 below 40 ticks, 0.25 at 80-99).
 const HIT_TICKS_PER_EFOLD: f64 = 55.0;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// Loadable from JSON (`devtool eval --config`): missing keys take the defaults, unknown keys are
+/// errors.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct TargetingSettings {
     pub angle_step_degrees: u16,
     pub max_simulation_ticks: usize,
